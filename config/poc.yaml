@@ -1,0 +1,23 @@
+# ~100M POC config. Target ~3B tokens (~Chinchilla for 100M), seq length 1024.
+# The tied embedding (vocab x d_model ~= 50280*768 ~= 38M) is a large share of the
+# budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers lands near 100M.
+d_model: 768           # d_inner = expand*d_model = 1536
+n_layers: 24
+d_state: 16
+expand: 2
+d_conv: 4
+dt_rank: auto
+
+vocab_size: 50280      # OLMo tokenizer; confirm < 65536 for uint16 packing
+seq_len: 1024          # <= ~2k -> chunking NOT required for the training run
+tie_embeddings: true
+
+# CONFIRM ON MLX in milestone 1 (do NOT assume bf16). fp16 + loss scaling is the
+# likely Metal-friendly choice; bf16 is historically less optimized on Metal.
+precision: fp16
+chunk_size: null       # set an int only for long-context inference
+
+# dt-projection bias init (load-bearing)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
