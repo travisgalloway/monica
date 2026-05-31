@@ -26,9 +26,11 @@ def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if isinstance(ids, np.ndarray):
+        # Validate the ORIGINAL values: casting to uint16 first would silently
+        # wrap out-of-range / negative ids and defeat the check.
+        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= 65536):
+            raise ValueError("token id out of range for uint16 [0, 65535]")
         arr = ids.astype(DTYPE, copy=False)
-        if arr.max(initial=0) >= 65536:
-            raise ValueError("token id >= 65536 does not fit uint16")
         arr.tofile(out_path)
         n = arr.size
     else:
@@ -36,8 +38,8 @@ def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
         with open(out_path, "wb") as f:
             buf = []
             for tid in ids:
-                if tid >= 65536:
-                    raise ValueError("token id >= 65536 does not fit uint16")
+                if tid < 0 or tid >= 65536:
+                    raise ValueError("token id out of range for uint16 [0, 65535]")
                 buf.append(tid)
                 if len(buf) >= chunk:
                     np.asarray(buf, dtype=DTYPE).tofile(f)

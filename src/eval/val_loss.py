@@ -39,12 +39,15 @@ def evaluate(model: ModelInterface, loader: PackedLoader,
     `to_numpy` converts backend logits to numpy (identity by default; on MLX pass
     a converter). Backend-free otherwise.
     """
-    total, n = 0.0, 0
+    # Weight each batch's mean CE by its token count so a smaller final batch
+    # (drop_last=False) does not bias the result.
+    total_ce, total_tokens = 0.0, 0
     for i, (inputs, targets) in enumerate(loader.epoch()):
         if max_batches is not None and i >= max_batches:
             break
         logits = to_numpy(model.forward(inputs))
-        total += cross_entropy(logits, targets)
-        n += 1
-    mean_ce = total / max(1, n)
+        n_tokens = int(np.asarray(targets).size)
+        total_ce += cross_entropy(logits, targets) * n_tokens
+        total_tokens += n_tokens
+    mean_ce = total_ce / max(1, total_tokens)
     return {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}

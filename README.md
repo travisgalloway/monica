@@ -8,9 +8,10 @@ so a successful POC migrates to **CUDA** for a larger run with minimal rewrite.
 
 All hardware-specific code lives behind `src/model/interface.py`
 (`ModelInterface`). Everything above it — `data/`, `train/`, `serve/`, `eval/`,
-`conformance/` — is portable Python that **never imports MLX or CUDA**. Only
-`src/model/mlx_backend.py` and `src/model/cuda_backend.py` touch a hardware
-library. `tests/test_import_guard.py` enforces this.
+`conformance/` — is portable Python that **never imports MLX or CUDA**. Only the
+backend modules — `src/model/mlx_backend.py`, `src/model/mlx_train_step.py`, and
+`src/model/cuda_backend.py` — touch a hardware library.
+`tests/test_import_guard.py` enforces this.
 
 `ModelInterface`: `forward` (parallel training path) · `step` (recurrence inference
 path) · `init_state` · `get_state`/`set_state` · `save`/`load` · `config`.

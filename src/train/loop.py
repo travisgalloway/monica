@@ -16,7 +16,7 @@ Required "robust run" features (wired on the Mac):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..model.interface import ModelInterface

@@ -23,8 +23,10 @@ mlx = ["mlx>=0.18"]
 logging = ["wandb>=0.16"]
 dev = ["pytest>=8.0"]
 
-[tool.setuptools]
-packages = ["src"]
+[tool.setuptools.packages.find]
+# Discover `src` and all subpackages (src.data, src.train, ...); a bare
+# packages=["src"] omits subpackages in non-editable installs.
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

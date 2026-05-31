@@ -4,8 +4,9 @@ Ordered, local checklist for finishing the POC on Apple Silicon. Mirrors the
 GitHub tracker (parent issue #2) and milestones M1–M4. Each step lists the files
 to touch, the command to run, and the acceptance gate.
 
-> Backend rule: only `src/model/mlx_backend.py` may import `mlx`. Keep everything
-> above the seam backend-free (`tests/test_import_guard.py` enforces this).
+> Backend rule: only the backend modules — `src/model/mlx_backend.py` and
+> `src/model/mlx_train_step.py` — may import `mlx`. Keep everything above the seam
+> backend-free (`tests/test_import_guard.py` enforces this).
 
 ---
 

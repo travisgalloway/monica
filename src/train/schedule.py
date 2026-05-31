@@ -17,6 +17,19 @@ class CosineSchedule:
     total_steps: int
     min_lr_ratio: float = 0.1  # floor as a fraction of base_lr; never 0
 
+    def __post_init__(self) -> None:
+        # Fail fast on misconfiguration that would yield negative/increasing LRs.
+        if self.base_lr <= 0:
+            raise ValueError("base_lr must be > 0")
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0")
+        if self.total_steps <= 0:
+            raise ValueError("total_steps must be > 0")
+        if self.total_steps < self.warmup_steps:
+            raise ValueError("total_steps must be >= warmup_steps")
+        if not 0 < self.min_lr_ratio <= 1:
+            raise ValueError("min_lr_ratio must be in (0, 1]")
+
     def lr_at(self, step: int) -> float:
         if step < 0:
             raise ValueError("step must be >= 0")

@@ -22,7 +22,7 @@ PORTABLE_MODULES = [
     "src.conformance.forward_step_parity",
 ]
 
-FORBIDDEN = ("mlx", "mlx.core", "mlx.nn", "torch")
+FORBIDDEN_ROOTS = ("mlx", "torch")
 
 
 def test_portable_modules_do_not_import_backends():
@@ -34,5 +34,6 @@ def test_portable_modules_do_not_import_backends():
     for mod in PORTABLE_MODULES:
         importlib.import_module(mod)
 
-    leaked = [m for m in sys.modules if m in FORBIDDEN]
+    # Match by top-level package so submodules (mlx.core, torch._C, ...) also fail.
+    leaked = sorted({m for m in sys.modules if m.split(".")[0] in FORBIDDEN_ROOTS})
     assert not leaked, f"backend leaked above the seam: {leaked}"

@@ -76,6 +76,18 @@ def load_resume(path: str, optimizer_deserializer: Callable[[str], Any]) -> dict
 
 
 def _jsonable(x: Any) -> Any:
+    """Recursively convert RNG/optimizer state into JSON-serializable values.
+
+    Real RNG states (e.g. ``np.random.default_rng(...).bit_generator.state``) are
+    nested dicts containing np.ndarrays and NumPy scalar types, so a shallow
+    conversion would raise inside ``json.dumps``.
+    """
     if isinstance(x, np.ndarray):
         return {"__ndarray__": x.tolist(), "dtype": str(x.dtype)}
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
     return x
