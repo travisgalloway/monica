@@ -30,18 +30,20 @@ scripts/smoke_test.py      the milestone-4 gate
 tests/                     in-container unit tests
 ```
 
-## Status — scaffold for milestones 1–4
+## Status — milestone 1 implemented; awaiting Mac sign-off
 
-This Linux repo holds the **structure + seam + configs + runnable data pipeline**,
-with **skeletons/stubs** for MLX-specific bodies. MLX only runs on Apple Silicon,
-so the model, training loop, and smoke test are **completed and run on a Mac**.
+The seam, configs, data pipeline, MLX model/backend, training loop, and smoke test
+are **implemented and unit-tested** (`pytest` → 20 passing). MLX only runs on Apple
+Silicon, so the MLX-specific paths are exercised here via the portable conformance
+tests and need a **final run on a Mac** to formally close M1–M4. Progress is
+tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2).
 
 | Milestone | State | Where it runs |
 |---|---|---|
-| 1 Seam + toy MLX model | interface/config done; backend skeleton | Mac |
+| 1 Seam + toy MLX model | seam/config done; MLX backend implemented + parity-tested | Mac sign-off |
 | 2 Data pipeline (tiny) | implemented + unit-tested | here (Linux) |
-| 3 Minimal training loop | schedule/checkpoint/val done; loop skeleton | Mac |
-| 4 Smoke test (gate) | skeleton | Mac |
+| 3 Minimal training loop | schedule/checkpoint/val + `train_step` + loop done | Mac sign-off |
+| 4 Smoke test (gate) | implemented; ran on a Mac (`runs/smoke/`) | Mac sign-off |
 | 5–8 POC scale, OLMES, serve/rewind, CUDA | deferred stubs | later |
 
 **Locked decisions:** poc = d_model 768 / 24 layers / d_state 16 / seq 1024 /
@@ -63,7 +65,7 @@ python -m src.data.pack --in data/ids.npy --out data/packed.bin
 python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 2000
 ```
 
-On a Mac: `pip install mlx`, complete the `TODO[mac]` bodies in
-`src/model/mlx_backend.py` + an MLX `train_step`, then run
-`python scripts/smoke_test.py --data data/split` (the M4 gate) before scaling to
+On a Mac: `pip install mlx`, then run
+`python scripts/smoke_test.py --data data/split` (the M4 gate) to confirm the MLX
+backend, training loop, and exact-resume all pass before scaling to
 `config/poc.yaml`.
