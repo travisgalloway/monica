@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monica-mamba-poc"
+version = "0.0.1"
+description = "Mamba (selective SSM) LM proof-of-concept: develop on Apple Silicon (MLX), migrate to CUDA behind one seam."
+requires-python = ">=3.10"
+# Portable deps (run anywhere, incl. this Linux container).
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# Data pipeline at full scale (download/tokenize).
+data = ["datasets>=2.0", "transformers>=4.40"]
+# Apple Silicon backend (NOT installable on Linux/CUDA hosts).
+mlx = ["mlx>=0.18"]
+# Experiment logging.
+logging = ["wandb>=0.16"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+# Discover `src` and all subpackages (src.data, src.train, ...); a bare
+# packages=["src"] omits subpackages in non-editable installs.
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

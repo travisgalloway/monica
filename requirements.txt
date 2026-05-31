@@ -1,0 +1,21 @@
+# Portable core (this Linux container + the Mac).
+numpy>=1.24
+pyyaml>=6.0
+safetensors>=0.4
+
+# Data pipeline at full scale.
+datasets>=2.0
+transformers>=4.40
+
+# Experiment logging.
+wandb>=0.16
+
+# Dev/test.
+pytest>=8.0
+
+# Apple Silicon ONLY (uncomment on a Mac; not installable on Linux/CUDA):
+# mlx>=0.18
+
+# CUDA scale-up ONLY (added at that milestone):
+# torch
+# mamba-ssm
