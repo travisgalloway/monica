@@ -1,12 +1,14 @@
-"""Pull a small slice of Dolma (or generate synthetic text for offline testing).
+"""Pull a small slice of FineWeb-Edu (or generate synthetic text for offline testing).
 
 Target for the POC run: ~2-5B tokens total (~10-20GB raw text; packed files are
 several GB on their own — plan disk accordingly). For the smoke test a few million
 tokens is plenty.
 
-Before downloading raw text, CHECK whether AI2 publishes a pre-tokenized Dolma
-subset (e.g. on the HuggingFace Hub). If so, prefer it and skip `tokenize.py`
-entirely.
+Corpus (issue #4): ``HuggingFaceFW/fineweb-edu`` (ODC-By), using a ready sample
+subset (e.g. ``sample-10BT``) streamed via `datasets`. NOTE: there is no
+compatibly-licensed pre-tokenized small-vocab (< 65536) subset on the HF Hub — AI2's
+dolma3 mixes are raw text at the OLMo-2 100278 vocab, and third-party tokenized sets
+use Llama/Pile tokenizers — so we tokenize raw text ourselves via `tokenize.py`.
 
 Network access in some environments is restricted; `--dummy` produces synthetic
 text so the rest of the pipeline can be exercised without a download.
@@ -29,14 +31,18 @@ def dummy_texts(n_docs: int = 1000, seed: int = 0) -> Iterator[str]:
         yield " ".join(rng.choice(vocab) for _ in range(n))
 
 
-def download_dolma_slice(out_dir: Path, max_docs: int) -> Path:
-    """Stream a Dolma slice to `out_dir` as line-delimited text shards.
+def download_fineweb_edu_slice(out_dir: Path, max_docs: int) -> Path:
+    """Stream a FineWeb-Edu slice to `out_dir` as line-delimited text shards.
 
-    Implemented against `datasets`/HuggingFace at run time on a networked host.
+    Implemented against `datasets`/HuggingFace at run time on a networked host (#10):
+    stream `HuggingFaceFW/fineweb-edu` (e.g. the `sample-10BT` subset) and write the
+    `text` field line by line. No compatible pre-tokenized subset exists, so the raw
+    text feeds `tokenize.py`.
     """
     raise NotImplementedError(
-        "Wire to AI2 Dolma via `datasets` on a networked host; check first for a "
-        "pre-tokenized subset to skip tokenize.py. Use --dummy for offline testing."
+        "Wire to HuggingFaceFW/fineweb-edu (sample-10BT) via `datasets` on a networked "
+        "host (#10), writing the `text` field as line-delimited shards. Use --dummy for "
+        "offline testing."
     )
 
 
@@ -54,7 +60,7 @@ def main() -> None:
                 f.write(doc + "\n")
         print(f"wrote synthetic text -> {path}")
     else:
-        download_dolma_slice(args.out, args.max_docs)
+        download_fineweb_edu_slice(args.out, args.max_docs)
 
 
 if __name__ == "__main__":

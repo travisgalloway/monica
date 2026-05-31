@@ -35,10 +35,11 @@ to touch, the command to run, and the acceptance gate.
 - [ ] Gate: scan-vs-sequential test green **and** forward_step_parity green.
 
 ## 2. M2 — Data pipeline at scale  (issues #4, #10)
-- [ ] **Tokenizer check (#4):** confirm an `OLMO_TOKENIZER_CANDIDATES` entry loads via HF,
-      `vocab_size < 65536`; set `vocab_size` in `config/poc.yaml`. Check for a pre-tokenized
-      Dolma subset (would skip tokenize).
-- [ ] **Download (#10):** implement `download_dolma_slice` in `src/data/download.py`.
+- [x] **Tokenizer check (#4):** CONFIRMED `allenai/OLMo-7B-hf` loads via HF, vocab 50280
+      (eos 50279) < 65536; `vocab_size` set in `config/poc.yaml`. No compatibly-licensed
+      pre-tokenized <65536-vocab subset exists on HF → tokenize raw text ourselves.
+- [ ] **Download (#10):** implement `download_fineweb_edu_slice` in `src/data/download.py`
+      (stream `HuggingFaceFW/fineweb-edu` `sample-10BT`, ODC-By).
 - [ ] Run the real pipeline (~2–5B tokens; plan ~10–20GB raw, several GB packed):
       `download → tokenize → pack → split`. (`pack`/`split`/`loader` are done + tested.)
 - [ ] Gate: loader yields contiguous batches; val shard disjoint from train.

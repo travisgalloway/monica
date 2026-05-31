@@ -1,8 +1,13 @@
 """Tokenize raw text to token-id streams using the OLMo tokenizer.
 
 Use the OLMo tokenizer (via HuggingFace) so the vocab matches AI2's, enabling
-later comparison. VERIFY availability first — do not assume the exact tokenizer is
-one import away; the model id may need adjusting.
+later comparison.
+
+CONFIRMED (issue #4): ``allenai/OLMo-7B-hf`` is reachable on the HF Hub with
+vocab_size=50280 (eos_token_id=50279), which fits the uint16 packing requirement
+(< 65536). ``allenai/OLMo-2-1124-7B`` is deliberately NOT a candidate: its vocab is
+100278 (> 65536) and can never satisfy the uint16 constraint enforced by
+``MambaConfig.validate()``.
 
 A byte-level fallback tokenizer is provided ONLY for offline pipeline testing; it
 is not vocab-compatible with OLMo and must not be used for a real run.
@@ -14,8 +19,8 @@ import argparse
 from pathlib import Path
 from typing import Iterable, List
 
-# Candidate OLMo tokenizer ids on the HF Hub. Confirm one is reachable before a run.
-OLMO_TOKENIZER_CANDIDATES = ("allenai/OLMo-2-1124-7B", "allenai/OLMo-7B-hf")
+# Confirmed OLMo tokenizer ids on the HF Hub (uint16-compatible, vocab < 65536).
+OLMO_TOKENIZER_CANDIDATES = ("allenai/OLMo-7B-hf",)
 
 
 def load_olmo_tokenizer(model_id: str | None = None):

@@ -8,7 +8,7 @@ expand: 2
 d_conv: 4
 dt_rank: auto
 
-vocab_size: 50280      # OLMo tokenizer; confirm < 65536 for uint16 packing
+vocab_size: 50280      # CONFIRMED: allenai/OLMo-7B-hf, vocab 50280 < 65536 (uint16)
 seq_len: 1024          # <= ~2k -> chunking NOT required for the training run
 tie_embeddings: true
 
