@@ -12,8 +12,9 @@ vocab_size: 50280      # OLMo tokenizer; confirm < 65536 for uint16 packing
 seq_len: 1024          # <= ~2k -> chunking NOT required for the training run
 tie_embeddings: true
 
-# CONFIRM ON MLX in milestone 1 (do NOT assume bf16). fp16 + loss scaling is the
-# likely Metal-friendly choice; bf16 is historically less optimized on Metal.
+# CONFIRMED ON MLX (M1 micro-benchmark): fp16 ~3.96 TFLOP/s vs bf16 ~3.36 and
+# fp32 ~3.40 on this Metal GPU -> fp16 is ~18% faster; bf16 gives no speedup.
+# Use fp16 + loss scaling for the scale run (toy/smoke stay fp32 for exact resume).
 precision: fp16
 chunk_size: null       # set an int only for long-context inference
 

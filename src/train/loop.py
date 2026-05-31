@@ -50,13 +50,15 @@ def train(
     *,
     val_eval: Optional[Callable[[ModelInterface], float]] = None,
     logger: Optional[Callable[[dict], None]] = None,
+    on_checkpoint: Optional[Callable[[int], None]] = None,
     start_step: int = 0,
 ) -> None:
     """Run the training loop. `train_step` and the optimizer live in the backend.
 
-    SKELETON: the orchestration shape is here; gradient accumulation, clipping,
-    checkpoint save/resume, and logging payloads are completed when the MLX
-    `train_step` is wired on Apple Silicon.
+    Pure orchestration: the backprop/optimizer primitive (`train_step`) and the
+    checkpoint writer (`on_checkpoint(step)`, which persists portable weights + a
+    within-backend resume bundle) are injected so this stays backend-free. Resume
+    is driven by `start_step`.
     """
     schedule = CosineSchedule(cfg.base_lr, cfg.warmup_steps, cfg.total_steps)
     step = start_step
@@ -73,7 +75,8 @@ def train(
                     payload["val_loss"] = val_eval(model)
                 log(payload)
 
-            # TODO[mac]: ckpt_every -> model.save(weights) + save_resume(bundle).
             step += 1
+            if on_checkpoint and step % cfg.ckpt_every == 0:
+                on_checkpoint(step)
             if step >= cfg.total_steps:
                 break
