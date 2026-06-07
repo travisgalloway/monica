@@ -5,7 +5,8 @@ several GB on their own — plan disk accordingly). For the smoke test a few mil
 tokens is plenty.
 
 Corpus (issue #4): ``HuggingFaceFW/fineweb-edu`` (ODC-By), using a ready sample
-subset (e.g. ``sample-10BT``) streamed via `datasets`. NOTE: there is no
+subset (e.g. ``sample-10BT``) streamed via `datasets` to a single line-delimited
+text file (one normalized document per line). NOTE: there is no
 compatibly-licensed pre-tokenized small-vocab (< 65536) subset on the HF Hub — AI2's
 dolma3 mixes are raw text at the OLMo-2 100278 vocab, and third-party tokenized sets
 use Llama/Pile tokenizers — so we tokenize raw text ourselves via `tokenize.py`.
@@ -31,25 +32,56 @@ def dummy_texts(n_docs: int = 1000, seed: int = 0) -> Iterator[str]:
         yield " ".join(rng.choice(vocab) for _ in range(n))
 
 
-def download_fineweb_edu_slice(out_dir: Path, max_docs: int) -> Path:
-    """Stream a FineWeb-Edu slice to `out_dir` as line-delimited text shards.
+def _normalize_doc(text: str) -> str:
+    """Collapse all whitespace (incl. internal newlines) so each doc is one line.
 
-    Implemented against `datasets`/HuggingFace at run time on a networked host (#10):
-    stream `HuggingFaceFW/fineweb-edu` (e.g. the `sample-10BT` subset) and write the
-    `text` field line by line. No compatible pre-tokenized subset exists, so the raw
-    text feeds `tokenize.py`.
+    The pipeline is one-doc-per-line and `tokenize.py` appends EOS *per line*; a raw
+    document's internal newlines would otherwise inject spurious EOS boundaries
+    mid-document. Collapsing runs of whitespace to single spaces is lossy on layout
+    but correct for the perplexity-curve POC.
     """
-    raise NotImplementedError(
-        "Wire to HuggingFaceFW/fineweb-edu (sample-10BT) via `datasets` on a networked "
-        "host (#10), writing the `text` field as line-delimited shards. Use --dummy for "
-        "offline testing."
+    return " ".join(text.split())
+
+
+def download_fineweb_edu_slice(
+    out_dir: Path, max_docs: int, subset: str = "sample-10BT"
+) -> Path:
+    """Stream a FineWeb-Edu slice to a single line-delimited text file. Returns its path.
+
+    Streams `HuggingFaceFW/fineweb-edu` (the `subset` config, default `sample-10BT`)
+    via `datasets`, writing each document's normalized `text` field as one line to
+    `out_dir / "fineweb-edu.txt"`. No compatible pre-tokenized small-vocab subset
+    exists, so the raw text feeds `tokenize.py` (OLMo tokenizer). Stops after
+    `max_docs` non-empty documents.
+    """
+    from datasets import load_dataset  # imported lazily (optional `data` extra)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "fineweb-edu.txt"
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu", name=subset, split="train", streaming=True
     )
+    written = 0
+    with open(path, "w") as f:
+        for ex in ds:
+            doc = _normalize_doc(ex.get("text", ""))
+            if not doc:
+                continue
+            f.write(doc + "\n")
+            written += 1
+            if written % 100_000 == 0:
+                print(f"  ... {written} docs")
+            if written >= max_docs:
+                break
+    print(f"wrote {written} docs -> {path}")
+    return path
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, default=Path("data/raw"))
     ap.add_argument("--max-docs", type=int, default=10000)
+    ap.add_argument("--subset", default="sample-10BT", help="FineWeb-Edu config name")
     ap.add_argument("--dummy", action="store_true", help="synthetic text, no network")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -60,7 +92,7 @@ def main() -> None:
                 f.write(doc + "\n")
         print(f"wrote synthetic text -> {path}")
     else:
-        download_fineweb_edu_slice(args.out, args.max_docs)
+        download_fineweb_edu_slice(args.out, args.max_docs, args.subset)
 
 
 if __name__ == "__main__":
