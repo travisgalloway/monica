@@ -70,6 +70,11 @@ dt_max: 0.1
 dt_init_floor: 0.0001
 ```
 
+> Note on `chunking NOT required` / `chunk_size: null`: as with the toy config, this
+> means the backend's default chunk size (the MLX backend uses 32), **not** an
+> unchunked single pass — the scan is always chunked. See
+> [why always chunk](02-model-ssm.md#why-always-chunk).
+
 ## The decisions, distilled
 
 ### Sizing: ~100M params, ~3B tokens

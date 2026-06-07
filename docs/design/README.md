@@ -7,7 +7,7 @@ verified; the milestone tracking and remaining work (M5–M8) live in
 project overview, see the root [`README.md`](../../README.md).
 
 Every claim here is sourced from a docstring or config comment in the code, with a
-`src/...` path so you can jump to the source of truth.
+`src/...` or `config/...` path so you can jump to the source of truth.
 
 ## Topics
 
@@ -35,7 +35,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Tokenizer | `allenai/OLMo-7B-hf` (vocab 50280) | fits uint16; matches AI2 for comparison | `src/data/tokenize.py` |
 | Embedding | tied (input = output) | ~38M of ~100M budget at POC scale | `config/poc.yaml` |
 | dt-bias init | inverse-softplus, log-uniform | **load-bearing** — model can't learn recall without it | `src/model/mlx_backend.py` |
-| Selective scan | chunked closed form (default 32) | a single-pass cumsum overflows fp32 | `src/model/mlx_backend.py` |
+| Selective scan | chunked closed form (default 32) | the `exp(-A_cum)` term overflows fp32 unchunked | `src/model/mlx_backend.py` |
 | Precision (poc) | fp16 + loss scaling | ~18% faster than bf16 on Metal (M1 benchmark) | `config/poc.yaml` |
 | Precision (toy/smoke) | fp32 | exact, reproducible resume | `config/toy.yaml` |
 | Conformance | compare in fp32, ~1e-4 rel | bf16 epsilon (~8e-3) too large to be meaningful | `src/conformance/` |
