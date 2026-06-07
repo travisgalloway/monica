@@ -30,20 +30,20 @@ scripts/smoke_test.py      the milestone-4 gate
 tests/                     in-container unit tests
 ```
 
-## Status — milestone 1 implemented (Apple Silicon dev env)
+## Status — M1–M4 done (verified on Apple Silicon)
 
 The seam, configs, data pipeline, MLX model/backend, training loop, and smoke test
-are **implemented and unit-tested** (`pytest` → 20 passing). Development runs on
-Apple Silicon; the remaining step to formally close M1–M4 is `pip install mlx` then
-running the smoke gate (below). Progress is tracked in
-[issue #2](https://github.com/travisgalloway/monica/issues/2).
+are **implemented and verified on Apple Silicon** — `pytest` → 20 passing (incl. the
+real MLX paths) and the M4 smoke gate passes end to end (exact save/kill/resume +
+held-out perplexity eval). Remaining work is the scale-up (M5–M8). Progress is
+tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2).
 
 | Milestone | State |
 |---|---|
-| 1 Seam + toy MLX model | seam/config done; MLX backend implemented + parity-tested |
-| 2 Data pipeline (tiny) | implemented + unit-tested |
-| 3 Minimal training loop | schedule/checkpoint/val + `train_step` + loop done |
-| 4 Smoke test (gate) | implemented; confirm via the smoke gate |
+| 1 Seam + toy MLX model | done; MLX backend + forward/step parity verified |
+| 2 Data pipeline (tiny) | done; unit-tested |
+| 3 Minimal training loop | done; `train_step` + loop exercised by the smoke gate |
+| 4 Smoke test (gate) | passing — resume exact, eval runs |
 | 5–8 POC scale, OLMES, serve/rewind, CUDA | deferred stubs |
 
 **Locked decisions:** poc = d_model 768 / 24 layers / d_state 16 / seq 1024 /
