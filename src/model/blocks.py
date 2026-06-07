@@ -58,8 +58,9 @@ class MambaConfig:
     # fp16 + loss scaling is the likely Metal-friendly choice).
     precision: str = "fp32"
 
-    # Chunked scan working-set bound. None => single-pass parallel scan, which is
-    # fine for seq_len up to ~2k. Set an int for long-context (prevents exp overflow).
+    # Chunked scan working-set bound. None => the backend's default chunk size (the
+    # MLX backend uses 32); fine for seq_len up to ~2k. Set an int to tune the chunk
+    # for long-context (keeps the per-chunk decay bounded so exp stays finite).
     chunk_size: Optional[int] = None
 
     # --- dt-projection bias init (LOAD-BEARING) ---

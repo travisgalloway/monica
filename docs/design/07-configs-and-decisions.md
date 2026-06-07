@@ -36,6 +36,11 @@ The toy config exists to make the [smoke gate](06-smoke-gate-and-eval.md) fast a
 **bit-exact**: tiny dims, `fp32` (so fixed-seed resume is reproducible), and
 `vocab_size: 256` to run on the byte-fallback tokenizer with no network.
 
+> Note on `chunk_size: null`: the inline comments here predate the backend default
+> and read as "single-pass". In practice `null` means *the backend's default chunk
+> size* (the MLX backend uses 32) — the scan is always chunked. See
+> [why always chunk](02-model-ssm.md#why-always-chunk).
+
 ## `config/poc.yaml`
 
 ```yaml
@@ -71,8 +76,9 @@ dt_init_floor: 0.0001
 
 `d_model 768 × 24 layers` lands near 100M parameters; the target ~3B tokens is
 roughly Chinchilla-optimal for that size. `seq_len 1024` is comfortably under the ~2k
-limit where the scan would need explicit chunking, so the training run uses the
-single-pass path.
+limit, so `chunk_size` can stay `null` — meaning the backend's default chunk (32),
+not an unchunked pass; the scan is [always chunked](02-model-ssm.md#why-always-chunk).
+An explicit `chunk_size` is only needed to tune long-context behavior.
 
 ### Tied embedding is mandatory at scale
 

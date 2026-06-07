@@ -35,10 +35,11 @@ docs/MAC_RUNBOOK.md        ordered build checklist (M0–M5)
 ## Status — M1–M4 done (verified on Apple Silicon)
 
 The seam, configs, data pipeline, MLX model/backend, training loop, and smoke test
-are **implemented and verified on Apple Silicon** — `pytest` → 20 passing (incl. the
-real MLX paths) and the M4 smoke gate passes end to end (exact save/kill/resume +
-held-out perplexity eval). Remaining work is the scale-up (M5–M8). Progress is
-tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2).
+are **implemented and verified on Apple Silicon** — `pytest` → 20 passing on a Mac
+(incl. the real MLX paths; on Linux the MLX-only tests skip and the rest pass) and
+the M4 smoke gate passes end to end (exact save/kill/resume + held-out perplexity
+eval). Remaining work is the scale-up (M5–M8). Progress is tracked in
+[issue #2](https://github.com/travisgalloway/monica/issues/2).
 
 | Milestone | State |
 |---|---|
@@ -57,8 +58,15 @@ Conformance compares in **fp32** (~1e-4 rel). OLMES + serving/rewind deferred;
 ## Quickstart
 
 ```bash
-pip install -e ".[dev,data,mlx]"  # mlx requires Apple Silicon
-pytest                            # schedule, val_loss, data pipeline, import guard
+# Apple Silicon (full backend):
+pip install -e ".[dev,data,mlx]"  # the mlx extra installs only on Apple Silicon
+
+# Linux / CUDA host (portable layers only — omit the mlx extra):
+pip install -e ".[dev,data]"
+
+pytest                            # Mac: 20 passed. Linux: MLX-only tests
+                                  # (pytest.importorskip("mlx.core")) are skipped,
+                                  # not failed — the portable suite still runs.
 
 # Data pipeline offline smoke (no network/tokenizer):
 python -m src.data.download --dummy --out data/raw --max-docs 2000

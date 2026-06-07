@@ -42,28 +42,30 @@ The SSM is implemented twice and the two must agree (see
 
 ### Why always chunk
 
-The closed-form scan exponentiates a cumulative log-decay (`A_cum`). Over a long
-sequence that cumulative sum grows without bound and `exp(A_cum)` overflows fp32 —
-even at modest sequence lengths. Chunking bounds the working set so the decay inside
-each chunk stays finite. The default chunk size is **32**; the per-chunk recurrence
-carries state across chunk boundaries.
+The closed-form scan accumulates a log-decay `A_cum = cumsum(delta * A)`. Since
+`A = -exp(A_log)` is negative, `A_cum` is large-magnitude **negative** over a long
+sequence — so `exp(A_cum)` stays `<= 1` (safe), but the paired `exp(-A_cum)` term
+grows exponentially and **overflows fp32**. Chunking bounds the per-chunk decay so
+that `exp(-A_cum)` stays finite. The default chunk size is **32**; the per-chunk
+recurrence carries state across chunk boundaries.
 
 The closed-form per-chunk update (from `parallel`):
 
 ```
-A_cum = cumsum(a_c)                              # inclusive log-decay
+A_cum = cumsum(a_c)                              # inclusive log-decay (<= 0)
 # h_j = exp(A_cum_j) * (h_carry + sum_{i<=j} exp(-A_cum_i) * bu_i)
-inner = cumsum(exp(-A_cum) * bu_c)
+inner = cumsum(exp(-A_cum) * bu_c)              # exp(-A_cum) is the term that can overflow
 h     = exp(A_cum) * (h_carry + inner)
 ```
 
 `chunk_size` is also a `MambaConfig` field. From `blocks.py`:
 
-> Chunked scan working-set bound. None => single-pass parallel scan, which is fine
-> for seq_len up to ~2k. Set an int for long-context (prevents exp overflow).
+> Chunked scan working-set bound. None => the backend's default chunk size (the MLX
+> backend uses 32) ... Set an int to tune the chunk for long-context.
 
-(The `null` default in the configs still uses the internal default chunk of 32; an
-explicit int is only needed for long-context inference.)
+So `chunk_size: null` does **not** mean a single unchunked pass — the MLX backend
+falls back to a default chunk of 32 (`chunk = self.config.chunk_size or min(L, 32)`).
+An explicit int is only needed to tune the chunk for long-context.
 
 ## Diagonal-A initialization
 
