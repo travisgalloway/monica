@@ -28,21 +28,25 @@ src/conformance/           forward_step_parity · backend_parity (fp32 guards)
 src/serve/                 sessions · rewind (deferred)
 scripts/smoke_test.py      the milestone-4 gate
 tests/                     in-container unit tests
+docs/design/               design choices + rationale (start at docs/design/README.md)
 ```
 
-## Status — scaffold for milestones 1–4
+## Status — M1–M4 done (verified on Apple Silicon)
 
-This Linux repo holds the **structure + seam + configs + runnable data pipeline**,
-with **skeletons/stubs** for MLX-specific bodies. MLX only runs on Apple Silicon,
-so the model, training loop, and smoke test are **completed and run on a Mac**.
+The seam, configs, data pipeline, MLX model/backend, training loop, and smoke test
+are **implemented and verified on Apple Silicon** — `pytest` → 20 passing on a Mac
+(incl. the real MLX paths; on Linux the MLX-only tests skip and the rest pass) and
+the M4 smoke gate passes end to end (exact save/kill/resume + held-out perplexity
+eval). Remaining work is the scale-up (M5–M8). Progress is tracked in
+[issue #2](https://github.com/travisgalloway/monica/issues/2).
 
-| Milestone | State | Where it runs |
-|---|---|---|
-| 1 Seam + toy MLX model | interface/config done; backend skeleton | Mac |
-| 2 Data pipeline (tiny) | implemented + unit-tested | here (Linux) |
-| 3 Minimal training loop | schedule/checkpoint/val done; loop skeleton | Mac |
-| 4 Smoke test (gate) | skeleton | Mac |
-| 5–8 POC scale, OLMES, serve/rewind, CUDA | deferred stubs | later |
+| Milestone | State |
+|---|---|
+| 1 Seam + toy MLX model | done; MLX backend + forward/step parity verified |
+| 2 Data pipeline (tiny) | done; unit-tested |
+| 3 Minimal training loop | done; `train_step` + loop exercised by the smoke gate |
+| 4 Smoke test (gate) | passing — resume exact, eval runs |
+| 5–8 POC scale, OLMES, serve/rewind, CUDA | deferred stubs |
 
 **Locked decisions:** poc = d_model 768 / 24 layers / d_state 16 / seq 1024 /
 ~3B tokens (tied embedding mandatory). toy = d_model 64 / 2 layers / seq 128 /
@@ -50,11 +54,18 @@ fp32. Precision for poc (fp16 vs bf16) **confirmed on MLX in M1** — not assume
 Conformance compares in **fp32** (~1e-4 rel). OLMES + serving/rewind deferred;
 **POC success = a smoothly decreasing held-out val-perplexity curve**.
 
-## Quickstart (this container)
+## Quickstart
 
 ```bash
-pip install -e ".[dev,data]"      # mlx is Apple-Silicon only; omit on Linux
-pytest                            # schedule, val_loss, data pipeline, import guard
+# Apple Silicon (full backend):
+pip install -e ".[dev,data,mlx]"  # the mlx extra installs only on Apple Silicon
+
+# Linux / CUDA host (portable layers only — omit the mlx extra):
+pip install -e ".[dev,data]"
+
+pytest                            # Mac: 20 passed. Linux: MLX-only tests
+                                  # (pytest.importorskip("mlx.core")) are skipped,
+                                  # not failed — the portable suite still runs.
 
 # Data pipeline offline smoke (no network/tokenizer):
 python -m src.data.download --dummy --out data/raw --max-docs 2000
@@ -63,7 +74,9 @@ python -m src.data.pack --in data/ids.npy --out data/packed.bin
 python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 2000
 ```
 
-On a Mac: `pip install mlx`, complete the `TODO[mac]` bodies in
-`src/model/mlx_backend.py` + an MLX `train_step`, then run
-`python scripts/smoke_test.py --data data/split` (the M4 gate) before scaling to
-`config/poc.yaml`.
+Run the smoke gate (the M4 gate) to confirm the MLX backend, training loop, and
+exact-resume all pass before scaling to `config/poc.yaml`:
+
+```bash
+python scripts/smoke_test.py --data data/split
+```
