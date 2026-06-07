@@ -1,9 +1,10 @@
 # Design docs
 
 Why the Mamba POC is built the way it is. These files explain the **design
-choices and their rationale** — the *what* and *why*. For the ordered *how/when*
-checklist of building it on Apple Silicon, see [`../MAC_RUNBOOK.md`](../MAC_RUNBOOK.md).
-For the project overview, see the root [`README.md`](../../README.md).
+choices and their rationale** — the *what* and *why*. M1–M4 are implemented and
+verified; the milestone tracking and remaining work (M5–M8) live in
+[GitHub issue #2](https://github.com/travisgalloway/monica/issues/2). For the
+project overview, see the root [`README.md`](../../README.md).
 
 Every claim here is sourced from a docstring or config comment in the code, with a
 `src/...` path so you can jump to the source of truth.

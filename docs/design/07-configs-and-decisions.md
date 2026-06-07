@@ -112,4 +112,4 @@ every backend, not a per-run tuning choice.
 - [Model: the Mamba block + selective SSM](02-model-ssm.md) — what these dims build.
 - [Training](05-training.md) — how fp16 loss scaling is applied.
 - [Data pipeline](04-data-pipeline.md) — the uint16 / vocab link.
-- [`../MAC_RUNBOOK.md`](../MAC_RUNBOOK.md) — the milestone sequencing that produced these.
+- [GitHub issue #2](https://github.com/travisgalloway/monica/issues/2) — the milestone tracker.

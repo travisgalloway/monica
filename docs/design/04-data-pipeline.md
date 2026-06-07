@@ -86,6 +86,23 @@ For exact-resume testing, the [smoke gate](06-smoke-gate-and-eval.md) pre-materi
 a fixed batch list (shuffle off) so the batch at global step *s* is identical across
 runs.
 
+## Scaling up (M2 / M5)
+
+The pipeline runs end to end offline today on the byte-fallback path. The remaining
+**M2 work (issue #10)** is the real corpus at scale, and the **M5 POC run (issue
+#13)** consumes it:
+
+- **Corpus:** `HuggingFaceFW/fineweb-edu` (ODC-By), streamed via `datasets` using a
+  ready subset (e.g. `sample-10BT`) — implemented in `download_fineweb_edu_slice`
+  (`src/data/download.py`). No compatibly-licensed pre-tokenized `<65536`-vocab
+  subset exists on HF, so we tokenize raw text ourselves with the OLMo tokenizer.
+- **Target:** ~2–5B tokens (~Chinchilla-optimal for the ~100M `poc.yaml`). Budget
+  roughly ~10–20GB raw text and several GB packed (uint16).
+- **Run:** `download → tokenize → pack → split`, then train `config/poc.yaml` on the
+  result. Success is a smoothly decreasing held-out val-perplexity curve (watch grad
+  norm too); benchmark scores are not required — see
+  [smoke gate & eval](06-smoke-gate-and-eval.md).
+
 ## Related
 
 - [Architecture: the hardware seam](01-architecture-seam.md) — why the loader yields numpy.

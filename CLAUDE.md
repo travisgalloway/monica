@@ -100,6 +100,5 @@ The smoke gate stresses exactly this round-trip.
   sub-issue references "Part of #2". M1–M4 are done and verified; M5 (scale run), and
   M6–M8 (OLMES eval, serving/rewind, CUDA backend) are deferred.
 - `docs/design/` documents the design choices and rationale (start at
-  `docs/design/README.md`). `docs/MAC_RUNBOOK.md` is the ordered build checklist
-  (M0–M5). After completing a milestone, tick its box in issue #2.
+  `docs/design/README.md`). After completing a milestone, tick its box in issue #2.
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.
