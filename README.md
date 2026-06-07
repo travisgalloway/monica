@@ -28,6 +28,8 @@ src/conformance/           forward_step_parity · backend_parity (fp32 guards)
 src/serve/                 sessions · rewind (deferred)
 scripts/smoke_test.py      the milestone-4 gate
 tests/                     in-container unit tests
+docs/design/               design choices + rationale (start at docs/design/README.md)
+docs/MAC_RUNBOOK.md        ordered build checklist (M0–M5)
 ```
 
 ## Status — M1–M4 done (verified on Apple Silicon)
