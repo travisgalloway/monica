@@ -22,3 +22,24 @@ chunk_size: null       # set an int only for long-context inference
 dt_min: 0.001
 dt_max: 0.1
 dt_init_floor: 0.0001
+
+# --- Recommended scale run (decision record; run params are CLI flags, NOT model
+# config, so they live here as comments — load_config maps only model fields above).
+#
+# 1. Data prep (~3B OLMo tokens; see docs/design/04-data-pipeline.md). ~6GB packed:
+#      python -m src.data.download --out data/raw --max-docs 3500000 --subset sample-10BT
+#      python -m src.data.tokenize --in data/raw/fineweb-edu.txt --out data/packed.bin \
+#          --max-tokens 3000000000
+#      python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 10000000
+#
+# 2. Train (~3B tokens = Chinchilla-ish for 100M). Tune batch/grad-accum to M-series
+#    memory; warmup defaults to total_steps//100; fp16 -> dynamic loss scaling on:
+#      .venv/bin/python scripts/train.py --config config/poc.yaml --data data/split \
+#          --out runs/poc --total-tokens 3000000000 --batch-size 32 --grad-accum 4 \
+#          --eval-every 200 --ckpt-every 500
+#
+# 3. Resume after an interruption (auto-detects runs/poc/resume if --resume omitted):
+#      ... same command ...  --resume runs/poc/resume
+#
+# Success = a smoothly decreasing val_perplexity in runs/poc/metrics.jsonl with a
+# stable grad_norm. Benchmark scores are NOT required (see issue #13).

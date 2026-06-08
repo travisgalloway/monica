@@ -61,8 +61,8 @@ def _train_losses(model, batches, *, base_lr=3e-4):
     n = len(batches)
     sched = CosineSchedule(base_lr=base_lr, warmup_steps=max(1, n // 6), total_steps=n)
     opt = optim.AdamW(learning_rate=base_lr)
-    step = make_train_step(model, opt, grad_clip=1.0)
-    return [step(model, inp, tgt, sched.lr_at(s))["loss"]
+    step = make_train_step(model, opt, grad_clip=1.0, scaler=None)
+    return [step(model, [(inp, tgt)], sched.lr_at(s))["loss"]
             for s, (inp, tgt) in enumerate(batches)]
 
 

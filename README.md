@@ -63,7 +63,7 @@ pip install -e ".[dev,data,mlx]"  # the mlx extra installs only on Apple Silicon
 # Linux / CUDA host (portable layers only — omit the mlx extra):
 pip install -e ".[dev,data]"
 
-pytest                            # Mac: 20 passed. Linux: MLX-only tests
+pytest                            # Mac: 36 passed. Linux: MLX-only tests
                                   # (pytest.importorskip("mlx.core")) are skipped,
                                   # not failed — the portable suite still runs.
 
@@ -80,3 +80,22 @@ exact-resume all pass before scaling to `config/poc.yaml`:
 ```bash
 python scripts/smoke_test.py --data data/split
 ```
+
+### Scale run (M5)
+
+[`scripts/train.py`](scripts/train.py) is the real run driver: config → model → data →
+loop, with fp16 dynamic loss scaling, gradient accumulation, JSONL metrics, periodic
+checkpoints, and held-out val-perplexity. The recommended `config/poc.yaml` invocation
+(and the one-time ~3B-token data prep) is recorded as comments in that file. Sketch:
+
+```bash
+# ... data prep into data/split (see config/poc.yaml comments) ...
+python scripts/train.py --config config/poc.yaml --data data/split --out runs/poc \
+    --total-tokens 3000000000 --batch-size 32 --grad-accum 4
+# resume after an interruption (auto-detects runs/poc/resume if --resume omitted):
+python scripts/train.py --config config/poc.yaml --data data/split --out runs/poc \
+    --total-tokens 3000000000 --batch-size 32 --grad-accum 4 --resume runs/poc/resume
+```
+
+**POC success = a smoothly decreasing `val_perplexity` in `runs/poc/metrics.jsonl`**
+with a stable `grad_norm` — not a benchmark score.

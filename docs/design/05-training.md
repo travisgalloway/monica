@@ -23,15 +23,17 @@ module. The thing that actually computes gradients is hardware-specific, so it i
 The injected callable has a fixed contract:
 
 ```python
-# (model, inputs, targets, lr) -> dict(loss=, grad_norm=)
-TrainStepFn = Callable[[ModelInterface, object, object, float], dict]
+# (model, micro_batches, lr) -> dict(loss=, grad_norm=, [loss_scale=, skipped=])
+TrainStepFn = Callable[[ModelInterface, list, float], dict]
 ```
 
-The loop is pure orchestration: schedule the LR, call `train_step`, log, checkpoint,
-and support resume via `start_step`. The "robust run" features it wires up
-(documented in the loop docstring): mixed precision, warmup+cosine LR, gradient
-accumulation, gradient clipping, checkpointing, and logging from step 1 (loss, val
-loss/perplexity, LR, grad norm, tokens/sec).
+`micro_batches` is a list of `(inputs, targets)` of length `cfg.grad_accum`; the step
+averages gradients over them so an effective batch can exceed what fits in memory
+(only one micro-batch is materialized at a time). The loop is pure orchestration:
+schedule the LR, pull `grad_accum` micro-batches, call `train_step`, log, checkpoint,
+and support resume via `start_step`. The "robust run" features it wires up: mixed
+precision, warmup+cosine LR, gradient accumulation, gradient clipping, checkpointing,
+and logging from step 1 (loss, val loss/perplexity, LR, grad norm, tokens/sec).
 
 ## LR schedule: warmup + cosine, never zero
 
@@ -55,14 +57,25 @@ From `src/model/mlx_train_step.py`:
 > Provides the backend-specific `train_step` that `train.loop.train` injects, plus
 > optimizer-state (de)serialization for within-backend exact resume.
 
-`make_train_step(model, optimizer, grad_clip=1.0, loss_scale=None)` closes over the
+`make_train_step(model, optimizer, grad_clip=1.0, scaler=None)` closes over the
 optimizer so Adam moments persist across steps, and returns the `TrainStepFn`
-closure. Two notable choices:
+closure. Three notable choices:
 
+- **Gradient accumulation** — the step sums grads/loss over the micro-batch list and
+  divides by the count, `mx.eval`-ing between micro-batches so peak memory stays at one
+  micro-batch. A single micro-batch with no scaler is numerically identical to a plain
+  unscaled step (this is what keeps the fp32 [smoke gate](06-smoke-gate-and-eval.md)
+  bit-exact).
 - **Gradient clipping** by global norm (`grad_clip=1.0`) — proven necessary even at
   toy scale to keep training stable.
-- **Loss scaling** for the fp16 path — scales the loss before backprop and unscales
-  the grads after; pass `None` for fp32 (toy/smoke). This is the runtime half of the
+- **Dynamic loss scaling** for the fp16 path — a
+  [`DynamicLossScaler`](../../src/train/loss_scale.py) scales the loss before backprop
+  and the grads are unscaled after. The *policy* (halve on a non-finite gradient, grow
+  after N clean steps) is a pure-Python state machine kept **above the seam** so it is
+  unit-testable without MLX; only the inf/nan detection on the gradient tensors lives in
+  the backend step. On overflow the optimizer step is **skipped** and the scale backs
+  off (the returned dict carries `loss_scale`/`skipped`). Pass `None` for fp32
+  (toy/smoke). This is the runtime half of the
   [fp16 precision decision](07-configs-and-decisions.md).
 
 ## Checkpointing: two concerns, deliberately separate
@@ -94,6 +107,24 @@ This separation is the crux of the migration story:
 The [smoke gate](06-smoke-gate-and-eval.md) exercises exactly this: save portable
 weights + a resume bundle, tear everything down, rebuild, load, and continue — then
 assert the trajectory matches bit-for-bit.
+
+## The scale run (M5)
+
+[`scripts/train.py`](../../scripts/train.py) is the real run driver — it wires the
+pieces above to the MLX backend for `config/poc.yaml`: it loads + validates the config,
+builds the model and AdamW, turns on the `DynamicLossScaler` when `precision == fp16`,
+opens train/val `PackedLoader`s, and runs the loop with a JSONL logger, periodic
+checkpoints, and a held-out val-perplexity callback. It resumes from `<out>/resume`
+automatically when present (or via `--resume`), restoring weights + optimizer + step +
+loss-scale and appending to `metrics.jsonl`. Run params (steps/tokens, batch,
+grad-accum, cadences) are **CLI flags**, not model config — they don't belong in
+`MambaConfig`; the recommended invocation is recorded as comments in `config/poc.yaml`.
+
+Success is read straight off `<out>/metrics.jsonl`: a smoothly decreasing
+`val_perplexity` with a stable `grad_norm`. Note the toy model is a *correctness* model
+on ~1M repetitive bytes — it is fine for short smoke/validation runs but will eventually
+destabilize in fp32 if pushed far past that regime; the poc run (100M params, fp16 +
+dynamic scaling, ~3B diverse tokens) is the regime M5 actually targets.
 
 ## Related
 

@@ -39,8 +39,18 @@ def main() -> None:
     args = ap.parse_args()
 
     # MLX-only imports kept local so the seam stays clean for portable hosts.
-    import mlx.core as mx
-    import mlx.optimizers as optim
+    try:
+        import mlx.core as mx
+        import mlx.optimizers as optim
+    except ModuleNotFoundError as e:
+        if e.name != "mlx":
+            raise
+        raise SystemExit(
+            "mlx not found — run with the project venv on Apple Silicon:\n"
+            "    .venv/bin/python scripts/smoke_test.py ...\n"
+            "(mlx installs only on Apple Silicon via the '[mlx]' extra; a bare "
+            "`python` likely points at a different interpreter.)"
+        ) from e
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
     from src.model.mlx_train_step import make_train_step, save_optimizer, load_optimizer
@@ -70,12 +80,13 @@ def main() -> None:
         mx.random.seed(args.seed)                 # identical init weights each run
         model = MLXMambaModel(cfg)
         opt = optim.AdamW(learning_rate=sched.base_lr)
-        return model, opt, make_train_step(model, opt, grad_clip=1.0)
+        return model, opt, make_train_step(model, opt, grad_clip=1.0, scaler=None)
 
     def run_window(model, step_fn, lo, hi, into):
         for s in range(lo, hi):
             inp, tgt = batches[s]
-            into[s] = step_fn(model, inp, tgt, sched.lr_at(s))["loss"]
+            # New step contract takes a list of micro-batches; one batch == grad_accum 1.
+            into[s] = step_fn(model, [(inp, tgt)], sched.lr_at(s))["loss"]
 
     # --- 1) reference run -------------------------------------------------------
     ref = {}

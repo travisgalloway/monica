@@ -17,6 +17,7 @@ PORTABLE_MODULES = [
     "src.data.split",
     "src.train.schedule",
     "src.train.checkpoint",
+    "src.train.loss_scale",
     "src.train.loop",
     "src.eval.val_loss",
     "src.conformance.forward_step_parity",
