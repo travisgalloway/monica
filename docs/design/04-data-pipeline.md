@@ -103,6 +103,31 @@ The pipeline runs end to end offline today on the byte-fallback path. The remain
   norm too); benchmark scores are not required — see
   [smoke gate & eval](06-smoke-gate-and-eval.md).
 
+### Full-scale run (M2) — commands
+
+```bash
+pip install -e ".[data]"          # datasets + transformers
+
+# 1. Stream raw text to a single line-delimited file (one normalized doc per line).
+#    Over-provision docs; step 2's --max-tokens trims to target. ~3B OLMo tokens is a
+#    few million docs / ~10–15GB raw text. Re-run with a larger --max-docs if short.
+python -m src.data.download --out data/raw --max-docs 3500000 --subset sample-10BT
+
+# 2. Tokenize + pack in one streamed pass (bounded memory), capped at ~3B tokens.
+#    A .bin output streams straight through pack_ids and writes the .meta.json sidecar,
+#    so it feeds `split` directly — no separate `pack` step at scale.
+python -m src.data.tokenize --in data/raw/fineweb-edu.txt --out data/packed.bin \
+    --max-tokens 3000000000
+
+# 3. Cut a disjoint held-out val shard (contiguous tail).
+python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 10000000
+```
+
+Disk: ~10–15GB raw + ~6GB packed + ~6GB train/val copies (`split` duplicates). Delete
+`data/raw/` after step 2 and `data/packed.bin` after step 3 to reclaim space. (The
+offline byte-fallback smoke in [CLAUDE.md](../../CLAUDE.md) still uses the `.npy` path
++ a separate `pack` step; the `.bin` fold-in above is the scale path.)
+
 ## Related
 
 - [Architecture: the hardware seam](01-architecture-seam.md) — why the loader yields numpy.

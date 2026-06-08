@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, Iterator, List
 
 # Confirmed OLMo tokenizer ids on the HF Hub (uint16-compatible, vocab < 65536).
 OLMO_TOKENIZER_CANDIDATES = ("allenai/OLMo-7B-hf",)
@@ -60,22 +60,50 @@ def tokenize_texts(texts: Iterable[str], tokenizer) -> Iterable[int]:
             yield eos
 
 
+def _capped(stream: Iterable[int], max_tokens: int | None) -> Iterator[int]:
+    """Truncate an id stream at `max_tokens` (pass-through when None)."""
+    if max_tokens is None:
+        yield from stream
+        return
+    for n, tid in enumerate(stream):
+        if n >= max_tokens:
+            break
+        yield tid
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in", dest="inp", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True, help="raw .npy/.bin uint16 ids")
+    ap.add_argument("--out", type=Path, required=True, help="uint16 ids; .bin streams "
+                    "straight into the packed format, .npy goes through `pack` separately")
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
     ap.add_argument("--model-id", default=None)
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="stop after this many tokens (caps the scale run)")
     args = ap.parse_args()
-
-    import numpy as np
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        ap.error("--max-tokens must be positive (a value <= 0 silently yields 0 tokens)")
 
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
-    with open(args.inp) as f:
-        texts = (line.rstrip("\n") for line in f)
-        ids = np.fromiter(tokenize_texts(texts, tok), dtype=np.uint16)
-    np.save(args.out, ids)
-    print(f"tokenized {ids.size} ids (vocab {tok.vocab_size}) -> {args.out}")
+    # Explicit UTF-8 (corpus is UTF-8; avoids locale-dependent decoding) and strip any
+    # trailing \r so \r\n-terminated input doesn't leak a stray carriage return into a doc.
+    with open(args.inp, encoding="utf-8") as f:
+        texts = (line.rstrip("\r\n") for line in f)
+        stream = _capped(tokenize_texts(texts, tok), args.max_tokens)
+        if args.out.suffix == ".bin":
+            # Stream straight into the packed format (chunked, bounded memory) — this
+            # folds the `pack` stage in for the scale run and writes the .meta.json
+            # sidecar, so `split` can consume the output directly.
+            from .pack import pack_ids
+
+            n = pack_ids(stream, args.out)
+            print(f"tokenized+packed {n} ids (vocab {tok.vocab_size}) -> {args.out}")
+        else:
+            import numpy as np
+
+            ids = np.fromiter(stream, dtype=np.uint16)
+            np.save(args.out, ids)
+            print(f"tokenized {ids.size} ids (vocab {tok.vocab_size}) -> {args.out}")
 
 
 if __name__ == "__main__":
