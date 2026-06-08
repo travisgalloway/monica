@@ -70,12 +70,13 @@ def main() -> None:
         mx.random.seed(args.seed)                 # identical init weights each run
         model = MLXMambaModel(cfg)
         opt = optim.AdamW(learning_rate=sched.base_lr)
-        return model, opt, make_train_step(model, opt, grad_clip=1.0)
+        return model, opt, make_train_step(model, opt, grad_clip=1.0, scaler=None)
 
     def run_window(model, step_fn, lo, hi, into):
         for s in range(lo, hi):
             inp, tgt = batches[s]
-            into[s] = step_fn(model, inp, tgt, sched.lr_at(s))["loss"]
+            # New step contract takes a list of micro-batches; one batch == grad_accum 1.
+            into[s] = step_fn(model, [(inp, tgt)], sched.lr_at(s))["loss"]
 
     # --- 1) reference run -------------------------------------------------------
     ref = {}

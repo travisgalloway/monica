@@ -16,7 +16,7 @@ as a smoothly decreasing held-out validation-perplexity curve — not benchmark 
 pip install -e ".[dev,data,mlx]"   # mlx requires Apple Silicon; omit on Linux/CUDA hosts
 
 # Tests (uses the venv at .venv):
-.venv/bin/python -m pytest                                   # full suite (20 tests)
+.venv/bin/python -m pytest                                   # full suite (36 tests)
 .venv/bin/python -m pytest tests/test_mlx_parity.py          # one file
 .venv/bin/python -m pytest tests/test_mlx_parity.py::test_forward_step_parity_toy  # one test
 .venv/bin/python -m pytest -q -rs                            # quiet, report skips

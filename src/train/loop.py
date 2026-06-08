@@ -16,7 +16,9 @@ Required "robust run" features (wired on the Mac):
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from itertools import islice
 from typing import Callable, Optional
 
 from ..model.interface import ModelInterface
@@ -38,8 +40,17 @@ class TrainConfig:
     seed: int = 0
 
 
-# A backend-provided step: (model, inputs, targets, lr) -> dict(loss=, grad_norm=).
-TrainStepFn = Callable[[ModelInterface, object, object, float], dict]
+# A backend-provided step: (model, micro_batches, lr) -> dict(loss=, grad_norm=, ...).
+# `micro_batches` is a list of `(inputs, targets)` of length `cfg.grad_accum`.
+TrainStepFn = Callable[[ModelInterface, list, float], dict]
+
+
+def _micro_batch_stream(train_loader: PackedLoader, seed: int):
+    """Infinite stream of (inputs, targets), reseeding the shuffle each epoch."""
+    epoch_idx = 0
+    while True:
+        yield from train_loader.epoch(reseed=seed + epoch_idx)
+        epoch_idx += 1
 
 
 def train(
@@ -48,7 +59,7 @@ def train(
     cfg: TrainConfig,
     train_step: TrainStepFn,
     *,
-    val_eval: Optional[Callable[[ModelInterface], float]] = None,
+    val_eval: Optional[Callable[[ModelInterface], dict]] = None,
     logger: Optional[Callable[[dict], None]] = None,
     on_checkpoint: Optional[Callable[[int], None]] = None,
     start_step: int = 0,
@@ -58,25 +69,40 @@ def train(
     Pure orchestration: the backprop/optimizer primitive (`train_step`) and the
     checkpoint writer (`on_checkpoint(step)`, which persists portable weights + a
     within-backend resume bundle) are injected so this stays backend-free. Resume
-    is driven by `start_step`.
+    is driven by `start_step`. Each step consumes `cfg.grad_accum` micro-batches.
+    `val_eval(model)` returns a metrics dict (e.g. {val_loss, val_perplexity}) that
+    is merged into the logged payload.
     """
     schedule = CosineSchedule(cfg.base_lr, cfg.warmup_steps, cfg.total_steps)
     step = start_step
     log = logger or (lambda payload: print(payload))
+    tokens_per_step = train_loader.batch_size * train_loader.seq_len * cfg.grad_accum
+
+    stream = _micro_batch_stream(train_loader, cfg.seed)
+    t0 = time.perf_counter()
+    steps_since_log = 0
 
     while step < cfg.total_steps:
-        for inputs, targets in train_loader.epoch(reseed=cfg.seed + step):
-            lr = schedule.lr_at(step)
-            metrics = train_step(model, inputs, targets, lr)  # backend: fwd+bwd+opt
+        micro = list(islice(stream, cfg.grad_accum))
+        if not micro:
+            break
+        lr = schedule.lr_at(step)
+        metrics = train_step(model, micro, lr)            # backend: fwd+bwd+opt
+        steps_since_log += 1
 
-            if step % cfg.log_every == 0:
-                payload = {"step": step, "lr": lr, **metrics}
-                if val_eval and step % cfg.eval_every == 0:
-                    payload["val_loss"] = val_eval(model)
-                log(payload)
+        if step % cfg.log_every == 0:
+            now = time.perf_counter()
+            dt = now - t0
+            tps = steps_since_log * tokens_per_step / dt if dt > 0 else 0.0
+            payload = {"step": step, "lr": lr, **metrics, "tokens_per_sec": tps}
+            if val_eval and step % cfg.eval_every == 0:
+                payload.update(val_eval(model))
+            log(payload)
+            t0 = time.perf_counter()
+            steps_since_log = 0
 
-            step += 1
-            if on_checkpoint and step % cfg.ckpt_every == 0:
-                on_checkpoint(step)
-            if step >= cfg.total_steps:
-                break
+        step += 1
+        if on_checkpoint and step % cfg.ckpt_every == 0:
+            on_checkpoint(step)
+        if step >= cfg.total_steps:
+            break
