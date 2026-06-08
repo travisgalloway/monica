@@ -39,8 +39,18 @@ def main() -> None:
     args = ap.parse_args()
 
     # MLX-only imports kept local so the seam stays clean for portable hosts.
-    import mlx.core as mx
-    import mlx.optimizers as optim
+    try:
+        import mlx.core as mx
+        import mlx.optimizers as optim
+    except ModuleNotFoundError as e:
+        if e.name != "mlx":
+            raise
+        raise SystemExit(
+            "mlx not found — run with the project venv on Apple Silicon:\n"
+            "    .venv/bin/python scripts/smoke_test.py ...\n"
+            "(mlx installs only on Apple Silicon via the '[mlx]' extra; a bare "
+            "`python` likely points at a different interpreter.)"
+        ) from e
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
     from src.model.mlx_train_step import make_train_step, save_optimizer, load_optimizer
