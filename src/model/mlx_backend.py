@@ -156,7 +156,12 @@ class SelectiveSSM(nn.Module):
         # 2) each chunk's final state, from that chunk's inputs only
         decay_end = mx.exp(Acum[..., -1:] - Acum)            # (B,H,nc,Q)
         states = mx.einsum("bhcj,bcjhp,bcjn->bchpn", decay_end, Xc, Bc)
-        # 3) inter-chunk recurrence (the only scan, over nc chunk-states)
+        # 3) inter-chunk recurrence over the nc chunk-states. The canonical SSD form
+        # (Dao & Gu) does this as a matmul against an (nc+1, nc+1) decay matrix rather
+        # than a sequential scan: parallel/tensor-core-friendly, at the cost of O(nc^2).
+        # nc = ceil(L/Q) is small (16 at poc seq 1024 / Q 64), so the matrix is tiny vs
+        # the per-position activations; for very long contexts raise `chunk_size` (Q) to
+        # keep nc bounded. (A true O(nc) scan would be slower at these scales.)
         states = mx.concatenate(
             [mx.zeros((B_, 1, H, P, N), dtype=states.dtype), states], axis=1)
         chunk_tot = mx.pad(Acum[..., -1], [(0, 0), (0, 0), (1, 0)])   # (B,H,nc+1)
