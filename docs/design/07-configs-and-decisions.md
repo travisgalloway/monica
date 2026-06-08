@@ -14,9 +14,10 @@ decision record — reproduced verbatim below.
 # Tiny + fp32 so fixed-seed resume is exactly reproducible.
 d_model: 64
 n_layers: 2
-d_state: 16
-expand: 2
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
 d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 heads (scalar A per head)
 dt_rank: auto
 
 vocab_size: 256        # byte fallback tokenizer for offline smoke testing
@@ -24,7 +25,8 @@ seq_len: 128
 tie_embeddings: true
 
 precision: fp32        # correctness first; trivial exact resume
-chunk_size: null       # seq_len well under ~2k -> single-pass scan
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny model -> not needed; keep smoke exact-resume cheap
 
 # dt-projection bias init (load-bearing)
 dt_min: 0.001
@@ -34,12 +36,12 @@ dt_init_floor: 0.0001
 
 The toy config exists to make the [smoke gate](06-smoke-gate-and-eval.md) fast and
 **bit-exact**: tiny dims, `fp32` (so fixed-seed resume is reproducible), and
-`vocab_size: 256` to run on the byte-fallback tokenizer with no network.
+`vocab_size: 256` to run on the byte-fallback tokenizer with no network. `head_dim 16`
+gives 8 heads — enough timescale spread for the dt-init recall test.
 
-> Note on `chunk_size: null`: the inline comments here predate the backend default
-> and read as "single-pass". In practice `null` means *the backend's default chunk
-> size* (the MLX backend uses 32) — the scan is always chunked. See
-> [why always chunk](02-model-ssm.md#why-always-chunk).
+> Note on `chunk_size: null`: it means *the backend's default chunk length* (the MLX
+> SSD scan uses **64**), not an unchunked pass. The SSD scan is overflow-safe by
+> construction — see [the SSD scan](02-model-ssm.md#the-ssd-chunked-matmul-scan).
 
 ## `config/poc.yaml`
 
@@ -49,20 +51,23 @@ The toy config exists to make the [smoke gate](06-smoke-gate-and-eval.md) fast a
 # budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers lands near 100M.
 d_model: 768           # d_inner = expand*d_model = 1536
 n_layers: 24
-d_state: 16
+d_state: 16            # SSM state width N (per head, shared B/C group)
 expand: 2
 d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 1536/64 = 24 heads (scalar A per head)
 dt_rank: auto
 
 vocab_size: 50280      # CONFIRMED: allenai/OLMo-7B-hf, vocab 50280 < 65536 (uint16)
-seq_len: 1024          # <= ~2k -> chunking NOT required for the training run
+seq_len: 1024
 tie_embeddings: true
 
 # CONFIRMED ON MLX (M1 micro-benchmark): fp16 ~3.96 TFLOP/s vs bf16 ~3.36 and
 # fp32 ~3.40 on this Metal GPU -> fp16 is ~18% faster; bf16 gives no speedup.
 # Use fp16 + loss scaling for the scale run (toy/smoke stay fp32 for exact resume).
 precision: fp16
-chunk_size: null       # set an int only for long-context inference
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: true  # REQUIRED at depth: recompute layers in backward so the
+                       # 24-layer fp16 backward fits in unified memory (else it swaps)
 
 # dt-projection bias init (load-bearing)
 dt_min: 0.001
@@ -70,20 +75,21 @@ dt_max: 0.1
 dt_init_floor: 0.0001
 ```
 
-> Note on `chunking NOT required` / `chunk_size: null`: as with the toy config, this
-> means the backend's default chunk size (the MLX backend uses 32), **not** an
-> unchunked single pass — the scan is always chunked. See
-> [why always chunk](02-model-ssm.md#why-always-chunk).
+> Note on `chunk_size: null`: it means the backend's default SSD chunk length (**64**),
+> not an unchunked pass. The migration to **Mamba-2 / SSD** (scalar A) plus
+> `grad_checkpoint` is what makes the poc step fit in memory and run fast — see
+> [the SSD scan](02-model-ssm.md#the-ssd-chunked-matmul-scan) and
+> [why scalar A](02-model-ssm.md#why-scalar-a-mamba-2).
 
 ## The decisions, distilled
 
 ### Sizing: ~100M params, ~3B tokens
 
 `d_model 768 × 24 layers` lands near 100M parameters; the target ~3B tokens is
-roughly Chinchilla-optimal for that size. `seq_len 1024` is comfortably under the ~2k
-limit, so `chunk_size` can stay `null` — meaning the backend's default chunk (32),
-not an unchunked pass; the scan is [always chunked](02-model-ssm.md#why-always-chunk).
-An explicit `chunk_size` is only needed to tune long-context behavior.
+roughly Chinchilla-optimal for that size. `seq_len 1024` runs the [SSD
+scan](02-model-ssm.md#the-ssd-chunked-matmul-scan) with the default chunk length
+`Q = 64`; an explicit `chunk_size` is only needed to tune that. `head_dim 64` splits
+`d_inner = 1536` into 24 scalar-A heads.
 
 ### Tied embedding is mandatory at scale
 

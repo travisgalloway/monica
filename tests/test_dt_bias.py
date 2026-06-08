@@ -73,7 +73,7 @@ def test_dt_bias_timescales_in_range():
     bias = ssm.dt_proj.bias
     dt = _np(_softplus(bias))
 
-    assert bias.shape == (cfg.d_inner,)
+    assert bias.shape == (cfg.n_heads,)        # Mamba-2: one dt per head
     assert np.all(dt > 0.0)
     # log-uniform in [dt_min, dt_max], clamped up to dt_init_floor. The floor
     # (1e-4) is below dt_min (1e-3) here, so the effective range is [dt_min, dt_max].
