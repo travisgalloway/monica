@@ -10,7 +10,8 @@ The Mamba block (described here textually; implemented in a backend):
       -> split into `main` and `gate`
       -> short causal depthwise conv on `main` (width `d_conv`)
       -> SiLU
-      -> selective SSM (diagonal A; input-dependent B, C, delta; parallel scan)
+      -> selective SSM (Mamba-2 / SSD: scalar A per head; input-dependent B, C,
+         delta; chunked-matmul parallel scan)
       -> multiply by SiLU(gate)
       -> output projection
 
@@ -40,9 +41,14 @@ class MambaConfig:
     # --- core dimensions ---
     d_model: int
     n_layers: int
-    d_state: int = 16
+    d_state: int = 16          # SSM state width N (per head, shared B/C group)
     expand: int = 2
     d_conv: int = 4
+    # Mamba-2 / SSD head dimension P. d_inner is split into n_heads = d_inner//head_dim
+    # heads, each with a SCALAR decay A (the SSD restriction that makes the scan a
+    # matmul). Must divide d_inner. 64 divides both toy (128->2 heads) and poc
+    # (1536->24 heads).
+    head_dim: int = 64
     # dt projection rank; "auto" -> ceil(d_model / 16)
     dt_rank: Union[int, str] = "auto"
 
@@ -58,10 +64,16 @@ class MambaConfig:
     # fp16 + loss scaling is the likely Metal-friendly choice).
     precision: str = "fp32"
 
-    # Chunked scan working-set bound. None => the backend's default chunk size (the
-    # MLX backend uses 32); fine for seq_len up to ~2k. Set an int to tune the chunk
-    # for long-context (keeps the per-chunk decay bounded so exp stays finite).
+    # SSD chunk length Q. None => the backend default (64). The chunked-matmul scan
+    # processes the sequence in chunks of Q; the sequence is padded up to a multiple
+    # of Q (padded steps carry zero input, trimmed from the output).
     chunk_size: Optional[int] = None
+
+    # Recompute each layer's forward in the backward pass instead of retaining its
+    # activations (mlx.nn.utils.checkpoint). Trades ~one extra forward for a large
+    # memory cut — required at poc scale (without it the 24-layer backward exceeds
+    # 32GB and swaps). Off for toy/smoke (tiny; keep exact-resume cheap).
+    grad_checkpoint: bool = False
 
     # --- dt-projection bias init (LOAD-BEARING) ---
     # Inverse-softplus of a sample in [dt_min, dt_max] initializes the dt bias.
@@ -73,6 +85,10 @@ class MambaConfig:
     @property
     def d_inner(self) -> int:
         return self.expand * self.d_model
+
+    @property
+    def n_heads(self) -> int:
+        return self.d_inner // self.head_dim
 
     @property
     def dt_rank_resolved(self) -> int:
@@ -92,6 +108,11 @@ class MambaConfig:
             raise ValueError("chunk_size must be positive or None")
         if self.d_conv < 1:
             raise ValueError("d_conv must be >= 1")
+        if self.head_dim <= 0 or self.d_inner % self.head_dim != 0:
+            raise ValueError(
+                f"head_dim={self.head_dim} must divide d_inner={self.d_inner} "
+                "(d_inner = expand*d_model)."
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
