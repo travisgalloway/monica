@@ -62,7 +62,10 @@ def download_fineweb_edu_slice(
         "HuggingFaceFW/fineweb-edu", name=subset, split="train", streaming=True
     )
     written = 0
-    with open(path, "w") as f:
+    # Explicit UTF-8 + "\n" newlines: the corpus is UTF-8, and forcing the line
+    # terminator avoids Windows \r\n translation that downstream tokenization would
+    # otherwise mis-strip.
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         for ex in ds:
             doc = _normalize_doc(ex.get("text", ""))
             if not doc:

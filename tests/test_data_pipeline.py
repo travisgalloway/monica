@@ -5,6 +5,9 @@ Exercises pack -> split -> loader and asserts the two invariants that matter mos
   * the validation shard does not overlap the training stream
 """
 
+import subprocess
+import sys
+
 import numpy as np
 
 from src.data.download import _normalize_doc
@@ -61,6 +64,18 @@ def test_capped_truncates_stream():
     assert list(_capped(iter(range(100)), 5)) == [0, 1, 2, 3, 4]
     assert list(_capped(iter(range(3)), 10)) == [0, 1, 2]  # cap above length
     assert list(_capped(iter(range(10)), None)) == list(range(10))  # pass-through
+
+
+def test_nonpositive_max_tokens_rejected(tmp_path):
+    # A value <= 0 would silently yield 0 tokens (enumerate starts at 0); the CLI must
+    # reject it at parse time rather than produce a surprising "successful" empty run.
+    inp = tmp_path / "in.txt"
+    inp.write_text("abc\n")
+    cmd = [sys.executable, "-m", "src.data.tokenize", "--in", str(inp),
+           "--out", str(tmp_path / "o.bin"), "--byte-fallback", "--max-tokens", "-1"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode != 0
+    assert "must be positive" in res.stderr
 
 
 def test_loader_contiguous_windows(tmp_path):

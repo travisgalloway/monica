@@ -81,10 +81,14 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="stop after this many tokens (caps the scale run)")
     args = ap.parse_args()
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        ap.error("--max-tokens must be positive (a value <= 0 silently yields 0 tokens)")
 
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
-    with open(args.inp) as f:
-        texts = (line.rstrip("\n") for line in f)
+    # Explicit UTF-8 (corpus is UTF-8; avoids locale-dependent decoding) and strip any
+    # trailing \r so \r\n-terminated input doesn't leak a stray carriage return into a doc.
+    with open(args.inp, encoding="utf-8") as f:
+        texts = (line.rstrip("\r\n") for line in f)
         stream = _capped(tokenize_texts(texts, tok), args.max_tokens)
         if args.out.suffix == ".bin":
             # Stream straight into the packed format (chunked, bounded memory) — this
