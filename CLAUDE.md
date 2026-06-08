@@ -53,7 +53,8 @@ do not import a backend — and add new portable modules to that test's
 Consequences of the seam that shape how code is written:
 - The training loop (`src/train/loop.py`) is backend-free and receives the
   backprop/optimizer primitive as an injected `train_step` callable
-  (`TrainStepFn = (model, inputs, targets, lr) -> {loss, grad_norm}`). The MLX
+  (`TrainStepFn = (model, micro_batches, lr) -> {loss, grad_norm, ...}`, where
+  `micro_batches` is a list of `(inputs, targets)` of length `grad_accum`). The MLX
   implementation is `make_train_step(...)` in `src/model/mlx_train_step.py`.
 - The data loader yields **numpy**; the backend converts to its own array type inside
   `forward`. Eval (`src/eval/val_loss.py`) takes a `to_numpy` converter at the seam.
@@ -70,21 +71,41 @@ are the decision record** — read them before changing values. Key locked decis
 - **toy.yaml** (smoke/correctness): tiny, `fp32` for bit-exact fixed-seed resume,
   `vocab_size 256` (byte-fallback tokenizer, offline).
 - **poc.yaml** (~100M scale run): `vocab_size 50280` (OLMo-7B-hf, confirmed `<65536`),
-  `precision fp16` + loss scaling (~18% faster than bf16 on Metal per the M1
+  `precision fp16` + (dynamic) loss scaling (~18% faster than bf16 on Metal per the M1
   micro-benchmark — **do not assume bf16**), tied embedding **mandatory** (~38M of
-  ~100M params).
+  ~100M params), `grad_checkpoint: true` (required at this depth — see below).
+- **`head_dim`** is the Mamba-2 head width: `d_inner` splits into
+  `n_heads = d_inner // head_dim` heads, each with a **scalar** decay A (the SSD
+  restriction that makes the scan a matmul). `validate()` requires `head_dim | d_inner`
+  (poc `head_dim 64` → 24 heads; toy `head_dim 16` → 8 heads).
 - **dt-bias init** (`dt_min`/`dt_max`/`dt_init_floor`) is **load-bearing** — without
   the inverse-softplus init in `SelectiveSSM._init_dt_bias` the model fails to learn
-  recall. These params are identical across both configs by design.
+  recall. Now **per-head** (shape `n_heads`). These params are identical across both
+  configs by design.
 
-## Two compute paths must agree
+## The SSM: Mamba-2 / SSD (scalar A)
 
-The model has two separate implementations of the SSM that must produce identical
-logits: `forward` (parallel chunked scan, training) and `step` (recurrence,
-inference). The selective scan **always chunks** (default 32) because a single-pass
-cumsum overflows fp32. Conformance (`src/conformance/`) guards this:
-`forward_step_parity` (train vs infer) and `backend_parity` (MLX vs CUDA, deferred)
-both compare in **fp32 at ~1e-4 rel** — bf16's epsilon is too coarse to be meaningful.
+The SSM is **Mamba-2 / SSD** (Dao & Gu, *State Space Duality*): scalar A **per head**,
+multi-head with one shared B/C group — migrated from the original diagonal-A Mamba-1
+for training throughput/memory (see `docs/design/02-model-ssm.md`). Two separate
+implementations must produce identical logits: `forward` (the SSD **chunked-matmul**
+scan, training) and `step` (the matching one-step recurrence, inference). The scan
+**always chunks** (length Q = `chunk_size`, default **64**) but, unlike the old
+diagonal-A cumsum scan, is **overflow-safe by construction** — every decay is `exp` of
+a non-positive sum (in `[0,1]`). Conformance (`src/conformance/`) guards train/infer
+equivalence: `forward_step_parity` and `backend_parity` (MLX vs CUDA, deferred) both
+compare in **fp32 at ~1e-4 rel** — bf16's epsilon is too coarse to be meaningful.
+
+## Training: the scale-run driver and its memory lever
+
+`scripts/train.py` is the real run driver (config → model → data → loop, with resume).
+It wires **gradient accumulation** (the loop pulls `grad_accum` micro-batches per step),
+**dynamic fp16 loss scaling** (`src/train/loss_scale.py`, a portable policy; the backend
+does the inf/nan check and skips overflowing steps), and **gradient checkpointing**
+(`grad_checkpoint` config — recompute each layer in backward instead of retaining its
+activations). Checkpointing is mandatory at poc depth: without it the 24-layer backward
+exceeds the 32 GB unified memory and swaps. Mamba-2/SSD + checkpointing took the poc
+step from ~180 s (diagonal-A, swapping) to ~3 s.
 
 ## Checkpointing: two deliberately separate concerns
 
@@ -97,8 +118,10 @@ The smoke gate stresses exactly this round-trip.
 ## Workflow
 
 - Milestones M1–M8 are tracked in **GitHub issue #2** (the milestone tracker); each
-  sub-issue references "Part of #2". M1–M4 are done and verified; M5 (scale run), and
-  M6–M8 (OLMES eval, serving/rewind, CUDA backend) are deferred.
+  sub-issue references "Part of #2". M1–M4 are done and verified; M2 data (#10) is done;
+  **M5 infrastructure is done** — the `scripts/train.py` driver (#22) and the Mamba-2/SSD
+  perf migration (#23, PR #25) — with the full 2–5B-token run + dataset generation still
+  pending (user-driven). M6–M8 (OLMES eval, serving/rewind, CUDA backend) are deferred.
 - `docs/design/` documents the design choices and rationale (start at
   `docs/design/README.md`). After completing a milestone, tick its box in issue #2.
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.
