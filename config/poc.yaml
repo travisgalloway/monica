@@ -13,9 +13,10 @@ vocab_size: 50280      # CONFIRMED: allenai/OLMo-7B-hf, vocab 50280 < 65536 (uin
 seq_len: 1024
 tie_embeddings: true
 
-# CONFIRMED ON MLX (M1 micro-benchmark): fp16 ~3.96 TFLOP/s vs bf16 ~3.36 and
-# fp32 ~3.40 on this Metal GPU -> fp16 is ~18% faster; bf16 gives no speedup.
-# Use fp16 + loss scaling for the scale run (toy/smoke stay fp32 for exact resume).
+# CONFIRMED ON MLX (issue #3, reproduce: `python scripts/bench_precision.py`):
+# fp16 ~4.37 TFLOP/s vs bf16 ~3.78 vs fp32 ~3.33 on this Metal GPU -> fp16 is ~16%
+# faster than bf16 (and ~31% over fp32). Do NOT assume bf16. Use fp16 + loss scaling
+# for the scale run (toy/smoke stay fp32 for exact resume).
 precision: fp16
 chunk_size: null       # SSD chunk length Q (null -> backend default 64)
 grad_checkpoint: true  # REQUIRED at this depth: recompute layers in backward so the

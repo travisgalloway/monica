@@ -52,3 +52,14 @@ class DynamicLossScaler:
             return
         self.scale = float(state["scale"])
         self._good_steps = int(state.get("good_steps", 0))
+
+
+def scaler_for_precision(precision: str, init_scale: float = 2.0 ** 13):
+    """Map a config `precision` to the loss scaler the train step needs.
+
+    Only fp16 needs dynamic loss scaling (its narrow exponent range under/overflows);
+    fp32 and bf16 train unscaled, so they get `None`. This is the single source of
+    truth for the precision->scaler wiring, kept here (above the seam) so it is
+    unit-testable without a backend. See `scripts/train.py` for how it is consumed.
+    """
+    return DynamicLossScaler(init_scale) if precision == "fp16" else None

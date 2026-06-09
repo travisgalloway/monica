@@ -82,7 +82,7 @@ def main() -> None:
         make_train_step, save_optimizer, load_optimizer,
     )
     from src.data.loader import PackedLoader
-    from src.train.loss_scale import DynamicLossScaler
+    from src.train.loss_scale import scaler_for_precision
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
     from src.train.checkpoint import save_resume, load_resume
@@ -99,7 +99,7 @@ def main() -> None:
     mx.random.seed(args.seed)
     model = MLXMambaModel(cfg)
     opt = optim.AdamW(learning_rate=args.base_lr)
-    scaler = DynamicLossScaler(args.init_loss_scale) if cfg.precision == "fp16" else None
+    scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
     if scaler is None and cfg.precision != "fp32":
         print(f"[warn] precision={cfg.precision!r}: training without loss scaling")
     train_step = make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler)

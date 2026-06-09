@@ -1,6 +1,6 @@
 """DynamicLossScaler policy — portable (no backend); just the number machine."""
 
-from src.train.loss_scale import DynamicLossScaler
+from src.train.loss_scale import DynamicLossScaler, scaler_for_precision
 
 
 def test_overflow_backs_off_and_resets_counter():
@@ -57,3 +57,22 @@ def test_load_empty_state_is_noop():
     assert s.scale == 512.0
     s.load_state_dict(None)             # resume with no scaler bundle
     assert s.scale == 512.0
+
+
+# --- precision -> scaler wiring (issue #3, acceptance criterion 3) --------------
+def test_scaler_for_precision_fp16_enables_scaling():
+    s = scaler_for_precision("fp16", init_scale=4096.0)
+    assert isinstance(s, DynamicLossScaler)
+    assert s.scale == 4096.0             # the requested init scale is honored
+
+
+def test_scaler_for_precision_fp16_default_init():
+    s = scaler_for_precision("fp16")
+    assert isinstance(s, DynamicLossScaler)
+    assert s.scale == 2.0 ** 13          # matches DynamicLossScaler's default
+
+
+def test_scaler_for_precision_skips_scaling_for_fp32_and_bf16():
+    # bf16's wide exponent range and fp32 don't need (and must not get) loss scaling.
+    assert scaler_for_precision("fp32") is None
+    assert scaler_for_precision("bf16") is None

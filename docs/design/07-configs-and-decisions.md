@@ -101,11 +101,15 @@ separate LM head) is therefore not a tuning knob but a requirement; see
 ### Precision: fp16 for poc, fp32 for toy/smoke
 
 The fp16-vs-bf16 question was settled empirically on MLX in M1 (issue #3), not
-assumed. The micro-benchmark on this Metal GPU: **fp16 ~3.96 TFLOP/s vs bf16 ~3.36
-and fp32 ~3.40** — fp16 is ~18% faster and bf16 gives no speedup. So the scale run
-uses **fp16 + loss scaling** (the loss-scaling machinery lives in
-[training](05-training.md)), while toy/smoke stay **fp32** for exact resume. Note this
-contradicts the common assumption that bf16 is the safe default — on Metal it isn't.
+assumed. The benchmark — reproducible in-repo via `scripts/bench_precision.py`, which
+times the poc forward GEMM workload (per-layer in/x/out projections + the tied head)
+in each dtype — on this Metal GPU: **fp16 ~4.37 TFLOP/s vs bf16 ~3.78 and fp32 ~3.33**.
+fp16 is **~16% faster than bf16** (and ~31% over fp32); bf16 buys only a small edge on
+fp32. So the scale run uses **fp16 + loss scaling** (the loss-scaling machinery lives
+in [training](05-training.md); the precision→scaler wiring is `scaler_for_precision`
+in `src/train/loss_scale.py`), while toy/smoke stay **fp32** for exact resume. Note
+this contradicts the common assumption that bf16 is the safe default — on Metal it
+isn't. Re-run `python scripts/bench_precision.py` on new hardware to re-confirm.
 
 ### Vocab is locked to uint16
 
