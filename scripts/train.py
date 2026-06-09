@@ -101,7 +101,8 @@ def main() -> None:
     opt = optim.AdamW(learning_rate=args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
     if scaler is None and cfg.precision != "fp32":
-        print(f"[warn] precision={cfg.precision!r}: training without loss scaling")
+        print(f"[info] precision={cfg.precision!r}: training unscaled "
+              "(loss scaling is fp16-only; expected for bf16)")
     train_step = make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler)
 
     # --- data ------------------------------------------------------------------

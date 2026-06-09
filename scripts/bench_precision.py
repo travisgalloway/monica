@@ -34,7 +34,18 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--iters", type=int, default=50, help="timed iterations per dtype")
     ap.add_argument("--warmup", type=int, default=10, help="untimed warmup iterations per dtype")
     ap.add_argument("--seed", type=int, default=0)
-    return ap.parse_args()
+    args = ap.parse_args()
+    # Fail fast on inputs that would crash or report nonsense (e.g. --iters 0 leaves
+    # `last` unset and divides by ~0; non-positive batch/seq/warmup are meaningless).
+    if args.iters < 1:
+        ap.error("--iters must be >= 1")
+    if args.warmup < 0:
+        ap.error("--warmup must be >= 0")
+    if args.batch < 1:
+        ap.error("--batch must be >= 1")
+    if args.seq is not None and args.seq < 1:
+        ap.error("--seq must be >= 1")
+    return args
 
 
 def _gemm_shapes(cfg, tokens: int):
@@ -108,7 +119,9 @@ def main() -> None:
             last = run_iter()
         elapsed = time.perf_counter() - t0
 
-        if not bool(mx.all(mx.isfinite(last[0])).item()):
+        # Check every GEMM output, not just the first — the widest one (the LM head,
+        # last in the list) is the most likely to overflow in low precision.
+        if not all(bool(mx.all(mx.isfinite(o)).item()) for o in last):
             raise RuntimeError(f"{name}: non-finite GEMM output — benchmark is degenerate")
 
         tflops = (flops_per_iter * args.iters) / elapsed / 1e12

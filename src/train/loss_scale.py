@@ -54,7 +54,7 @@ class DynamicLossScaler:
         self._good_steps = int(state.get("good_steps", 0))
 
 
-def scaler_for_precision(precision: str, init_scale: float = 2.0 ** 13):
+def scaler_for_precision(precision: str, init_scale: float = 2.0 ** 13) -> "DynamicLossScaler | None":
     """Map a config `precision` to the loss scaler the train step needs.
 
     Only fp16 needs dynamic loss scaling (its narrow exponent range under/overflows);
