@@ -1,15 +1,18 @@
 """MLX backend for the Mamba POC (Apple Silicon).
 
-Implements `ModelInterface` with the standard Mamba block (Gu & Dao): a diagonal
-selective SSM with input-dependent B, C, delta. Two code paths must agree
+Implements `ModelInterface` with a Mamba-2 / SSD block: a SCALAR-A selective SSM
+(Dao & Gu, State Space Duality), multi-head with one shared B/C group. Scalar A is
+what lets the scan become a sequence of matmuls. Two code paths must agree
 (forward_step_parity, fp32 ~1e-4 rel):
 
-  * `parallel(x)`     : a chunked closed-form selective scan over the full
-                        sequence (training path). Chunking keeps the per-chunk
-                        cumulative decay bounded so `exp` does not overflow — a
-                        global single-pass cumsum overflows fp32 even at modest
-                        seq_len, so we always chunk (default chunk 32).
+  * `parallel(x)`     : the SSD chunked-matmul scan over the full sequence (training
+                        path). Intra-chunk via matmul, a short recurrence across
+                        chunk-states. All decays are exp of non-positive sums, so it
+                        is overflow-safe; chunk length Q comes from `chunk_size`.
   * `recurrence(x, h)`: one-step state update (inference path).
+
+Memory at depth is controlled with gradient checkpointing (recompute each layer's
+forward in backward); see `MLXMambaModel.__init__`.
 
 This file imports `mlx`, so it does NOT import on Linux/CUDA hosts — intentional
 and allowed: it lives below the seam and nothing portable imports it.
@@ -22,6 +25,7 @@ from typing import List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.utils import checkpoint as _checkpoint
 from mlx.utils import tree_flatten, tree_unflatten
 import numpy as np
 
@@ -52,30 +56,49 @@ class RMSNorm(nn.Module):
         return self.weight * (x * norm)
 
 
+def _segsum(x: Array) -> Array:
+    """Lower-triangular segment-sum. out[..., i, j] = sum_{j < k <= i} x_k for i >= j,
+    and -inf above the diagonal. `exp(_segsum(g))` is the within-window decay matrix
+    of a scalar SSM (a 1-semiseparable matrix); the -inf upper triangle exp's to 0,
+    enforcing causality."""
+    T = x.shape[-1]
+    xc = mx.cumsum(x, axis=-1)
+    seg = xc[..., :, None] - xc[..., None, :]
+    mask = mx.tril(mx.ones((T, T), dtype=mx.bool_))
+    return mx.where(mask, seg, mx.array(float("-inf"), dtype=seg.dtype))
+
+
 class SelectiveSSM(nn.Module):
-    """Diagonal-A selective state space with input-dependent B, C, delta."""
+    """Scalar-A Mamba-2 / SSD selective state space.
+
+    d_inner is split into `n_heads` heads of width `head_dim` (P); each head has a
+    SCALAR decay A (the SSD restriction that turns the scan into matmuls). B and C
+    are a single group of width `d_state` (N), shared across heads. The training
+    path (`parallel`) is the SSD chunked-matmul scan; the inference path
+    (`recurrence`) is the matching one-step recurrence. Both compute the same
+    function (forward_step_parity, fp32 ~1e-4)."""
 
     def __init__(self, config: MambaConfig):
         super().__init__()
         self.config = config
         d_inner, d_state = config.d_inner, config.d_state
-        dt_rank = config.dt_rank_resolved
+        dt_rank, H = config.dt_rank_resolved, config.n_heads
 
-        # x_proj produces (delta, B, C); dt_proj maps dt_rank -> d_inner.
+        # x_proj produces (dt_pre, B, C); B and C are one group, shared across heads.
         self.x_proj = nn.Linear(d_inner, dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
+        # dt is PER-HEAD in Mamba-2: dt_proj maps dt_rank -> n_heads.
+        self.dt_proj = nn.Linear(dt_rank, H, bias=True)
 
-        # Diagonal A stored as log for stability: A = -exp(A_log). Init A = -(1..d_state)
-        # broadcast across channels (the standard "S4D-real" init).
-        a = mx.arange(1, d_state + 1, dtype=mx.float32)          # (d_state,)
-        self.A_log = mx.log(mx.ones((d_inner, d_state)) * a)     # (d_inner, d_state)
-        self.D = mx.ones((d_inner,))
+        # Scalar decay A per head, stored as log: A = -exp(A_log). S4D-real init.
+        self.A_log = mx.log(mx.arange(1, H + 1, dtype=mx.float32))   # (H,)
+        self.D = mx.ones((H,))                                       # (H,) skip per head
 
         self._init_dt_bias()
 
     def _init_dt_bias(self) -> None:
         """LOAD-BEARING dt-projection bias init (inverse-softplus into a small
-        positive range). Without this the model fails to learn recall.
+        positive range). Without this the model fails to learn recall. Now PER-HEAD
+        (shape n_heads), since Mamba-2 has one dt per head.
 
             dt   = uniform(log(dt_min), log(dt_max)).exp().clamp(min=dt_init_floor)
             bias = dt + log(-expm1(-dt))          # inverse softplus
@@ -83,57 +106,87 @@ class SelectiveSSM(nn.Module):
         c = self.config
         dt = mx.exp(mx.random.uniform(
             low=math.log(c.dt_min), high=math.log(c.dt_max),
-            shape=(c.d_inner,)))
+            shape=(c.n_heads,)))
         dt = mx.maximum(dt, c.dt_init_floor)
-        inv_softplus = dt + mx.log(-mx.expm1(-dt))
-        self.dt_proj.bias = inv_softplus
+        self.dt_proj.bias = dt + mx.log(-mx.expm1(-dt))             # (H,)
 
     # --- shared projections --------------------------------------------------
     def _project(self, x: Array):
+        """x: (..., d_inner) -> delta (..., H), a (H,), B (..., N), C (..., N)."""
         dt_rank, d_state = self.config.dt_rank_resolved, self.config.d_state
         proj = self.x_proj(x)
-        dt = proj[..., :dt_rank]
+        dt_pre = proj[..., :dt_rank]
         B = proj[..., dt_rank:dt_rank + d_state]
         C = proj[..., dt_rank + d_state:]
-        delta = _softplus(self.dt_proj(dt))     # (..., d_inner)
-        A = -mx.exp(self.A_log)                  # (d_inner, d_state)
-        return delta, A, B, C
+        delta = _softplus(self.dt_proj(dt_pre))   # (..., H) per head
+        a = -mx.exp(self.A_log)                    # (H,) scalar decay
+        return delta, a, B, C
 
     def parallel(self, x: Array) -> Array:
-        """Chunked closed-form selective scan. x: (B, L, d_inner) -> (B, L, d_inner)."""
+        """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
+
+        Pads L up to a multiple of the chunk length Q (padded steps carry zero
+        input and are trimmed). All decays are exp of non-positive sums, so the
+        scan is overflow-safe by construction."""
         B_, L, d_inner = x.shape
-        delta, A, Bmat, Cmat = self._project(x)
+        H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
+        Q = self.config.chunk_size or 64
+        delta, a, Bm, Cm = self._project(x)        # delta (B,L,H); Bm,Cm (B,L,N)
+        X = x.reshape(B_, L, H, P)
 
-        # Discretized terms: a = delta*A (log-decay), deltaBu = delta*B*x.
-        a = delta[..., None] * A[None, None]                 # (B, L, di, ds)
-        deltaBu = delta[..., None] * Bmat[:, :, None, :] * x[..., None]  # (B,L,di,ds)
+        pad = (-L) % Q
+        if pad:
+            zc = lambda t, shp: mx.concatenate([t, mx.zeros(shp, dtype=t.dtype)], axis=1)
+            X, delta = zc(X, (B_, pad, H, P)), zc(delta, (B_, pad, H))
+            Bm, Cm = zc(Bm, (B_, pad, N)), zc(Cm, (B_, pad, N))
+        Lp, nc = L + pad, (L + pad) // Q
+        g = delta * a                              # (B,Lp,H) log-decay (<= 0)
+        Xin = delta[..., None] * X                 # (B,Lp,H,P) input = dt * X
 
-        chunk = self.config.chunk_size or min(L, 32)
-        d_state = self.config.d_state
-        h_carry = mx.zeros((B_, d_inner, d_state))
-        ys = []
-        for s in range(0, L, chunk):
-            e = min(s + chunk, L)
-            a_c = a[:, s:e]                                  # (B, lc, di, ds)
-            bu_c = deltaBu[:, s:e]
-            C_c = Cmat[:, s:e]                               # (B, lc, ds)
-            A_cum = mx.cumsum(a_c, axis=1)                   # inclusive log-decay
-            # h_j = exp(A_cum_j) * (h_carry + sum_{i<=j} exp(-A_cum_i) * bu_i)
-            inner = mx.cumsum(mx.exp(-A_cum) * bu_c, axis=1)
-            h = mx.exp(A_cum) * (h_carry[:, None] + inner)   # (B, lc, di, ds)
-            ys.append(mx.sum(h * C_c[:, :, None, :], axis=-1))  # (B, lc, di)
-            h_carry = h[:, -1]
-        y = mx.concatenate(ys, axis=1)                       # (B, L, di)
-        return y + x * self.D
+        gc = g.reshape(B_, nc, Q, H).transpose(0, 3, 1, 2)   # (B,H,nc,Q)
+        Xc = Xin.reshape(B_, nc, Q, H, P)
+        Bc = Bm.reshape(B_, nc, Q, N)
+        Cc = Cm.reshape(B_, nc, Q, N)
+        Acum = mx.cumsum(gc, axis=-1)                        # (B,H,nc,Q)
+
+        # 1) intra-chunk diagonal block (attention-like, within each chunk)
+        Lmask = mx.exp(_segsum(gc))                          # (B,H,nc,Q,Q)
+        CB = mx.einsum("bcin,bcjn->bcij", Cc, Bc)            # (B,nc,Q,Q)
+        Ydiag = mx.einsum("bhcij,bcij,bcjhp->bcihp", Lmask, CB, Xc)
+        # 2) each chunk's final state, from that chunk's inputs only
+        decay_end = mx.exp(Acum[..., -1:] - Acum)            # (B,H,nc,Q)
+        states = mx.einsum("bhcj,bcjhp,bcjn->bchpn", decay_end, Xc, Bc)
+        # 3) inter-chunk recurrence over the nc chunk-states. The canonical SSD form
+        # (Dao & Gu) does this as a matmul against an (nc+1, nc+1) decay matrix rather
+        # than a sequential scan: parallel/tensor-core-friendly, at the cost of O(nc^2).
+        # nc = ceil(L/Q) is small (16 at poc seq 1024 / Q 64), so the matrix is tiny vs
+        # the per-position activations; for very long contexts raise `chunk_size` (Q) to
+        # keep nc bounded. (A true O(nc) scan would be slower at these scales.)
+        states = mx.concatenate(
+            [mx.zeros((B_, 1, H, P, N), dtype=states.dtype), states], axis=1)
+        chunk_tot = mx.pad(Acum[..., -1], [(0, 0), (0, 0), (1, 0)])   # (B,H,nc+1)
+        decay_chunk = mx.exp(_segsum(chunk_tot))                      # (B,H,nc+1,nc+1)
+        new_states = mx.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        S_enter = new_states[:, :-1]                                  # (B,nc,H,P,N)
+        # 4) off-diagonal output: entering state decayed to each position
+        out_decay = mx.exp(Acum)                                      # (B,H,nc,Q)
+        Yoff = mx.einsum("bcin,bchpn,bhci->bcihp", Cc, S_enter, out_decay)
+
+        Y = (Ydiag + Yoff).reshape(B_, Lp, H, P)[:, :L]             # (B,L,H,P)
+        Y = Y + X[:, :L] * self.D[None, None, :, None]             # skip
+        return Y.reshape(B_, L, d_inner)
 
     def recurrence(self, x: Array, state: State) -> Tuple[Array, State]:
-        """Single timestep. x: (B, d_inner), state h: (B, d_inner, d_state)."""
-        delta, A, Bmat, Cmat = self._project(x)
-        dA = mx.exp(delta[..., None] * A[None])              # (B, di, ds)
-        dBu = delta[..., None] * Bmat[:, None, :] * x[..., None]
-        h = dA * state + dBu                                 # (B, di, ds)
-        y = mx.sum(h * Cmat[:, None, :], axis=-1) + x * self.D
-        return y, h
+        """One timestep. x: (B, d_inner), state h: (B, H, P, N) -> y: (B, d_inner)."""
+        B_ = x.shape[0]
+        H, P = self.config.n_heads, self.config.head_dim
+        delta, a, Bm, Cm = self._project(x)        # delta (B,H); Bm,Cm (B,N)
+        Xh = x.reshape(B_, H, P)
+        dA = mx.exp(delta * a)                      # (B,H)
+        dBx = (delta[..., None] * Xh)[..., None] * Bm[:, None, None, :]  # (B,H,P,N)
+        h = dA[:, :, None, None] * state + dBx      # (B,H,P,N)
+        y = mx.sum(h * Cm[:, None, None, :], axis=-1) + Xh * self.D[None, :, None]
+        return y.reshape(B_, -1), h
 
 
 class MambaBlock(nn.Module):
@@ -192,6 +245,13 @@ class MLXMambaModel(ModelInterface, nn.Module):
         if not config.tie_embeddings:
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self._state = None
+        # Gradient checkpointing: recompute each layer's forward in the backward pass
+        # instead of retaining its activations. Essential at poc scale — without it the
+        # 24-layer backward exceeds 32GB and swaps. `step` (inference) is unaffected.
+        if config.grad_checkpoint:
+            self._layer_fns = [_checkpoint(l, l.forward_seq) for l in self.layers]
+        else:
+            self._layer_fns = [l.forward_seq for l in self.layers]
 
     def _head(self, h: Array) -> Array:
         if self._tie_embeddings:
@@ -201,8 +261,8 @@ class MLXMambaModel(ModelInterface, nn.Module):
     # --- ModelInterface ---
     def forward(self, token_batch: Array) -> Array:
         h = self.embedding(mx.array(token_batch))
-        for layer in self.layers:
-            h = layer.forward_seq(h)
+        for layer_fn in self._layer_fns:
+            h = layer_fn(h)
         return self._head(self.norm_f(h))
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
@@ -214,8 +274,11 @@ class MLXMambaModel(ModelInterface, nn.Module):
         return self._head(self.norm_f(h)), new_state
 
     def init_state(self, batch_size: int) -> State:
-        di, ds, k = self.config.d_inner, self.config.d_state, self.config.d_conv
-        return [(mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, di, ds)))
+        c = self.config
+        di, k = c.d_inner, c.d_conv
+        H, P, N = c.n_heads, c.head_dim, c.d_state
+        # Per layer: (conv window (B,k-1,di), SSM state (B,H,P,N)).
+        return [(mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, H, P, N)))
                 for _ in range(self.config.n_layers)]
 
     def get_state(self) -> State:

@@ -26,44 +26,45 @@ def _np(a):
 
 
 def _seq_reference_numpy(ssm, x_np):
-    """Fully independent fp64 sequential selective scan.
+    """Fully independent fp64 sequential scan of the scalar-A Mamba-2 / SSD SSM.
 
-    Computes the projections, softplus, diagonal-A discretization and the
+    Computes the projections, softplus, scalar-A (per-head) discretization and the
     recurrence FROM SCRATCH in numpy using only the SSM's raw parameters — it
-    shares no code with `SelectiveSSM.parallel` or `.recurrence`, so a bug living
-    identically in their shared `_project`/discretization cannot hide here.
+    shares no code with `SelectiveSSM.parallel` (SSD matmul) or `.recurrence`, so a
+    bug living identically in their shared `_project`/discretization cannot hide here.
 
     x_np: (B, L, d_inner) float -> (B, L, d_inner) float64.
     """
     cfg = ssm.config
-    dt_rank, d_state = cfg.dt_rank_resolved, cfg.d_state
+    dt_rank, N = cfg.dt_rank_resolved, cfg.d_state
+    H, P = cfg.n_heads, cfg.head_dim
 
-    # Raw params -> fp64. MLX nn.Linear stores weight as (out, in) and computes
-    # `x @ W.T + b`, so we project with W.T.
-    Wx = _np(ssm.x_proj.weight).astype(np.float64)    # (dt_rank+2*ds, di)
-    Wdt = _np(ssm.dt_proj.weight).astype(np.float64)  # (di, dt_rank)
-    bdt = _np(ssm.dt_proj.bias).astype(np.float64)    # (di,)
-    A = -np.exp(_np(ssm.A_log).astype(np.float64))    # (di, ds)
-    D = _np(ssm.D).astype(np.float64)                 # (di,)
+    # Raw params -> fp64. MLX nn.Linear stores weight as (out, in), computes x @ W.T + b.
+    Wx = _np(ssm.x_proj.weight).astype(np.float64)    # (dt_rank+2N, d_inner)
+    Wdt = _np(ssm.dt_proj.weight).astype(np.float64)  # (H, dt_rank)
+    bdt = _np(ssm.dt_proj.bias).astype(np.float64)    # (H,)
+    a = -np.exp(_np(ssm.A_log).astype(np.float64))    # (H,) scalar decay per head
+    D = _np(ssm.D).astype(np.float64)                 # (H,)
 
     x = x_np.astype(np.float64)
     B_, L, di = x.shape
 
-    proj = x @ Wx.T                                   # (B, L, dt_rank+2*ds)
-    dt = proj[..., :dt_rank]
-    Bm = proj[..., dt_rank:dt_rank + d_state]         # (B, L, ds)
-    Cm = proj[..., dt_rank + d_state:]                # (B, L, ds)
-    delta = np.logaddexp(dt @ Wdt.T + bdt, 0.0)       # softplus -> (B, L, di)
+    proj = x @ Wx.T                                   # (B, L, dt_rank+2N)
+    Bm = proj[..., dt_rank:dt_rank + N]               # (B, L, N) shared across heads
+    Cm = proj[..., dt_rank + N:]                      # (B, L, N)
+    delta = np.logaddexp(proj[..., :dt_rank] @ Wdt.T + bdt, 0.0)  # softplus -> (B, L, H)
 
-    y = np.zeros((B_, L, di), np.float64)
-    h = np.zeros((B_, di, d_state), np.float64)
+    X = x.reshape(B_, L, H, P)
+    y = np.zeros((B_, L, H, P), np.float64)
+    h = np.zeros((B_, H, P, N), np.float64)           # per-head state (P, N)
     for t in range(L):
-        dlt = delta[:, t][..., None]                  # (B, di, 1)
-        dA = np.exp(dlt * A[None])                     # (B, di, ds)
-        dBu = dlt * Bm[:, t][:, None, :] * x[:, t][..., None]
-        h = dA * h + dBu
-        y[:, t] = np.sum(h * Cm[:, t][:, None, :], axis=-1) + x[:, t] * D
-    return y
+        dA = np.exp(delta[:, t] * a)                  # (B, H)
+        Xin = delta[:, t][..., None] * X[:, t]        # (B, H, P) input = dt * X
+        dBx = Xin[..., None] * Bm[:, t][:, None, None, :]    # (B, H, P, N)
+        h = dA[:, :, None, None] * h + dBx
+        y[:, t] = np.sum(h * Cm[:, t][:, None, None, :], axis=-1)  # (B, H, P)
+    y = y + X * D[None, None, :, None]
+    return y.reshape(B_, L, di)
 
 
 def test_ssm_parallel_matches_sequential():
@@ -75,8 +76,8 @@ def test_ssm_parallel_matches_sequential():
 
     y_par = _np(ssm.parallel(x))
 
-    # Sequential reference from the one-step recurrence.
-    h = mx.zeros((B, di, cfg.d_state))
+    # Sequential reference from the one-step recurrence. State is per-head (B,H,P,N).
+    h = mx.zeros((B, cfg.n_heads, cfg.head_dim, cfg.d_state))
     ys = []
     for t in range(L):
         y_t, h = ssm.recurrence(x[:, t], h)

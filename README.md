@@ -48,7 +48,9 @@ eval). Remaining work is the scale-up (M5–M8). Progress is tracked in
 | 4 Smoke test (gate) | passing — resume exact, eval runs |
 | 5–8 POC scale, OLMES, serve/rewind, CUDA | deferred stubs |
 
-**Locked decisions:** poc = d_model 768 / 24 layers / d_state 16 / seq 1024 /
+**Locked decisions:** SSM is **Mamba-2 / SSD** (scalar A per head; chunked-matmul
+scan) + gradient checkpointing — migrated from Mamba-1 for training throughput/memory.
+poc = d_model 768 / 24 layers / d_state 16 / head_dim 64 (24 heads) / seq 1024 /
 ~3B tokens (tied embedding mandatory). toy = d_model 64 / 2 layers / seq 128 /
 fp32. Precision for poc (fp16 vs bf16) **confirmed on MLX in M1** — not assumed.
 Conformance compares in **fp32** (~1e-4 rel). OLMES + serving/rewind deferred;

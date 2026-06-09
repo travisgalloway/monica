@@ -56,8 +56,9 @@ def test_fp16_overflow_skips_update_and_backs_off():
     mx.random.seed(0)
     model = MLXMambaModel(cfg)
     opt = optim.AdamW(learning_rate=1e-3)
-    # A huge scale forces loss*scale -> inf, so the unscaled grads are non-finite.
-    scaler = DynamicLossScaler(init_scale=1e38, backoff=0.5, min_scale=1.0)
+    # A scale above fp32-max makes loss*scale -> inf, so the gradients are
+    # non-finite regardless of the per-element grad magnitude (robust trigger).
+    scaler = DynamicLossScaler(init_scale=1e40, backoff=0.5, min_scale=1.0)
     step_fn = make_train_step(model, opt, grad_clip=1.0, scaler=scaler)
 
     before = [np.array(v) for _, v in tree_flatten(model.parameters())]
@@ -65,7 +66,7 @@ def test_fp16_overflow_skips_update_and_backs_off():
     after = [np.array(v) for _, v in tree_flatten(model.parameters())]
 
     assert out["skipped"] is True
-    assert scaler.scale == 0.5e38                 # backed off on overflow
+    assert scaler.scale == 0.5e40                 # backed off on overflow
     for b, a in zip(before, after):
         assert np.array_equal(b, a)               # weights untouched on a skipped step
 
