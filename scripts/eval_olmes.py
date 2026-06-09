@@ -5,8 +5,8 @@ Wires config -> MLXMambaModel -> tokenizer -> the lm-eval adapter
 end": with random-init or 100M-scale weights the accuracies will sit near
 chance — that is expected and fine for the POC.
 
-Needs the eval extra (pip install -e ".[eval]"; pulls torch, CPU wheels on
-macOS) and network for the HF datasets + OLMo tokenizer. If `datasets` refuses
+Needs the eval extra (pip install -e ".[eval]") and network for the HF
+datasets + OLMo tokenizer. If `datasets` refuses
 piqa's script-based loader, set HF_DATASETS_TRUST_REMOTE_CODE=1 or drop piqa.
 
     .venv/bin/python scripts/eval_olmes.py --config config/poc.yaml --tasks piqa --limit 10
@@ -51,8 +51,8 @@ def main() -> None:
         import lm_eval
     except ModuleNotFoundError as e:
         raise SystemExit(
-            "lm-eval not found — install the eval extra (pulls torch, CPU "
-            "wheels on macOS):\n    .venv/bin/pip install -e \".[eval]\""
+            "lm-eval not found — install the eval extra:\n"
+            "    .venv/bin/pip install -e \".[eval]\""
         ) from e
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
     from src.eval.olmes_adapter import make_lm_eval_adapter

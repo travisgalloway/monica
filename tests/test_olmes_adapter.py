@@ -15,11 +15,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-# Optional backends imported at collection time (module level), matching the
-# repo convention: tests/test_import_guard.py deletes mlx/torch from
-# sys.modules mid-run, and re-importing a native extension afterwards aborts
-# the process — so grab the references before the guard runs and never
-# importorskip these inside a test body.
+# Optional backends imported at module level so only the tests that need them
+# skip (a module-level importorskip would skip the offline numpy tests too).
 try:
     import mlx.core as mx
 except ImportError:  # non-Apple-Silicon host

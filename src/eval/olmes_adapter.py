@@ -6,8 +6,9 @@ methods) over `ModelInterface.forward`, with the same split as `val_loss`: a
 pure-numpy scoring core (`score_continuation`, `disjoint_rolling_windows`) that
 is testable anywhere, and a thin lm-eval shell built by `make_lm_eval_adapter`.
 
-lm-eval hard-depends on torch, so it is imported ONLY inside the factory — this
-module stays above the seam (guarded by tests/test_import_guard.py).
+lm-eval is a heavy optional dependency (and some versions of it pull in torch),
+so it is imported ONLY inside the factory — this module stays above the seam
+(guarded by tests/test_import_guard.py).
 
 The classic trap here is the loglikelihood token-indexing off-by-one:
 `forward` logits at position i predict the token at position i+1, so the model
