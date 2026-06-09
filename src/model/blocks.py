@@ -46,8 +46,8 @@ class MambaConfig:
     d_conv: int = 4
     # Mamba-2 / SSD head dimension P. d_inner is split into n_heads = d_inner//head_dim
     # heads, each with a SCALAR decay A (the SSD restriction that makes the scan a
-    # matmul). Must divide d_inner. 64 divides both toy (128->2 heads) and poc
-    # (1536->24 heads).
+    # matmul). Must divide d_inner. The configs override this: poc.yaml uses 64
+    # (d_inner 1536 -> 24 heads); toy.yaml uses 16 (d_inner 128 -> 8 heads).
     head_dim: int = 64
     # dt projection rank; "auto" -> ceil(d_model / 16)
     dt_rank: Union[int, str] = "auto"
