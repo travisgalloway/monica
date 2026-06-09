@@ -43,6 +43,34 @@ def _softplus(x: Array) -> Array:
 
 
 # --------------------------------------------------------------------------- #
+# Mixed precision (issue #27): fp32 master weights + fp16/bf16 compute.
+#
+# Params stay fp32; we cast to `compute_dtype` (cd) AT THE MATMUL SITE. MLX
+# autodiff returns fp32 grads through the `astype` cast, so AdamW keeps updating
+# the fp32 masters with no optimizer change, and the fp16 loss scaler (#3) finally
+# does meaningful work. For fp32 every cast is guarded to the original op verbatim,
+# so the fp32 path stays bit-identical (smoke gate + conformance untouched).
+# --------------------------------------------------------------------------- #
+_DTYPES = {"fp32": mx.float32, "fp16": mx.float16, "bf16": mx.bfloat16}
+
+
+def _f32(t: Array) -> Array:
+    """Upcast to fp32, but return `t` unchanged when already fp32 (no identity node)."""
+    return t if t.dtype == mx.float32 else t.astype(mx.float32)
+
+
+def _linear(layer: nn.Linear, x: Array, cd) -> Array:
+    """nn.Linear with operands cast to `cd`. fp32 routes to the original call verbatim
+    (fp16 @ fp32 would promote back to fp32, so BOTH operands must be cast)."""
+    if cd == mx.float32:
+        return layer(x)
+    y = x.astype(cd) @ layer.weight.astype(cd).T
+    if "bias" in layer:                              # in/x/out_proj are bias-free; dt_proj has bias
+        y = y + layer.bias.astype(cd)
+    return y
+
+
+# --------------------------------------------------------------------------- #
 # Building blocks
 # --------------------------------------------------------------------------- #
 class RMSNorm(nn.Module):
@@ -52,8 +80,13 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones((d_model,))
 
     def __call__(self, x: Array) -> Array:
-        norm = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return self.weight * (x * norm)
+        if x.dtype == mx.float32:                    # fp32 path: original op, bit-identical
+            norm = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
+            return self.weight * (x * norm)
+        # Mixed precision: do the reduction in fp32 (weight is fp32), return in x's dtype.
+        xf = x.astype(mx.float32)
+        norm = mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        return (self.weight * (xf * norm)).astype(x.dtype)
 
 
 def _segsum(x: Array) -> Array:
@@ -112,14 +145,19 @@ class SelectiveSSM(nn.Module):
 
     # --- shared projections --------------------------------------------------
     def _project(self, x: Array):
-        """x: (..., d_inner) -> delta (..., H), a (H,), B (..., N), C (..., N)."""
+        """x: (..., d_inner) -> delta (..., H), a (H,), B (..., N), C (..., N).
+
+        `x_proj` is the heavy SSM GEMM and runs in `compute_dtype`; its outputs
+        (dt_pre, B, C) upcast to fp32 so the rest of the scan — dt_proj, softplus,
+        the decays, cumsum/_segsum, and all state einsums — runs in fp32."""
+        cd = _DTYPES[self.config.precision]
         dt_rank, d_state = self.config.dt_rank_resolved, self.config.d_state
-        proj = self.x_proj(x)
-        dt_pre = proj[..., :dt_rank]
-        B = proj[..., dt_rank:dt_rank + d_state]
-        C = proj[..., dt_rank + d_state:]
-        delta = _softplus(self.dt_proj(dt_pre))   # (..., H) per head
-        a = -mx.exp(self.A_log)                    # (H,) scalar decay
+        proj = _linear(self.x_proj, x, cd)
+        dt_pre = _f32(proj[..., :dt_rank])
+        B = _f32(proj[..., dt_rank:dt_rank + d_state])
+        C = _f32(proj[..., dt_rank + d_state:])
+        delta = _softplus(self.dt_proj(dt_pre))   # (..., H) per head, fp32
+        a = -mx.exp(self.A_log)                    # (H,) scalar decay, fp32
         return delta, a, B, C
 
     def parallel(self, x: Array) -> Array:
@@ -131,8 +169,11 @@ class SelectiveSSM(nn.Module):
         B_, L, d_inner = x.shape
         H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
         Q = self.config.chunk_size or 64
-        delta, a, Bm, Cm = self._project(x)        # delta (B,L,H); Bm,Cm (B,L,N)
-        X = x.reshape(B_, L, H, P)
+        cd = _DTYPES[self.config.precision]
+        delta, a, Bm, Cm = self._project(x)        # delta (B,L,H); Bm,Cm (B,L,N) — fp32
+        # Upcast the head inputs to fp32 so the whole scan (and the pad zeros, which
+        # inherit t.dtype) runs in fp32; the output casts back to cd for out_proj.
+        X = _f32(x).reshape(B_, L, H, P)
 
         pad = (-L) % Q
         if pad:
@@ -174,19 +215,20 @@ class SelectiveSSM(nn.Module):
 
         Y = (Ydiag + Yoff).reshape(B_, Lp, H, P)[:, :L]             # (B,L,H,P)
         Y = Y + X[:, :L] * self.D[None, None, :, None]             # skip
-        return Y.reshape(B_, L, d_inner)
+        return Y.reshape(B_, L, d_inner).astype(cd)                # back to compute dtype
 
     def recurrence(self, x: Array, state: State) -> Tuple[Array, State]:
         """One timestep. x: (B, d_inner), state h: (B, H, P, N) -> y: (B, d_inner)."""
         B_ = x.shape[0]
         H, P = self.config.n_heads, self.config.head_dim
-        delta, a, Bm, Cm = self._project(x)        # delta (B,H); Bm,Cm (B,N)
-        Xh = x.reshape(B_, H, P)
+        cd = _DTYPES[self.config.precision]
+        delta, a, Bm, Cm = self._project(x)        # delta (B,H); Bm,Cm (B,N) — fp32
+        Xh = _f32(x).reshape(B_, H, P)             # scan + state stay fp32
         dA = mx.exp(delta * a)                      # (B,H)
         dBx = (delta[..., None] * Xh)[..., None] * Bm[:, None, None, :]  # (B,H,P,N)
-        h = dA[:, :, None, None] * state + dBx      # (B,H,P,N)
+        h = dA[:, :, None, None] * state + dBx      # (B,H,P,N) — fp32 state
         y = mx.sum(h * Cm[:, None, None, :], axis=-1) + Xh * self.D[None, :, None]
-        return y.reshape(B_, -1), h
+        return y.reshape(B_, -1).astype(cd), h
 
 
 class MambaBlock(nn.Module):
@@ -204,29 +246,44 @@ class MambaBlock(nn.Module):
         self.ssm = SelectiveSSM(config)
         self.out_proj = nn.Linear(d_inner, config.d_model, bias=False)
 
+    def _conv_seq(self, x_main: Array, cd) -> Array:
+        """Causal depthwise conv in `cd`. fp32 routes to nn.Conv1d verbatim; the
+        functional path mirrors the layer's own call (stride/padding/dilation/groups
+        pulled from the layer so the two paths can't drift) and adds the bias."""
+        if cd == mx.float32:
+            return self.conv(x_main)
+        c = self.conv
+        y = mx.conv1d(x_main.astype(cd), c.weight.astype(cd),
+                      c.stride, c.padding, c.dilation, c.groups)
+        return y + c.bias.astype(cd)
+
     def forward_seq(self, x: Array) -> Array:
         L = x.shape[1]
+        cd = _DTYPES[self.config.precision]
         xn = self.norm(x)
-        x_main, z = mx.split(self.in_proj(xn), 2, axis=-1)   # (B,L,di) each
+        x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)   # (B,L,di) each
         # Causal depthwise conv: pad both sides (d_conv-1), keep the first L outputs.
-        xc = self.conv(x_main)[:, :L]
+        xc = self._conv_seq(x_main, cd)[:, :L]
         xc = _silu(xc)
         y = self.ssm.parallel(xc)
         y = y * _silu(z)
-        return x + self.out_proj(y)
+        return x + _linear(self.out_proj, y, cd)
 
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
         conv_state, ssm_state = state                        # (B,k-1,di), (B,di,ds)
+        cd = _DTYPES[self.config.precision]
         xn = self.norm(x)
-        x_main, z = mx.split(self.in_proj(xn), 2, axis=-1)    # (B,di) each
+        x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)    # (B,di) each
         window = mx.concatenate([conv_state, x_main[:, None, :]], axis=1)  # (B,k,di)
-        # depthwise conv at this timestep: sum over kernel positions.
+        # depthwise conv at this timestep: sum over kernel positions (in cd to match
+        # the conv in forward_seq; cast no-ops for fp32).
         wk = self.conv.weight[:, :, 0].T                      # (k, di)
-        conv_out = mx.sum(window * wk[None], axis=1) + self.conv.bias       # (B, di)
+        conv_out = (mx.sum(window.astype(cd) * wk.astype(cd)[None], axis=1)
+                    + self.conv.bias.astype(cd))              # (B, di)
         xc = _silu(conv_out)
         y, new_ssm = self.ssm.recurrence(xc, ssm_state)
         y = y * _silu(z)
-        out = x + self.out_proj(y)
+        out = x + _linear(self.out_proj, y, cd)
         return out, (window[:, 1:], new_ssm)
 
 
@@ -238,6 +295,7 @@ class MLXMambaModel(ModelInterface, nn.Module):
         nn.Module.__init__(self)
         config.validate()
         self.config = config
+        self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = [MambaBlock(config) for _ in range(config.n_layers)]
         self.norm_f = RMSNorm(config.d_model)
@@ -254,19 +312,22 @@ class MLXMambaModel(ModelInterface, nn.Module):
             self._layer_fns = [l.forward_seq for l in self.layers]
 
     def _head(self, h: Array) -> Array:
+        # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is
+        # upcast so the head matmul is fp32 regardless of compute dtype.
+        h = _f32(h)
         if self._tie_embeddings:
             return h @ self.embedding.weight.T
         return self.lm_head(h)
 
     # --- ModelInterface ---
     def forward(self, token_batch: Array) -> Array:
-        h = self.embedding(mx.array(token_batch))
+        h = self.embedding(mx.array(token_batch)).astype(self._cd)   # activation stream in cd
         for layer_fn in self._layer_fns:
             h = layer_fn(h)
         return self._head(self.norm_f(h))
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
-        h = self.embedding(mx.array(token))
+        h = self.embedding(mx.array(token)).astype(self._cd)
         new_state = []
         for layer, st in zip(self.layers, state):
             h, st2 = layer.step(h, st)

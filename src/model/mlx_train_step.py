@@ -40,7 +40,11 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
         logits = model.forward(inputs)                      # (B, L, V)
         V = logits.shape[-1]
         t = mx.array(targets).reshape(-1).astype(mx.int32)
-        ce = nn.losses.cross_entropy(logits.reshape(-1, V), t, reduction="mean")
+        # Cross-entropy in fp32 (wide-vocab softmax stability). The MLX backend's
+        # `_head` already returns fp32 logits, so this is a no-op there; the cast
+        # keeps the contract explicit and backend-independent.
+        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                     t, reduction="mean")
         return ce * scaler.scale if scaler else ce
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
