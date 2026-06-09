@@ -59,6 +59,12 @@ def _f32(t: Array) -> Array:
     return t if t.dtype == mx.float32 else t.astype(mx.float32)
 
 
+def _cast(t: Array, cd) -> Array:
+    """Cast to compute dtype `cd`, returning `t` unchanged when already `cd` (no
+    identity node) — so the fp32 path stays verbatim, like `_f32`."""
+    return t if t.dtype == cd else t.astype(cd)
+
+
 def _linear(layer: nn.Linear, x: Array, cd) -> Array:
     """nn.Linear with operands cast to `cd`. fp32 routes to the original call verbatim
     (fp16 @ fp32 would promote back to fp32, so BOTH operands must be cast)."""
@@ -215,7 +221,7 @@ class SelectiveSSM(nn.Module):
 
         Y = (Ydiag + Yoff).reshape(B_, Lp, H, P)[:, :L]             # (B,L,H,P)
         Y = Y + X[:, :L] * self.D[None, None, :, None]             # skip
-        return Y.reshape(B_, L, d_inner).astype(cd)                # back to compute dtype
+        return _cast(Y.reshape(B_, L, d_inner), cd)                # back to compute dtype
 
     def recurrence(self, x: Array, state: State) -> Tuple[Array, State]:
         """One timestep. x: (B, d_inner), state h: (B, H, P, N) -> y: (B, d_inner)."""
@@ -228,7 +234,7 @@ class SelectiveSSM(nn.Module):
         dBx = (delta[..., None] * Xh)[..., None] * Bm[:, None, None, :]  # (B,H,P,N)
         h = dA[:, :, None, None] * state + dBx      # (B,H,P,N) — fp32 state
         y = mx.sum(h * Cm[:, None, None, :], axis=-1) + Xh * self.D[None, :, None]
-        return y.reshape(B_, -1).astype(cd), h
+        return _cast(y.reshape(B_, -1), cd), h
 
 
 class MambaBlock(nn.Module):
@@ -321,13 +327,13 @@ class MLXMambaModel(ModelInterface, nn.Module):
 
     # --- ModelInterface ---
     def forward(self, token_batch: Array) -> Array:
-        h = self.embedding(mx.array(token_batch)).astype(self._cd)   # activation stream in cd
+        h = _cast(self.embedding(mx.array(token_batch)), self._cd)   # activation stream in cd
         for layer_fn in self._layer_fns:
             h = layer_fn(h)
         return self._head(self.norm_f(h))
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
-        h = self.embedding(mx.array(token)).astype(self._cd)
+        h = _cast(self.embedding(mx.array(token)), self._cd)
         new_state = []
         for layer, st in zip(self.layers, state):
             h, st2 = layer.step(h, st)

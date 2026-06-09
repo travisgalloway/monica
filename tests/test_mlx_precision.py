@@ -84,16 +84,19 @@ def test_fp16_short_run_decreases_loss_with_scaler():
     assert scaler is not None                         # fp16 gets the dynamic scaler
     step = make_train_step(m, optim.AdamW(learning_rate=1e-3), grad_clip=1.0, scaler=scaler)
 
+    # Overfit a SINGLE fixed batch: with the data held constant the loss must fall
+    # monotonically-ish, so this checks fp16 numerics + the scaler rather than a
+    # noisy trend over varying random data (which need not decrease).
     rng = np.random.default_rng(0)
+    inp = rng.integers(0, cfg.vocab_size, size=(4, 32)).astype(np.int32)
+    tgt = rng.integers(0, cfg.vocab_size, size=(4, 32)).astype(np.int32)
     losses = []
-    for _ in range(12):
-        inp = rng.integers(0, cfg.vocab_size, size=(4, 32)).astype(np.int32)
-        tgt = rng.integers(0, cfg.vocab_size, size=(4, 32)).astype(np.int32)
+    for _ in range(20):
         out = step(m, [(inp, tgt)], 1e-3)
         assert np.isfinite(out["loss"])               # no NaNs under fp16 + scaling
         losses.append(out["loss"])
 
-    assert losses[-1] < losses[0]                      # loss trends down
+    assert losses[-1] < losses[0]                      # the fixed batch is learned
     assert out["loss_scale"] >= 1.0                    # scaler stayed engaged
 
 
