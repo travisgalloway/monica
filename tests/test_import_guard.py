@@ -20,6 +20,7 @@ PORTABLE_MODULES = [
     "src.train.loss_scale",
     "src.train.loop",
     "src.eval.val_loss",
+    "src.eval.olmes_adapter",
     "src.conformance.forward_step_parity",
 ]
 
