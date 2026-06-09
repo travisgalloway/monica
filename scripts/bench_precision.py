@@ -7,12 +7,18 @@ bf16, and reports achieved TFLOP/s and a tokens/sec-equivalent for each. The sha
 come from the model config (default `config/poc.yaml`), so the numbers are
 representative of the real run, not a generic square GEMM.
 
-This is op-level on purpose: it reproduces the kind of measurement the precision
-decision rests on (see config/poc.yaml + docs/design/07-configs-and-decisions.md)
-without requiring the model itself to compute in low precision. The model still runs
-fp32; `precision` only toggles the fp16 loss scaler.
+Two modes:
+  * `--mode gemm` (default): op-level — it times the isolated matmul (GEMM) workload
+    that dominates a Mamba-2 forward (the per-layer in/x/out projections + the tied LM
+    head). This reproduces the precision decision (see config/poc.yaml +
+    docs/design/07-configs-and-decisions.md) without building the model.
+  * `--mode model`: end-to-end — builds the real `MLXMambaModel` per dtype and times a
+    full forward+backward (value_and_grad) step. Since issue #27 the model actually
+    computes in `precision` (fp32 master weights + fp16/bf16 compute), so this measures
+    the real mixed-precision speedup, not just isolated GEMM throughput.
 
-    .venv/bin/python scripts/bench_precision.py                       # config/poc.yaml
+    .venv/bin/python scripts/bench_precision.py                       # gemm, config/poc.yaml
+    .venv/bin/python scripts/bench_precision.py --mode model --batch 8
     .venv/bin/python scripts/bench_precision.py --batch 8 --iters 100
 
 MLX imports are kept local so the module stays importable for `--help` on any host.
@@ -29,6 +35,9 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
+    ap.add_argument("--mode", choices=("gemm", "model"), default="gemm",
+                    help="gemm: isolated matmul throughput (default). "
+                         "model: end-to-end model forward+backward.")
     ap.add_argument("--batch", type=int, default=4, help="sequences per GEMM (rows = batch*seq)")
     ap.add_argument("--seq", type=int, default=None, help="sequence length (default: config seq_len)")
     ap.add_argument("--iters", type=int, default=50, help="timed iterations per dtype")
@@ -67,6 +76,70 @@ def _gemm_shapes(cfg, tokens: int):
     ]
 
 
+def _bench_model(args, cfg, mx) -> None:
+    """End-to-end model forward+backward per dtype (the real mixed-precision path)."""
+    import dataclasses
+
+    import mlx.nn as nn
+    import numpy as np
+
+    from src.model.mlx_backend import MLXMambaModel
+
+    seq = args.seq if args.seq is not None else cfg.seq_len
+    tokens = args.batch * seq
+    print(f"[bench/model] config={args.config}  d_model={cfg.d_model}  "
+          f"d_inner={cfg.d_inner}  n_layers={cfg.n_layers}  vocab={cfg.vocab_size}")
+    print(f"[bench/model] batch={args.batch} x seq={seq} = {tokens} tokens/step  "
+          f"grad_checkpoint={cfg.grad_checkpoint}  "
+          f"iters={args.iters} (+{args.warmup} warmup)\n")
+
+    def loss_fn(model, inp, tgt):
+        logits = model.forward(inp)
+        V = logits.shape[-1]
+        return nn.losses.cross_entropy(
+            logits.reshape(-1, V).astype(mx.float32),
+            tgt.reshape(-1).astype(mx.int32), reduction="mean")
+
+    results = []
+    for name in ("fp32", "fp16", "bf16"):
+        mx.random.seed(args.seed)
+        model = MLXMambaModel(dataclasses.replace(cfg, precision=name))
+        grad = nn.value_and_grad(model, loss_fn)
+        rng = np.random.default_rng(args.seed)
+        inp = mx.array(rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32))
+        tgt = mx.array(rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32))
+
+        def run_iter():
+            loss, grads = grad(model, inp, tgt)
+            mx.eval(loss, grads)
+            return loss
+
+        for _ in range(args.warmup):
+            run_iter()
+        t0 = time.perf_counter()
+        last = None
+        for _ in range(args.iters):
+            last = run_iter()
+        elapsed = time.perf_counter() - t0
+
+        if not bool(mx.isfinite(last).item()):
+            raise RuntimeError(f"{name}: non-finite loss — run is degenerate")
+        tok_per_s = (tokens * args.iters) / elapsed
+        ms = elapsed / args.iters * 1e3
+        results.append((name, ms, tok_per_s))
+
+    fp32_tok = next(t for n, _, t in results if n == "fp32")
+    print(f"{'dtype':<6} {'ms/step':>9} {'tokens/s':>12} {'vs fp32':>9}")
+    print("-" * 40)
+    for name, ms, tok in results:
+        print(f"{name:<6} {ms:>9.2f} {tok:>12,.0f} {tok / fp32_tok:>8.2f}x")
+    fp16_tok = next(t for n, _, t in results if n == "fp16")
+    bf16_tok = next(t for n, _, t in results if n == "bf16")
+    best = max(results, key=lambda r: r[2])
+    print(f"\n[verdict] fastest: {best[0]} ({best[2]:,.0f} tok/s).  "
+          f"fp16 is {fp16_tok / bf16_tok:.2f}x bf16 and {fp16_tok / fp32_tok:.2f}x fp32.")
+
+
 def main() -> None:
     args = _parse_args()
     import mlx.core as mx
@@ -74,6 +147,10 @@ def main() -> None:
     from src.model.blocks import load_config
 
     cfg = load_config(str(args.config))
+    if args.mode == "model":
+        _bench_model(args, cfg, mx)
+        return
+
     seq = args.seq if args.seq is not None else cfg.seq_len
     tokens = args.batch * seq                       # rows M of every GEMM
     shapes = _gemm_shapes(cfg, tokens)
