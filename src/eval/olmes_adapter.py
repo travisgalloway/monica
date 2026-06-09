@@ -82,7 +82,8 @@ def disjoint_rolling_windows(
     Matches lm-eval's make_disjoint_window(get_rolling_token_windows(...,
     context_len=1)): the first window is conditioned on the prefix (EOT) token,
     full windows on the single preceding token, and the final short window on
-    as many preceding tokens as fit (ctx + cont always spans max_length + 1).
+    as many preceding tokens as fit — once the document exceeds one window,
+    every window's ctx + cont spans exactly max_length + 1 tokens.
     """
     tokens = list(tokens)
     windows = []

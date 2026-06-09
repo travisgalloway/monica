@@ -50,6 +50,8 @@ def main() -> None:
     try:
         import lm_eval
     except ModuleNotFoundError as e:
+        if e.name != "lm_eval":
+            raise
         raise SystemExit(
             "lm-eval not found — install the eval extra:\n"
             "    .venv/bin/pip install -e \".[eval]\""
@@ -80,8 +82,8 @@ def main() -> None:
             f"--byte-fallback only with toy-scale configs.")
 
     lm = make_lm_eval_adapter(model, tok, to_numpy=lambda a: np.array(a))
-    results = lm_eval.simple_evaluate(
-        model=lm, tasks=args.tasks.split(","), limit=args.limit)
+    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    results = lm_eval.simple_evaluate(model=lm, tasks=tasks, limit=args.limit)
 
     print(lm_eval.utils.make_table(results))
     if args.output:

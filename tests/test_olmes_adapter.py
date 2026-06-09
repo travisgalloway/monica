@@ -39,8 +39,8 @@ class FakeModel:
     """Successor model: logits[b, t] = BIG * one_hot((input[b, t] + 1) % V).
 
     The greedy prediction after token t is exactly t+1 (mod V), so a continuation
-    is is_greedy iff every token is its predecessor + 1 — which makes the correct
-    off-by-one slice the only one that scores it as greedy.
+    is flagged greedy iff every token is its predecessor + 1 — which makes the
+    correct off-by-one slice the only one that scores it as greedy.
     """
 
     def __init__(self, vocab_size=8, seq_len=64):
@@ -93,7 +93,7 @@ def test_single_token_continuation():
 
 def test_left_truncation_keeps_continuation():
     m = FakeModel()
-    ctx = list(range(8, 18)) * 0 + [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]  # length 10
+    ctx = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]  # length 10
     lp, greedy = score_continuation(m, ctx, [2, 3], max_length=4)
     assert m.last_input.shape == (1, 4)
     # Identical to scoring with the pre-truncated context (last 3 ctx tokens).
