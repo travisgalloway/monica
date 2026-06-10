@@ -87,9 +87,11 @@ def _bench_train(args, cfg, mx) -> None:
     train_step = make_train_step(model, opt, grad_clip=1.0, scaler=scaler)
 
     rng = np.random.default_rng(args.seed)
+    # Mirror PackedLoader: micro-batches are numpy. forward/loss_fn do the mx.array
+    # conversion inside the timed step, exactly as scripts/train.py runs it.
     micro_batches = [
-        (mx.array(rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32)),
-         mx.array(rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32)))
+        (rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32),
+         rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32))
         for _ in range(args.grad_accum)
     ]
 
@@ -144,12 +146,12 @@ def _bench_decode(args, cfg, mx) -> None:
     state = model.init_state(1)
     last = None
     for i in range(warmup_tokens):
-        last, state = model.step(mx.array(tokens[i:i + 1]), state)
+        last, state = model.step(tokens[i:i + 1], state)   # step wraps in mx.array internally
         mx.eval(last, state)
 
     t0 = time.perf_counter()
     for i in range(warmup_tokens, warmup_tokens + measure_tokens):
-        last, state = model.step(mx.array(tokens[i:i + 1]), state)
+        last, state = model.step(tokens[i:i + 1], state)
         mx.eval(last, state)
     elapsed = time.perf_counter() - t0
 
