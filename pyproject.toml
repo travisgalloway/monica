@@ -21,6 +21,10 @@ data = ["datasets>=2.0", "transformers>=4.40"]
 mlx = ["mlx>=0.18"]
 # Experiment logging.
 logging = ["wandb>=0.16"]
+# Tier-2 OLMES/lm-eval benchmark harness. A heavy optional dependency (some
+# versions pull in torch) — install only where benchmarks run; above the seam
+# it may only ever be imported lazily (inside functions), never at module level.
+eval = ["lm-eval>=0.4.5,<0.5"]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
