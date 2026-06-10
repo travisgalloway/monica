@@ -87,11 +87,11 @@ def _bench_train(args, cfg, mx) -> None:
     train_step = make_train_step(model, opt, grad_clip=1.0, scaler=scaler)
 
     rng = np.random.default_rng(args.seed)
-    # Mirror PackedLoader: micro-batches are numpy. forward/loss_fn do the mx.array
-    # conversion inside the timed step, exactly as scripts/train.py runs it.
+    # Mirror PackedLoader exactly: numpy int64 token ids (src/data/loader.py:_chunk).
+    # forward/loss_fn do the mx.array conversion inside the timed step, as train.py runs it.
     micro_batches = [
-        (rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32),
-         rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int32))
+        (rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int64),
+         rng.integers(0, cfg.vocab_size, size=(args.batch, seq)).astype(np.int64))
         for _ in range(args.grad_accum)
     ]
 
@@ -141,7 +141,7 @@ def _bench_decode(args, cfg, mx) -> None:
 
     rng = np.random.default_rng(args.seed)
     tokens = rng.integers(0, cfg.vocab_size,
-                          size=warmup_tokens + measure_tokens).astype(np.int32)
+                          size=warmup_tokens + measure_tokens).astype(np.int64)
 
     state = model.init_state(1)
     last = None
