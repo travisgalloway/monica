@@ -354,6 +354,11 @@ class MLXMambaModel(ModelInterface, nn.Module):
     def set_state(self, state: State) -> None:
         self._state = state
 
+    def clone_state(self, state: State) -> State:
+        # MLX arrays are immutable, so rebuilding the list/tuples (arrays shared) yields
+        # an independent snapshot: later `step`s allocate new arrays rather than mutate.
+        return [(conv, ssm) for (conv, ssm) in state]
+
     def save(self, path: str) -> None:
         from ..train.checkpoint import save_weights
         save_weights(self._portable_state_dict(), path, config=self.config)

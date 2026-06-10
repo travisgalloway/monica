@@ -59,6 +59,16 @@ class ModelInterface(ABC):
     def set_state(self, state: State) -> None:
         """Restore recurrent state previously produced by get_state/step."""
 
+    @abstractmethod
+    def clone_state(self, state: State) -> State:
+        """Return an independent snapshot of `state`, safe to retain while stepping.
+
+        The serving layer (serve/sessions, serve/rewind) holds many states at once and
+        snapshots them at turn boundaries. On an immutable-array backend (MLX) a
+        structural copy suffices; a backend whose `step` mutates buffers in place must
+        deep-copy here so the snapshot cannot be aliased by later steps.
+        """
+
     # --- checkpointing (weights via checkpoint module) ---
     @abstractmethod
     def save(self, path: str) -> None:
