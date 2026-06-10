@@ -104,8 +104,13 @@ It wires **gradient accumulation** (the loop pulls `grad_accum` micro-batches pe
 does the inf/nan check and skips overflowing steps), and **gradient checkpointing**
 (`grad_checkpoint` config — recompute each layer in backward instead of retaining its
 activations). Checkpointing is mandatory at poc depth: without it the 24-layer backward
-exceeds the 32 GB unified memory and swaps. Mamba-2/SSD + checkpointing took the poc
-step from ~180 s (diagonal-A, swapping) to ~3 s.
+exceeds the 32 GB unified memory and swaps. Mamba-2/SSD + checkpointing brought the poc
+step down from the swapping diagonal-A regime to **~99 s/step** at the standard protocol
+(batch 32 × grad_accum 4 × seq 1024 = 131,072 tokens/step, fp16, peak ~24.8 GB of 32 GB
+on an M1 Pro) — the measured baseline from `scripts/bench_train_step.py` (issue #31,
+posted to #30). Note: an earlier "~3 s/step" figure here was never validated at full
+shape; treat ~99 s/step as the real per-step cost (so a 3B-token run is ~26 days of
+compute) when planning runs or judging the #30 optimization spike.
 
 ## Checkpointing: two deliberately separate concerns
 
