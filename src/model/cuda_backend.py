@@ -43,6 +43,9 @@ class CUDAMambaModel(ModelInterface):
     def set_state(self, state: State) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    def clone_state(self, state: State) -> State:  # pragma: no cover
+        raise NotImplementedError
+
     def save(self, path: str) -> None:  # pragma: no cover
         raise NotImplementedError
 

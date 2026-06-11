@@ -42,6 +42,8 @@ PORTABLE_MODULES = [
     "src.eval.val_loss",
     "src.eval.olmes_adapter",
     "src.conformance.forward_step_parity",
+    "src.serve.sessions",
+    "src.serve.rewind",
 ]
 
 FORBIDDEN_ROOTS = ("mlx", "torch")
