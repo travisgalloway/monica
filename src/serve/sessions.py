@@ -77,6 +77,8 @@ class SessionStore:
         self._per_session_bytes = per_session_state_bytes(model.config)
 
         if max_concurrent is not None:
+            if max_concurrent < 1:
+                raise ValueError(f"max_concurrent={max_concurrent} must be >= 1")
             self.max_concurrent: Optional[int] = max_concurrent
         elif memory_budget_bytes is not None:
             self.max_concurrent = memory_budget_bytes // self._per_session_bytes

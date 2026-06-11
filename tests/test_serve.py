@@ -80,6 +80,11 @@ def test_budget_too_small_for_one_session_raises():
         SessionStore(model, memory_budget_bytes=one - 1)
 
 
+def test_explicit_max_concurrent_below_one_raises():
+    with pytest.raises(ValueError):
+        SessionStore(FakeModel(), max_concurrent=0)
+
+
 def test_explicit_max_concurrent_overrides_budget():
     model = FakeModel()
     store = SessionStore(model, memory_budget_bytes=10**12, max_concurrent=2)
