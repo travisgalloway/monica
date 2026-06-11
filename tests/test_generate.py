@@ -70,6 +70,16 @@ def test_top_p_restricts_to_nucleus():
         assert sample(logits, temperature=1.0, top_p=0.5, rng=rng) == 0
 
 
+def test_top_p_includes_threshold_crossing_token():
+    # Two near-tied leaders (0.3 each); nucleus 0.5 must include the SECOND token (the
+    # one whose mass crosses 0.5), not just the first. Tokens 2 and 3 stay excluded.
+    # A plain `cumulative <= top_p` would wrongly keep only token 0.
+    logits = np.log(np.array([0.3, 0.3, 0.25, 0.15]))
+    rng = np.random.default_rng(0)
+    draws = {sample(logits, temperature=1.0, top_p=0.5, rng=rng) for _ in range(200)}
+    assert draws == {0, 1}
+
+
 def test_negative_temperature_raises():
     with pytest.raises(ValueError):
         sample(np.zeros(4), temperature=-1.0)

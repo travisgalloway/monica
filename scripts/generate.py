@@ -87,21 +87,34 @@ def main() -> None:
     to_numpy = lambda a: np.array(a)
 
     def run(text: str, *, stop_marker: str | None) -> None:
-        """Encode `text`, stream the continuation to stdout, on one fresh session."""
+        """Encode `text`, emit the continuation to stdout, on one fresh session.
+
+        Completion mode (no stop marker) streams token-by-token. Chat mode buffers and
+        prints once: the stop marker is only detectable *after* its tokens are produced,
+        so streaming would leak the marker to stdout before it could be truncated.
+        """
         ids = tok.encode(text)
         if not ids:
             return
         sid = "cli"
         store.create(sid)
         try:
-            stop_fn = None
-            if stop_marker is not None:
-                stop_fn = lambda gen: stop_marker in tok.decode(gen)
-            generate(
-                store, sid, ids, sampler=sampler, to_numpy=to_numpy,
-                max_new_tokens=args.max_new_tokens, eos_id=eos_id, stop_fn=stop_fn,
-                on_token=lambda t: (sys.stdout.write(tok.decode([t])), sys.stdout.flush()),
-            )
+            if stop_marker is None:
+                generate(
+                    store, sid, ids, sampler=sampler, to_numpy=to_numpy,
+                    max_new_tokens=args.max_new_tokens, eos_id=eos_id,
+                    on_token=lambda t: (sys.stdout.write(tok.decode([t])),
+                                        sys.stdout.flush()),
+                )
+            else:
+                out_ids = generate(
+                    store, sid, ids, sampler=sampler, to_numpy=to_numpy,
+                    max_new_tokens=args.max_new_tokens, eos_id=eos_id,
+                    stop_fn=lambda gen: stop_marker in tok.decode(gen),
+                )
+                out = tok.decode(out_ids)
+                cut = out.find(stop_marker)
+                sys.stdout.write(out if cut == -1 else out[:cut])
         finally:
             store.remove(sid)
         print()

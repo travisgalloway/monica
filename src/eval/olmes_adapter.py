@@ -145,13 +145,16 @@ def generate_until_texts(
     Pure over `ModelInterface` + tokenizer (no lm-eval), so it is unit-testable. Each
     request gets a fresh single-session `SessionStore`; the context is left-truncated to
     leave room for `max_gen_toks`, prefilled, then continued by the shared `generate`
-    core. Generation halts on the eot token, on `max_gen_toks`, or as soon as a stop
-    string appears in the decoded text; the result is truncated at the earliest stop.
+    core. Generation halts on the tokenizer's EOS (if it has one), on `max_gen_toks`,
+    or as soon as a stop string appears in the decoded text; the result is truncated at
+    the earliest stop.
     """
     store = SessionStore(model, max_concurrent=1)
     rng = np.random.default_rng(seed)
-    eot = getattr(tokenizer, "eos_token_id", None)
-    eot = 0 if eot is None else int(eot)
+    eos = getattr(tokenizer, "eos_token_id", None)
+    # None => no EOS stop condition. Don't coerce a missing EOS to token 0, which would
+    # make an ordinary token (id 0) silently end generation.
+    eos_id = int(eos) if eos is not None else None
 
     outputs: List[str] = []
     for i, (context, gen_kwargs) in enumerate(requests):
@@ -163,7 +166,9 @@ def generate_until_texts(
         keep = max(1, max_length - max_gen)
         ids = ids[-keep:] if len(ids) > keep else ids
         if not ids:
-            ids = [eot]  # nothing to condition on; seed the recurrence
+            # Nothing to condition on; seed the recurrence with EOS (a natural BOS-like
+            # start) if the tokenizer has one, else a generic token 0.
+            ids = [eos_id if eos_id is not None else 0]
 
         sid = f"gen-{i}"
         store.create(sid)
@@ -174,7 +179,7 @@ def generate_until_texts(
                 store, sid, ids,
                 sampler=_sampler_from_kwargs(gen_kwargs, rng),
                 to_numpy=to_numpy, max_new_tokens=max_gen,
-                eos_id=eot, stop_fn=stop_fn,
+                eos_id=eos_id, stop_fn=stop_fn,
             )
         finally:
             store.remove(sid)

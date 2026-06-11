@@ -49,9 +49,13 @@ def sample(
     # top-p (nucleus): keep the smallest prefix of the sorted mass reaching top_p.
     if top_p is not None and 0.0 < top_p < 1.0:
         order = np.argsort(probs)[::-1]
-        cumulative = np.cumsum(probs[order])
-        # Keep everything up to and including the token that crosses top_p.
-        keep = cumulative <= top_p
+        sorted_probs = probs[order]
+        cumulative = np.cumsum(sorted_probs)
+        # Standard nucleus: keep the smallest prefix whose mass reaches top_p,
+        # *including* the token that crosses the threshold. A token is dropped only
+        # once the mass strictly BEFORE it has already reached top_p, so the crossing
+        # token survives (unlike a plain `cumulative <= top_p`, which drops it).
+        keep = (cumulative - sorted_probs) < top_p
         keep[0] = True  # always keep the most probable token
         mask = np.zeros_like(probs, dtype=bool)
         mask[order[keep]] = True
