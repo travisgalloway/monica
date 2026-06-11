@@ -44,7 +44,12 @@ class FakeModel:
     """
 
     def __init__(self, vocab_size=8, seq_len=64):
-        self.config = SimpleNamespace(vocab_size=vocab_size, seq_len=seq_len)
+        # State-shape fields let the same FakeModel back a SessionStore for the
+        # generate_until path (it never inspects the state contents).
+        self.config = SimpleNamespace(
+            vocab_size=vocab_size, seq_len=seq_len, n_layers=2, d_conv=4,
+            d_inner=128, n_heads=8, head_dim=16, d_state=16, precision="fp32",
+        )
         self.last_input = None
 
     def forward(self, token_batch):
@@ -52,6 +57,17 @@ class FakeModel:
         succ = (self.last_input + 1) % self.config.vocab_size
         eye = np.eye(self.config.vocab_size, dtype=np.float32)
         return BIG * eye[succ]
+
+    # Inference path (successor logits, consistent with forward) for generate_until.
+    def init_state(self, batch_size):
+        return np.zeros((batch_size,), dtype=np.int64)
+
+    def step(self, token, state):
+        succ = (np.asarray(token) + 1) % self.config.vocab_size
+        return BIG * np.eye(self.config.vocab_size, dtype=np.float32)[succ], state
+
+    def clone_state(self, state):
+        return np.array(state, copy=True)
 
 
 def _lp_match(v):
@@ -191,8 +207,14 @@ def test_lm_eval_adapter_integration():
         disable_tqdm=True)
     assert len(rolling) == 1 and isinstance(rolling[0], float)
 
-    with pytest.raises(NotImplementedError):
-        lm.generate_until([], disable_tqdm=True)
+    # generate_until now delegates to the shared generation core. From "ab" (last
+    # byte 'b'=98) the successor model emits 'c','d',...; until=["d"] stops and the
+    # returned text is truncated before 'd' -> "c".
+    gen = lm.generate_until(
+        [Instance(request_type="generate_until", doc={},
+                  arguments=("ab", {"until": ["d"], "max_gen_toks": 5}), idx=0)],
+        disable_tqdm=True)
+    assert gen == ["c"]
 
     # Our hand-rolled windows match lm_eval's reference utilities.
     from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
