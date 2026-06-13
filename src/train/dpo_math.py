@@ -64,3 +64,31 @@ def dpo_loss_from_logprobs(logp_pol_c, logp_ref_c, logp_pol_r, logp_ref_r,
     margin = chosen_reward - rejected_reward
     loss = float(-np.mean(_log_sigmoid(margin)))
     return loss, float(np.mean(margin)), float(np.mean(margin > 0))
+
+
+def evaluate_dpo(policy, ref, loader, *, beta: float = 0.1,
+                 max_batches=None, to_numpy=np.asarray) -> dict:
+    """Held-out DPO metrics (no grad): {val_loss, reward_margin, reward_accuracy}.
+
+    `loader` yields the `DPOLoader` 6-tuple. Both policy and reference are run forward
+    (their logits converted via `to_numpy` at the seam), so this stays backend-free. The
+    rising reward margin is the primary DPO health signal.
+    """
+    tot_loss = tot_margin = tot_acc = 0.0
+    n = 0
+    for i, (c_in, c_tgt, c_mask, r_in, r_tgt, r_mask) in enumerate(loader.epoch()):
+        if max_batches is not None and i >= max_batches:
+            break
+        lp_c = masked_sequence_logprob(to_numpy(policy.forward(c_in)), c_tgt, c_mask)
+        lp_r = masked_sequence_logprob(to_numpy(policy.forward(r_in)), r_tgt, r_mask)
+        lr_c = masked_sequence_logprob(to_numpy(ref.forward(c_in)), c_tgt, c_mask)
+        lr_r = masked_sequence_logprob(to_numpy(ref.forward(r_in)), r_tgt, r_mask)
+        loss, margin, acc = dpo_loss_from_logprobs(lp_c, lr_c, lp_r, lr_r, beta=beta)
+        b = int(lp_c.shape[0])
+        tot_loss += loss * b
+        tot_margin += margin * b
+        tot_acc += acc * b
+        n += b
+    w = max(1, n)
+    return {"val_loss": tot_loss / w, "reward_margin": tot_margin / w,
+            "reward_accuracy": tot_acc / w}

@@ -137,6 +137,55 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
     return train_step
 
 
+def _masked_seq_logprob(model, inputs, targets, mask) -> mx.array:
+    """Per-sequence summed log-prob of `targets` over masked (response) positions. (B,)."""
+    logits = model.forward(inputs).astype(mx.float32)        # (B, L, V)
+    logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    t = mx.array(targets).astype(mx.int32)
+    chosen = mx.take_along_axis(logp, t[..., None], axis=-1)[..., 0]   # (B, L)
+    m = mx.array(mask).astype(mx.float32)
+    return (chosen * m).sum(axis=-1)                         # (B,)
+
+
+def _log_sigmoid(x: mx.array) -> mx.array:
+    """Stable log(sigmoid(x)) = -softplus(-x)."""
+    return -mx.logaddexp(mx.zeros_like(x), -x)
+
+
+def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1,
+                        grad_clip: float = 1.0, scaler=None) -> Callable:
+    """Build a DPO `train_step(model, micro_batches, lr) -> dict`.
+
+    `micro_batches` is a list of the `DPOLoader` 6-tuple `(c_in, c_tgt, c_mask, r_in,
+    r_tgt, r_mask)`. The loss is `-mean(log sigmoid(beta * (pi_logratio - ref_logratio)))`
+    where `pi_logratio = logpθ(chosen) - logpθ(rejected)` and `ref_logratio` is the same
+    under the frozen reference. Gradients flow through `policy_model` only: the optimizer
+    updates the policy, and the reference forward is wrapped in `mx.stop_gradient` (and
+    `ref_model` is a distinct object never handed to the optimizer), so the reference
+    stays frozen. Accumulation / fp16 scaling / clipping are shared via
+    `_accumulate_and_step`.
+    """
+    def loss_fn(policy, c_in, c_tgt, c_mask, r_in, r_tgt, r_mask):
+        lp_c = _masked_seq_logprob(policy, c_in, c_tgt, c_mask)
+        lp_r = _masked_seq_logprob(policy, r_in, r_tgt, r_mask)
+        lr_c = mx.stop_gradient(_masked_seq_logprob(ref_model, c_in, c_tgt, c_mask))
+        lr_r = mx.stop_gradient(_masked_seq_logprob(ref_model, r_in, r_tgt, r_mask))
+        margin = beta * ((lp_c - lr_c) - (lp_r - lr_r))     # (B,)
+        loss = -mx.mean(_log_sigmoid(margin))
+        return loss * scaler.scale if scaler else loss
+
+    value_and_grad = nn.value_and_grad(policy_model, loss_fn)
+
+    def loss_and_grad(model, mb):
+        return value_and_grad(model, *mb)
+
+    def train_step(model, micro_batches, lr: float) -> dict:
+        return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
+                                    lr, grad_clip, scaler)
+
+    return train_step
+
+
 def _unscale(grads, factor):
     from mlx.utils import tree_map
     return tree_map(lambda g: g * factor, grads)
