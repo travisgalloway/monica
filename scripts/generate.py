@@ -93,7 +93,13 @@ def main() -> None:
         prints once: the stop marker is only detectable *after* its tokens are produced,
         so streaming would leak the marker to stdout before it could be truncated.
         """
-        ids = tok.encode(text)
+        # add_special_tokens=False: the HF tokenizer otherwise appends EOS to the
+        # prompt, which makes the model immediately predict end-of-text and emit
+        # nothing. ByteTokenizer.encode takes no kwargs, hence the fallback.
+        try:
+            ids = tok.encode(text, add_special_tokens=False)
+        except TypeError:
+            ids = tok.encode(text)
         if not ids:
             return
         sid = "cli"
