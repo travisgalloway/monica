@@ -20,12 +20,15 @@ from .pack import open_packed
 
 class PackedLoader:
     def __init__(self, packed_path: Path, seq_len: int, batch_size: int,
-                 shuffle: bool = True, seed: int = 0, drop_last: bool = True):
+                 shuffle: bool = True, seed: int = 0, drop_last: bool = True,
+                 vocab_size: Optional[int] = None):
+        self.path = packed_path
         self.data = open_packed(packed_path)
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.vocab_size = vocab_size
         self.rng = np.random.default_rng(seed)
 
         # Non-overlapping chunks of length seq_len+1 (extra token = shift target).
@@ -59,7 +62,14 @@ class PackedLoader:
         if batch and not self.drop_last:
             yield self._collate(batch)
 
-    @staticmethod
-    def _collate(batch: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    def _collate(self, batch: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
         arr = np.stack(batch)              # (B, seq_len+1)
+        if self.vocab_size is not None:
+            top = int(arr.max())
+            if top >= self.vocab_size:
+                raise ValueError(
+                    f"token id {top} >= vocab_size {self.vocab_size} in {self.path}. "
+                    "The packed data does not match the model config — likely a stale or "
+                    "clobbered data file (e.g. a real-corpus run overwrote a toy/test path)."
+                )
         return arr[:, :-1], arr[:, 1:]      # inputs, targets

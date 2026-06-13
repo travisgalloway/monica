@@ -33,7 +33,6 @@ from src.train.schedule import CosineSchedule
 from src.data.loader import PackedLoader
 
 TOY_CFG = "config/toy.yaml"
-TRAIN_BIN = "data/split/train.bin"
 
 
 def _np(a):
@@ -44,10 +43,11 @@ def _softplus(x):
     return mx.logaddexp(x, mx.zeros_like(x))
 
 
-def _fixed_batches(cfg, n, batch_size=8):
+def _fixed_batches(cfg, n, train_bin, batch_size=8):
     """A deterministic, pre-materialized batch stream (shuffle off => batch at
     step s is identical across runs), mirroring scripts/smoke_test.py."""
-    loader = PackedLoader(TRAIN_BIN, cfg.seq_len, batch_size, shuffle=False)
+    loader = PackedLoader(train_bin, cfg.seq_len, batch_size, shuffle=False,
+                          vocab_size=cfg.vocab_size)
     out = []
     for inp, tgt in loader.epoch():
         out.append((inp, tgt))
@@ -87,9 +87,9 @@ def test_dt_bias_timescales_in_range():
     assert np.max(np.abs(_np(recon) - _np(bias))) < 1e-4
 
 
-def test_dt_bias_loss_decreases():
+def test_dt_bias_loss_decreases(toy_train_bin):
     cfg = load_config(TOY_CFG)
-    batches = _fixed_batches(cfg, 40)
+    batches = _fixed_batches(cfg, 40, toy_train_bin)
     mx.random.seed(0)
     model = MLXMambaModel(cfg)
     losses = _train_losses(model, batches)

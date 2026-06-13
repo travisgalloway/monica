@@ -19,20 +19,22 @@ from src.model.blocks import load_config
 from src.model.mlx_backend import MLXMambaModel
 from src.model.mlx_train_step import make_train_step
 from src.train.loss_scale import DynamicLossScaler
-from src.data.loader import PackedLoader
 
 TOY_CFG = "config/toy.yaml"
-TRAIN_BIN = "data/split/train.bin"
 
 
-def _first_batch(cfg):
-    loader = PackedLoader(TRAIN_BIN, cfg.seq_len, batch_size=4, shuffle=False)
-    return next(iter(loader.epoch()))
+def _rand_batch(cfg, B=4, L=32, seed=0):
+    """An in-range, in-memory batch (ids < vocab_size). Hermetic — no shared data
+    path. Mirrors tests/test_cuda_train_step.py for cross-backend consistency."""
+    rng = np.random.default_rng(seed)
+    inp = rng.integers(0, cfg.vocab_size, size=(B, L)).astype(np.int64)
+    tgt = rng.integers(0, cfg.vocab_size, size=(B, L)).astype(np.int64)
+    return inp, tgt
 
 
 def test_grad_accum_two_identical_microbatches_equal_single():
     cfg = load_config(TOY_CFG)
-    inp, tgt = _first_batch(cfg)
+    inp, tgt = _rand_batch(cfg)
 
     mx.random.seed(0)
     m1 = MLXMambaModel(cfg)
@@ -51,7 +53,7 @@ def test_grad_accum_two_identical_microbatches_equal_single():
 
 def test_fp16_overflow_skips_update_and_backs_off():
     cfg = load_config(TOY_CFG)
-    inp, tgt = _first_batch(cfg)
+    inp, tgt = _rand_batch(cfg)
 
     mx.random.seed(0)
     model = MLXMambaModel(cfg)
@@ -73,7 +75,7 @@ def test_fp16_overflow_skips_update_and_backs_off():
 
 def test_fp16_clean_step_updates_and_reports_scale():
     cfg = load_config(TOY_CFG)
-    inp, tgt = _first_batch(cfg)
+    inp, tgt = _rand_batch(cfg)
 
     mx.random.seed(0)
     model = MLXMambaModel(cfg)
