@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.data.instruct_format import INSTRUCTION_MARKER, format_prompt
+from src.data.instruct_format import INSTRUCTION_MARKER, render
 from src.serve import sampling
 from src.serve.generate import generate
 from src.serve.sessions import SessionStore
@@ -45,6 +45,11 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument("--repetition-penalty", type=float, default=1.0,
+                    help="CTRL-style penalty on already-seen tokens (1.0 = off; "
+                         "~1.2-1.3 curbs the 'United States, the United States…' loops)")
+    ap.add_argument("--no-repeat-ngram-size", type=int, default=None,
+                    help="hard-ban repeating any n-gram of this size (e.g. 3)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--byte-fallback", action="store_true",
                     help="offline ByteTokenizer (toy config only; not OLMo-compatible)")
@@ -82,16 +87,20 @@ def main() -> None:
     eos_id = getattr(tok, "eos_token_id", None)
     rng = np.random.default_rng(args.seed)
     sampler = partial(sampling.sample, temperature=args.temperature,
-                      top_k=args.top_k, top_p=args.top_p, rng=rng)
+                      top_k=args.top_k, top_p=args.top_p, rng=rng,
+                      repetition_penalty=args.repetition_penalty,
+                      no_repeat_ngram_size=args.no_repeat_ngram_size)
     store = SessionStore(model, max_concurrent=1)
     to_numpy = lambda a: np.array(a)
 
-    def run(text: str, *, stop_marker: str | None) -> None:
+    def run(text: str, *, stop_marker: str | None) -> str:
         """Encode `text`, emit the continuation to stdout, on one fresh session.
 
         Completion mode (no stop marker) streams token-by-token. Chat mode buffers and
         prints once: the stop marker is only detectable *after* its tokens are produced,
         so streaming would leak the marker to stdout before it could be truncated.
+        Returns the produced text (truncated at the stop marker in chat mode) so the
+        REPL can append it to the running conversation history.
         """
         # add_special_tokens=False: the HF tokenizer otherwise appends EOS to the
         # prompt, which makes the model immediately predict end-of-text and emit
@@ -101,14 +110,16 @@ def main() -> None:
         except TypeError:
             ids = tok.encode(text)
         if not ids:
-            return
+            return ""
         sid = "cli"
         store.create(sid)
+        produced = ""
         try:
             if stop_marker is None:
                 generate(
                     store, sid, ids, sampler=sampler, to_numpy=to_numpy,
                     max_new_tokens=args.max_new_tokens, eos_id=eos_id,
+                    pass_context=True,
                     on_token=lambda t: (sys.stdout.write(tok.decode([t])),
                                         sys.stdout.flush()),
                 )
@@ -116,17 +127,21 @@ def main() -> None:
                 out_ids = generate(
                     store, sid, ids, sampler=sampler, to_numpy=to_numpy,
                     max_new_tokens=args.max_new_tokens, eos_id=eos_id,
+                    pass_context=True,
                     stop_fn=lambda gen: stop_marker in tok.decode(gen),
                 )
                 out = tok.decode(out_ids)
                 cut = out.find(stop_marker)
-                sys.stdout.write(out if cut == -1 else out[:cut])
+                produced = out if cut == -1 else out[:cut]
+                sys.stdout.write(produced)
         finally:
             store.remove(sid)
         print()
+        return produced
 
     if args.chat:
         print("chat mode — type a message (Ctrl-D / Ctrl-C to exit).", file=sys.stderr)
+        messages: list[dict] = []
         while True:
             try:
                 line = input(">>> ")
@@ -135,7 +150,12 @@ def main() -> None:
                 break
             if not line.strip():
                 continue
-            run(format_prompt(line), stop_marker=INSTRUCTION_MARKER)
+            messages.append({"role": "user", "content": line})
+            # Prompt up to (and including) a trailing empty "### Response:" marker; the
+            # model fills in the answer. A first turn renders to format_prompt(line).
+            prompt = render(messages + [{"role": "assistant", "content": ""}])
+            reply = run(prompt, stop_marker=INSTRUCTION_MARKER)
+            messages.append({"role": "assistant", "content": reply.strip()})
     else:
         sys.stdout.write(args.prompt)
         run(args.prompt, stop_marker=None)
