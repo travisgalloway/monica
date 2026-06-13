@@ -38,6 +38,8 @@ PORTABLE_MODULES = [
     "src.data.split",
     "src.data.download",
     "src.data.instruct_format",
+    "src.data.sft_data",
+    "src.data.sft_loader",
     "src.train.schedule",
     "src.train.checkpoint",
     "src.train.loss_scale",
