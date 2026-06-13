@@ -24,13 +24,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", type=Path, default=Path("config/toy.yaml"))
     ap.add_argument("--data", type=Path, required=True, help="dir with train.bin/val.bin")
+    ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
+                    help="hardware backend (auto: try mlx, fall back to cuda/torch)")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
@@ -38,32 +38,21 @@ def main() -> None:
     ap.add_argument("--atol", type=float, default=1e-4)
     args = ap.parse_args()
 
-    # MLX-only imports kept local so the seam stays clean for portable hosts.
-    try:
-        import mlx.core as mx
-        import mlx.optimizers as optim
-    except ModuleNotFoundError as e:
-        if e.name != "mlx":
-            raise
-        raise SystemExit(
-            "mlx not found — run with the project venv on Apple Silicon:\n"
-            "    .venv/bin/python scripts/smoke_test.py ...\n"
-            "(mlx installs only on Apple Silicon via the '[mlx]' extra; a bare "
-            "`python` likely points at a different interpreter.)"
-        ) from e
+    # Backend selection stays behind the seam factory; only portable modules are
+    # imported at module scope.
+    from src.model.backend import get_backend
     from src.model.blocks import load_config
-    from src.model.mlx_backend import MLXMambaModel
-    from src.model.mlx_train_step import make_train_step, save_optimizer, load_optimizer
     from src.data.loader import PackedLoader
     from src.train.schedule import CosineSchedule
     from src.train.checkpoint import save_weights, save_resume, load_resume
     from src.eval.val_loss import evaluate
 
+    backend = get_backend(args.backend)
     cfg = load_config(str(args.config))
     assert cfg.precision == "fp32", "smoke test requires fp32 for exact resume"
     N = args.steps
     half = N // 2
-    np_to = lambda a: np.array(a)
+    np_to = backend.to_numpy
 
     # --- fixed batch stream (shuffle off => batch at step s is deterministic) ---
     train_loader = PackedLoader(args.data / "train.bin", cfg.seq_len,
@@ -77,10 +66,10 @@ def main() -> None:
     sched = CosineSchedule(base_lr=3e-4, warmup_steps=max(1, N // 6), total_steps=N)
 
     def fresh_model_opt():
-        mx.random.seed(args.seed)                 # identical init weights each run
-        model = MLXMambaModel(cfg)
-        opt = optim.AdamW(learning_rate=sched.base_lr)
-        return model, opt, make_train_step(model, opt, grad_clip=1.0, scaler=None)
+        backend.seed(args.seed)                   # identical init weights each run
+        model = backend.model_cls(cfg)
+        opt = backend.make_optimizer(model, sched.base_lr)
+        return model, opt, backend.make_train_step(model, opt, grad_clip=1.0, scaler=None)
 
     def run_window(model, step_fn, lo, hi, into):
         for s in range(lo, hi):
@@ -105,16 +94,17 @@ def main() -> None:
     run_window(model_a, step_fn_a, 0, half, res)
     model_a.save(weights_path)                                  # portable weights
     save_resume(bundle_dir, step=half, rng_state=None,
-                optimizer_serializer=lambda p: save_optimizer(opt_a, p))
+                optimizer_serializer=lambda p: backend.save_optimizer(opt_a, p))
     del model_a, opt_a, step_fn_a                               # "kill" the process state
 
-    mx.random.seed(args.seed + 999)            # different RNG: weights come from disk
-    model_b = MLXMambaModel(cfg)
+    backend.seed(args.seed + 999)              # different RNG: weights come from disk
+    model_b = backend.model_cls(cfg)
     model_b.load(weights_path)
-    opt_b = optim.AdamW(learning_rate=sched.base_lr)
-    meta = load_resume(bundle_dir, optimizer_deserializer=lambda p: load_optimizer(opt_b, p))
+    opt_b = backend.make_optimizer(model_b, sched.base_lr)
+    meta = load_resume(bundle_dir,
+                       optimizer_deserializer=lambda p: backend.load_optimizer(opt_b, p))
     start = meta["step"]
-    step_fn_b = make_train_step(model_b, opt_b, grad_clip=1.0)
+    step_fn_b = backend.make_train_step(model_b, opt_b, grad_clip=1.0)
     run_window(model_b, step_fn_b, start, N, res)
     print(f"[resumed]   resumed at step={start}  step{N-1} loss={res[N-1]:.5f}")
 
