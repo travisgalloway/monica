@@ -21,7 +21,9 @@ Resume after an interruption:
         --out runs/poc --total-tokens 3_000_000_000 --batch-size 32 --grad-accum 4 \\
         --resume runs/poc/resume
 
-MLX imports are kept local so the module stays importable for `--help` on any host.
+The backend (MLX or CUDA/PyTorch) is selected via `--backend {auto,mlx,cuda}`; backend
+imports stay behind `src.model.backend.get_backend`, so the module stays importable for
+`--help` on any host.
 """
 
 from __future__ import annotations
@@ -36,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--data", type=Path, required=True, help="dir with train.bin/val.bin")
     ap.add_argument("--out", type=Path, default=Path("runs/poc"))
+    ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
+                    help="hardware backend (auto: try mlx, fall back to cuda/torch)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--total-steps", type=int, help="number of optimizer steps")
     g.add_argument("--total-tokens", type=int,
@@ -61,32 +65,20 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    # MLX-only imports kept local so the seam stays clean for portable hosts.
+    # Backend selection stays behind the seam factory; only portable modules are
+    # imported at module scope.
     import numpy as np
-    try:
-        import mlx.core as mx
-        import mlx.optimizers as optim
-    except ModuleNotFoundError as e:
-        if e.name != "mlx":
-            raise
-        raise SystemExit(
-            "mlx not found — run with the project venv on Apple Silicon:\n"
-            "    .venv/bin/python scripts/train.py ...\n"
-            "(mlx installs only on Apple Silicon via the '[mlx]' extra; a bare "
-            "`python` likely points at a different interpreter.)"
-        ) from e
 
+    from src.model.backend import get_backend
     from src.model.blocks import load_config
-    from src.model.mlx_backend import MLXMambaModel
-    from src.model.mlx_train_step import (
-        make_train_step, save_optimizer, load_optimizer,
-    )
     from src.data.loader import PackedLoader
     from src.train.loss_scale import scaler_for_precision
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
     from src.train.checkpoint import save_resume, load_resume
     from src.eval.val_loss import evaluate
+
+    backend = get_backend(args.backend)
 
     cfg = load_config(str(args.config))                 # validates (vocab < 65536, ...)
 
@@ -96,21 +88,21 @@ def main() -> None:
     warmup = args.warmup_steps if args.warmup_steps is not None else max(1, total_steps // 100)
 
     # --- model + optimizer + (dynamic) loss scaling ----------------------------
-    mx.random.seed(args.seed)
-    model = MLXMambaModel(cfg)
-    opt = optim.AdamW(learning_rate=args.base_lr)
+    backend.seed(args.seed)
+    model = backend.model_cls(cfg)
+    opt = backend.make_optimizer(model, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
     if scaler is None and cfg.precision != "fp32":
         print(f"[info] precision={cfg.precision!r}: training unscaled "
               "(loss scaling is fp16-only; expected for bf16)")
-    train_step = make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler)
+    train_step = backend.make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler)
 
     # --- data ------------------------------------------------------------------
     train_loader = PackedLoader(args.data / "train.bin", cfg.seq_len,
                                 args.batch_size, shuffle=True, seed=args.seed)
     val_loader = PackedLoader(args.data / "val.bin", cfg.seq_len,
                               args.batch_size, shuffle=False, drop_last=False)
-    np_to = lambda a: np.array(a)
+    np_to = backend.to_numpy
     max_b = args.eval_batches or None
     val_eval = lambda m: evaluate(m, val_loader, max_batches=max_b, to_numpy=np_to)
 
@@ -126,7 +118,7 @@ def main() -> None:
     if resume_dir is not None:
         model.load(weights_path)
         meta = load_resume(str(resume_dir),
-                           optimizer_deserializer=lambda p: load_optimizer(opt, p))
+                           optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
         start_step = int(meta["step"])
         if scaler is not None:
             scaler.load_state_dict(meta.get("rng_state") or {})
@@ -138,7 +130,7 @@ def main() -> None:
         model.save(weights_path)                        # portable weights + config
         save_resume(bundle_dir, step=step,
                     rng_state=(scaler.state_dict() if scaler else None),
-                    optimizer_serializer=lambda p: save_optimizer(opt, p))
+                    optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
 
     tcfg = TrainConfig(
         total_steps=total_steps, base_lr=args.base_lr, warmup_steps=warmup,
