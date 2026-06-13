@@ -142,10 +142,10 @@ def generate_until_texts(
 ) -> List[str]:
     """Greedy/sampled generation for each (context, gen_kwargs) request.
 
-    Pure over `ModelInterface` + tokenizer (no lm-eval), so it is unit-testable. Each
-    request gets a fresh single-session `SessionStore`; the context is left-truncated to
-    leave room for `max_gen_toks`, prefilled, then continued by the shared `generate`
-    core. Generation halts on the tokenizer's EOS (if it has one), on `max_gen_toks`,
+    Pure over `ModelInterface` + tokenizer (no lm-eval), so it is unit-testable. Requests
+    share one single-session `SessionStore` (a fresh session is created and removed per
+    request); the context is left-truncated to leave room for `max_gen_toks`, prefilled,
+    then continued by the shared `generate` core. Generation halts on the tokenizer's EOS (if it has one), on `max_gen_toks`,
     or as soon as a stop string appears in the decoded text; the result is truncated at
     the earliest stop.
     """

@@ -54,8 +54,10 @@ def generate(
         generated.append(nxt)
         if on_token is not None:
             on_token(nxt)
+        # Feed the emitted token back BEFORE the stop check so the session state always
+        # reflects every id in `generated` (a caller can resume generation in-session).
+        logits = store.step(session_id, nxt)
         if stop_fn is not None and stop_fn(generated):
             break
-        logits = store.step(session_id, nxt)
 
     return generated

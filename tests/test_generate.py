@@ -116,6 +116,17 @@ def test_stop_fn_halts_generation():
     assert out == [1, 2, 3]
 
 
+def test_stop_fn_session_state_reflects_all_emitted_tokens():
+    # Regression: when stop_fn halts, the last emitted token is fed back BEFORE the stop
+    # check, so the session state reflects every id in `generated` (resume-safe).
+    store = _store()
+    out = generate(store, "s", [0], sampler=partial(sample, temperature=0.0),
+                   max_new_tokens=10, stop_fn=lambda gen: len(gen) >= 3)
+    assert out == [1, 2, 3]
+    # state = running sum of all fed tokens: prefill 0 + generated 1+2+3 = 6.
+    assert int(store.get_state("s")[0]) == 6
+
+
 def test_on_token_streams_each_generated_id():
     store = _store()
     seen = []

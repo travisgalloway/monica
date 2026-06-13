@@ -200,12 +200,14 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.dummy:
-        args.out.mkdir(parents=True, exist_ok=True)
-        path = args.out / "dummy.txt"
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
+        out = args.out
+        if out.is_dir() or out.suffix == "":   # --out may be a dir (legacy) or a file
+            out = out / "dummy.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             for doc in dummy_texts(args.max_docs):
                 f.write(doc + "\n")
-        print(f"wrote synthetic text -> {path}")
+        print(f"wrote synthetic text -> {out}")
         return
 
     # If --out is an existing dir (or the legacy default), pick a source-named file in it.
