@@ -30,6 +30,7 @@ def generate(
     eos_id: Optional[int] = None,
     stop_fn: Optional[Callable[[List[int]], bool]] = None,
     on_token: Optional[Callable[[int], None]] = None,
+    pass_context: bool = False,
 ) -> List[int]:
     """Generate up to `max_new_tokens` continuation ids for `session_id`.
 
@@ -38,17 +39,24 @@ def generate(
     stop on `eos_id`, on reaching `max_new_tokens`, or when `stop_fn(generated)` is
     True. `prompt_ids` must be non-empty (the recurrence needs a token to advance on).
     Returns only the generated ids (not the prompt).
+
+    `pass_context=True` calls `sampler(logits, previous_tokens=prompt + generated)` so a
+    repetition-aware sampler can penalize already-emitted tokens; the default keeps the
+    bare `sampler(logits)` contract the lm-eval adapter relies on.
     """
     if len(prompt_ids) == 0:
         raise ValueError("prompt_ids must be non-empty")
 
+    prompt = [int(t) for t in prompt_ids]
     logits = None
-    for tok in prompt_ids:
-        logits = store.step(session_id, int(tok))
+    for tok in prompt:
+        logits = store.step(session_id, tok)
 
     generated: List[int] = []
     for _ in range(max_new_tokens):
-        nxt = sampler(to_numpy(logits)[0])  # (1, vocab) -> (vocab,)
+        row = to_numpy(logits)[0]  # (1, vocab) -> (vocab,)
+        nxt = sampler(row, previous_tokens=prompt + generated) if pass_context \
+            else sampler(row)
         if eos_id is not None and nxt == eos_id:
             break
         generated.append(nxt)
