@@ -1,6 +1,7 @@
-# Mamba POC generated artifacts (datasets, packed tokens, run logs/checkpoints)
-data/
-runs/
+# Mamba POC generated artifacts (datasets, packed tokens, run logs/checkpoints).
+# Anchored to the repo root so they don't also match the tracked `src/data/` package.
+/data/
+/runs/
 
 # Claude Code local/runtime artifacts (transient; not project config). Intentional
 # shared config (e.g. .claude/settings.json, .claude/commands/) can still be added.

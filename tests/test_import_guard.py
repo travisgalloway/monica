@@ -35,6 +35,8 @@ PORTABLE_MODULES = [
     "src.data.loader",
     "src.data.pack",
     "src.data.split",
+    "src.data.download",
+    "src.data.instruct_format",
     "src.train.schedule",
     "src.train.checkpoint",
     "src.train.loss_scale",
@@ -44,6 +46,8 @@ PORTABLE_MODULES = [
     "src.conformance.forward_step_parity",
     "src.serve.sessions",
     "src.serve.rewind",
+    "src.serve.sampling",
+    "src.serve.generate",
 ]
 
 FORBIDDEN_ROOTS = ("mlx", "torch")

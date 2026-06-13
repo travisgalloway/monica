@@ -49,6 +49,10 @@ class ByteTokenizer:
     def encode(self, text: str) -> List[int]:
         return list(text.encode("utf-8"))
 
+    def decode(self, ids: Iterable[int]) -> str:
+        """Inverse of `encode` (lossy on invalid byte sequences). For offline serving."""
+        return bytes(int(i) & 0xFF for i in ids).decode("utf-8", "replace")
+
 
 def tokenize_texts(texts: Iterable[str], tokenizer) -> Iterable[int]:
     """Yield a flat stream of token ids across all documents (with EOS if available)."""

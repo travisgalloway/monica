@@ -21,11 +21,15 @@ it runs end to end (scripts/eval_olmes.py), not by leaderboard position.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from ..model.interface import ModelInterface
+from ..serve import sampling
+from ..serve.generate import generate
+from ..serve.sessions import SessionStore
 
 
 def _log_softmax(logits: np.ndarray) -> np.ndarray:
@@ -95,6 +99,107 @@ def disjoint_rolling_windows(
     return windows
 
 
+def _normalize_until(until) -> List[str]:
+    """lm-eval passes `until` as a string or list of strings (or omits it)."""
+    if until is None:
+        return []
+    if isinstance(until, str):
+        return [until]
+    return [s for s in until if s]
+
+
+def _truncate_at_stops(text: str, stops: Sequence[str]) -> str:
+    """Cut `text` at the earliest occurrence of any stop string (lm-eval semantics)."""
+    cut = len(text)
+    for s in stops:
+        i = text.find(s)
+        if i != -1:
+            cut = min(cut, i)
+    return text[:cut]
+
+
+def _sampler_from_kwargs(gen_kwargs: dict, rng: np.random.Generator):
+    """Build a `sampler(logits)->int` from lm-eval gen kwargs (greedy unless do_sample)."""
+    if not gen_kwargs.get("do_sample", False):
+        return partial(sampling.sample, temperature=0.0)
+    return partial(
+        sampling.sample,
+        temperature=float(gen_kwargs.get("temperature", 1.0)),
+        top_k=gen_kwargs.get("top_k"),
+        top_p=gen_kwargs.get("top_p"),
+        rng=rng,
+    )
+
+
+def generate_until_texts(
+    model: ModelInterface,
+    tokenizer,
+    requests: Sequence[Tuple[str, dict]],
+    *,
+    max_length: int,
+    to_numpy=np.asarray,
+    seed: int = 0,
+) -> List[str]:
+    """Greedy/sampled generation for each (context, gen_kwargs) request.
+
+    Pure over `ModelInterface` + tokenizer (no lm-eval), so it is unit-testable. Requests
+    share one single-session `SessionStore` (a fresh session is created and removed per
+    request); the context is left-truncated to leave room for `max_gen_toks`, prefilled,
+    then continued by the shared `generate` core. Generation halts on the tokenizer's EOS (if it has one), on `max_gen_toks`,
+    or as soon as a stop string appears in the decoded text; the result is truncated at
+    the earliest stop.
+    """
+    store = SessionStore(model, max_concurrent=1)
+    rng = np.random.default_rng(seed)
+    eos = getattr(tokenizer, "eos_token_id", None)
+    # None => no EOS stop condition. Don't coerce a missing EOS to token 0, which would
+    # make an ordinary token (id 0) silently end generation.
+    eos_id = int(eos) if eos is not None else None
+
+    outputs: List[str] = []
+    for i, (context, gen_kwargs) in enumerate(requests):
+        gen_kwargs = dict(gen_kwargs or {})
+        stops = _normalize_until(gen_kwargs.get("until"))
+        # Cap generation so prompt (>=1 token) + new tokens stays within max_length,
+        # mirroring score_continuation's len(cont) <= max_length contract. (Mamba has no
+        # hard context limit, but generating past the trained seq_len goes
+        # off-distribution; capping keeps the eval bounded rather than erroring mid-run.)
+        max_gen = min(int(gen_kwargs.get("max_gen_toks", 256)), max(1, max_length - 1))
+
+        ids = list(_encode(tokenizer, context))
+        keep = max(1, max_length - max_gen)
+        ids = ids[-keep:] if len(ids) > keep else ids
+        if not ids:
+            # Nothing to condition on; seed the recurrence with EOS (a natural BOS-like
+            # start) if the tokenizer has one, else a generic token 0.
+            ids = [eos_id if eos_id is not None else 0]
+
+        sid = f"gen-{i}"
+        store.create(sid)
+        try:
+            def stop_fn(gen):  # decode once per step, then test every stop string
+                text = tokenizer.decode(gen)
+                return any(s in text for s in stops)
+            out_ids = generate(
+                store, sid, ids,
+                sampler=_sampler_from_kwargs(gen_kwargs, rng),
+                to_numpy=to_numpy, max_new_tokens=max_gen,
+                eos_id=eos_id, stop_fn=stop_fn if stops else None,
+            )
+        finally:
+            store.remove(sid)
+        outputs.append(_truncate_at_stops(tokenizer.decode(out_ids), stops))
+    return outputs
+
+
+def _encode(tokenizer, string: str) -> List[int]:
+    """Encode without special tokens; tolerate ByteTokenizer's kwarg-free signature."""
+    try:
+        return tokenizer.encode(string, add_special_tokens=False)
+    except TypeError:
+        return tokenizer.encode(string)
+
+
 def make_lm_eval_adapter(
     model: ModelInterface,
     tokenizer,
@@ -147,10 +252,11 @@ def make_lm_eval_adapter(
             return results
 
         def generate_until(self, requests, **kwargs):
-            raise NotImplementedError(
-                "generate_until is not implemented: HellaSwag/ARC/PIQA are "
-                "loglikelihood (multiple-choice) tasks and never call it. "
-                "Implement over ModelInterface.step when generative tasks are "
-                "needed.")
+            # lm-eval Instance.args = (context_str, gen_kwargs); delegate to the shared
+            # generation core so generative tasks share the CLI's inference path.
+            pairs = [(req.args[0], req.args[1] if len(req.args) > 1 else {})
+                     for req in requests]
+            return generate_until_texts(
+                model, tokenizer, pairs, max_length=seq_limit, to_numpy=to_numpy)
 
     return _MonicaLM()
