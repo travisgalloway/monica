@@ -19,6 +19,9 @@ dependencies = [
 data = ["datasets>=2.0", "transformers>=4.40"]
 # Apple Silicon backend (NOT installable on Linux/CUDA hosts).
 mlx = ["mlx>=0.18"]
+# CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
+# The optional mamba-ssm fused selective-scan kernel is a separate perf extra (#40).
+cuda = ["torch>=2.0"]
 # Experiment logging.
 logging = ["wandb>=0.16"]
 # Tier-2 OLMES/lm-eval benchmark harness. A heavy optional dependency (some
