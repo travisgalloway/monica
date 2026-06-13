@@ -177,13 +177,14 @@ def generate_until_texts(
         sid = f"gen-{i}"
         store.create(sid)
         try:
-            stop_fn = (lambda gen: any(s in tokenizer.decode(gen) for s in stops)) \
-                if stops else None
+            def stop_fn(gen):  # decode once per step, then test every stop string
+                text = tokenizer.decode(gen)
+                return any(s in text for s in stops)
             out_ids = generate(
                 store, sid, ids,
                 sampler=_sampler_from_kwargs(gen_kwargs, rng),
                 to_numpy=to_numpy, max_new_tokens=max_gen,
-                eos_id=eos_id, stop_fn=stop_fn,
+                eos_id=eos_id, stop_fn=stop_fn if stops else None,
             )
         finally:
             store.remove(sid)

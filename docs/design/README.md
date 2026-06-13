@@ -5,7 +5,7 @@ choices and their rationale** — the *what* and *why*. M1–M4 are implemented 
 verified, and M5's infrastructure (training driver + Mamba-2/SSD perf migration) has
 landed; the milestone tracking and remaining work (the full M5 run, M6–M8) live in
 [GitHub issue #2](https://github.com/travisgalloway/monica/issues/2). For the
-project overview see the root [`README.md`](../../README.md); for end-to-end commands
+project overview, see the root [`README.md`](../../README.md); for end-to-end commands
 (install → data → train → serve/chat → eval) see [`../usage.md`](../usage.md).
 
 Every claim here is sourced from a docstring or config comment in the code, with a
