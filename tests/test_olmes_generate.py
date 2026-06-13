@@ -83,3 +83,10 @@ def test_context_is_left_truncated_to_make_room():
     # bounded string (regression guard on the truncation arithmetic).
     (out,) = _run([("abcdef", {"max_gen_toks": 3})], max_length=4)
     assert isinstance(out, str) and len(out) == 3
+
+
+def test_max_gen_toks_capped_to_max_length():
+    # max_gen_toks (100) far exceeds max_length (4); generation must be capped so
+    # prompt (>=1 token) + new tokens stays within max_length -> at most 3 generated.
+    (out,) = _run([("a", {"max_gen_toks": 100})], max_length=4)
+    assert len(out) <= 3

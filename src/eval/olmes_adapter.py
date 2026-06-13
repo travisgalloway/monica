@@ -160,7 +160,11 @@ def generate_until_texts(
     for i, (context, gen_kwargs) in enumerate(requests):
         gen_kwargs = dict(gen_kwargs or {})
         stops = _normalize_until(gen_kwargs.get("until"))
-        max_gen = int(gen_kwargs.get("max_gen_toks", 256))
+        # Cap generation so prompt (>=1 token) + new tokens stays within max_length,
+        # mirroring score_continuation's len(cont) <= max_length contract. (Mamba has no
+        # hard context limit, but generating past the trained seq_len goes
+        # off-distribution; capping keeps the eval bounded rather than erroring mid-run.)
+        max_gen = min(int(gen_kwargs.get("max_gen_toks", 256)), max(1, max_length - 1))
 
         ids = list(_encode(tokenizer, context))
         keep = max(1, max_length - max_gen)
