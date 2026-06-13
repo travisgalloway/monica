@@ -16,6 +16,6 @@ pytest>=8.0
 # Apple Silicon ONLY (uncomment on a Mac; not installable on Linux/CUDA):
 # mlx>=0.18
 
-# CUDA scale-up ONLY (added at that milestone):
-# torch
-# mamba-ssm
+# CUDA / PyTorch backend (uncomment on a Linux/CUDA host; also CPU-only for conformance):
+# torch>=2.0
+# mamba-ssm   # optional fused selective-scan kernel (#40); CUDA-only
