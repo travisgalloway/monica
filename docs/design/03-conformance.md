@@ -36,15 +36,22 @@ the parity check proves train/infer equivalence. Both are needed.
 
 ## backend-vs-backend parity
 
-When the CUDA backend exists, the same weights and input must give the same logits on
-MLX and CUDA. From
+The same weights and input must give the same logits on MLX and the CUDA/PyTorch
+backend. From
 [`src/conformance/backend_parity.py`](../../src/conformance/backend_parity.py):
 
 > Fixed seed, fixed weights, fixed input batch. Run `forward` through both the MLX
 > and CUDA backends and assert agreement. Run the comparison in FP32 on BOTH sides.
 
 It loads identical [portable weights](05-training.md) into each backend (the seam's
-`save`/`load`), then compares.
+`save`/`load`), then compares. Because the CUDA backend is **pure PyTorch and runs on
+CPU**, this is runnable entirely on a Mac (mlx + torch-CPU both present) — no GPU
+required. `tests/test_backend_parity.py` exercises it on the toy config, and also tests
+the **portable-weights round-trip in both directions** (MLX → safetensors → torch →
+safetensors → MLX, logits unchanged), which is what lets a CUDA-trained model come back
+to the Mac. The only layout subtlety is the depthwise-conv weight: the portable format
+is MLX-canonical `(out, k, in/groups)`, and the torch backend transposes to/from torch's
+`(out, in/groups, k)` in `_portable_state_dict`/`_load_portable`.
 
 ## Why fp32, ~1e-4
 
@@ -60,12 +67,11 @@ to catch *math* bugs, not measure numerical noise.
 
 ## Status
 
-`forward_step_parity` is active and passing on MLX. `backend_parity` requires both
-backends present, so it:
-
-> runs only where CUDA is available; until then it stays a stub the seam can point at.
-
-It will come online with the M8 CUDA backend.
+`forward_step_parity` is active and passing on both backends (MLX, and the pure-PyTorch
+CUDA backend on torch-CPU). `backend_parity` is implemented and exercised by
+`tests/test_backend_parity.py`; the cross-backend cases need both backends present, so
+they **skip cleanly** on a single-backend host (e.g. a Linux/CUDA box without mlx, or a
+Mac without torch) and run in full on a Mac with torch-CPU installed.
 
 ## Related
 
