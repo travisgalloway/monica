@@ -96,6 +96,52 @@ class MambaConfig:
             return math.ceil(self.d_model / 16)
         return int(self.dt_rank)
 
+    def parameter_breakdown(self) -> dict:
+        """Closed-form trainable-parameter count, broken out by named term.
+
+        Returned as an ordered dict {term: count} so callers can inspect where the
+        budget goes and so the hybrid-attention work (#67) can add an "attention"
+        term without disturbing the existing keys. Verified exactly against the
+        built model's `_portable_state_dict()` (tests/test_sizing.py MLX safety-net):
+        every weight/bias/buffer registered as a parameter is accounted for here,
+        including the per-head SSM `A_log` and `D` (the `ssm_A_D` term).
+
+        Mirrors the layer construction in the backends:
+          in_proj  (d_model -> 2*d_inner)      conv (depthwise, width d_conv, + bias)
+          x_proj   (d_inner -> dt_rank+2*N)     dt_proj (dt_rank -> n_heads, + bias)
+          A_log,D  (n_heads each)               out_proj (d_inner -> d_model)
+        plus a pre-block RMSNorm per layer, a final RMSNorm, and the (tied) embedding.
+        """
+        d_model = self.d_model
+        d_inner = self.d_inner
+        n_heads = self.n_heads
+        dt_rank = self.dt_rank_resolved
+        N = self.d_state
+
+        per_layer = (
+            d_model                                  # pre-block RMSNorm weight
+            + 2 * d_inner * d_model                  # in_proj
+            + d_inner * (self.d_conv + 1)            # depthwise conv weight + bias
+            + d_inner * (dt_rank + 2 * N)            # x_proj (delta, B, C)
+            + dt_rank * n_heads + n_heads            # dt_proj weight + bias
+            + 2 * n_heads                            # A_log + D (scalar per head)
+            + d_inner * d_model                      # out_proj
+        )
+
+        bd = {
+            "embedding": self.vocab_size * d_model,
+            "layers": self.n_layers * per_layer,
+            "final_norm": d_model,
+        }
+        # Tied embedding reuses the input matrix as the LM head -> no extra params.
+        if not self.tie_embeddings:
+            bd["lm_head"] = self.vocab_size * d_model
+        return bd
+
+    def num_parameters(self) -> int:
+        """Total trainable parameters (sum of `parameter_breakdown()`)."""
+        return sum(self.parameter_breakdown().values())
+
     def validate(self) -> None:
         if self.vocab_size >= 65536:
             raise ValueError(
