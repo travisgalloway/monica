@@ -24,7 +24,7 @@ def generate(
     session_id: str,
     prompt_ids: Sequence[int],
     *,
-    sampler: Callable[[np.ndarray], int],
+    sampler: Callable[..., int],
     to_numpy: Callable[[object], np.ndarray] = np.asarray,
     max_new_tokens: int = 128,
     eos_id: Optional[int] = None,

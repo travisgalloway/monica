@@ -56,9 +56,10 @@ def sample(
         logits = logits.copy()  # own the buffer before in-place penalty edits
         prev = np.asarray(previous_tokens, dtype=np.int64).reshape(-1)
         if repetition_penalty != 1.0:
-            if repetition_penalty <= 0:
+            if repetition_penalty < 1.0:
                 raise ValueError(
-                    f"repetition_penalty {repetition_penalty} must be > 0")
+                    f"repetition_penalty {repetition_penalty} must be >= 1.0 "
+                    "(1.0 = off; CTRL-style penalty only suppresses, never boosts)")
             seen = np.unique(prev)
             seen = seen[(seen >= 0) & (seen < logits.size)]
             v = logits[seen]
