@@ -1,0 +1,28 @@
+# ~2B Mamba-2 config (M10 scaling ladder; epic #65). 100M(poc)->1B->2B->4B.
+# d_model 2560 x 46 layers -> ~1.98B params (verify: `python scripts/model_size.py`).
+# Provisional dims from #66: n_layers nudged 44->46 to land within +-5% of the 2B
+# target with margin. bf16 weights ~4.0 GB (~= inference footprint; no KV cache).
+# Fits A100 40GB / L40S 48GB for training.
+d_model: 2560          # d_inner = expand*d_model = 5120
+n_layers: 46
+d_state: 16            # SSM state width N (per head, shared B/C group)
+expand: 2
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 5120/64 = 80 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 50280      # OLMo-7B-hf, < 65536 (uint16 packing). Final tokenizer pending #74.
+seq_len: 1024
+tie_embeddings: true   # vocab x d_model ~= 129M; tied head stays mandatory at scale.
+
+# bf16, NOT fp16: poc's fp16>bf16 was an MLX/Metal micro-benchmark finding (issue #3).
+# The scale runs are CUDA, where bf16 is native and needs no loss scaling
+# (scaler_for_precision returns None for bf16). toy/smoke stay fp32 for exact resume.
+precision: bf16
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: true  # REQUIRED at this depth: recompute layers in backward to fit VRAM.
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
