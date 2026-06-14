@@ -148,3 +148,31 @@ def test_empty_prompt_raises():
     store = _store()
     with pytest.raises(ValueError):
         generate(store, "s", [], sampler=partial(sample, temperature=0.0))
+
+
+def test_pass_context_forwards_prompt_plus_generated():
+    # A repetition-aware sampler needs the running context; pass_context=True must hand
+    # it prompt + everything emitted so far, each step.
+    store = _store()
+    seen = []
+
+    def recording_sampler(logits, previous_tokens=None):
+        seen.append(list(previous_tokens))
+        return int(np.asarray(logits).argmax())
+
+    out = generate(store, "s", [0], sampler=recording_sampler, max_new_tokens=3,
+                   pass_context=True)
+    assert out == [1, 2, 3]
+    assert seen == [[0], [0, 1], [0, 1, 2]]
+
+
+def test_default_uses_bare_sampler_contract():
+    # Without pass_context the lm-eval adapter's `sampler(logits)` contract is preserved
+    # (a sampler taking no previous_tokens kwarg still works).
+    store = _store()
+
+    def bare_sampler(logits):
+        return int(np.asarray(logits).argmax())
+
+    out = generate(store, "s", [0], sampler=bare_sampler, max_new_tokens=2)
+    assert out == [1, 2]

@@ -35,6 +35,10 @@ class Backend:
     make_optimizer: Callable[[Any, float], Any]
     seed: Callable[[int], None]
     to_numpy: Callable[[Any], Any]
+    # Post-training (M9) step factories, mirroring `make_train_step`. SFT/DPO are
+    # MLX-only for now; the CUDA branch raises a clear NotImplementedError.
+    make_sft_train_step: Callable[..., Callable]
+    make_dpo_train_step: Callable[..., Callable]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -73,7 +77,13 @@ def _mlx_backend() -> Backend:
     import numpy as np
 
     from .mlx_backend import MLXMambaModel
-    from .mlx_train_step import make_train_step, save_optimizer, load_optimizer
+    from .mlx_train_step import (make_train_step, make_sft_train_step,
+                                 save_optimizer, load_optimizer)
+
+    # Lazy so constructing the backend never requires the DPO step to exist yet.
+    def _make_dpo_train_step(*args, **kwargs):
+        from .mlx_train_step import make_dpo_train_step
+        return make_dpo_train_step(*args, **kwargs)
 
     return Backend(
         name="mlx",
@@ -86,6 +96,8 @@ def _mlx_backend() -> Backend:
         make_optimizer=lambda model, base_lr: optim.AdamW(learning_rate=base_lr),
         seed=lambda value: mx.random.seed(value),
         to_numpy=lambda a: np.array(a),
+        make_sft_train_step=make_sft_train_step,
+        make_dpo_train_step=_make_dpo_train_step,
     )
 
 
@@ -119,6 +131,12 @@ def _cuda_backend() -> Backend:
         from .cuda_train_step import load_optimizer
         return load_optimizer(optimizer, path)
 
+    def _post_training_unsupported(*args, **kwargs):
+        raise NotImplementedError(
+            "SFT/DPO (M9) are implemented on the MLX dev backend only; the CUDA "
+            "post-training steps are deferred (run scripts/sft.py / scripts/dpo.py on "
+            "Apple Silicon).")
+
     return Backend(
         name="cuda",
         model_cls=CUDAMambaModel,
@@ -129,4 +147,6 @@ def _cuda_backend() -> Backend:
             model.parameters(), lr=base_lr),
         seed=lambda value: torch.manual_seed(value),
         to_numpy=lambda a: a.detach().to("cpu").numpy(),
+        make_sft_train_step=_post_training_unsupported,
+        make_dpo_train_step=_post_training_unsupported,
     )

@@ -26,9 +26,21 @@ Portable: pure string formatting, no dependencies, lives above the seam.
 
 from __future__ import annotations
 
+from typing import List, Tuple
+
 INSTRUCTION_MARKER = "### Instruction:"
 CONTEXT_MARKER = "### Input:"
 RESPONSE_MARKER = "### Response:"
+SYSTEM_MARKER = "### System:"
+
+# Role -> marker. `user` reuses the instruction marker and `assistant` the response
+# marker so a single user/assistant exchange renders byte-identically to
+# `format_example` (the format the base model was pretrained on) — see `render`.
+ROLE_MARKERS = {
+    "system": SYSTEM_MARKER,
+    "user": INSTRUCTION_MARKER,
+    "assistant": RESPONSE_MARKER,
+}
 
 
 def format_prompt(instruction: str, context: str = "") -> str:
@@ -48,3 +60,63 @@ def format_prompt(instruction: str, context: str = "") -> str:
 def format_example(instruction: str, response: str, context: str = "") -> str:
     """A full training document: the prompt block followed by the response text."""
     return f"{format_prompt(instruction, context)} {response.strip()}"
+
+
+# --- multi-turn chat (SFT/DPO) ------------------------------------------------------
+
+def _render_turn(role: str, content: str) -> str:
+    """One turn as `<marker>[ <content>]` — marker alone when content is empty (a
+    trailing empty assistant turn is exactly the prompt the model continues from)."""
+    marker = ROLE_MARKERS[role]
+    content = content.strip()
+    return f"{marker} {content}" if content else marker
+
+
+def render(messages: List[dict]) -> str:
+    """Render a multi-turn conversation to one newline-free training/prompt string.
+
+    `messages` is `[{"role": "system"|"user"|"assistant", "content": str}, ...]`, turns
+    joined by single spaces. By construction this is byte-identical to the pretraining
+    format on a single exchange: `render([{user:i},{assistant:r}]) == format_example(i, r)`
+    and `render([{user:i},{assistant:""}]) == format_prompt(i)`, so the SFT/chat format
+    never drifts from what the base model already knows. Content is only `.strip()`ed
+    (matching `format_example`); collapsing internal whitespace to stay newline-free is
+    the caller's job (the data builders run `download._normalize_doc` on each content).
+    """
+    return " ".join(_render_turn(m["role"], m["content"]) for m in messages)
+
+
+def _encode(tokenizer, text: str) -> List[int]:
+    """Encode without special tokens (HF appends EOS otherwise); ByteTokenizer.encode
+    takes no kwargs, hence the fallback."""
+    try:
+        return tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
+def response_spans(messages: List[dict], tokenizer) -> Tuple[List[int], List[Tuple[int, int]]]:
+    """Tokenize `render(messages)` and return `(full_ids, spans)` where each span is a
+    half-open `[start, end)` token range covering one assistant turn's *content* (the
+    `### Response:` marker tokens are excluded — only the answer is trained on).
+
+    Spans are found by tokenizing growing prefixes of the *same* rendered string and
+    diffing their lengths, so the indices line up with `full_ids` even though BPE token
+    boundaries do not coincide with character boundaries. The leading space before the
+    content merges into the first content token (the token the model predicts after the
+    marker), so it is included in the span — matching `format_example`'s " {response}".
+    """
+    full = render(messages)
+    full_ids = _encode(tokenizer, full)
+    spans: List[Tuple[int, int]] = []
+    prefix = ""
+    for m in messages:
+        turn = _render_turn(m["role"], m["content"])
+        sep = " " if prefix else ""
+        if m["role"] == "assistant" and m["content"].strip():
+            marker_prefix = prefix + sep + ROLE_MARKERS["assistant"]
+            start = len(_encode(tokenizer, marker_prefix))
+            end = len(_encode(tokenizer, prefix + sep + turn))
+            spans.append((start, end))
+        prefix = prefix + sep + turn
+    return full_ids, spans
