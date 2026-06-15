@@ -35,6 +35,7 @@ PORTABLE_MODULES = [
     "src.model.backend",
     "src.model.sizing",
     "src.data.loader",
+    "src.data.corpus",
     "src.data.pack",
     "src.data.split",
     "src.data.download",

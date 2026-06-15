@@ -1,0 +1,213 @@
+"""Corpus pipeline skeleton (#69): the staged flow that turns raw sources into cleaned,
+re-mixable text shards — runnable locally on the Mac before any cloud exists.
+
+This is the laptop-scale, pyarrow-native version of the datatrove pipeline in
+docs/design/08-corpus-pipeline.md (Stage 2, Normalize). Every source maps into one
+COMMON SCHEMA record `{text, source, lang, license, meta}`; the flow is
+ingest -> normalize -> filter -> write Parquet shards. At scale (#80) the same shape
+runs on HF `datatrove` with the writer pointed at R2 via `s3fs` — the `out_uri` seam
+below (an fsspec URI) is exactly where that swap happens: `file://` now, `s3://` later.
+
+ABOVE THE SEAM — no `mlx`/`torch`. Heavy data deps (pyarrow, fsspec) are imported
+LAZILY inside the IO functions, mirroring download.py/tokenize.py, so importing this
+module stays cheap and the seam guard (tests/test_import_guard.py) needs nothing extra.
+
+CLI (mirrors download/tokenize/pack/split):
+    python -m src.data.corpus --source dummy --in data/raw/dummy.txt --out data/cleaned
+The Parquet shards it writes feed the existing tokenize/pack/split stages:
+    python -m src.data.tokenize --in data/cleaned --out data/packed.bin --byte-fallback
+    python -m src.data.split    --packed data/packed.bin --out data/split --val-tokens 2000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator, List
+
+from .download import _normalize_doc, dummy_texts
+
+#: The common-schema columns, in Parquet column order.
+RECORD_FIELDS = ("text", "source", "lang", "license", "meta")
+
+
+@dataclass
+class Record:
+    """One document in the common corpus schema. `meta` is free-form per-source
+    metadata, stored as a JSON-string column in Parquet so the table schema is stable
+    across sources."""
+
+    text: str
+    source: str
+    lang: str = "en"
+    license: str = "unknown"
+    meta: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {"text": self.text, "source": self.source, "lang": self.lang,
+                "license": self.license, "meta": dict(self.meta)}
+
+
+# --------------------------------------------------------------------------- #
+# Stages: ingest -> normalize -> filter
+# --------------------------------------------------------------------------- #
+def ingest_text_file(path, source: str, lang: str = "en",
+                     license: str = "unknown") -> Iterator[Record]:
+    """One raw Record per line of a UTF-8 text file (normalize() cleans it)."""
+    with open(Path(path), encoding="utf-8") as f:
+        for line in f:
+            yield Record(text=line.rstrip("\r\n"), source=source, lang=lang, license=license)
+
+
+def ingest_dummy(n_docs: int = 1000, seed: int = 0,
+                 source: str = "dummy") -> Iterator[Record]:
+    """Synthetic Records for offline testing (no network), via download.dummy_texts."""
+    for text in dummy_texts(n_docs, seed):
+        yield Record(text=text, source=source, lang="en", license="synthetic")
+
+
+def normalize(records: Iterable[Record]) -> Iterator[Record]:
+    """Collapse each doc's whitespace to one line (reuses download._normalize_doc) and
+    drop docs that normalize to empty — the Stage-2 contract."""
+    for r in records:
+        text = _normalize_doc(r.text)
+        if text:
+            yield Record(text=text, source=r.source, lang=r.lang,
+                         license=r.license, meta=r.meta)
+
+
+def filter_records(records: Iterable[Record], min_chars: int = 1) -> Iterator[Record]:
+    """Light length heuristic placeholder (the real Stage-3 filters are #72): keep docs
+    with at least `min_chars` characters."""
+    for r in records:
+        if len(r.text) >= min_chars:
+            yield r
+
+
+# --------------------------------------------------------------------------- #
+# Local sharded Parquet IO (the durable, re-mixable artifact)
+# --------------------------------------------------------------------------- #
+def _table_from_records(batch: List[Record]):
+    import pyarrow as pa
+    return pa.table({
+        "text": [r.text for r in batch],
+        "source": [r.source for r in batch],
+        "lang": [r.lang for r in batch],
+        "license": [r.license for r in batch],
+        "meta": [json.dumps(r.meta, separators=(",", ":"), sort_keys=True) for r in batch],
+    })
+
+
+def write_shards(records: Iterable[Record], out_uri, shard_size_mb: int = 128,
+                 prefix: str = "part", compression: str = "zstd") -> List[str]:
+    """Write Records as Parquet shards under `out_uri` (an fsspec URI: a local path /
+    `file://` now, `s3://` later via s3fs at #80 — same code path). Rolls a new shard
+    once the buffered text passes `shard_size_mb`, so output is FEW LARGE files (the R2
+    Class-A-ops constraint). Returns the shard paths written, in order.
+    """
+    import fsspec
+    import pyarrow.parquet as pq
+
+    fs, root = fsspec.core.url_to_fs(str(out_uri))
+    root = root.rstrip("/")
+    fs.makedirs(root, exist_ok=True)
+    budget = shard_size_mb * (1 << 20)
+    written: List[str] = []
+    buf: List[Record] = []
+    nbytes = 0
+    idx = 0
+
+    def flush() -> None:
+        nonlocal buf, nbytes, idx
+        if not buf:
+            return
+        shard = f"{root}/{prefix}-{idx:05d}.parquet"
+        with fs.open(shard, "wb") as fo:
+            pq.write_table(_table_from_records(buf), fo, compression=compression)
+        written.append(shard)
+        idx += 1
+        buf, nbytes = [], 0
+
+    for r in records:
+        buf.append(r)
+        nbytes += len(r.text.encode("utf-8"))
+        if nbytes >= budget:
+            flush()
+    flush()
+    return written
+
+
+def _shard_paths(uri) -> List[str]:
+    import fsspec
+    fs, root = fsspec.core.url_to_fs(str(uri))
+    if fs.isdir(root):
+        return sorted(fs.glob(f"{root.rstrip('/')}/*.parquet"))
+    return [root]
+
+
+def read_shards(uri) -> Iterator[Record]:
+    """Read Records back from the Parquet shard(s) at `uri` (reverses write_shards)."""
+    import fsspec
+    import pyarrow.parquet as pq
+
+    fs, _ = fsspec.core.url_to_fs(str(uri))
+    for shard in _shard_paths(uri):
+        with fs.open(shard, "rb") as fo:
+            tbl = pq.read_table(fo)
+        d = tbl.to_pydict()
+        for i in range(tbl.num_rows):
+            yield Record(text=d["text"][i], source=d["source"][i], lang=d["lang"][i],
+                         license=d["license"][i], meta=json.loads(d["meta"][i] or "{}"))
+
+
+def iter_shard_texts(uri) -> Iterator[str]:
+    """Just the `text` column from the shard(s) at `uri` — this is what feeds tokenize."""
+    for r in read_shards(uri):
+        yield r.text
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator + CLI
+# --------------------------------------------------------------------------- #
+def build_corpus(records: Iterable[Record], out_uri, *, min_chars: int = 1,
+                 shard_size_mb: int = 128) -> List[str]:
+    """The Stage-2 flow end to end: normalize -> filter -> write Parquet shards.
+    Returns the shard paths written."""
+    cleaned = filter_records(normalize(records), min_chars=min_chars)
+    return write_shards(cleaned, out_uri, shard_size_mb=shard_size_mb)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--source", choices=("dummy", "text"), default="text",
+                    help="dummy: synthetic offline docs; text: a UTF-8 text file (--in)")
+    ap.add_argument("--in", dest="inp", default=None, help="input text file (--source text)")
+    ap.add_argument("--out", required=True, help="output dir / fsspec URI for Parquet shards")
+    ap.add_argument("--source-name", default=None,
+                    help="value for the schema `source` field (default: source type / filename)")
+    ap.add_argument("--lang", default="en")
+    ap.add_argument("--license", default="unknown")
+    ap.add_argument("--max-docs", type=int, default=1000, help="--source dummy: #synthetic docs")
+    ap.add_argument("--min-chars", type=int, default=1)
+    ap.add_argument("--shard-size-mb", type=int, default=128,
+                    help="roll a new shard past this size (few large shards)")
+    args = ap.parse_args()
+
+    if args.source == "dummy":
+        records = ingest_dummy(args.max_docs, source=args.source_name or "dummy")
+    else:
+        if not args.inp:
+            ap.error("--in is required for --source text")
+        name = args.source_name or Path(args.inp).stem
+        records = ingest_text_file(args.inp, source=name, lang=args.lang, license=args.license)
+
+    shards = build_corpus(records, args.out, min_chars=args.min_chars,
+                          shard_size_mb=args.shard_size_mb)
+    print(f"wrote {len(shards)} shard(s) -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()

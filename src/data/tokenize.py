@@ -16,6 +16,7 @@ is not vocab-compatible with OLMo and must not be used for a real run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from pathlib import Path
 from typing import Iterable, Iterator, List
 
@@ -75,6 +76,22 @@ def _capped(stream: Iterable[int], max_tokens: int | None) -> Iterator[int]:
         yield tid
 
 
+@contextlib.contextmanager
+def _open_texts(inp: Path):
+    """Yield an iterator of doc texts from `inp`, transparently handling both inputs:
+    a one-doc-per-line text file (the download.py output), or a directory / `.parquet`
+    file of corpus Parquet shards (the corpus.py output) — so the cleaned shards feed
+    this stage with no extra step. Parquet text is already normalized one-line-per-doc."""
+    if inp.is_dir() or inp.suffix == ".parquet":
+        from .corpus import iter_shard_texts
+        yield iter_shard_texts(inp)
+    else:
+        # Explicit UTF-8 (corpus is UTF-8; avoids locale-dependent decoding) and strip
+        # any trailing \r so \r\n-terminated input doesn't leak a carriage return.
+        with open(inp, encoding="utf-8") as f:
+            yield (line.rstrip("\r\n") for line in f)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in", dest="inp", type=Path, required=True)
@@ -89,10 +106,8 @@ def main() -> None:
         ap.error("--max-tokens must be positive (a value <= 0 silently yields 0 tokens)")
 
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
-    # Explicit UTF-8 (corpus is UTF-8; avoids locale-dependent decoding) and strip any
-    # trailing \r so \r\n-terminated input doesn't leak a stray carriage return into a doc.
-    with open(args.inp, encoding="utf-8") as f:
-        texts = (line.rstrip("\r\n") for line in f)
+    # Input is either a one-doc-per-line text file or corpus Parquet shards (dir/.parquet).
+    with _open_texts(args.inp) as texts:
         stream = _capped(tokenize_texts(texts, tok), args.max_tokens)
         if args.out.suffix == ".bin":
             # Stream straight into the packed format (chunked, bounded memory) — this
