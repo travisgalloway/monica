@@ -42,9 +42,23 @@ def test_minhash_signature_deterministic_and_similarity():
     assert jaccard(sa1, h.signature(shingles(near))) > jaccard(sa1, h.signature(shingles(far)))
 
 
-def test_minhashlsh_bands_validation():
+def test_minhashlsh_param_validation():
     with pytest.raises(ValueError):
         MinHashLSH(num_perm=128, bands=17)             # 128 % 17 != 0
+    with pytest.raises(ValueError):
+        MinHashLSH(num_perm=128, bands=0)              # would ZeroDivision
+    with pytest.raises(ValueError):
+        MinHashLSH(threshold=1.5)                      # out of [0, 1]
+    with pytest.raises(ValueError):
+        MinHashLSH(shingle_size=0)
+
+
+def test_minhash_signature_chunking_is_size_invariant():
+    # The chunked signature must be independent of chunk size and self-similar = 1.0.
+    h = MinHasher(num_perm=64, seed=3)
+    shs = shingles(" ".join(f"w{i}" for i in range(600)))   # ~596 distinct 5-gram shingles
+    assert np.array_equal(h.signature(shs, chunk=8), h.signature(shs, chunk=4096))
+    assert jaccard(h.signature(shs), h.signature(shs)) == 1.0
 
 
 # --- near dedup ----------------------------------------------------------------------

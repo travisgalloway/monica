@@ -88,12 +88,26 @@ class MinHasher:
         self.a = rng.integers(1, 1 << 31, size=num_perm, dtype=np.uint64)
         self.b = rng.integers(0, 1 << 31, size=num_perm, dtype=np.uint64)
 
-    def signature(self, shs: Set[str]) -> np.ndarray:
-        """MinHash signature (uint64 array of length num_perm). Empty set -> all-max."""
-        if not shs:
-            return np.full(self.num_perm, _PRIME, dtype=np.uint64)
-        hv = np.fromiter((_hash32(s) & _MAX32 for s in shs), dtype=np.uint64, count=len(shs))
-        # (num_perm, k): affine-permute every shingle hash, then take the per-row min.
+    def signature(self, shs: Set[str], chunk: int = 256) -> np.ndarray:
+        """MinHash signature (uint64 array of length num_perm). Empty set -> all-max.
+
+        Shingles are hashed in fixed-size chunks so peak memory stays bounded at
+        (num_perm x chunk) rather than (num_perm x #shingles) — long docs don't blow up
+        the streaming dedup."""
+        acc = np.full(self.num_perm, _PRIME, dtype=np.uint64)
+        block: List[int] = []
+        for s in shs:
+            block.append(_hash32(s) & _MAX32)
+            if len(block) >= chunk:
+                acc = np.minimum(acc, self._block_min(block))
+                block = []
+        if block:
+            acc = np.minimum(acc, self._block_min(block))
+        return acc
+
+    def _block_min(self, hashes: List[int]) -> np.ndarray:
+        hv = np.asarray(hashes, dtype=np.uint64)
+        # (num_perm, <=chunk): affine-permute the block's hashes, take the per-row min.
         mixed = (self.a[:, None] * hv[None, :] + self.b[:, None]) % _PRIME
         return mixed.min(axis=1)
 
@@ -114,8 +128,16 @@ class MinHashLSH:
 
     def __init__(self, threshold: float = 0.8, num_perm: int = 128, bands: int = 16,
                  shingle_size: int = 5, seed: int = 0):
+        if num_perm <= 0:
+            raise ValueError(f"num_perm must be positive, got {num_perm}")
+        if bands <= 0:
+            raise ValueError(f"bands must be positive, got {bands}")
         if num_perm % bands:
             raise ValueError(f"num_perm ({num_perm}) must be divisible by bands ({bands})")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"threshold must be in [0, 1], got {threshold}")
+        if shingle_size < 1:
+            raise ValueError(f"shingle_size must be >= 1, got {shingle_size}")
         self.threshold = threshold
         self.bands = bands
         self.rows = num_perm // bands
