@@ -51,6 +51,8 @@ PORTABLE_MODULES = [
     "src.data.dpo_loader",
     "src.data.dpo_sources",
     "src.train.dpo_math",
+    "src.train.grpo",
+    "src.train.verifiers",
     "src.train.schedule",
     "src.train.checkpoint",
     "src.train.loss_scale",
