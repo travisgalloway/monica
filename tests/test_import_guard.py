@@ -46,6 +46,7 @@ PORTABLE_MODULES = [
     "src.data.instruct_format",
     "src.data.sft_data",
     "src.data.sft_loader",
+    "src.data.sft_sources",
     "src.data.dpo_data",
     "src.data.dpo_loader",
     "src.train.dpo_math",
