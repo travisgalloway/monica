@@ -38,6 +38,8 @@ PORTABLE_MODULES = [
     "src.data.corpus",
     "src.data.filters",
     "src.data.dedup",
+    "src.data.blend",
+    "src.data.shard",
     "src.data.pack",
     "src.data.split",
     "src.data.download",

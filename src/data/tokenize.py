@@ -22,24 +22,37 @@ from typing import Iterable, Iterator, List
 
 # Confirmed OLMo tokenizer ids on the HF Hub (uint16-compatible, vocab < 65536).
 OLMO_TOKENIZER_CANDIDATES = ("allenai/OLMo-7B-hf",)
+# StarCoder2 tokenizer (#74): mixed prose+code, vocab ~49,152 — FITS uint16 (< 65536).
+# Llama-3 (~128,256) deliberately excluded: it exceeds the bound and would force uint32
+# packing (~2x shard storage) + relaxing MambaConfig.validate(). Flag that before choosing.
+STARCODER2_TOKENIZER_CANDIDATES = ("bigcode/starcoder2-3b", "bigcode/starcoder2-15b")
 
 
-def load_olmo_tokenizer(model_id: str | None = None):
-    """Load the OLMo tokenizer via transformers. Raises if unavailable."""
+def _load_hf_tokenizer(candidates, model_id, label):
+    """Load an HF tokenizer, confirming its vocab fits uint16 packing (< 65536)."""
     from transformers import AutoTokenizer  # imported lazily
 
-    ids = (model_id,) if model_id else OLMO_TOKENIZER_CANDIDATES
+    ids = (model_id,) if model_id else candidates
     last_err = None
     for mid in ids:
         try:
             tok = AutoTokenizer.from_pretrained(mid)
-            # Confirm the vocab fits uint16 packing before committing to it.
             if tok.vocab_size >= 65536:
                 raise ValueError(f"{mid} vocab {tok.vocab_size} too large for uint16")
             return tok
         except Exception as e:  # pragma: no cover - network/availability dependent
             last_err = e
-    raise RuntimeError(f"No OLMo tokenizer reachable from {ids}: {last_err}")
+    raise RuntimeError(f"No {label} tokenizer reachable from {ids}: {last_err}")
+
+
+def load_olmo_tokenizer(model_id: str | None = None):
+    """Load the OLMo tokenizer via transformers. Raises if unavailable."""
+    return _load_hf_tokenizer(OLMO_TOKENIZER_CANDIDATES, model_id, "OLMo")
+
+
+def load_starcoder2_tokenizer(model_id: str | None = None):
+    """Load the StarCoder2 tokenizer (#74 scale-run default). Raises if unavailable."""
+    return _load_hf_tokenizer(STARCODER2_TOKENIZER_CANDIDATES, model_id, "StarCoder2")
 
 
 class ByteTokenizer:
@@ -63,6 +76,19 @@ def tokenize_texts(texts: Iterable[str], tokenizer) -> Iterable[int]:
             yield tid
         if eos is not None:
             yield eos
+
+
+def tokenize_docs(texts: Iterable[str], tokenizer) -> Iterator[List[int]]:
+    """Yield one token-id list PER document (EOS appended if available). Unlike
+    `tokenize_texts` this preserves document boundaries — `shard.pack_sequences` needs
+    them to mark doc-starts so the SSM state can be reset across packed docs (#68/#74)."""
+    eos = getattr(tokenizer, "eos_token_id", None)
+    for text in texts:
+        ids = list(tokenizer.encode(text))
+        if eos is not None:
+            ids.append(eos)
+        if ids:
+            yield ids
 
 
 def _capped(stream: Iterable[int], max_tokens: int | None) -> Iterator[int]:
