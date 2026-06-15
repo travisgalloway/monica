@@ -15,8 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Data pipeline at full scale (download/tokenize).
-data = ["datasets>=2.0", "transformers>=4.40"]
+# Data pipeline at full scale (download/tokenize). pyarrow + fsspec back the corpus
+# Parquet sharded IO (src/data/corpus.py); fsspec also gives the file://-now /
+# s3://-later storage URI seam (the R2 writer swap is #80).
+data = ["datasets>=2.0", "transformers>=4.40", "pyarrow>=14", "fsspec>=2024.0"]
+# Scale corpus engine (#65/#80): HF datatrove runs the same pipeline shape on
+# R2/RunPod. The local skeleton (src/data/corpus.py) is pyarrow-native and does NOT
+# require this; install it only where the cloud pipeline runs.
+datatrove = ["datatrove>=0.6"]
 # Apple Silicon backend (NOT installable on Linux/CUDA hosts).
 mlx = ["mlx>=0.18"]
 # CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
