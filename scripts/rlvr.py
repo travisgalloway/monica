@@ -102,9 +102,11 @@ def main() -> None:
             store.create(sid)
             sampler = partial(sample, temperature=args.temperature, top_k=args.top_k,
                               rng=np.random.default_rng(int(rng.integers(1 << 30))))
-            gen = generate(store, sid, prompt_ids, sampler=sampler, to_numpy=np_to,
-                           max_new_tokens=args.max_new_tokens, eos_id=eos)
-            store.remove(sid)
+            try:
+                gen = generate(store, sid, prompt_ids, sampler=sampler, to_numpy=np_to,
+                               max_new_tokens=args.max_new_tokens, eos_id=eos)
+            finally:
+                store.remove(sid)   # never leak the session if generate/sampling raises
             rollouts.append((prompt_ids, gen or [eos or 0]))
             rewards.append(reward_fn(tok.decode(gen), str(prob.get("answer", ""))))
 

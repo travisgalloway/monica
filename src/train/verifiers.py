@@ -82,8 +82,11 @@ class CodeVerifier:
         for t in tests:
             program = f"{code}\n{t}\n"
             try:
+                # Discard untrusted stdout/stderr (a candidate can print unbounded data);
+                # only the exit code matters.
                 r = subprocess.run([sys.executable, "-c", program],
-                                   capture_output=True, timeout=self.timeout)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=self.timeout)
                 passed += int(r.returncode == 0)
             except subprocess.TimeoutExpired:
                 pass

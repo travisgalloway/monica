@@ -43,7 +43,10 @@ def grpo_loss_from_logprobs(logp: np.ndarray, advantages: np.ndarray,
 
 
 def reward_stats(rewards: np.ndarray) -> dict:
-    """Run diagnostics for logging: mean reward and fraction solved (reward == max)."""
+    """Run diagnostics for logging: mean reward and fraction *fully solved* (reward >= 1.0,
+    i.e. a perfect score — not merely the group max, so partial-credit groups with no
+    perfect solution report 0, not 1). Empty input yields zeros, not NaN."""
     r = np.asarray(rewards, dtype=np.float64)
-    return {"mean_reward": float(r.mean()),
-            "frac_solved": float(np.mean(r >= r.max())) if r.size else 0.0}
+    if r.size == 0:
+        return {"mean_reward": 0.0, "frac_solved": 0.0}
+    return {"mean_reward": float(r.mean()), "frac_solved": float(np.mean(r >= 1.0))}

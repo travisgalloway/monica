@@ -35,4 +35,14 @@ def test_grpo_loss_zero_advantage_is_zero():
 def test_reward_stats():
     s = reward_stats([1.0, 0.0, 1.0])
     assert s["mean_reward"] == pytest.approx(2 / 3)
-    assert s["frac_solved"] == pytest.approx(2 / 3)   # reward == max (1.0) for 2 of 3
+    assert s["frac_solved"] == pytest.approx(2 / 3)   # two perfect (1.0) of three
+
+
+def test_reward_stats_partial_credit_not_solved():
+    # No completion is perfect -> frac_solved must be 0, not 1 (the group-max trap).
+    s = reward_stats([0.2, 0.4, 0.6])
+    assert s["mean_reward"] == pytest.approx(0.4) and s["frac_solved"] == 0.0
+
+
+def test_reward_stats_empty_is_zero_not_nan():
+    assert reward_stats([]) == {"mean_reward": 0.0, "frac_solved": 0.0}
