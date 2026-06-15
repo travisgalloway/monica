@@ -37,6 +37,7 @@ PORTABLE_MODULES = [
     "src.data.loader",
     "src.data.corpus",
     "src.data.filters",
+    "src.data.dedup",
     "src.data.pack",
     "src.data.split",
     "src.data.download",
