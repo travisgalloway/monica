@@ -39,8 +39,8 @@ def build_oasst1_threads(rows: Iterable[dict], lang: Optional[str] = "en",
     """Walk the OASST1 message tree: for each assistant node, emit the root->node path as a
     multi-turn `{messages}` example (so every conversational prefix ending in an assistant
     turn becomes a training example). `prompter`->user, `assistant`->assistant. If `lang`
-    is set, every node on the path must match it. Rows: {message_id, parent_id, text, role,
-    lang}."""
+    is set, every node on the path must match it OR have no language tag (missing tags are
+    permitted). Rows: {message_id, parent_id, text, role, lang}."""
     by_id = {r.get("message_id"): r for r in rows}
     for r in by_id.values():
         if r.get("role") != "assistant":
@@ -73,7 +73,9 @@ def build_oasst1_threads(rows: Iterable[dict], lang: Optional[str] = "en",
 
 def load_oasst1(split: str = "train", lang: Optional[str] = "en",
                 max_examples: Optional[int] = None) -> Iterator[dict]:
-    """Stream OASST1 from the Hub and reconstruct multi-turn threads (lazy `datasets`)."""
+    """Load OASST1 from the Hub and reconstruct multi-turn threads (lazy `datasets`). The
+    split is materialized, not streamed — thread reconstruction needs the whole message
+    tree (random access by message_id)."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     rows = load_dataset("OpenAssistant/oasst1", split=split)
@@ -118,7 +120,7 @@ def load_dolly(max_examples: Optional[int] = None) -> Iterator[dict]:
     """Stream Dolly-15k as instruction/response rows, license-tagged (lazy `datasets`)."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
-    ds = load_dataset("databricks/databricks-dolly-15k", split="train")
+    ds = load_dataset("databricks/databricks-dolly-15k", split="train", streaming=True)
     for i, row in enumerate(ds):
         if max_examples is not None and i >= max_examples:
             break
@@ -180,7 +182,8 @@ def main() -> None:
                     choices=tuple(_LOADERS), help="clean-license SFT sources to include")
     ap.add_argument("--out", type=Path, required=True, help="output SFT JSONL")
     ap.add_argument("--max-per-source", type=int, default=None)
-    ap.add_argument("--max-seq-len", type=int, default=None)
+    ap.add_argument("--max-seq-len", type=int, default=1024,
+                    help="drop examples longer than this (bounds SFTLoader batch padding)")
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
     ap.add_argument("--model-id", default=None)
     args = ap.parse_args()
