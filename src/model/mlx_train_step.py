@@ -186,6 +186,35 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
     return train_step
 
 
+def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
+                         scaler=None) -> Callable:
+    """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
+
+    `micro_batches` is a list of `(inputs, targets, mask, advantages)`: a batch of sampled
+    rollouts (mask = 1 on the generated/completion tokens) and their group-standardized
+    advantages (one per sequence, precomputed in the driver via `train.grpo.group_advantages`
+    from verifier rewards). The loss is `-mean(advantage * logpθ(completion))` — REINFORCE
+    with the GRPO group baseline; gradients flow through the policy only. Accumulation /
+    fp16 scaling / clipping are shared via `_accumulate_and_step`.
+    """
+    def loss_fn(model, inputs, targets, mask, advantages):
+        logp = _masked_seq_logprob(model, inputs, targets, mask)     # (B,)
+        adv = mx.array(advantages).astype(mx.float32).reshape(-1)    # (B,)
+        loss = -mx.mean(adv * logp)
+        return loss * scaler.scale if scaler else loss
+
+    value_and_grad = nn.value_and_grad(model, loss_fn)
+
+    def loss_and_grad(model, mb):
+        return value_and_grad(model, *mb)
+
+    def train_step(model, micro_batches, lr: float) -> dict:
+        return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
+                                    lr, grad_clip, scaler)
+
+    return train_step
+
+
 def _unscale(grads, factor):
     from mlx.utils import tree_map
     return tree_map(lambda g: g * factor, grads)

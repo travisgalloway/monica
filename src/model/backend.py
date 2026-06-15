@@ -39,6 +39,7 @@ class Backend:
     # MLX-only for now; the CUDA branch raises a clear NotImplementedError.
     make_sft_train_step: Callable[..., Callable]
     make_dpo_train_step: Callable[..., Callable]
+    make_grpo_train_step: Callable[..., Callable]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -80,10 +81,14 @@ def _mlx_backend() -> Backend:
     from .mlx_train_step import (make_train_step, make_sft_train_step,
                                  save_optimizer, load_optimizer)
 
-    # Lazy so constructing the backend never requires the DPO step to exist yet.
+    # Lazy so constructing the backend never requires the DPO/GRPO step to exist yet.
     def _make_dpo_train_step(*args, **kwargs):
         from .mlx_train_step import make_dpo_train_step
         return make_dpo_train_step(*args, **kwargs)
+
+    def _make_grpo_train_step(*args, **kwargs):
+        from .mlx_train_step import make_grpo_train_step
+        return make_grpo_train_step(*args, **kwargs)
 
     return Backend(
         name="mlx",
@@ -98,6 +103,7 @@ def _mlx_backend() -> Backend:
         to_numpy=lambda a: np.array(a),
         make_sft_train_step=make_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
+        make_grpo_train_step=_make_grpo_train_step,
     )
 
 
@@ -149,4 +155,5 @@ def _cuda_backend() -> Backend:
         to_numpy=lambda a: a.detach().to("cpu").numpy(),
         make_sft_train_step=_post_training_unsupported,
         make_dpo_train_step=_post_training_unsupported,
+        make_grpo_train_step=_post_training_unsupported,
     )
