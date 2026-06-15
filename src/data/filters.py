@@ -18,7 +18,7 @@ At scale (#80) these map onto ``datatrove`` filter stages keyed on the same sche
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Tuple
 
 from .corpus import Record
@@ -269,16 +269,30 @@ def filter_record(record: Record, *, min_chars: int = 1, quality: bool = False,
             stats.dropped_quality += 1
         return None
 
+    # Collect mutations (scrub text, obligation tag) and rebuild the record once.
+    text = record.text
+    meta_updates: dict = {}
+
+    # Share-alike / attribution licenses are KEPT but carry obligations — surface that in
+    # `meta` so the blend/accounting stages (#74) can't miss it downstream.
+    if is_flagged(record.license):
+        meta_updates["license_obligation"] = "share-alike-attribution"
+
     if scrub:
-        scrubbed, n = scrub_secrets(record.text)
+        scrubbed, n = scrub_secrets(text)
         if n:
-            meta = dict(record.meta)
-            meta["secrets_scrubbed"] = int(meta.get("secrets_scrubbed", 0)) + n
-            record = Record(text=scrubbed, source=record.source, lang=record.lang,
-                            license=record.license, meta=meta)
+            text = scrubbed
+            meta_updates["secrets_scrubbed"] = int((record.meta or {}).get(
+                "secrets_scrubbed", 0)) + n
             if stats is not None:
                 stats.docs_scrubbed += 1
                 stats.secrets_scrubbed += n
+
+    if meta_updates:
+        meta = dict(record.meta)
+        meta.update(meta_updates)
+        record = Record(text=text, source=record.source, lang=record.lang,
+                        license=record.license, meta=meta)
 
     if stats is not None:
         stats.kept += 1

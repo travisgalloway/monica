@@ -12,7 +12,8 @@ from src.data.filters import (DEFAULT_THRESHOLDS, FilterStats, QualityThresholds
                               looks_minified, scrub_secrets, text_quality_ok,
                               text_quality_reasons)
 
-pytest.importorskip("pyarrow")  # only build_corpus end-to-end needs it
+# Most tests here are pure-Python; only the build_corpus end-to-end cases need pyarrow
+# (skipped per-test below), so the heuristics stay covered on minimal dev installs.
 
 
 # --- license gating (code only) ------------------------------------------------------
@@ -93,6 +94,17 @@ def test_filter_records_stats_and_drops():
     assert stats.dropped_license == 1 and stats.dropped_quality == 1 and stats.kept == 1
 
 
+def test_filter_records_tags_share_alike_obligation():
+    # Flagged (CC-BY-SA) records are KEPT but marked so blend/accounting can't miss it.
+    recs = [Record("Some encyclopedic prose. " * 20, "finewiki", lang="en",
+                   license="CC-BY-SA-4.0")]
+    out = list(filter_records(recs))
+    assert out[0].meta["license_obligation"] == "share-alike-attribution"
+    # Permissive text gets no obligation tag.
+    perm = list(filter_records([Record("x" * 50, "src", license="MIT")]))
+    assert "license_obligation" not in perm[0].meta
+
+
 def test_filter_records_scrub_modifies_text_and_meta():
     recs = [Record("reach me at bob@x.com now and then", "src", lang="en")]
     stats = FilterStats()
@@ -103,6 +115,7 @@ def test_filter_records_scrub_modifies_text_and_meta():
 
 def test_build_corpus_default_off_is_unchanged(tmp_path):
     """Default build_corpus keeps the #69 behavior: only the length floor applies."""
+    pytest.importorskip("pyarrow")  # build_corpus writes Parquet shards
     recs = [Record("w1 w2 w3 w4 w5", "dummy", license="synthetic") for _ in range(4)]
     shards = build_corpus(recs, tmp_path / "cleaned")
     from src.data.corpus import read_shards
@@ -110,6 +123,7 @@ def test_build_corpus_default_off_is_unchanged(tmp_path):
 
 
 def test_build_corpus_with_filters_drops_planted_bad_doc(tmp_path):
+    pytest.importorskip("pyarrow")  # build_corpus writes Parquet shards
     recs = [
         Record("Real curated prose. " * 30, "fineweb-edu", lang="en"),
         Record("$$$ " * 100, "fineweb-edu", lang="en"),                  # quality drop
