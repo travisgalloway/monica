@@ -29,6 +29,15 @@ Every claim here is sourced from a docstring or config comment in the code, with
    gate, and val perplexity as the success metric.
 7. [Configs & locked decisions](07-configs-and-decisions.md) — `toy.yaml` /
    `poc.yaml` in full, plus the precision benchmark and sizing math.
+8. [Corpus pipeline](08-corpus-pipeline.md) — the scale-up data flow: `datatrove`
+   stages, the common schema, R2 storage layout, RunPod topology, and clean-license
+   post-training (SFT/DPO/RLVR).
+9. [Hybrid architectures](09-hybrid-architectures.md) — why the scale-up model is a
+   Mamba-2 hybrid (config-gated attention), and the 100M/1B/2B/4B sizing.
+
+> Topics 8–9 are the **scale-up** design record (the datatrove + RunPod + R2 program,
+> [issue #65](https://github.com/travisgalloway/monica/issues/65)) — forward-looking
+> decisions, not yet implemented, unlike the verified POC in topics 1–7.
 
 ## Locked decisions at a glance
 
@@ -48,3 +57,6 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Checkpoints | portable weights + separate resume bundle | weights port across backends; optimizer state doesn't need to | `src/train/checkpoint.py` |
 | Success metric | held-out val perplexity (Tier-1) | a smoothly decreasing curve *is* the POC goal | `src/eval/val_loss.py` |
 | OLMES / lm-eval | deferred (Tier-2) | its own milestone-sized task; not needed for the POC | `src/eval/olmes_adapter.py` |
+| Scale-up data framework | `datatrove` + R2 + RunPod | one framework, durable re-mixable shards, zero-egress storage | `docs/design/08-corpus-pipeline.md` |
+| Scale-up tokenizer | StarCoder2 (vocab ~49k) | mixed prose+code; fits uint16 (Llama-3 ~128k does not) | `docs/design/08-corpus-pipeline.md` |
+| Scale-up model family | Mamba-2 hybrid, 100M/1B/2B/4B | attention layers close the SSM retrieval gap; no-KV-cache sizing | `docs/design/09-hybrid-architectures.md` |
