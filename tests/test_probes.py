@@ -27,11 +27,15 @@ def test_needle_shapes_and_supervision():
     x, t, m = make_needle_batch(rng, 4, 64)
     assert x.shape == t.shape == m.shape == (4, 64)
     assert m.sum() == 4                                    # exactly one supervised pos/seq
-    # supervised target is a value id, and the queried key earlier in the context matches
+    # default needle id ranges: filler [0,128), keys [128,192), values [192,256)
     for b in range(4):
         q = int(np.flatnonzero(m[b])[0])
-        assert t[b, q] >= needle_vocab() - 64              # value range
-        assert x[b, q] == x[b, q]                          # query key present
+        qkey = x[b, q]
+        assert 128 <= qkey < 192                           # query is a key id
+        earlier = np.flatnonzero(x[b, :q] == qkey)         # the planted needle key, earlier
+        assert earlier.size >= 1
+        p = int(earlier[0])
+        assert x[b, p + 1] == t[b, q] >= 192               # planted value == supervised target
     assert probe_accuracy(_oracle_logits(x, t, needle_vocab()), t, m) == 1.0
 
 
