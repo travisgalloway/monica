@@ -32,6 +32,14 @@ def test_pack_sequences_drops_final_partial(tmp_path):
     assert len(toks) == 10
 
 
+def test_n_documents_counts_only_emitted_starts(tmp_path):
+    # doc A fills seq 0 (5 tok); doc B starts at offset 5 inside the dropped partial.
+    manifest = pack_sequences([[1, 2, 3, 4, 5], [6, 7, 8]], tmp_path, seq_len=5)
+    assert manifest["n_sequences"] == 1 and manifest["n_documents"] == 1   # B not counted
+    _, bnds = open_shard(tmp_path, manifest["shards"][0]["name"])
+    assert int(np.asarray(bnds).sum()) == manifest["n_documents"]          # matches sidecar
+
+
 def test_pack_sequences_rolls_few_large_shards(tmp_path):
     # tiny budget -> one shard per (sequence-aligned) budget; proves few-large rolling.
     docs = [list(range(1, 5)) for _ in range(8)]      # 8 docs x 4 = 32 tokens

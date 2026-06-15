@@ -63,6 +63,9 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
         state["idx"] += 1
         state["seqs"] += n_seq
         state["tokens"] += n_tokens
+        # Count docs by the doc-starts actually emitted, so n_documents matches the
+        # .bounds sidecar and excludes starts that land in the dropped final partial.
+        state["docs"] += int(sum(bnd_buf[:n_tokens]))
         del tok_buf[:n_tokens]
         del bnd_buf[:n_tokens]
 
@@ -70,7 +73,6 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
         ids = list(doc)
         if not ids:
             continue
-        state["docs"] += 1
         tok_buf.extend(ids)                       # OverflowError if any id not in [0, 65535]
         bnd_buf.append(1)
         bnd_buf.extend(b"\x00" * (len(ids) - 1))
@@ -129,10 +131,10 @@ def main() -> None:
     else:
         tok = load_starcoder2_tokenizer(args.model_id)
 
+    tok_label = "byte" if args.byte_fallback else getattr(tok, "name_or_path", args.tokenizer)
     docs = tokenize_docs(iter_shard_texts(args.inp), tok)
     manifest = pack_sequences(docs, args.out, seq_len=args.seq_len,
-                              shard_size_mb=args.shard_size_mb,
-                              tokenizer=getattr(tok, "name_or_path", args.tokenizer))
+                              shard_size_mb=args.shard_size_mb, tokenizer=tok_label)
     print(f"packed {manifest['n_sequences']} seq x {args.seq_len} "
           f"({manifest['n_tokens']} tokens, {len(manifest['shards'])} shard(s)) -> {args.out}")
 
