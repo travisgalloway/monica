@@ -56,6 +56,7 @@ PORTABLE_MODULES = [
     "src.eval.val_loss",
     "src.eval.olmes_adapter",
     "src.eval.retrieval_probe",
+    "src.eval.probes",
     "src.conformance.forward_step_parity",
     "src.conformance.backend_parity",
     "src.serve.sessions",
