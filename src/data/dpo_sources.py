@@ -39,13 +39,13 @@ def build_oasst1_prefs(rows: Iterable[dict], lang: Optional[str] = "en") -> Iter
     """For each prompter node with >=2 ranked assistant children, pair the best-ranked
     (chosen) against the worst-ranked (rejected). `rank` 0 is best. Rows: {message_id,
     parent_id, text, role, rank, lang}."""
-    rows = list(rows)
     children: dict = defaultdict(list)
-    for r in rows:
+    prompters: list = []
+    for r in rows:                                   # single pass (streaming-friendly)
         children[r.get("parent_id")].append(r)
-    for r in rows:
-        if r.get("role") != "prompter":
-            continue
+        if r.get("role") == "prompter":
+            prompters.append(r)
+    for r in prompters:
         if lang is not None and r.get("lang") not in (None, lang):
             continue
         kids = [c for c in children.get(r.get("message_id"), [])
@@ -83,9 +83,10 @@ def shp_to_pref(row: dict) -> Optional[dict]:
     `human_ref_A` is preferred."""
     prompt = (row.get("history") or "").strip()
     a, b = (row.get("human_ref_A") or "").strip(), (row.get("human_ref_B") or "").strip()
-    if not (prompt and a and b):
-        return None
-    chosen, rejected = (a, b) if row.get("labels") == 1 else (b, a)
+    label = row.get("labels")
+    if not (prompt and a and b) or label not in (0, 1):
+        return None                                  # reject malformed / non-binary labels
+    chosen, rejected = (a, b) if label == 1 else (b, a)
     return _pref(prompt, chosen, rejected, "shp")
 
 
@@ -110,13 +111,16 @@ def load_shp_slice(split: str = "train", max_examples: Optional[int] = None) -> 
 def pairs_from_scored(prompt: str, scored: Sequence[Tuple[str, float]],
                       source: str = "onpolicy") -> Optional[dict]:
     """Build a pref from K scored on-policy samples: highest-scored is chosen, lowest is
-    rejected. Returns None if fewer than 2 distinct-scored non-empty candidates. The
-    scorer (a verifier/reward/heuristic) lives in the caller (gen_onpolicy_prefs.py)."""
+    rejected. Returns None for an empty prompt, fewer than 2 non-empty candidates, equal
+    best/worst scores, or identical chosen/rejected text (all degenerate). The scorer (a
+    verifier/reward/heuristic) lives in the caller (gen_onpolicy_prefs.py)."""
+    if not prompt or not prompt.strip():
+        return None
     cands = [(str(resp).strip(), float(s)) for resp, s in scored if str(resp).strip()]
     if len(cands) < 2:
         return None
     best, worst = max(cands, key=lambda c: c[1]), min(cands, key=lambda c: c[1])
-    if best[1] == worst[1]:
+    if best[1] == worst[1] or best[0] == worst[0]:
         return None
     return _pref(prompt, best[0], worst[0], source)
 

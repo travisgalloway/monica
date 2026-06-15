@@ -8,9 +8,9 @@ need no external preference data, only a scorer.
   python scripts/gen_onpolicy_prefs.py --config config/poc.yaml \
       --init runs/sft/weights.safetensors --prompts prompts.txt --out data/dpo_onpolicy.jsonl
 
-The default scorer is a placeholder (length + lexical diversity); plug a real reward model
-or verifier (#78) via --import for production on-policy DPO. MLX-only (uses the backend +
-serving recurrence), like scripts/sft.py / scripts/dpo.py.
+The default scorer is a placeholder (length + lexical diversity); swap in a real reward
+model or verifier (#78) by editing `default_scorer` for production on-policy DPO. MLX-only
+(uses the backend + serving recurrence), like scripts/sft.py / scripts/dpo.py.
 """
 
 from __future__ import annotations
@@ -87,7 +87,8 @@ def main() -> None:
             gen_ids = generate(store, sid, prompt_ids, sampler=sampler, to_numpy=np_to,
                                max_new_tokens=args.max_new_tokens, eos_id=eos)
             store.remove(sid)
-            scored.append((tok.decode(gen_ids), default_scorer(tok.decode(gen_ids))))
+            text = tok.decode(gen_ids)
+            scored.append((text, default_scorer(text)))
         pref = pairs_from_scored(prompt, scored)
         if pref is not None:
             pairs.append(pref)

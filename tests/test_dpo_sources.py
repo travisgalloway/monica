@@ -40,6 +40,9 @@ def test_shp_to_pref_uses_label():
     assert ra["chosen"][0]["content"] == "A" and ra["rejected"][0]["content"] == "B"
     assert rb["chosen"][0]["content"] == "B" and rb["rejected"][0]["content"] == "A"
     assert shp_to_pref({"history": "", "human_ref_A": "A", "human_ref_B": "B"}) is None
+    # non-binary / missing labels are rejected, not silently treated as "prefer B"
+    assert shp_to_pref({"history": "c", "human_ref_A": "A", "human_ref_B": "B"}) is None
+    assert shp_to_pref({"history": "c", "human_ref_A": "A", "human_ref_B": "B", "labels": 2}) is None
 
 
 def test_pairs_from_scored_best_vs_worst():
@@ -50,6 +53,8 @@ def test_pairs_from_scored_best_vs_worst():
     assert pairs_from_scored("p", [("only", 0.5)]) is None
     assert pairs_from_scored("p", [("a", 0.5), ("b", 0.5)]) is None
     assert pairs_from_scored("p", [("", 0.1), ("x", 0.9)]) is None
+    assert pairs_from_scored("  ", [("a", 0.1), ("b", 0.9)]) is None   # empty prompt
+    assert pairs_from_scored("p", [("same", 0.1), ("same", 0.9)]) is None   # identical text
 
 
 def test_prefs_feed_build_dpo_records():
