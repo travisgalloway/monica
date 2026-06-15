@@ -131,6 +131,20 @@ def test_forward_step_parity_toy():
     assert result["ok"], result
 
 
+def test_forward_step_parity_hybrid():
+    # Attention block (RoPE + KV cache) on the torch backend: forward vs step parity.
+    torch.manual_seed(0)
+    cfg = load_config("config/toy-hybrid.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    assert any(type(l).__name__ == "AttentionBlock" for l in model.layers)
+    B, L = 2, 40
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+    with torch.no_grad():
+        result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
+    assert result["ok"], result
+
+
 def test_portable_roundtrip(tmp_path):
     """save -> reload into a fresh instance -> identical logits (the portable bridge)."""
     torch.manual_seed(0)

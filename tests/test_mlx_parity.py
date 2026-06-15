@@ -129,3 +129,17 @@ def test_forward_step_parity_toy():
     tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
     result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
     assert result["ok"], result
+
+
+def test_forward_step_parity_hybrid():
+    # The hybrid model interleaves attention blocks (RoPE + KV cache). forward (full
+    # causal attention) and step (incremental cache) must still agree — the attention
+    # path's train/infer equivalence, alongside the SSM's.
+    mx.random.seed(0)
+    cfg = load_config("config/toy-hybrid.yaml")
+    model = MLXMambaModel(cfg)
+    assert any(type(l).__name__ == "AttentionBlock" for l in model.layers)
+    B, L = 2, 40
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+    result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
+    assert result["ok"], result

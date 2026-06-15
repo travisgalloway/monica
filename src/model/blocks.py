@@ -75,6 +75,17 @@ class MambaConfig:
     # 32GB and swaps). Off for toy/smoke (tiny; keep exact-resume cheap).
     grad_checkpoint: bool = False
 
+    # --- hybrid attention (#67) ---
+    # Make the model a Mamba-2 HYBRID: every Nth block is a causal multi-head
+    # attention block INSTEAD OF a Mamba block (n_layers unchanged). Pure SSMs lag on
+    # exact copying / in-context retrieval; a few attention layers (Jamba pattern ~1
+    # attn per 7 Mamba => attn_every 8) recover it. None = pure Mamba (current default).
+    # Layer i is attention iff `attn_every and (i+1) % attn_every == 0`.
+    attn_every: Optional[int] = None
+    # Heads for the attention blocks. None => d_model // 64 (so attn_head_dim ~= 64).
+    # Must divide d_model. Unused when attn_every is None.
+    n_attn_heads: Optional[int] = None
+
     # --- dt-projection bias init (LOAD-BEARING) ---
     # Inverse-softplus of a sample in [dt_min, dt_max] initializes the dt bias.
     # Without this the model fails to learn recall. Carry these into every backend.
@@ -95,6 +106,29 @@ class MambaConfig:
         if self.dt_rank == "auto":
             return math.ceil(self.d_model / 16)
         return int(self.dt_rank)
+
+    # --- hybrid attention derived params ---
+    @property
+    def n_attn_heads_resolved(self) -> int:
+        if self.n_attn_heads is not None:
+            return int(self.n_attn_heads)
+        return max(1, self.d_model // 64)
+
+    @property
+    def attn_head_dim(self) -> int:
+        """Attention head width. qkv project d_model -> n_attn_heads * attn_head_dim,
+        with attn_head_dim = d_model // n_attn_heads (so d_attn == d_model)."""
+        return self.d_model // self.n_attn_heads_resolved
+
+    def is_attention_layer(self, i: int) -> bool:
+        """True if block `i` (0-indexed) is a causal-attention block, not a Mamba block."""
+        return bool(self.attn_every) and (i + 1) % self.attn_every == 0
+
+    @property
+    def n_attention_layers(self) -> int:
+        if not self.attn_every:
+            return 0
+        return self.n_layers // self.attn_every
 
     def parameter_breakdown(self) -> dict:
         """Closed-form trainable-parameter count, broken out by named term.
@@ -128,11 +162,21 @@ class MambaConfig:
             + d_inner * d_model                      # out_proj
         )
 
+        n_attn = self.n_attention_layers
+        n_mamba = self.n_layers - n_attn
+
         bd = {
             "embedding": self.vocab_size * d_model,
-            "layers": self.n_layers * per_layer,
+            "layers": n_mamba * per_layer,
             "final_norm": d_model,
         }
+        # Hybrid (#67): attention blocks REPLACE that many Mamba blocks. Each is a
+        # pre-norm + bias-free qkv (d_model -> 3*d_attn) + bias-free o_proj
+        # (d_attn -> d_model); d_attn = n_attn_heads * attn_head_dim = d_model.
+        if n_attn:
+            d_attn = self.n_attn_heads_resolved * self.attn_head_dim
+            attn_per_layer = d_model + 3 * d_model * d_attn + d_attn * d_model
+            bd["attention"] = n_attn * attn_per_layer
         # Tied embedding reuses the input matrix as the LM head -> no extra params.
         if not self.tie_embeddings:
             bd["lm_head"] = self.vocab_size * d_model
@@ -159,6 +203,15 @@ class MambaConfig:
                 f"head_dim={self.head_dim} must divide d_inner={self.d_inner} "
                 "(d_inner = expand*d_model)."
             )
+        if self.attn_every is not None:
+            if self.attn_every <= 0:
+                raise ValueError("attn_every must be a positive int or None")
+            nah = self.n_attn_heads_resolved
+            if nah <= 0 or self.d_model % nah != 0:
+                raise ValueError(
+                    f"n_attn_heads={nah} must divide d_model={self.d_model} "
+                    "(attn_head_dim = d_model // n_attn_heads)."
+                )
 
     def to_dict(self) -> dict:
         return asdict(self)

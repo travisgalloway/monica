@@ -294,6 +294,97 @@ class MambaBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Hybrid attention (#67): causal MHA with RoPE, parity-exact forward/step.
+# --------------------------------------------------------------------------- #
+def _rope_cos_sin(positions: Array, head_dim: int) -> Tuple[Array, Array]:
+    """RoPE cos/sin for absolute `positions` (fp32). Computed on the fly (no stored
+    buffer) so nothing extra lands in the parameter tree. Returns (T, head_dim) each."""
+    half = head_dim // 2
+    inv_freq = mx.exp(-math.log(10000.0) * mx.arange(0, half, dtype=mx.float32) / half)
+    ang = positions.astype(mx.float32)[:, None] * inv_freq[None, :]   # (T, half)
+    cos = mx.concatenate([mx.cos(ang), mx.cos(ang)], axis=-1)         # (T, head_dim)
+    sin = mx.concatenate([mx.sin(ang), mx.sin(ang)], axis=-1)
+    return cos, sin
+
+
+def _rotate_half(x: Array) -> Array:
+    half = x.shape[-1] // 2
+    return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+
+
+def _apply_rope(x: Array, cos: Array, sin: Array) -> Array:
+    # x: (B, H, T, Dh); cos/sin: (T, Dh) -> broadcast over (B, H).
+    cos = cos[None, None]
+    sin = sin[None, None]
+    return x * cos + _rotate_half(x) * sin
+
+
+def _softmax_lastdim(scores: Array) -> Array:
+    scores = scores - mx.max(scores, axis=-1, keepdims=True)
+    w = mx.exp(scores)
+    return w / mx.sum(w, axis=-1, keepdims=True)
+
+
+class AttentionBlock(nn.Module):
+    """Pre-norm causal multi-head attention with RoPE (the hybrid's attention layer).
+
+    Drop-in for MambaBlock: same `forward_seq(x)->x` (training) and
+    `step(x, state)->(x, state)` (inference) contract. State is a (k_cache, v_cache)
+    pair, each (B, H, T, Dh), grown one token per `step` — a 2-tuple of arrays, so the
+    model's state plumbing (init/clone) treats it exactly like the Mamba (conv, ssm)
+    pair. Scores/softmax run in fp32 (qkv/o_proj GEMMs in compute dtype) so forward and
+    step agree at the fp32 ~1e-4 parity tolerance."""
+
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.H = config.n_attn_heads_resolved
+        self.Dh = config.attn_head_dim
+        d_attn = self.H * self.Dh
+        self.norm = RMSNorm(config.d_model)
+        self.qkv_proj = nn.Linear(config.d_model, 3 * d_attn, bias=False)
+        self.o_proj = nn.Linear(d_attn, config.d_model, bias=False)
+
+    def _qkv(self, xn: Array, cd):
+        B = xn.shape[0]
+        T = xn.shape[1] if xn.ndim == 3 else 1
+        qkv = _linear(self.qkv_proj, xn, cd)                 # (B,[T,]3*d_attn)
+        q, k, v = mx.split(qkv, 3, axis=-1)
+        def heads(t):                                        # -> (B,H,T,Dh) fp32
+            return _f32(t).reshape(B, T, self.H, self.Dh).transpose(0, 2, 1, 3)
+        return heads(q), heads(k), heads(v)
+
+    def forward_seq(self, x: Array) -> Array:
+        cd = _DTYPES[self.config.precision]
+        L = x.shape[1]
+        xn = self.norm(x)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,L,Dh) fp32
+        cos, sin = _rope_cos_sin(mx.arange(L), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(self.Dh)   # (B,H,L,L)
+        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
+        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        out = _softmax_lastdim(scores) @ v                   # (B,H,L,Dh)
+        out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd)
+
+    def step(self, x: Array, state: State) -> Tuple[Array, State]:
+        cd = _DTYPES[self.config.precision]
+        k_cache, v_cache = state                             # (B,H,T,Dh) each, fp32
+        t = k_cache.shape[2]                                 # absolute position
+        xn = self.norm(x)                                    # x: (B, d_model)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,1,Dh) fp32
+        cos, sin = _rope_cos_sin(mx.arange(t, t + 1), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        k_cache = mx.concatenate([k_cache, k], axis=2)       # (B,H,t+1,Dh)
+        v_cache = mx.concatenate([v_cache, v], axis=2)
+        scores = (q @ k_cache.transpose(0, 1, 3, 2)) / math.sqrt(self.Dh)  # (B,H,1,t+1)
+        out = _softmax_lastdim(scores) @ v_cache             # (B,H,1,Dh)
+        out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (k_cache, v_cache)
+
+
+# --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class MLXMambaModel(ModelInterface, nn.Module):
@@ -303,7 +394,9 @@ class MLXMambaModel(ModelInterface, nn.Module):
         self.config = config
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.layers = [MambaBlock(config) for _ in range(config.n_layers)]
+        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions.
+        self.layers = [AttentionBlock(config) if config.is_attention_layer(i)
+                       else MambaBlock(config) for i in range(config.n_layers)]
         self.norm_f = RMSNorm(config.d_model)
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
@@ -344,9 +437,15 @@ class MLXMambaModel(ModelInterface, nn.Module):
         c = self.config
         di, k = c.d_inner, c.d_conv
         H, P, N = c.n_heads, c.head_dim, c.d_state
-        # Per layer: (conv window (B,k-1,di), SSM state (B,H,P,N)).
-        return [(mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, H, P, N)))
-                for _ in range(self.config.n_layers)]
+        Ha, Dh = c.n_attn_heads_resolved, c.attn_head_dim
+        # Per Mamba layer: (conv window (B,k-1,di), SSM state (B,H,P,N)).
+        # Per attention layer: a zero-length KV cache (k,v), each (B,Ha,0,Dh), grown by step.
+        def layer_state(i):
+            if c.is_attention_layer(i):
+                z = mx.zeros((batch_size, Ha, 0, Dh))
+                return (z, z)
+            return (mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, H, P, N)))
+        return [layer_state(i) for i in range(self.config.n_layers)]
 
     def get_state(self) -> State:
         return self._state

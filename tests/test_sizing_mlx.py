@@ -17,7 +17,7 @@ from src.model.mlx_backend import MLXMambaModel
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
 
-@pytest.mark.parametrize("name", ["toy", "poc"])
+@pytest.mark.parametrize("name", ["toy", "poc", "toy-hybrid"])
 def test_num_parameters_matches_built_model(name):
     cfg = load_config(CONFIG_DIR / f"{name}.yaml")
     model = MLXMambaModel(cfg)

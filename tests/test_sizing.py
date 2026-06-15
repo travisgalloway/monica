@@ -34,6 +34,28 @@ def test_num_parameters_equals_breakdown_sum():
         assert all(v > 0 for v in bd.values())
 
 
+def test_hybrid_breakdown_sums_and_counts_attention():
+    cfg = load_config(CONFIG_DIR / "toy-hybrid.yaml")
+    cfg.validate()
+    bd = cfg.parameter_breakdown()
+    assert "attention" in bd and bd["attention"] > 0
+    assert cfg.num_parameters() == sum(bd.values())
+    assert cfg.n_attention_layers == cfg.n_layers // cfg.attn_every
+    # Attention layers REPLACE Mamba layers: at toy dims a Mamba block is heavier than
+    # an attention block, so the hybrid has fewer params than the all-Mamba twin.
+    pure = MambaConfig(**{**cfg.to_dict(), "attn_every": None})
+    assert cfg.num_parameters() < pure.num_parameters()
+
+
+def test_attention_param_formula():
+    # attn layer = norm(d_model) + qkv(3*d_model*d_attn) + o_proj(d_attn*d_model), d_attn=d_model.
+    cfg = MambaConfig(d_model=64, n_layers=4, head_dim=16, vocab_size=256,
+                      attn_every=2, n_attn_heads=4)
+    d_model, d_attn = 64, 64
+    expect_per = d_model + 3 * d_model * d_attn + d_attn * d_model
+    assert cfg.parameter_breakdown()["attention"] == cfg.n_attention_layers * expect_per
+
+
 def test_untied_adds_lm_head():
     tied = MambaConfig(d_model=64, n_layers=2, head_dim=16, vocab_size=256,
                        tie_embeddings=True)

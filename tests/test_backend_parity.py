@@ -75,6 +75,33 @@ def test_backend_parity_mlx_vs_torch(tmp_path):
 
 @pytest.mark.skipif(not (HAVE_MLX and HAVE_TORCH),
                     reason="needs both mlx and torch (run on a Mac)")
+def test_backend_parity_hybrid(tmp_path):
+    """Hybrid (attention layers present): identical portable weights in both backends ->
+    `forward` agrees in fp32. Proves the attention block ports MLX<->torch, including the
+    qkv_proj/o_proj weights round-tripping through the portable state dict."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.cuda_backend import CUDAMambaModel
+
+    cfg = load_config("config/toy-hybrid.yaml")
+    torch.manual_seed(0)
+    src = CUDAMambaModel(cfg)
+    assert any(type(l).__name__ == "AttentionBlock" for l in src.layers)
+    path = str(tmp_path / "weights.safetensors")
+    src.save(path)
+
+    mlx_m = MLXMambaModel(cfg); mlx_m.load(path)
+    cuda_m = CUDAMambaModel(cfg); cuda_m.load(path)
+
+    tokens = _tokens(cfg, B=2, L=24)
+    with torch.no_grad():
+        result = check_backend_parity(mlx_m, cuda_m, tokens,
+                                      to_numpy_a=_mlx_np, to_numpy_b=_torch_np,
+                                      rtol=1e-4, atol=1e-5)
+    assert result["ok"], result
+
+
+@pytest.mark.skipif(not (HAVE_MLX and HAVE_TORCH),
+                    reason="needs both mlx and torch (run on a Mac)")
 def test_portable_weights_roundtrip_both_directions(tmp_path):
     """MLX save -> torch _load_portable -> torch save -> load back into MLX; the MLX
     logits are unchanged. Proves the cross-backend bridge in both directions (a

@@ -264,6 +264,94 @@ class MambaBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Hybrid attention (#67): causal MHA with RoPE — torch port of the MLX block.
+# --------------------------------------------------------------------------- #
+def _rope_cos_sin(positions: Array, head_dim: int) -> Tuple[Array, Array]:
+    """RoPE cos/sin for absolute `positions` (fp32). Computed on the fly (no buffer),
+    so the parameter set matches MLX exactly. Returns (T, head_dim) each."""
+    half = head_dim // 2
+    device = positions.device
+    inv_freq = torch.exp(-math.log(10000.0)
+                         * torch.arange(0, half, dtype=torch.float32, device=device) / half)
+    ang = positions.to(torch.float32)[:, None] * inv_freq[None, :]    # (T, half)
+    cos = torch.cat([torch.cos(ang), torch.cos(ang)], dim=-1)         # (T, head_dim)
+    sin = torch.cat([torch.sin(ang), torch.sin(ang)], dim=-1)
+    return cos, sin
+
+
+def _rotate_half(x: Array) -> Array:
+    half = x.shape[-1] // 2
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+
+def _apply_rope(x: Array, cos: Array, sin: Array) -> Array:
+    # x: (B, H, T, Dh); cos/sin: (T, Dh) -> broadcast over (B, H).
+    return x * cos[None, None] + _rotate_half(x) * sin[None, None]
+
+
+def _softmax_lastdim(scores: Array) -> Array:
+    scores = scores - torch.amax(scores, dim=-1, keepdim=True)
+    w = torch.exp(scores)
+    return w / torch.sum(w, dim=-1, keepdim=True)
+
+
+class AttentionBlock(nn.Module):
+    """Pre-norm causal multi-head attention with RoPE (mirror of mlx_backend.AttentionBlock).
+
+    Same `forward_seq` / `step` contract and the same submodule names/shapes
+    (`norm`, `qkv_proj`, `o_proj`) so portable weights round-trip MLX<->torch. State is
+    a (k_cache, v_cache) pair, each (B, H, T, Dh), grown one token per `step`."""
+
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.H = config.n_attn_heads_resolved
+        self.Dh = config.attn_head_dim
+        d_attn = self.H * self.Dh
+        self.norm = RMSNorm(config.d_model)
+        self.qkv_proj = nn.Linear(config.d_model, 3 * d_attn, bias=False)
+        self.o_proj = nn.Linear(d_attn, config.d_model, bias=False)
+
+    def _qkv(self, xn: Array, cd):
+        B = xn.shape[0]
+        T = xn.shape[1] if xn.dim() == 3 else 1
+        qkv = _linear(self.qkv_proj, xn, cd)                 # (B,[T,]3*d_attn)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        def heads(t):                                        # -> (B,H,T,Dh) fp32
+            return _f32(t).reshape(B, T, self.H, self.Dh).permute(0, 2, 1, 3)
+        return heads(q), heads(k), heads(v)
+
+    def forward_seq(self, x: Array) -> Array:
+        cd = _DTYPES[self.config.precision]
+        L = x.shape[1]
+        xn = self.norm(x)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,L,Dh) fp32
+        cos, sin = _rope_cos_sin(torch.arange(L, device=x.device), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.Dh)      # (B,H,L,L)
+        causal = torch.tril(torch.ones((L, L), dtype=torch.bool, device=x.device))
+        scores = scores.masked_fill(~causal, float("-inf"))
+        out = _softmax_lastdim(scores) @ v                   # (B,H,L,Dh)
+        out = out.permute(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd)
+
+    def step(self, x: Array, state: State) -> Tuple[Array, State]:
+        cd = _DTYPES[self.config.precision]
+        k_cache, v_cache = state                             # (B,H,T,Dh) each, fp32
+        t = k_cache.shape[2]                                 # absolute position
+        xn = self.norm(x)                                    # x: (B, d_model)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,1,Dh) fp32
+        cos, sin = _rope_cos_sin(torch.arange(t, t + 1, device=x.device), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        k_cache = torch.cat([k_cache, k], dim=2)             # (B,H,t+1,Dh)
+        v_cache = torch.cat([v_cache, v], dim=2)
+        scores = (q @ k_cache.transpose(-1, -2)) / math.sqrt(self.Dh)   # (B,H,1,t+1)
+        out = _softmax_lastdim(scores) @ v_cache             # (B,H,1,Dh)
+        out = out.permute(0, 2, 1, 3).reshape(x.shape[0], self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (k_cache, v_cache)
+
+
+# --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class CUDAMambaModel(ModelInterface, nn.Module):
@@ -274,7 +362,10 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self._device = torch.device(device)
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.layers = nn.ModuleList([MambaBlock(config) for _ in range(config.n_layers)])
+        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions.
+        self.layers = nn.ModuleList(
+            [AttentionBlock(config) if config.is_attention_layer(i) else MambaBlock(config)
+             for i in range(config.n_layers)])
         self.norm_f = RMSNorm(config.d_model)
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
@@ -319,11 +410,17 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         c = self.config
         di, k = c.d_inner, c.d_conv
         H, P, N = c.n_heads, c.head_dim, c.d_state
+        Ha, Dh = c.n_attn_heads_resolved, c.attn_head_dim
         dev = self._device
-        # Per layer: (conv window (B,k-1,di), SSM state (B,H,P,N)). fp32 to match the scan.
-        return [(torch.zeros((batch_size, k - 1, di), device=dev),
-                 torch.zeros((batch_size, H, P, N), device=dev))
-                for _ in range(self.config.n_layers)]
+        # Per Mamba layer: (conv window (B,k-1,di), SSM state (B,H,P,N)), fp32.
+        # Per attention layer: a zero-length KV cache (k,v), each (B,Ha,0,Dh), grown by step.
+        def layer_state(i):
+            if c.is_attention_layer(i):
+                z = torch.zeros((batch_size, Ha, 0, Dh), device=dev)
+                return (z, z)
+            return (torch.zeros((batch_size, k - 1, di), device=dev),
+                    torch.zeros((batch_size, H, P, N), device=dev))
+        return [layer_state(i) for i in range(self.config.n_layers)]
 
     def get_state(self) -> State:
         return self._state
