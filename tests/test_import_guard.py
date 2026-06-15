@@ -49,6 +49,7 @@ PORTABLE_MODULES = [
     "src.data.sft_sources",
     "src.data.dpo_data",
     "src.data.dpo_loader",
+    "src.data.dpo_sources",
     "src.train.dpo_math",
     "src.train.schedule",
     "src.train.checkpoint",
