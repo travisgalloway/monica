@@ -29,23 +29,33 @@ Every claim here is sourced from a docstring or config comment in the code, with
    gate, and val perplexity as the success metric.
 7. [Configs & locked decisions](07-configs-and-decisions.md) — `toy.yaml` /
    `poc.yaml` in full, plus the precision benchmark and sizing math.
-8. [Corpus pipeline](08-corpus-pipeline.md) — the scale-up data flow: `datatrove`
-   stages, the common schema, R2 storage layout, RunPod topology, and clean-license
-   post-training (SFT/DPO/RLVR).
-9. [Hybrid architectures](09-hybrid-architectures.md) — why the scale-up model is a
-   Mamba-2 hybrid (config-gated attention), and the 100M/1B/2B/4B sizing.
+8. [Corpus pipeline](08-corpus-pipeline.md) — the clean-license data flow: `datatrove`
+   stages, the common schema, R2 storage layout, RunPod topology. Now the **teacher
+   corpus + production-reserve** path (its uint16/StarCoder2 from-scratch framing is
+   superseded by the distillation pivot — see 10).
+9. [Hybrid architectures](09-hybrid-architectures.md) — why the model is a Mamba-2
+   hybrid (config-gated attention) and how it sizes.
+10. [Distillation (teacher → hybrid student)](10-distillation.md) — the **distillation-first
+    pivot**: distil a compact (~1–1.5B) hybrid from a frozen DeepSeek-R1-Distill-Qwen-1.5B
+    teacher (Qwen2.5 tokenizer → uint32 packing, #90), precompute teacher artifacts once,
+    sweep student layouts cheaply (#98).
+11. [Post-training](11-post-training.md) — instruct SFT → reasoning-trace SFT → optional
+    tool-use → GRPO, the Qwen `<|im_end|>` chat-template invariant, shared with production.
 
-> Topics 8–9 are the **scale-up** design record (the datatrove + RunPod + R2 program,
-> [issue #65](https://github.com/travisgalloway/monica/issues/65)) — forward-looking
-> decisions, not yet implemented, unlike the verified POC in topics 1–7.
+> Topics 8–11 are the **scale-up / distillation** design record (epic
+> [#65](https://github.com/travisgalloway/monica/issues/65)) — forward-looking decisions,
+> partly implemented (the corpus stages, hybrid attention, post-training machinery, and the
+> #90 uint32 packing exist; the distillation pipeline #92–#104 is pending), unlike the fully
+> verified POC in topics 1–7. The current plan is **distillation-first** (10/11); the
+> from-scratch pretraining in 08 is deferred to a production reserve (#75).
 
 ## Locked decisions at a glance
 
 | Decision | Choice | Why | Source |
 |---|---|---|---|
 | Hardware isolation | one seam (`ModelInterface`) | clean MLX→CUDA migration | `src/model/interface.py` |
-| Token storage | uint16 packing | compact; vocab must be < 65536 | `src/data/pack.py` |
-| Tokenizer | `allenai/OLMo-7B-hf` (vocab 50280) | fits uint16; matches AI2 for comparison | `src/data/tokenize.py` |
+| Token storage | uint16/uint32 packing (per vocab, #90) | uint16 when vocab < 65536 (POC), uint32 for Qwen2.5 (151,646) | `src/data/pack.py` |
+| Tokenizer (POC) | `allenai/OLMo-7B-hf` (vocab 50280) | fits uint16; matches AI2 for comparison | `src/data/tokenize.py` |
 | Embedding | tied (input = output) | ~38M of ~100M budget at POC scale | `config/poc.yaml` |
 | dt-bias init | inverse-softplus, log-uniform (per head) | **load-bearing** — model can't learn recall without it | `src/model/mlx_backend.py` |
 | Selective SSM | Mamba-2 / SSD, scalar A per head | matmul scan; ~62× faster than diagonal-A at poc scale | `src/model/mlx_backend.py` |
@@ -57,6 +67,8 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Checkpoints | portable weights + separate resume bundle | weights port across backends; optimizer state doesn't need to | `src/train/checkpoint.py` |
 | Success metric | held-out val perplexity (Tier-1) | a smoothly decreasing curve *is* the POC goal | `src/eval/val_loss.py` |
 | OLMES / lm-eval | deferred (Tier-2) | its own milestone-sized task; not needed for the POC | `src/eval/olmes_adapter.py` |
-| Scale-up data framework | `datatrove` + R2 + RunPod | one framework, durable re-mixable shards, zero-egress storage | `docs/design/08-corpus-pipeline.md` |
-| Scale-up tokenizer | StarCoder2 (vocab ~49k) | mixed prose+code; fits uint16 (Llama-3 ~128k does not) | `docs/design/08-corpus-pipeline.md` |
-| Scale-up model family | Mamba-2 hybrid, 100M/1B/2B/4B | attention layers close the SSM retrieval gap; no-KV-cache sizing | `docs/design/09-hybrid-architectures.md` |
+| Build method | **distillation** from a frozen teacher (not pretrain) | reaches capability at <1% of from-scratch tokens; cheap layout sweep | `docs/design/10-distillation.md` |
+| Scale-up tokenizer | **Qwen2.5** (vocab 151,646) | fixed by the conversion teacher for logit/hidden matching; uint32 packing (#90). POC stays OLMo. StarCoder2 (the old uint16 pick) superseded. | `docs/design/10-distillation.md` |
+| Conversion teacher | DeepSeek-R1-Distill-Qwen-1.5B (MIT) | reasoning-ready, Qwen tokenizer, ~student size | `docs/design/10-distillation.md` |
+| Scale-up model | compact ~1–1.5B Mamba-2 hybrid reasoning student | attention layers close the SSM retrieval gap; no-KV-cache local inference | `docs/design/10-distillation.md` |
+| Data framework | `datatrove` + R2 + RunPod | builds the teacher corpus + production-reserve from-scratch data (#75) | `docs/design/08-corpus-pipeline.md` |

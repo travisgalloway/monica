@@ -69,8 +69,9 @@ Adam** — the VRAM-tight lever used in Phase 5 (#75).
 (see [configs & decisions](07-configs-and-decisions.md)). The scale configs train on **CUDA**,
 where **bf16 is native** and needs no loss scaling — so `config/{1b,2b,4b}.yaml` set
 `precision: bf16` (`scaler_for_precision` already returns `None` for bf16). `tie_embeddings`
-and `grad_checkpoint` stay on; vocab follows the chosen tokenizer (must stay < 65536 — see
-[corpus pipeline](08-corpus-pipeline.md)).
+and `grad_checkpoint` stay on; vocab follows the chosen tokenizer and sets the packed dtype —
+uint16 below 65536 (POC), uint32 for Qwen2.5 (the distillation student, #90; see
+[distillation](10-distillation.md)).
 
 ## Verifying the attention fraction
 

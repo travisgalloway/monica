@@ -8,6 +8,11 @@ ingest -> normalize -> filter -> write Parquet shards. At scale (#80) the same s
 runs on HF `datatrove` with the writer pointed at R2 via `s3fs` — the `out_uri` seam
 below (an fsspec URI) is exactly where that swap happens: `file://` now, `s3://` later.
 
+Under the distillation-first plan (docs/design/10-distillation.md) this corpus builds the
+**teacher corpus + the production-reserve from-scratch data (#75)**, not the distillation
+student's training data — the student consumes pre-tokenized Qwen2.5 artifacts + teacher
+top-k logits (#92/#94), which are precomputed once, not re-derived through these stages.
+
 ABOVE THE SEAM — no `mlx`/`torch`. Heavy data deps (pyarrow, fsspec) are imported
 LAZILY inside the IO functions, mirroring download.py/tokenize.py, so importing this
 module stays cheap and the seam guard (tests/test_import_guard.py) needs nothing extra.

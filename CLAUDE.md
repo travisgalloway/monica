@@ -65,12 +65,15 @@ Consequences of the seam that shape how code is written:
 
 Model dims and run params live in `config/toy.yaml` and `config/poc.yaml`, loaded into
 `MambaConfig` (`src/model/blocks.py`). `MambaConfig.validate()` enforces cross-cutting
-invariants (notably `vocab_size < 65536` for uint16 token packing). The YAML **comments
-are the decision record** — read them before changing values. Key locked decisions:
+invariants; **token packing is dtype-aware (#90)** — `vocab < 65536` packs as **uint16**
+(the original POC: OLMo-7B-hf), at/above it packs as **uint32** (the distillation student:
+Qwen2.5, vocab 151,646 — see `config/student-1b.yaml` and `docs/design/10-distillation.md`).
+The ceiling `validate()` enforces is now uint32 (`2**32`). The YAML **comments are the
+decision record** — read them before changing values. Key locked decisions:
 
 - **toy.yaml** (smoke/correctness): tiny, `fp32` for bit-exact fixed-seed resume,
   `vocab_size 256` (byte-fallback tokenizer, offline).
-- **poc.yaml** (~100M scale run): `vocab_size 50280` (OLMo-7B-hf, confirmed `<65536`),
+- **poc.yaml** (~100M scale run): `vocab_size 50280` (OLMo-7B-hf, confirmed `<65536`, uint16),
   `precision fp16` + (dynamic) loss scaling (~18% faster than bf16 on Metal per the M1
   micro-benchmark — **do not assume bf16**), tied embedding **mandatory** (~38M of
   ~100M params), `grad_checkpoint: true` (required at this depth — see below).
