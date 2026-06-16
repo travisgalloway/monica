@@ -14,7 +14,7 @@ from typing import Tuple
 
 import numpy as np
 
-from .pack import open_packed, DTYPE
+from .pack import open_packed, packed_dtype
 
 
 def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
@@ -26,6 +26,7 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     data = open_packed(packed_path)
+    dtype = packed_dtype(packed_path)          # uint16 (POC) / uint32 (Qwen2.5) — preserved
     n = data.shape[0]
     if val_tokens >= n:
         raise ValueError(f"val_tokens={val_tokens} >= total tokens={n}")
@@ -36,11 +37,11 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
         val, train = data[:val_tokens], data[val_tokens:]
 
     train_path, val_path = out_dir / "train.bin", out_dir / "val.bin"
-    np.asarray(train, dtype=DTYPE).tofile(train_path)
-    np.asarray(val, dtype=DTYPE).tofile(val_path)
+    np.asarray(train, dtype=dtype).tofile(train_path)
+    np.asarray(val, dtype=dtype).tofile(val_path)
     for p, a in ((train_path, train), (val_path, val)):
         with open(p.with_suffix(".meta.json"), "w") as f:
-            json.dump({"dtype": "uint16", "n_tokens": int(a.shape[0])}, f)
+            json.dump({"dtype": dtype.name, "n_tokens": int(a.shape[0])}, f)
     return train_path, val_path
 
 

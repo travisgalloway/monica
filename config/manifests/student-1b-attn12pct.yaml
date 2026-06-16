@@ -1,0 +1,20 @@
+# Student sweep manifest (#98) — one architecture trial against the FROZEN teacher signal.
+# A sweep is a set of sibling manifests (this + student-1b-attn8pct.yaml ...) pointing at the
+# SAME teacher_outputs/corpus; only `layout` changes. Changing layout invalidates nothing
+# upstream (docs/design/10-distillation.md). Resolves to a student config via the harness (#98).
+student: 1b-attn12pct
+conversion_teacher: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B   # #91/#93
+tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90)
+seq_len: 8192
+layout:
+  d_model: 2048
+  n_layers: 48
+  attention_every: 8             # ~12.5% attention
+  state_size: 128                # -> MambaConfig.d_state
+init: mamba-in-the-llama         # or: mohawk  (#99)
+stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # tool-sft optional
+corpus: poc-distill/corpus/tokenized/qwen25-8k        # #92
+teacher_outputs: poc-distill/teacher-outputs/topk-logits   # #94
+sft: shared/sft/tokenized/qwen25-8k                   # #95/#96/#102
+rl: shared/rl                                          # #103
+schedule: { lr: 3.0e-4, warmup: 0.02, batch_tokens: 1_000_000 }
