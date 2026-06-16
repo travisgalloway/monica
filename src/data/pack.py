@@ -35,7 +35,11 @@ def packing_dtype_for(vocab_or_max_id: int) -> np.dtype:
 
 def typecode_for(dtype) -> str:
     """`array` module typecode for a packed dtype ('H' uint16 / 'I' uint32)."""
-    return _TYPECODE[np.dtype(dtype)]
+    try:
+        return _TYPECODE[np.dtype(dtype)]
+    except KeyError:
+        raise ValueError(
+            f"unsupported packing dtype {np.dtype(dtype).name}; use uint16 or uint32")
 
 
 def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
@@ -51,6 +55,9 @@ def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
     hi = int(np.iinfo(dtype).max)
 
     if isinstance(ids, np.ndarray):
+        if not np.issubdtype(ids.dtype, np.integer):
+            raise ValueError(f"ids array must have an integer dtype, got {ids.dtype} "
+                             "(float ids would silently truncate/wrap on cast)")
         if ids.size and (int(ids.min()) < 0 or int(ids.max()) > hi):
             raise ValueError(f"token id out of range for {dtype.name} [0, {hi}]")
         arr = ids.astype(dtype, copy=False)

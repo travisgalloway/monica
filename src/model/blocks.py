@@ -194,10 +194,10 @@ class MambaConfig:
         return "uint16" if self.vocab_size < 65536 else "uint32"
 
     def validate(self) -> None:
-        if self.vocab_size >= (1 << 32):
+        if self.vocab_size > (1 << 32):     # max id = vocab_size-1 must fit uint32 (2**32-1)
             raise ValueError(
-                f"vocab_size={self.vocab_size} exceeds the uint32 packing ceiling (2**32). "
-                "Token ids would not fit the packed token files."
+                f"vocab_size={self.vocab_size} exceeds the uint32 packing capacity "
+                "(max 2**32 token ids). Token ids would not fit the packed token files."
             )
         if self.precision not in ("fp32", "fp16", "bf16"):
             raise ValueError(f"unknown precision {self.precision!r}")

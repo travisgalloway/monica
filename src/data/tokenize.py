@@ -43,9 +43,9 @@ def _load_hf_tokenizer(candidates, model_id, label, max_vocab: int = _MAX_PACKAB
     for mid in ids:
         try:
             tok = AutoTokenizer.from_pretrained(mid)
-            if tok.vocab_size >= max_vocab:
+            if tok.vocab_size > max_vocab:   # max id = vocab-1 must fit (uint32: 2**32-1)
                 raise ValueError(f"{mid} vocab {tok.vocab_size} too large to pack "
-                                 f"(>= {max_vocab})")
+                                 f"(> {max_vocab})")
             return tok
         except Exception as e:  # pragma: no cover - network/availability dependent
             last_err = e

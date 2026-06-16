@@ -3,9 +3,8 @@
 # layer placement, and state size are the FREE variables (see docs/design/10-distillation.md).
 # Distilled from DeepSeek-R1-Distill-Qwen-1.5B (#91/#93), NOT pretrained from scratch.
 #
-# NOTE: vocab_size 151646 (Qwen2.5) exceeds the uint16 ceiling, so MambaConfig.validate()
-# REJECTS this config until #90 (uint32 packing + ceiling relaxation) lands. Land this file
-# WITH #90, or treat the validate() error as the expected Phase-0 gate, not a failure.
+# NOTE: vocab_size 151646 (Qwen2.5) exceeds the uint16 ceiling; it packs as uint32 and
+# MambaConfig.validate() accepts it now that #90 (dtype-aware packing) has landed.
 d_model: 2048          # d_inner = expand*d_model = 4096
 n_layers: 48           # ~1 attn per 8 -> 6 attention layers (~12.5%); swept by #98
 d_state: 128           # SSM state size N (Mamba-2 runs wider than Mamba-1's 16) — swept variable

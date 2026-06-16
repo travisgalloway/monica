@@ -22,6 +22,13 @@ def test_packing_dtype_for():
     assert packing_dtype_for(65536) == np.dtype(np.uint32)      # at the ceiling -> uint32
     assert packing_dtype_for(151646) == np.dtype(np.uint32)     # Qwen2.5
     assert typecode_for(np.uint16) == "H" and typecode_for(np.uint32) == "I"
+    with pytest.raises(ValueError):
+        typecode_for(np.int64)                                  # clear error, not KeyError
+
+
+def test_pack_ids_rejects_float_array(tmp_path):
+    with pytest.raises(ValueError):
+        pack_ids(np.array([0.0, 1.0, 2.0]), tmp_path / "f.bin")   # float ids would truncate
 
 
 # --- pack_ids round-trips ------------------------------------------------------------
@@ -97,8 +104,9 @@ def test_mambaconfig_packing_dtype_and_validate():
     big = MambaConfig(vocab_size=151646, **base)
     assert big.packing_dtype == "uint32"
     big.validate()                                              # no longer raises (#90)
+    MambaConfig(vocab_size=1 << 32, **base).validate()         # max id 2**32-1 still fits
     with pytest.raises(ValueError):
-        MambaConfig(vocab_size=1 << 32, **base).validate()     # above the uint32 ceiling
+        MambaConfig(vocab_size=(1 << 32) + 1, **base).validate()   # over the uint32 capacity
 
 
 def test_student_1b_config_validates():
