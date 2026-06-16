@@ -63,6 +63,7 @@ PORTABLE_MODULES = [
     "src.eval.probes",
     "src.conformance.forward_step_parity",
     "src.conformance.backend_parity",
+    "src.conformance.doc_boundary_parity",
     "src.serve.sessions",
     "src.serve.rewind",
     "src.serve.sampling",

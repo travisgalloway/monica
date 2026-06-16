@@ -32,14 +32,21 @@ DTYPE = np.uint16
 
 
 def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int = 8192,
-                   shard_size_mb: int = 512, prefix: str = "part",
-                   tokenizer: str = "") -> dict:
+                   shard_size_mb: int = 512, prefix: str = "part", tokenizer: str = "",
+                   chunk_align: int | None = None, pad_id: int = 0) -> dict:
     """Pack per-document token lists into fixed `seq_len` sequences across few large shards,
     writing token `.bin` + doc-boundary `.bounds` sidecars + a `manifest.json`. The final
     partial sequence (< seq_len) is dropped. Returns the manifest dict.
 
     `token_docs` yields one id list per document (see `tokenize.tokenize_docs`); each doc's
-    first token is flagged 1 in `.bounds`, the rest 0."""
+    first token is flagged 1 in `.bounds`, the rest 0.
+
+    `chunk_align` (set it to the model's `chunk_size`) pads each document up to a multiple of
+    that length with `pad_id`, so every document **starts on a chunk boundary** — the
+    requirement for the SSM's packing-aware boundary reset (#68). `seq_len` should be a
+    multiple of `chunk_align`."""
+    if chunk_align is not None and seq_len % chunk_align:
+        raise ValueError(f"seq_len {seq_len} must be a multiple of chunk_align {chunk_align}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,6 +80,10 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
         ids = list(doc)
         if not ids:
             continue
+        if chunk_align is not None:               # pad doc so the NEXT doc is chunk-aligned
+            rem = len(ids) % chunk_align
+            if rem:
+                ids = ids + [pad_id] * (chunk_align - rem)
         tok_buf.extend(ids)                       # OverflowError if any id not in [0, 65535]
         bnd_buf.append(1)
         bnd_buf.extend(b"\x00" * (len(ids) - 1))
@@ -105,6 +116,14 @@ def read_manifest(out_dir) -> dict:
 def doc_start_offsets(bounds: Sequence[int]) -> List[int]:
     """Global token offsets where a document begins (where bounds == 1)."""
     return [int(i) for i in np.nonzero(np.asarray(bounds))[0]]
+
+
+def segment_ids(bounds: Sequence[int]) -> np.ndarray:
+    """Per-position document id from the doc-start `.bounds` flags: `cumsum(bounds) - 1`.
+
+    This is the `seg_ids` the boundary-aware forward (#68) consumes — feed a sequence's
+    slice of it alongside the tokens so SSM/attention state resets at each document."""
+    return np.cumsum(np.asarray(bounds, dtype=np.int64)) - 1
 
 
 def main() -> None:

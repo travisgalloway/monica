@@ -390,7 +390,13 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         return layer.forward_seq(h)
 
     # --- ModelInterface ---
-    def forward(self, token_batch: Array) -> Array:
+    def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
+        if seg_ids is not None:
+            # Packing-aware document boundaries (#68) are MLX-only for now; the CUDA scan
+            # would need the same inter-chunk mask. Deferred with the rest of this backend.
+            raise NotImplementedError(
+                "seg_ids (packing-aware doc boundaries, #68) is not implemented on the "
+                "CUDA backend yet — run packed-boundary training on MLX.")
         ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
         h = _cast(self.embedding(ids), self._cd)     # activation stream in cd
         for layer in self.layers:
