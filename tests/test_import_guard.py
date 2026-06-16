@@ -33,6 +33,7 @@ PORTABLE_MODULES = [
     "src.model.interface",
     "src.model.blocks",
     "src.model.backend",
+    "src.model.teacher",
     "src.model.sizing",
     "src.data.loader",
     "src.data.corpus",
