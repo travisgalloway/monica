@@ -72,6 +72,12 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 
 ## Tokenize + shard (Phase 3, #74)
 
+> **Superseded by the distillation pivot ([10](10-distillation.md)).** The tokenizer is now
+> **fixed to Qwen2.5 (vocab 151,646)** by the conversion teacher — it intentionally *exceeds*
+> the uint16 bound, so packing is **uint32** (#90, now implemented: dtype-aware `pack.py` +
+> relaxed `MambaConfig.validate()`). The StarCoder2/uint16 reasoning below is the historical
+> record of the from-scratch plan (still used for the #75 production-reserve corpus).
+
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
   (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`
   (see [data pipeline](04-data-pipeline.md)). **StarCoder2** (vocab ~49,152) **fits**;
@@ -89,7 +95,7 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 ```
 r2://<bucket>/
   cleaned/   <source>/*.parquet   # Stage-4/5 output: durable, re-mixable text shards
-  tokens/    <tokenizer>/<seqlen>/*.bin   # Stage-6 output: training shards (uint16, vocab<65k)
+  tokens/    <tokenizer>/<seqlen>/*.bin   # Stage-6 output: training shards (uint16, or uint32 for Qwen2.5)
   ckpt/      <run>/...            # checkpoints synced from RunPod (RunPod is not durable)
 ```
 
