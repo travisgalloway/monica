@@ -66,6 +66,28 @@ HF repo id) and builds a tiny **synthetic** teacher via `from_config` for offlin
 local checks. Build one through `get_backend(...).make_teacher(...)`; the CUDA teacher is deferred
 (the branch raises `NotImplementedError`).
 
+### Student init from the teacher (#99)
+
+A trial is a **manifest** (`config/manifests/*.yaml`); `src/train/distill_manifest.py` parses it
+(portable, above the seam): `init:` resolves to an `InitMethod`, `stages:` is validated against
+the canonical list (the distill stages `mixing-match → hidden-align → logit-distill` plus the
+post-training ones), and `manifest_to_config` resolves the `layout` sweep-schema
+(`d_model`, `n_layers`, `attention_every → attn_every`, `state_size → d_state`) + `tokenizer →
+vocab_size` onto a `MambaConfig`.
+
+`get_backend(...).init_student(student, teacher, method)`
+(`src/model/mlx_student_init.py`) then performs the conversion. **Mamba-in-the-Llama** maps the
+teacher attention onto the student SSM — **Q → C**, **K → B** (the two `d_state` slices of the SSM
+`x_proj`), **V → input** (`in_proj` main half), **O → output** (`out_proj`) — copies the kept
+attention layers from the teacher and **freezes** them (the student has no MLP blocks, so the
+retained attention plays the role the paper's frozen MLPs do; the trainable set is the new Mamba
+layers). **MOHAWK** is a lighter init (copy attention, leave Mamba at default, freeze nothing);
+the matching happens in the staged distill loss (#100). Because teacher and student widths differ,
+the mapping is **adaptive** (exact copy where dims align, else copy-overlap + zero-pad/truncate);
+init quality is judged by the downstream distillation curve, not by exactness. Freezing uses MLX's
+native `nn.Module.freeze`, which `nn.value_and_grad` already honors, so the train step is
+unchanged. The CUDA initializer is deferred.
+
 ## The tokenizer is fixed by the conversion teacher (#90, #91)
 
 The student must **share a vocabulary with the conversion teacher** for logit and hidden-state
