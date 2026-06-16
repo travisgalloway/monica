@@ -45,8 +45,14 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     that length with `pad_id`, so every document **starts on a chunk boundary** — the
     requirement for the SSM's packing-aware boundary reset (#68). `seq_len` should be a
     multiple of `chunk_align`."""
-    if chunk_align is not None and seq_len % chunk_align:
-        raise ValueError(f"seq_len {seq_len} must be a multiple of chunk_align {chunk_align}")
+    if chunk_align is not None:
+        if chunk_align <= 0:
+            raise ValueError(f"chunk_align must be positive, got {chunk_align}")
+        if seq_len % chunk_align:
+            raise ValueError(
+                f"seq_len {seq_len} must be a multiple of chunk_align {chunk_align}")
+    if not 0 <= pad_id < 65536:
+        raise ValueError(f"pad_id {pad_id} out of uint16 range [0, 65535]")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

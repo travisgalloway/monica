@@ -310,6 +310,8 @@ class MambaBlock(nn.Module):
             wk = w[:, k, 0]                          # (d_inner,)
             if shift == 0:
                 xs = x
+            elif shift >= L:
+                continue                            # tap reaches entirely before the start
             else:
                 xs = mx.pad(x[:, :L - shift], [(0, 0), (shift, 0), (0, 0)])   # x[t-shift]
                 same = seg[:, shift:] == seg[:, :-shift]                       # (B, L-shift)
@@ -317,6 +319,8 @@ class MambaBlock(nn.Module):
                 xs = xs * valid[..., None]
             term = xs * wk
             acc = term if acc is None else acc + term
+        if acc is None:                             # K > L: all taps reach before the start
+            acc = mx.zeros((B_, L, x.shape[-1]), dtype=cd)
         return acc + c.bias.astype(cd)
 
     def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:

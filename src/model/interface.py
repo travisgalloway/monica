@@ -40,9 +40,10 @@ class ModelInterface(ABC):
         packing-aware training (#68): positions in different documents never interact, so
         recurrent SSM state and attention can't bleed across packed document boundaries.
         `None` (the default) is the original single-segment behavior. Document boundaries
-        must be **chunk-aligned** (each document starts at a multiple of `chunk_size`) — the
-        packer (`src/data/shard.py`) enforces this; `src/conformance/doc_boundary_parity.py`
-        verifies a packed multi-doc forward equals the per-document forwards.
+        must be **chunk-aligned** (each document starts at a multiple of `chunk_size`) —
+        `src/data/shard.py::pack_sequences` enforces this when packing with `chunk_align`
+        set; `src/conformance/doc_boundary_parity.py` verifies a packed multi-doc forward
+        equals the per-document forwards.
         """
 
     # --- inference path ---

@@ -74,6 +74,13 @@ def test_chunk_align_requires_divisible_seq_len(tmp_path):
         pack_sequences([[1, 2]], tmp_path, seq_len=6, chunk_align=4)   # 6 % 4 != 0
 
 
+def test_pack_sequences_validates_inputs(tmp_path):
+    with pytest.raises(ValueError):
+        pack_sequences([[1, 2]], tmp_path, seq_len=4, chunk_align=0)   # not ZeroDivisionError
+    with pytest.raises(ValueError):
+        pack_sequences([[1, 2]], tmp_path, seq_len=4, pad_id=70000)    # out of uint16 range
+
+
 def test_manifest_persisted(tmp_path):
     pack_sequences([[1, 2, 3, 4]], tmp_path, seq_len=2, tokenizer="starcoder2")
     m = read_manifest(tmp_path)
