@@ -77,7 +77,7 @@ def test_known_poc_count():
 def test_family_config_valid_and_on_target(name, target):
     cfg = _cfg(name)
     cfg.validate()                                   # raises on any invariant break
-    assert cfg.vocab_size < 65536
+    assert cfg.packing_dtype == "uint16"             # the POC family is uint16-packable
     assert cfg.d_inner % cfg.head_dim == 0
     dev = abs(cfg.num_parameters() - target) / target
     assert dev <= 0.05, f"{name}: {cfg.num_parameters()/1e6:.1f}M is {dev:.1%} off {target/1e6:.0f}M"

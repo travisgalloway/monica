@@ -7,13 +7,13 @@ to low-GB) to keep R2 Class-A op counts down. Alongside each token shard we writ
 #68 can **reset the SSM state at boundaries** instead of letting recurrent state bleed
 across packed docs.
 
-ABOVE THE SEAM — numpy + stdlib only. Token shards are the same flat uint16 format as
-``pack.py`` (so the existing ``PackedLoader`` reads them unchanged); the `.bounds` sidecar
-is the new, optional artifact a boundary-aware loader consumes. The storage URI is an
-fsspec seam (`file://` now, `s3://` at #80) — same code path.
+ABOVE THE SEAM — numpy + stdlib only. Token shards are the same flat format as ``pack.py``
+(uint16 for the POC vocab, uint32 for the Qwen2.5 distillation vocab, #90 — the dtype is
+recorded in the manifest, so ``PackedLoader``/``open_shard`` read them back correctly); the
+`.bounds` sidecar is the new artifact a boundary-aware loader consumes.
 
 Layout per output dir:
-    part-00000.bin     uint16 tokens, length = n_sequences * seq_len
+    part-00000.bin     uint16/uint32 tokens, length = n_sequences * seq_len
     part-00000.bounds  uint8 doc-start flags, same length
     manifest.json      {seq_len, dtype, tokenizer, shards:[{name,n_sequences,n_tokens}], ...}
 """
@@ -28,12 +28,12 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-DTYPE = np.uint16
+from .pack import DTYPE, typecode_for
 
 
 def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int = 8192,
                    shard_size_mb: int = 512, prefix: str = "part", tokenizer: str = "",
-                   chunk_align: int | None = None, pad_id: int = 0) -> dict:
+                   chunk_align: int | None = None, pad_id: int = 0, dtype=DTYPE) -> dict:
     """Pack per-document token lists into fixed `seq_len` sequences across few large shards,
     writing token `.bin` + doc-boundary `.bounds` sidecars + a `manifest.json`. The final
     partial sequence (< seq_len) is dropped. Returns the manifest dict.
@@ -44,30 +44,36 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     `chunk_align` (set it to the model's `chunk_size`) pads each document up to a multiple of
     that length with `pad_id`, so every document **starts on a chunk boundary** — the
     requirement for the SSM's packing-aware boundary reset (#68). `seq_len` should be a
-    multiple of `chunk_align`."""
+    multiple of `chunk_align`.
+
+    `dtype` is the packed token dtype: uint16 (POC default) or uint32 (Qwen2.5 vocab, #90).
+    The shards are the same flat format as `pack.py`; the manifest records the dtype."""
+    dtype = np.dtype(dtype)
+    hi = int(np.iinfo(dtype).max)
     if chunk_align is not None:
         if chunk_align <= 0:
             raise ValueError(f"chunk_align must be positive, got {chunk_align}")
         if seq_len % chunk_align:
             raise ValueError(
                 f"seq_len {seq_len} must be a multiple of chunk_align {chunk_align}")
-    if not 0 <= pad_id < 65536:
-        raise ValueError(f"pad_id {pad_id} out of uint16 range [0, 65535]")
+    if not 0 <= pad_id <= hi:
+        raise ValueError(f"pad_id {pad_id} out of {dtype.name} range [0, {hi}]")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Shard budget rounded down to a whole number of sequences (>= 1 sequence).
-    budget = max(seq_len, (shard_size_mb * (1 << 20)) // 2)   # 2 bytes/token (uint16)
+    bytes_per_token = dtype.itemsize
+    budget = max(seq_len, (shard_size_mb * (1 << 20)) // bytes_per_token)
     budget -= budget % seq_len
 
-    tok_buf = array("H")          # uint16 — raises OverflowError on out-of-range ids
+    tok_buf = array(typecode_for(dtype))   # uint16 'H' / uint32 'I' — overflow-checked
     bnd_buf = bytearray()
     shards: List[dict] = []
     state = {"idx": 0, "docs": 0, "seqs": 0, "tokens": 0}
 
     def emit(n_tokens: int) -> None:
         name = f"{prefix}-{state['idx']:05d}"
-        toks = np.frombuffer(tok_buf, dtype=DTYPE, count=n_tokens)
+        toks = np.frombuffer(tok_buf, dtype=dtype, count=n_tokens)
         toks.tofile(out_dir / f"{name}.bin")
         del toks   # release the exported buffer before resizing tok_buf below
         (out_dir / f"{name}.bounds").write_bytes(bytes(bnd_buf[:n_tokens]))
@@ -90,7 +96,7 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
             rem = len(ids) % chunk_align
             if rem:
                 ids = ids + [pad_id] * (chunk_align - rem)
-        tok_buf.extend(ids)                       # OverflowError if any id not in [0, 65535]
+        tok_buf.extend(ids)                       # OverflowError if any id exceeds the dtype
         bnd_buf.append(1)
         bnd_buf.extend(b"\x00" * (len(ids) - 1))
         while len(tok_buf) >= budget:
@@ -100,7 +106,7 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     if full:
         emit(full)
 
-    manifest = {"seq_len": seq_len, "dtype": "uint16", "tokenizer": tokenizer,
+    manifest = {"seq_len": seq_len, "dtype": dtype.name, "tokenizer": tokenizer,
                 "n_documents": state["docs"], "n_sequences": state["seqs"],
                 "n_tokens": state["tokens"], "shards": shards}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -108,9 +114,14 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
 
 
 def open_shard(out_dir, name: str) -> Tuple[np.memmap, np.memmap]:
-    """Memory-map a shard's (tokens uint16, boundaries uint8) pair, read-only."""
+    """Memory-map a shard's (tokens, boundaries uint8) pair, read-only. Token dtype comes
+    from the manifest (uint16 / uint32; fallback uint16 for legacy shards)."""
     out_dir = Path(out_dir)
-    toks = np.memmap(out_dir / f"{name}.bin", dtype=DTYPE, mode="r")
+    manifest_path = Path(out_dir) / "manifest.json"
+    dtype = np.dtype(DTYPE)
+    if manifest_path.exists():
+        dtype = np.dtype(json.loads(manifest_path.read_text()).get("dtype", "uint16"))
+    toks = np.memmap(out_dir / f"{name}.bin", dtype=dtype, mode="r")
     bnds = np.memmap(out_dir / f"{name}.bounds", dtype=np.uint8, mode="r")
     return toks, bnds
 
@@ -141,25 +152,30 @@ def main() -> None:
     ap.add_argument("--seq-len", type=int, default=8192)
     ap.add_argument("--shard-size-mb", type=int, default=512)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--tokenizer", choices=("starcoder2", "olmo"), default="starcoder2")
+    ap.add_argument("--tokenizer", choices=("qwen25", "starcoder2", "olmo"),
+                    default="qwen25")
     ap.add_argument("--model-id", default=None)
     args = ap.parse_args()
 
     from .corpus import iter_shard_texts
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer,
+    from .pack import packing_dtype_for
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
                            load_starcoder2_tokenizer, tokenize_docs)
 
     if args.byte_fallback:
         tok = ByteTokenizer()
     elif args.tokenizer == "olmo":
         tok = load_olmo_tokenizer(args.model_id)
-    else:
+    elif args.tokenizer == "starcoder2":
         tok = load_starcoder2_tokenizer(args.model_id)
+    else:
+        tok = load_qwen25_tokenizer(args.model_id)
 
     tok_label = "byte" if args.byte_fallback else getattr(tok, "name_or_path", args.tokenizer)
+    dtype = packing_dtype_for(tok.vocab_size)          # uint16 (POC) / uint32 (Qwen2.5)
     docs = tokenize_docs(iter_shard_texts(args.inp), tok)
     manifest = pack_sequences(docs, args.out, seq_len=args.seq_len,
-                              shard_size_mb=args.shard_size_mb, tokenizer=tok_label)
+                              shard_size_mb=args.shard_size_mb, tokenizer=tok_label, dtype=dtype)
     print(f"packed {manifest['n_sequences']} seq x {args.seq_len} "
           f"({manifest['n_tokens']} tokens, {len(manifest['shards'])} shard(s)) -> {args.out}")
 

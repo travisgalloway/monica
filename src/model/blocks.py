@@ -53,7 +53,9 @@ class MambaConfig:
     dt_rank: Union[int, str] = "auto"
 
     # --- vocab / sequence ---
-    # OLMo tokenizer vocab. MUST stay < 65536 to pack token ids as uint16.
+    # Tokenizer vocab. Determines the packed token dtype (see `packing_dtype`): < 65536
+    # packs as uint16 (POC: OLMo 50280), otherwise uint32 (Qwen2.5 151646, #90). Bounded
+    # by the uint32 ceiling (2**32).
     vocab_size: int = 50280
     seq_len: int = 1024
     tie_embeddings: bool = True
@@ -186,11 +188,16 @@ class MambaConfig:
         """Total trainable parameters (sum of `parameter_breakdown()`)."""
         return sum(self.parameter_breakdown().values())
 
+    @property
+    def packing_dtype(self) -> str:
+        """The token packing dtype implied by the vocab: 'uint16' (< 65536) or 'uint32'."""
+        return "uint16" if self.vocab_size < 65536 else "uint32"
+
     def validate(self) -> None:
-        if self.vocab_size >= 65536:
+        if self.vocab_size >= (1 << 32):
             raise ValueError(
-                f"vocab_size={self.vocab_size} does not fit uint16 packing (<65536). "
-                "Either confirm the tokenizer vocab or change the packed dtype."
+                f"vocab_size={self.vocab_size} exceeds the uint32 packing ceiling (2**32). "
+                "Token ids would not fit the packed token files."
             )
         if self.precision not in ("fp32", "fp16", "bf16"):
             raise ValueError(f"unknown precision {self.precision!r}")
