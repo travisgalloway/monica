@@ -31,10 +31,19 @@ class ModelInterface(ABC):
 
     # --- training path ---
     @abstractmethod
-    def forward(self, token_batch: Array) -> Array:
+    def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
         """Full-sequence parallel forward. `token_batch` is (batch, seq_len) ids.
 
         Returns logits (batch, seq_len, vocab_size). Uses the parallel scan.
+
+        `seg_ids` (optional, (batch, seq_len) int) is a per-position **document id** for
+        packing-aware training (#68): positions in different documents never interact, so
+        recurrent SSM state and attention can't bleed across packed document boundaries.
+        `None` (the default) is the original single-segment behavior. Document boundaries
+        must be **chunk-aligned** (each document starts at a multiple of `chunk_size`) —
+        `src/data/shard.py::pack_sequences` enforces this when packing with `chunk_align`
+        set; `src/conformance/doc_boundary_parity.py` verifies a packed multi-doc forward
+        equals the per-document forwards.
         """
 
     # --- inference path ---

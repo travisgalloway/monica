@@ -107,6 +107,30 @@ def _segsum(x: Array) -> Array:
     return mx.where(mask, seg, mx.array(float("-inf"), dtype=seg.dtype))
 
 
+def _chunk_seg_mask(seg_ids: Array, B: int, Q: int, nc: int, pad: int) -> Array:
+    """Boundary mask for the SSD inter-chunk decay matrix (#68).
+
+    Doc boundaries are chunk-aligned, so each length-Q scan chunk is single-document. The
+    inter-chunk recurrence carries each chunk's final state into later chunks; this mask
+    zeros that carry across documents, so SSM state can't bleed past a packed boundary. The
+    intra-chunk block needs no mask (single-document by construction) and chunk 0 already
+    gets a zero entering state from the decay matrix's lower-triangular structure.
+
+    `seg_ids` (B, L) document ids -> (B, nc+1, nc+1): entry [i, c] keeps the decay from
+    state c (chunk c-1's final; c=0 is the zero initial state) into entering chunk i iff
+    they share a document.
+    """
+    seg = mx.array(seg_ids)
+    if pad:
+        seg = mx.concatenate([seg, mx.broadcast_to(seg[:, -1:], (B, pad))], axis=1)
+    seg_chunks = seg.reshape(B, nc, Q)[:, :, 0]                  # (B, nc) doc id per chunk
+    sentinel_a = mx.full((B, 1), -1, dtype=seg_chunks.dtype)     # zero-state column
+    sentinel_b = mx.full((B, 1), -2, dtype=seg_chunks.dtype)     # dropped output row
+    src = mx.concatenate([sentinel_a, seg_chunks], axis=1)       # state c axis
+    out = mx.concatenate([seg_chunks, sentinel_b], axis=1)       # entering-chunk i axis
+    return (out[:, :, None] == src[:, None, :])                  # (B, nc+1, nc+1) bool
+
+
 class SelectiveSSM(nn.Module):
     """Scalar-A Mamba-2 / SSD selective state space.
 
@@ -166,12 +190,16 @@ class SelectiveSSM(nn.Module):
         a = -mx.exp(self.A_log)                    # (H,) scalar decay, fp32
         return delta, a, B, C
 
-    def parallel(self, x: Array) -> Array:
+    def parallel(self, x: Array, seg_ids: Array = None) -> Array:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Pads L up to a multiple of the chunk length Q (padded steps carry zero
         input and are trimmed). All decays are exp of non-positive sums, so the
-        scan is overflow-safe by construction."""
+        scan is overflow-safe by construction.
+
+        `seg_ids` (B, L) document ids (chunk-aligned boundaries) makes the scan
+        packing-aware (#68): the inter-chunk state carry is masked so recurrent state can't
+        bleed across documents. `None` is the original single-segment scan."""
         B_, L, d_inner = x.shape
         H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
         Q = self.config.chunk_size or 64
@@ -213,6 +241,9 @@ class SelectiveSSM(nn.Module):
             [mx.zeros((B_, 1, H, P, N), dtype=states.dtype), states], axis=1)
         chunk_tot = mx.pad(Acum[..., -1], [(0, 0), (0, 0), (1, 0)])   # (B,H,nc+1)
         decay_chunk = mx.exp(_segsum(chunk_tot))                      # (B,H,nc+1,nc+1)
+        if seg_ids is not None:                                       # #68: cross-doc reset
+            seg_mask = _chunk_seg_mask(seg_ids, B_, Q, nc, pad)       # (B,nc+1,nc+1) bool
+            decay_chunk = decay_chunk * seg_mask[:, None].astype(decay_chunk.dtype)
         new_states = mx.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
         S_enter = new_states[:, :-1]                                  # (B,nc,H,P,N)
         # 4) off-diagonal output: entering state decayed to each position
@@ -263,15 +294,48 @@ class MambaBlock(nn.Module):
                       c.stride, c.padding, c.dilation, c.groups)
         return y + c.bias.astype(cd)
 
-    def forward_seq(self, x: Array) -> Array:
+    def _conv_seq_seg(self, x_main: Array, cd, seg: Array) -> Array:
+        """Boundary-aware causal depthwise conv (#68): taps reaching into a previous
+        document are zeroed, so the conv window can't bleed across a packed boundary (the
+        conv is part of the per-doc recurrent state). `seg` is (B, L). Returns length L,
+        matching the full conv exactly within a single document."""
+        c = self.conv
+        K = self.config.d_conv
+        B_, L, _ = x_main.shape
+        x = x_main.astype(cd)
+        w = c.weight.astype(cd)                     # (d_inner, K, 1) MLX Conv1d layout
+        acc = None
+        for k in range(K):
+            shift = K - 1 - k                       # how far this tap reaches into the past
+            wk = w[:, k, 0]                          # (d_inner,)
+            if shift == 0:
+                xs = x
+            elif shift >= L:
+                continue                            # tap reaches entirely before the start
+            else:
+                xs = mx.pad(x[:, :L - shift], [(0, 0), (shift, 0), (0, 0)])   # x[t-shift]
+                same = seg[:, shift:] == seg[:, :-shift]                       # (B, L-shift)
+                valid = mx.pad(same, [(0, 0), (shift, 0)]).astype(cd)         # 0 across boundary
+                xs = xs * valid[..., None]
+            term = xs * wk
+            acc = term if acc is None else acc + term
+        if acc is None:                             # K > L: all taps reach before the start
+            acc = mx.zeros((B_, L, x.shape[-1]), dtype=cd)
+        return acc + c.bias.astype(cd)
+
+    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
         L = x.shape[1]
         cd = _DTYPES[self.config.precision]
         xn = self.norm(x)
         x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)   # (B,L,di) each
-        # Causal depthwise conv: pad both sides (d_conv-1), keep the first L outputs.
-        xc = self._conv_seq(x_main, cd)[:, :L]
+        # Causal depthwise conv: pad both sides (d_conv-1), keep the first L outputs. With
+        # seg_ids the conv is boundary-aware so its window can't cross a packed doc boundary.
+        if seg_ids is None:
+            xc = self._conv_seq(x_main, cd)[:, :L]
+        else:
+            xc = self._conv_seq_seg(x_main, cd, mx.array(seg_ids))
         xc = _silu(xc)
-        y = self.ssm.parallel(xc)
+        y = self.ssm.parallel(xc, seg_ids)
         y = y * _silu(z)
         return x + _linear(self.out_proj, y, cd)
 
@@ -354,7 +418,7 @@ class AttentionBlock(nn.Module):
             return _f32(t).reshape(B, T, self.H, self.Dh).transpose(0, 2, 1, 3)
         return heads(q), heads(k), heads(v)
 
-    def forward_seq(self, x: Array) -> Array:
+    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
         cd = _DTYPES[self.config.precision]
         L = x.shape[1]
         xn = self.norm(x)
@@ -363,7 +427,16 @@ class AttentionBlock(nn.Module):
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
         scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(self.Dh)   # (B,H,L,L)
         causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
-        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        if seg_ids is None:
+            scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        else:
+            # Block-diagonal: a token only attends within its own document (#68). Exact for
+            # arbitrary boundaries (attention needs no chunk-alignment, unlike the SSM scan).
+            seg = mx.array(seg_ids)
+            same = seg[:, :, None] == seg[:, None, :]        # (B,L,L)
+            allow = causal[None] & same                      # (B,L,L)
+            scores = mx.where(allow[:, None], scores,
+                              mx.array(float("-inf"), dtype=scores.dtype))
         out = _softmax_lastdim(scores) @ v                   # (B,H,L,Dh)
         out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
         return x + _linear(self.o_proj, _cast(out, cd), cd)
@@ -419,10 +492,15 @@ class MLXMambaModel(ModelInterface, nn.Module):
         return self.lm_head(h)
 
     # --- ModelInterface ---
-    def forward(self, token_batch: Array) -> Array:
+    def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)   # activation stream in cd
-        for layer_fn in self._layer_fns:
-            h = layer_fn(h)
+        if seg_ids is None:
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h)
+        else:
+            seg = mx.array(seg_ids)                                   # (B, L) document ids
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h, seg)                                  # boundary-aware (#68)
         return self._head(self.norm_f(h))
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
