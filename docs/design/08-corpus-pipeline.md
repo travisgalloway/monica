@@ -76,7 +76,9 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 > **fixed to Qwen2.5 (vocab 151,646)** by the conversion teacher — it intentionally *exceeds*
 > the uint16 bound, so packing is **uint32** (#90, now implemented: dtype-aware `pack.py` +
 > relaxed `MambaConfig.validate()`). The StarCoder2/uint16 reasoning below is the historical
-> record of the from-scratch plan (still used for the #75 production-reserve corpus).
+> record of the from-scratch plan; the #75 production-reserve corpus reuses these
+> clean-corpus *stages* but under the **same Qwen2.5 tokenizer + uint32 packing** — the
+> tokenizer lock is POC *and* production, so StarCoder2/uint16 is fully superseded.
 
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
   (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`

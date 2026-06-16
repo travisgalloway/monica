@@ -84,7 +84,10 @@ rl: shared/rl
 schedule: { lr: 3.0e-4, warmup: 0.02, batch_tokens: 1_000_000 }
 ```
 
-A sweep over architectures is a set of sibling manifests pointing at the **same** teacher signal.
+The `layout` keys (`attention_every`, `state_size`) are the manifest's own sweep-schema
+names; the #98 harness maps them onto the model config fields (`MambaConfig.attn_every` /
+`d_state`). A sweep over architectures is a set of sibling manifests pointing at the **same**
+teacher signal.
 
 ## What invalidates the precompute
 
