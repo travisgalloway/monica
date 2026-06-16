@@ -43,6 +43,9 @@ class Backend:
     # Distillation (M10): build a frozen, forward-only conversion teacher behind the seam
     # (`ConversionTeacher`). MLX-only for now; the CUDA branch raises NotImplementedError.
     make_teacher: Callable[..., Any]
+    # Distillation (M10/#99): initialize a student model from a teacher (Mamba-in-the-Llama /
+    # MOHAWK), returning an `InitReport`. MLX-only for now; CUDA raises NotImplementedError.
+    init_student: Callable[..., Any]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -101,6 +104,11 @@ def _mlx_backend() -> Backend:
             return MLXConversionTeacher.from_pretrained(pretrained, config)
         return MLXConversionTeacher.from_config(config, seed=seed)
 
+    def _init_student(student, teacher, method):
+        """Initialize a student from a teacher (#99); `method` is an `InitMethod`."""
+        from .mlx_student_init import init_student
+        return init_student(student, teacher, method)
+
     return Backend(
         name="mlx",
         model_cls=MLXMambaModel,
@@ -116,6 +124,7 @@ def _mlx_backend() -> Backend:
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
         make_teacher=_make_teacher,
+        init_student=_init_student,
     )
 
 
@@ -160,6 +169,11 @@ def _cuda_backend() -> Backend:
             "The conversion teacher (M10/#93) is implemented on the MLX dev backend only; "
             "the CUDA teacher loader is deferred.")
 
+    def _student_init_unsupported(*args, **kwargs):
+        raise NotImplementedError(
+            "Student init (M10/#99) is implemented on the MLX dev backend only; "
+            "the CUDA initializer is deferred.")
+
     return Backend(
         name="cuda",
         model_cls=CUDAMambaModel,
@@ -174,4 +188,5 @@ def _cuda_backend() -> Backend:
         make_dpo_train_step=_post_training_unsupported,
         make_grpo_train_step=_post_training_unsupported,
         make_teacher=_teacher_unsupported,
+        init_student=_student_init_unsupported,
     )
