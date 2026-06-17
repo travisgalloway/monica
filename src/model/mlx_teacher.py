@@ -158,6 +158,43 @@ class MLXConversionTeacher(ConversionTeacher):
         vals = mx.take_along_axis(pv, order, axis=-1)
         return mx.stop_gradient(vals), idx
 
+    def attention_matrices(self, token_batch) -> Tuple[mx.array, ...]:
+        """Per-layer head-averaged causal attention matrices `softmax(QK^T/sqrt(Dh))`, each
+        `(B, L, L)`, for the distillation `mixing-match` stage (#100). Stop-gradient wrapped
+        (the teacher is frozen)."""
+        c = self.config
+        h = self._w["embed"][mx.array(token_batch)]
+        L = h.shape[1]
+        cos, sin = _rope_cos_sin(mx.arange(L), c.head_dim, c.rope_theta)
+        mask = self._causal_mask(L)                                  # built once, shared
+        mats = []
+        for i in range(c.n_layers):
+            mats.append(mx.stop_gradient(self._attn_probs(h, i, cos, sin, mask)))
+            h = h + self._attn(h, i, cos, sin, mask)
+            h = h + self._mlp(h, i)
+        return tuple(mats)
+
+    def _attn_probs(self, x: mx.array, i: int, cos: mx.array, sin: mx.array,
+                    mask: mx.array) -> mx.array:
+        """Head-averaged causal attention probabilities for layer `i` -> (B, L, L)."""
+        c = self.config
+        p = f"layer.{i}."
+        B, L, _ = x.shape
+        Hq, Hkv, Dh = c.n_heads, c.n_kv_heads, c.head_dim
+        xn = _rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps)
+        q = xn @ self._w[p + "q_w"].T + self._w[p + "q_b"]
+        k = xn @ self._w[p + "k_w"].T + self._w[p + "k_b"]
+
+        def heads(t, H):
+            return t.reshape(B, L, H, Dh).transpose(0, 2, 1, 3)
+        q, k = heads(q, Hq), heads(k, Hkv)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        if Hkv != Hq:
+            k = mx.repeat(k, Hq // Hkv, axis=1)
+        scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(Dh)       # (B,Hq,L,L)
+        scores = mx.where(mask, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        return _softmax_lastdim(scores).mean(axis=1)                 # head-average -> (B,L,L)
+
     def attention_projection(self, layer: int) -> AttnProjections:
         p = f"layer.{layer}."
         g = lambda s: mx.stop_gradient(self._w[p + s])

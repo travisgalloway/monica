@@ -88,6 +88,32 @@ init quality is judged by the downstream distillation curve, not by exactness. F
 native `nn.Module.freeze`, which `nn.value_and_grad` already honors, so the train step is
 unchanged. The CUDA initializer is deferred.
 
+### The staged distillation loss + train step (#100)
+
+The student trains against the **cached** teacher signal through the manifest's distillation
+stages (`distill_stages(manifest)` → `mixing-match → hidden-align → logit-distill`, in order).
+Each stage is a separate injected `TrainStepFn` from
+`get_backend(...).make_distill_train_step(model, opt, stage=...)`
+(`src/model/mlx_distill.py`), mirroring SFT/DPO/GRPO and funnelling through the shared
+`_accumulate_and_step`, so the backend-free loop is unchanged:
+
+- **`logit-distill`** — compound `ce_weight·CE + kl_weight·KL_topk`, where `KL_topk` is the
+  `T²`-scaled KL between the teacher's cached **top-k** distribution and the student's logits
+  renormalized over the same support. No teacher inference in the loop (acceptance: KL+CE from
+  cached top-k).
+- **`hidden-align`** — MSE between per-layer hidden states, with **cached** teacher hidden states
+  in the micro-batch *or* **on-the-fly** recompute (`teacher.forward(return_hidden=True)`,
+  stop-gradient); compared over the overlapping `min(d)` channels (the width mismatch).
+- **`mixing-match`** — MSE between the student's head-averaged SSM **mixing matrix**
+  (`SelectiveSSM.mixing_matrix`, the materialized 1-semiseparable matrix, verified to reproduce
+  the scan) and the teacher's head-averaged causal attention matrix. A tractable simplification of
+  MOHAWK's strict per-layer teacher-forced orientation (each runs on its own forward, since the
+  widths differ).
+
+The compound loss is a single scalar, so the dynamic fp16 loss scaler
+(`train.loss_scale.DynamicLossScaler`) covers it unchanged — the combined term is scaled before
+backprop and overflowing steps skip cleanly. The CUDA distill step is deferred.
+
 ## The tokenizer is fixed by the conversion teacher (#90, #91)
 
 The student must **share a vocabulary with the conversion teacher** for logit and hidden-state
