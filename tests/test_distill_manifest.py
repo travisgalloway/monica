@@ -2,8 +2,9 @@
 
 import pytest
 
-from src.train.distill_manifest import (CANONICAL_STAGES, DistillManifest, InitMethod,
-                                        load_manifest, manifest_to_config)
+from src.train.distill_manifest import (CANONICAL_STAGES, DistillManifest, DistillStage,
+                                        InitMethod, distill_stages, load_manifest,
+                                        manifest_to_config)
 
 MANIFESTS = ["config/manifests/student-1b-attn12pct.yaml",
              "config/manifests/student-1b-attn8pct.yaml"]
@@ -28,6 +29,16 @@ def test_manifest_to_config(path):
     assert cfg.attn_every == m.layout["attention_every"]    # sweep-schema -> model field
     assert cfg.d_state == m.layout["state_size"]
     assert cfg.vocab_size == 151646 and cfg.seq_len == m.seq_len
+
+
+@pytest.mark.parametrize("path", MANIFESTS)
+def test_distill_stages_order_and_filter(path):
+    m = load_manifest(path)
+    stages = distill_stages(m)
+    # the three distillation stages, in manifest order; SFT/RL stages dropped
+    assert stages == [DistillStage.MIXING_MATCH, DistillStage.HIDDEN_ALIGN,
+                      DistillStage.LOGIT_DISTILL]
+    assert all(isinstance(s, DistillStage) for s in stages)
 
 
 def test_init_method_from_str():
