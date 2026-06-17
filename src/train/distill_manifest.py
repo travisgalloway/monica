@@ -39,6 +39,22 @@ class InitMethod(Enum):
             raise ValueError(f"unknown init method {value!r}; expected one of: {allowed}")
 
 
+class DistillStage(Enum):
+    """The progressive distillation-matching stages (#100), in their natural run order.
+
+    A manifest's `stages:` may also list post-training stages (SFT/RL, #11/#78); these three
+    are the distillation ones the distill train step (`model.mlx_distill`) implements.
+    """
+
+    MIXING_MATCH = "mixing-match"      # MOHAWK stage 1: orient the SSM mixer like attention
+    HIDDEN_ALIGN = "hidden-align"      # MOHAWK stage 2: match per-layer hidden states
+    LOGIT_DISTILL = "logit-distill"    # KL(top-k) + CE on the final logits
+
+    @classmethod
+    def from_str(cls, value: str) -> "DistillStage":
+        return cls(value)
+
+
 # Canonical distillation + post-training stages, in their natural run order. The manifest's
 # `stages:` is a subset/ordering of these; #100 runs the distill stages, post-training (#11)
 # runs the SFT/RL ones.
@@ -155,3 +171,16 @@ def manifest_to_config(manifest: DistillManifest) -> MambaConfig:
 
 def _opt_int(value: Any) -> Any:
     return None if value is None else int(value)
+
+
+_DISTILL_STAGE_VALUES = {s.value for s in DistillStage}
+
+
+def distill_stages(manifest: DistillManifest) -> List[DistillStage]:
+    """The manifest's distillation stages, in manifest order (SFT/RL stages dropped).
+
+    The distill train step (#100) loops over these, swapping the objective per stage:
+    `mixing-match -> hidden-align -> logit-distill`. Post-training stages (instruct-sft,
+    reasoning-sft, tool-sft, grpo) are handled elsewhere (#11/#78).
+    """
+    return [DistillStage.from_str(s) for s in manifest.stages if s in _DISTILL_STAGE_VALUES]

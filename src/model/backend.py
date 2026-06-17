@@ -46,6 +46,9 @@ class Backend:
     # Distillation (M10/#99): initialize a student model from a teacher (Mamba-in-the-Llama /
     # MOHAWK), returning an `InitReport`. MLX-only for now; CUDA raises NotImplementedError.
     init_student: Callable[..., Any]
+    # Distillation (M10/#100): staged distill train-step factory (mixing-match / hidden-align /
+    # logit-distill), mirroring make_*_train_step. MLX-only; CUDA raises NotImplementedError.
+    make_distill_train_step: Callable[..., Callable]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -109,6 +112,10 @@ def _mlx_backend() -> Backend:
         from .mlx_student_init import init_student
         return init_student(student, teacher, method)
 
+    def _make_distill_train_step(*args, **kwargs):
+        from .mlx_distill import make_distill_train_step
+        return make_distill_train_step(*args, **kwargs)
+
     return Backend(
         name="mlx",
         model_cls=MLXMambaModel,
@@ -125,6 +132,7 @@ def _mlx_backend() -> Backend:
         make_grpo_train_step=_make_grpo_train_step,
         make_teacher=_make_teacher,
         init_student=_init_student,
+        make_distill_train_step=_make_distill_train_step,
     )
 
 
@@ -174,6 +182,11 @@ def _cuda_backend() -> Backend:
             "Student init (M10/#99) is implemented on the MLX dev backend only; "
             "the CUDA initializer is deferred.")
 
+    def _distill_unsupported(*args, **kwargs):
+        raise NotImplementedError(
+            "The distillation train step (M10/#100) is implemented on the MLX dev backend "
+            "only; the CUDA distill step is deferred.")
+
     return Backend(
         name="cuda",
         model_cls=CUDAMambaModel,
@@ -189,4 +202,5 @@ def _cuda_backend() -> Backend:
         make_grpo_train_step=_post_training_unsupported,
         make_teacher=_teacher_unsupported,
         init_student=_student_init_unsupported,
+        make_distill_train_step=_distill_unsupported,
     )
