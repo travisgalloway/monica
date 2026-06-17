@@ -99,6 +99,9 @@ def _mlx_backend() -> Backend:
         from .mlx_teacher import MLXConversionTeacher
         if pretrained is not None:
             return MLXConversionTeacher.from_pretrained(pretrained, config)
+        if config is None:
+            raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
+                             "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
         return MLXConversionTeacher.from_config(config, seed=seed)
 
     return Backend(

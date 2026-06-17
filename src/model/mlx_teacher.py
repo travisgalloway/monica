@@ -105,16 +105,21 @@ class MLXConversionTeacher(ConversionTeacher):
                         ) -> "MLXConversionTeacher":
         """Load a local HuggingFace Qwen2 checkpoint directory (config.json + safetensors).
 
-        If `path` does not exist locally and `config.model_id` is set, the weights are
-        fetched lazily via `huggingface_hub.snapshot_download` (guarded — never reached in
-        offline tests). HF row-major projection weights are mapped onto the internal dict."""
+        `path` may be a local checkpoint directory or an HF repo id. When it is not a local
+        path, it is treated as the repo id (so `from_pretrained("deepseek-ai/...")` works with
+        no config); a bare name falls back to `config.model_id`. The fetch is lazy via
+        `huggingface_hub.snapshot_download` (guarded — never reached in offline tests). HF
+        row-major projection weights are mapped onto the internal dict."""
         p = Path(path)
         if not p.exists():
-            if config is None or not config.model_id:
+            # Not a local dir: use `path` as the repo id when it looks like one, else config.model_id.
+            repo_id = str(path) if "/" in str(path) else (config.model_id if config else None)
+            if not repo_id:
                 raise FileNotFoundError(
-                    f"teacher path {p} not found and no config.model_id to download from")
+                    f"teacher path {p} not found and no repo id (pass an HF 'owner/name' path "
+                    "or a config with model_id)")
             from huggingface_hub import snapshot_download   # lazy: optional dep, not in tests
-            p = Path(snapshot_download(config.model_id))
+            p = Path(snapshot_download(repo_id))
         if config is None:
             with open(p / "config.json") as f:
                 config = TeacherConfig.from_hf_dict(json.load(f))
@@ -128,20 +133,29 @@ class MLXConversionTeacher(ConversionTeacher):
         h = self._w["embed"][tokens]                          # (B, L, D)
         L = h.shape[1]
         cos, sin = _rope_cos_sin(mx.arange(L), c.head_dim, c.rope_theta)
+        mask = mx.tril(mx.ones((L, L), dtype=mx.bool_))       # causal mask, built once
         hidden: List[mx.array] = [h] if return_hidden else []
         for i in range(c.n_layers):
-            h = h + self._attn(h, i, cos, sin)
+            h = h + self._attn(h, i, cos, sin, mask)
             h = h + self._mlp(h, i)
             if return_hidden:
                 hidden.append(h)
-        logits = _rms_norm(h, self._w["final_ln"], c.rms_norm_eps) @ self._lm_head().T
+        # Emit logits over the tokenizer vocab (padded embedding rows are never teacher targets).
+        logits = (_rms_norm(h, self._w["final_ln"], c.rms_norm_eps)
+                  @ self._lm_head().T)[..., :c.effective_vocab_size]
         hs = tuple(mx.stop_gradient(t) for t in hidden) if return_hidden else None
         return TeacherForward(logits=mx.stop_gradient(logits), hidden_states=hs)
 
     def topk_logits(self, token_batch, k: int) -> Tuple[mx.array, mx.array]:
-        logits = self.forward(token_batch).logits             # (B, L, V)
-        idx = mx.argsort(-logits, axis=-1)[..., :k]            # descending, (B, L, k)
-        vals = mx.take_along_axis(logits, idx, axis=-1)
+        logits = self.forward(token_batch).logits             # (B, L, Ve)
+        k = min(k, logits.shape[-1])
+        # Partial selection (top-k), then sort only the k — far cheaper than a full argsort
+        # over the ~152k vocab (matters for the #94 precompute).
+        part = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+        pv = mx.take_along_axis(logits, part, axis=-1)
+        order = mx.argsort(-pv, axis=-1)                       # descending within the k
+        idx = mx.take_along_axis(part, order, axis=-1)
+        vals = mx.take_along_axis(pv, order, axis=-1)
         return mx.stop_gradient(vals), idx
 
     def attention_projection(self, layer: int) -> AttnProjections:
@@ -157,7 +171,12 @@ class MLXConversionTeacher(ConversionTeacher):
     def _lm_head(self) -> mx.array:
         return self._w["embed"] if self.config.tie_embeddings else self._w["lm_head"]
 
-    def _attn(self, x: mx.array, i: int, cos: mx.array, sin: mx.array) -> mx.array:
+    def _causal_mask(self, L: int) -> mx.array:
+        """Causal (L, L) bool mask, built once per forward and shared across layers."""
+        return mx.tril(mx.ones((L, L), dtype=mx.bool_))
+
+    def _attn(self, x: mx.array, i: int, cos: mx.array, sin: mx.array,
+              mask: mx.array) -> mx.array:
         c = self.config
         p = f"layer.{i}."
         B, L, _ = x.shape
@@ -175,8 +194,7 @@ class MLXConversionTeacher(ConversionTeacher):
             rep = Hq // Hkv
             k, v = mx.repeat(k, rep, axis=1), mx.repeat(v, rep, axis=1)
         scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(Dh)   # (B,Hq,L,L)
-        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
-        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        scores = mx.where(mask, scores, mx.array(float("-inf"), dtype=scores.dtype))
         out = _softmax_lastdim(scores) @ v                   # (B,Hq,L,Dh)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, Hq * Dh)
         return out @ self._w[p + "o_w"].T                    # (B,L,D), o has no bias

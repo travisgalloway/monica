@@ -42,7 +42,7 @@ class TeacherConfig:
     imports a backend, so the config is shared across backends like `MambaConfig`.
     """
 
-    vocab_size: int
+    vocab_size: int              # MODEL embedding width (may be padded above the tokenizer vocab)
     d_model: int                 # hidden_size
     n_layers: int                # num_hidden_layers
     n_heads: int                 # num_attention_heads (query heads)
@@ -53,6 +53,11 @@ class TeacherConfig:
     rope_theta: float = 10000.0
     tie_embeddings: bool = True
     model_id: Optional[str] = None   # HF repo id, for from_pretrained / provenance
+    # The TOKENIZER vocab, when the model embedding is padded above it (Qwen2.5: model 151936,
+    # tokenizer 151646). None => no padding (use `vocab_size`). `forward`/`topk_logits` expose
+    # logits/indices over `effective_vocab_size`, so a student with the tokenizer vocab can
+    # consume them — the padded rows are never emitted as teacher targets.
+    tokenizer_vocab_size: Optional[int] = None
 
     @classmethod
     def qwen_1_5b(cls) -> "TeacherConfig":
@@ -67,6 +72,7 @@ class TeacherConfig:
             vocab_size=151936, d_model=1536, n_layers=28, n_heads=12, n_kv_heads=2,
             head_dim=128, intermediate_size=8960, rms_norm_eps=1e-6, rope_theta=10000.0,
             tie_embeddings=True, model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+            tokenizer_vocab_size=151646,   # student/tokenizer vocab; padded rows 151646..151936 unused
         )
 
     @classmethod
@@ -99,6 +105,12 @@ class TeacherConfig:
         )
 
     @property
+    def effective_vocab_size(self) -> int:
+        """The vocab the teacher emits logits/top-k over: the tokenizer vocab when the model
+        embedding is padded above it, otherwise the full `vocab_size`."""
+        return self.tokenizer_vocab_size or self.vocab_size
+
+    @property
     def q_dim(self) -> int:
         """Width of the concatenated query projection (n_heads * head_dim)."""
         return self.n_heads * self.head_dim
@@ -118,6 +130,11 @@ class TeacherConfig:
         for name in ("vocab_size", "d_model", "n_layers", "intermediate_size"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.tokenizer_vocab_size is not None and not (
+                0 < self.tokenizer_vocab_size <= self.vocab_size):
+            raise ValueError(
+                f"tokenizer_vocab_size={self.tokenizer_vocab_size} must be in "
+                f"(0, vocab_size={self.vocab_size}].")
 
 
 @dataclass
