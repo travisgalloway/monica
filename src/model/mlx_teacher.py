@@ -166,14 +166,16 @@ class MLXConversionTeacher(ConversionTeacher):
         h = self._w["embed"][mx.array(token_batch)]
         L = h.shape[1]
         cos, sin = _rope_cos_sin(mx.arange(L), c.head_dim, c.rope_theta)
+        mask = self._causal_mask(L)                                  # built once, shared
         mats = []
         for i in range(c.n_layers):
-            mats.append(mx.stop_gradient(self._attn_probs(h, i, cos, sin)))
-            h = h + self._attn(h, i, cos, sin)
+            mats.append(mx.stop_gradient(self._attn_probs(h, i, cos, sin, mask)))
+            h = h + self._attn(h, i, cos, sin, mask)
             h = h + self._mlp(h, i)
         return tuple(mats)
 
-    def _attn_probs(self, x: mx.array, i: int, cos: mx.array, sin: mx.array) -> mx.array:
+    def _attn_probs(self, x: mx.array, i: int, cos: mx.array, sin: mx.array,
+                    mask: mx.array) -> mx.array:
         """Head-averaged causal attention probabilities for layer `i` -> (B, L, L)."""
         c = self.config
         p = f"layer.{i}."
@@ -190,8 +192,7 @@ class MLXConversionTeacher(ConversionTeacher):
         if Hkv != Hq:
             k = mx.repeat(k, Hq // Hkv, axis=1)
         scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(Dh)       # (B,Hq,L,L)
-        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
-        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        scores = mx.where(mask, scores, mx.array(float("-inf"), dtype=scores.dtype))
         return _softmax_lastdim(scores).mean(axis=1)                 # head-average -> (B,L,L)
 
     def attention_projection(self, layer: int) -> AttnProjections:

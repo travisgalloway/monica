@@ -126,7 +126,7 @@ def test_mixing_match_runs_and_decreases():
     step = make_distill_train_step(student, _opt(student), stage=DistillStage.MIXING_MATCH,
                                    teacher=teacher)
     # the matrix-matching objective is stiff; a small lr decreases it smoothly
-    losses = [step(student, [(_tokens(),)], 5e-3)["loss"] for _ in range(6)]
+    losses = [step(student, [(_tokens(),)], 3e-3)["loss"] for _ in range(6)]
     assert losses[0] >= 0 and losses[-1] < losses[0]
 
 
@@ -134,6 +134,24 @@ def test_mixing_match_requires_teacher():
     student = _student()
     with pytest.raises(ValueError):
         make_distill_train_step(student, _opt(student), stage=DistillStage.MIXING_MATCH)
+
+
+def test_mixing_match_rejects_pure_attention_layout():
+    teacher = _teacher()
+    # attn_every 1 -> every layer is attention, so there are no Mamba mixers to match
+    cfg = MambaConfig(d_model=48, n_layers=2, d_state=16, head_dim=16, vocab_size=VOCAB,
+                      seq_len=16, attn_every=1, n_attn_heads=4, precision="fp32")
+    get_backend("mlx").seed(0)
+    student = MLXMambaModel(cfg)
+    with pytest.raises(ValueError):
+        make_distill_train_step(student, _opt(student), stage=DistillStage.MIXING_MATCH,
+                                teacher=teacher)
+
+
+def test_align_maps_endpoints():
+    from src.model.mlx_distill import _align
+    assert [_align(i, 4, 28) for i in range(4)] == [0, 9, 18, 27]   # 0->0, last->last
+    assert _align(0, 1, 28) == 0                                    # n_src <= 1 fallback
 
 
 # --- fp16 dynamic-scaler integration (compound term) -------------------------

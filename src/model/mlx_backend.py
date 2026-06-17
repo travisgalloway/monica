@@ -256,11 +256,13 @@ class SelectiveSSM(nn.Module):
 
     def mixing_matrix(self, x: Array) -> Array:
         """Materialize the dense (B, H, L, L) 1-semiseparable mixing matrix M such that
-        `einsum('bhij,bjhp->bihp', M, X) == parallel(x)` (X = the head-split input). This is
-        the matrix the SSD scan applies; the distillation `mixing-match` stage (#100) matches
-        it against the teacher's attention matrix. Folds in the per-step `delta` scaling and
-        the per-head `D` skip, so it maps the RAW (unscaled) input. Dense O(L^2) — used only
-        as a training-time auxiliary at modest L, not in the chunked training path."""
+        `einsum('bhij,bjhp->bihp', M, X) == parallel(x)` (X = the head-split input) **in the
+        single-segment case** (`seg_ids=None`). This is the matrix the SSD scan applies; the
+        distillation `mixing-match` stage (#100) matches it against the teacher's attention
+        matrix. Folds in the per-step `delta` scaling and the per-head `D` skip, so it maps the
+        RAW (unscaled) input. It does NOT model the packing-aware `seg_ids` path (#68), whose
+        masked inter-chunk carry changes the scan; the equality holds only without `seg_ids`.
+        Dense O(L^2) — a training-time auxiliary at modest L, not the chunked training path."""
         B_, L, _ = x.shape
         H, N = self.config.n_heads, self.config.d_state
         delta, a, Bm, Cm = self._project(x)        # delta (B,L,H); Bm,Cm (B,L,N) — fp32

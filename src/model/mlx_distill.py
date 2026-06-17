@@ -30,8 +30,11 @@ from ..train.distill_manifest import DistillStage
 
 
 def _align(i: int, n_src: int, n_dst: int) -> int:
-    """Map index `i` in a depth-`n_src` stack onto the nearest index in a depth-`n_dst` one."""
-    return min(n_dst - 1, max(0, int(round(i * n_dst / max(1, n_src)))))
+    """Map index `i` in a depth-`n_src` stack onto a depth-`n_dst` one, endpoint-to-endpoint:
+    `0 -> 0` and `n_src-1 -> n_dst-1` (so the first/last always align), with clamping."""
+    if n_src <= 1:
+        return 0
+    return min(n_dst - 1, max(0, int(round(i * (n_dst - 1) / (n_src - 1)))))
 
 
 def _kl_topk(student_logits: mx.array, topk_vals: mx.array, topk_idx: mx.array,
@@ -62,7 +65,10 @@ def _hidden_mse(student_hs, teacher_hs, layers: List[int], n_s: int, n_t: int) -
     each layer); `layers` are student hidden indices to match."""
     terms = []
     for s in layers:
-        th = teacher_hs[min(n_t, max(0, round(s * n_t / n_s)))]   # align embedding(0)+layers(1..n)
+        # Map layer-to-layer: embedding(0)->0, and student layer s in 1..n_s -> teacher layer
+        # 1..n_t endpoint-to-endpoint (so layer 1 never collapses onto the teacher embedding).
+        th_idx = 0 if s == 0 else 1 + _align(s - 1, n_s, n_t)
+        th = teacher_hs[th_idx]
         sh = student_hs[s]
         m = min(sh.shape[-1], th.shape[-1])
         diff = sh[..., :m].astype(mx.float32) - th[..., :m].astype(mx.float32)
@@ -122,6 +128,9 @@ def make_distill_train_step(model, optimizer, *, stage, teacher=None,
     elif stage == DistillStage.MIXING_MATCH:
         if teacher is None:
             raise ValueError("mixing-match requires a teacher (on-the-fly attention matrices)")
+        if all(model.config.is_attention_layer(i) for i in range(n_s)):
+            raise ValueError("mixing-match has no Mamba layers to match in a pure-attention "
+                             "layout (attn_every covers every layer); skip this stage")
         n_t = teacher.n_layers
 
         def loss_fn(model, inputs):
