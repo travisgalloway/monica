@@ -40,6 +40,9 @@ class Backend:
     make_sft_train_step: Callable[..., Callable]
     make_dpo_train_step: Callable[..., Callable]
     make_grpo_train_step: Callable[..., Callable]
+    # Distillation (M10): build a frozen, forward-only conversion teacher behind the seam
+    # (`ConversionTeacher`). MLX-only for now; the CUDA branch raises NotImplementedError.
+    make_teacher: Callable[..., Any]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -90,6 +93,17 @@ def _mlx_backend() -> Backend:
         from .mlx_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
+    def _make_teacher(config=None, *, pretrained=None, seed=0):
+        """Frozen conversion teacher (#93): `pretrained` (an HF checkpoint dir / repo id)
+        loads real weights; otherwise a synthetic teacher is built from `config`."""
+        from .mlx_teacher import MLXConversionTeacher
+        if pretrained is not None:
+            return MLXConversionTeacher.from_pretrained(pretrained, config)
+        if config is None:
+            raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
+                             "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
+        return MLXConversionTeacher.from_config(config, seed=seed)
+
     return Backend(
         name="mlx",
         model_cls=MLXMambaModel,
@@ -104,6 +118,7 @@ def _mlx_backend() -> Backend:
         make_sft_train_step=make_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
+        make_teacher=_make_teacher,
     )
 
 
@@ -143,6 +158,11 @@ def _cuda_backend() -> Backend:
             "post-training steps are deferred (run scripts/sft.py / scripts/dpo.py on "
             "Apple Silicon).")
 
+    def _teacher_unsupported(*args, **kwargs):
+        raise NotImplementedError(
+            "The conversion teacher (M10/#93) is implemented on the MLX dev backend only; "
+            "the CUDA teacher loader is deferred.")
+
     return Backend(
         name="cuda",
         model_cls=CUDAMambaModel,
@@ -156,4 +176,5 @@ def _cuda_backend() -> Backend:
         make_sft_train_step=_post_training_unsupported,
         make_dpo_train_step=_post_training_unsupported,
         make_grpo_train_step=_post_training_unsupported,
+        make_teacher=_teacher_unsupported,
     )

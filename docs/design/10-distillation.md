@@ -48,6 +48,24 @@ Code/math conversion alternatives on the same tokenizer: Qwen2.5-Coder-1.5B, Qwe
 tokenizer source (use restrictions). The MOHAWK lineage's demonstrated teacher family was Phi
 (Phi-4-mini, MIT) — usable, but on a different tokenizer.
 
+### The teacher loader behind the seam (#93)
+
+The conversion teacher is loaded **frozen and forward-only** behind the hardware seam, exactly
+like DPO's frozen reference (`mlx_train_step.make_dpo_train_step` holds a distinct `ref_model`
+the optimizer never touches). The portable protocol is `ConversionTeacher`
+(`src/model/teacher.py`): `forward(return_hidden=...)` (logits + optional per-layer hidden
+states), `topk_logits(tokens, k)` (the cached signal #94/#100 match against), and
+`attention_projection(layer)` (the Q/K/V/O the #99 init maps onto the student SSM's
+C/B/input/output). Above the seam, callers see only opaque arrays plus a `to_numpy` converter —
+never a backend array type — and the teacher reports **no** trainable parameters, so it is
+structurally excluded from the optimizer and the resume bundle.
+
+The MLX implementation (`src/model/mlx_teacher.py`, a minimal self-contained Qwen2 forward — no
+`mlx-lm` dependency) loads real HF weights via `from_pretrained` (a checkpoint dir or, lazily, an
+HF repo id) and builds a tiny **synthetic** teacher via `from_config` for offline tests and small
+local checks. Build one through `get_backend(...).make_teacher(...)`; the CUDA teacher is deferred
+(the branch raises `NotImplementedError`).
+
 ## The tokenizer is fixed by the conversion teacher (#90, #91)
 
 The student must **share a vocabulary with the conversion teacher** for logit and hidden-state
