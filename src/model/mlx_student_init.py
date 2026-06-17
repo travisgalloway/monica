@@ -56,8 +56,11 @@ def _set(param_owner, name: str, value: mx.array) -> None:
 
 
 def _teacher_layer_for(i: int, n_student: int, n_teacher: int) -> int:
-    """Align student depth onto teacher depth (evenly spaced)."""
-    return min(n_teacher - 1, int(round(i * n_teacher / max(1, n_student))))
+    """Align student depth onto teacher depth, endpoint-to-endpoint (evenly spaced): student
+    layer 0 -> teacher 0 and the last student layer -> the last teacher layer."""
+    if n_student <= 1:
+        return 0
+    return min(n_teacher - 1, int(round(i * (n_teacher - 1) / (n_student - 1))))
 
 
 def _init_attention_layer(layer, proj, tcfg) -> None:

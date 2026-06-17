@@ -15,8 +15,15 @@ from src.model.mlx_backend import MLXMambaModel
 from src.model.blocks import MambaConfig
 from src.model.mlx_teacher import MLXConversionTeacher
 from src.model.teacher import TeacherConfig
-from src.model.mlx_student_init import init_student
+from src.model.mlx_student_init import init_student, _teacher_layer_for
 from src.train.distill_manifest import InitMethod, InitReport
+
+
+def test_teacher_layer_alignment_maps_endpoints():
+    # endpoints map to endpoints (not biased toward early teacher layers)
+    assert [_teacher_layer_for(i, 4, 28) for i in range(4)] == [0, 9, 18, 27]
+    assert _teacher_layer_for(0, 1, 28) == 0          # n_student <= 1 fallback
+    assert [_teacher_layer_for(i, 4, 4) for i in range(4)] == [0, 1, 2, 3]   # identity
 
 
 def _teacher(d_model=64, n_layers=4, n_heads=4, n_kv_heads=2, head_dim=16):
