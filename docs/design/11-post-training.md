@@ -21,7 +21,7 @@ SFT and GRPO refines it.
 **What.** Turn a text-continuer into a model that follows instructions, adopts a chat template,
 and respects a system prompt — the foundation every later layer assumes.
 
-**Why a stage at all.** The conversion teacher (DeepSeek-R1-Distill-Qwen-1.5B) is already
+**Why a stage at all.** The conversion teacher (`open-r1/OpenR1-Distill-7B`) is already
 instruction-tuned, so the hybrid inherits much of this through the matching — but the architecture
 conversion can blur instruction-following, so an explicit instruct SFT stage re-establishes it.
 

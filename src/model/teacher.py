@@ -6,7 +6,8 @@ stages depend on; each backend provides a concrete `ConversionTeacher` (the MLX
 one is `mlx_teacher.MLXConversionTeacher`).
 
 The conversion teacher is the transformer the student is *built from*
-(DeepSeek-R1-Distill-Qwen-1.5B by default — see `docs/design/10-distillation.md`).
+(`open-r1/OpenR1-Distill-7B` by default — a fully-open R1 reproduction on the
+Qwen2.5 tokenizer; see `docs/design/10-distillation.md`).
 It is run **forward only** — never trained — so it follows the same frozen-reference
 pattern DPO already uses (`mlx_train_step.make_dpo_train_step` holds a distinct
 `ref_model` the optimizer never touches). Two distillation issues consume it:
@@ -37,9 +38,11 @@ Array = Any
 class TeacherConfig:
     """Architecture of a Qwen2-family conversion teacher.
 
-    Defaults describe DeepSeek-R1-Distill-Qwen-1.5B (a Qwen2 decoder). The fields are
-    exactly what the MLX forward pass and the #99 projection mapping need; nothing here
-    imports a backend, so the config is shared across backends like `MambaConfig`.
+    The default teacher is `open-r1/OpenR1-Distill-7B` (a Qwen2 decoder built on
+    Qwen2.5-Math-7B — see `openr1_distill_7b`). `qwen_1_5b` is retained as a
+    smaller, back-compat fixture. The fields are exactly what the MLX forward pass
+    and the #99 projection mapping need; nothing here imports a backend, so the
+    config is shared across backends like `MambaConfig`.
     """
 
     vocab_size: int              # MODEL embedding width (may be padded above the tokenizer vocab)
@@ -58,6 +61,28 @@ class TeacherConfig:
     # logits/indices over `effective_vocab_size`, so a student with the tokenizer vocab can
     # consume them — the padded rows are never emitted as teacher targets.
     tokenizer_vocab_size: Optional[int] = None
+
+    @classmethod
+    def openr1_distill_7b(cls) -> "TeacherConfig":
+        """`open-r1/OpenR1-Distill-7B` — the default, fully-open conversion teacher.
+
+        HuggingFace's Open-R1 reproduction of R1 distillation: SFT of
+        Qwen2.5-Math-7B on the openly released Mixture-of-Thoughts / OpenR1-Math-220k
+        / CodeForces-CoTs reasoning traces (open data + recipe, Apache-2.0). It keeps
+        the Qwen2 architecture and Qwen2.5 tokenizer, so it is a drop-in for the MLX
+        Qwen2 forward; Open-R1 extends RoPE theta to 300k for a 32k context.
+
+        Dims are the Qwen2.5-Math-7B architecture (vocab 152064 is the padded *model*
+        embedding; the Qwen2.5 tokenizer vocab is 151646). `from_hf_dict` reads the
+        authoritative values from the checkpoint's `config.json` at load time; these
+        match that config and serve as the offline fixture.
+        """
+        return cls(
+            vocab_size=152064, d_model=3584, n_layers=28, n_heads=28, n_kv_heads=4,
+            head_dim=128, intermediate_size=18944, rms_norm_eps=1e-6, rope_theta=300000.0,
+            tie_embeddings=False, model_id="open-r1/OpenR1-Distill-7B",
+            tokenizer_vocab_size=151646,   # student/tokenizer vocab; padded rows 151646..152064 unused
+        )
 
     @classmethod
     def qwen_1_5b(cls) -> "TeacherConfig":

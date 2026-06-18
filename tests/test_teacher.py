@@ -28,6 +28,18 @@ def _tokens(B, L, vocab):
 
 
 # --- config ------------------------------------------------------------------
+def test_openr1_distill_7b_config_shape():
+    c = TeacherConfig.openr1_distill_7b()
+    assert (c.vocab_size, c.d_model, c.n_layers) == (152064, 3584, 28)
+    assert (c.n_heads, c.n_kv_heads, c.head_dim) == (28, 4, 128)
+    assert c.intermediate_size == 18944 and not c.tie_embeddings
+    assert c.rope_theta == 300000.0          # Open-R1 extends RoPE base for 32k context
+    assert c.q_dim == 3584 and c.kv_dim == 512
+    assert c.model_id == "open-r1/OpenR1-Distill-7B"
+    assert c.tokenizer_vocab_size == 151646 and c.effective_vocab_size == 151646
+    c.validate()
+
+
 def test_qwen_1_5b_config_shape():
     c = TeacherConfig.qwen_1_5b()
     assert (c.vocab_size, c.d_model, c.n_layers) == (151936, 1536, 28)
