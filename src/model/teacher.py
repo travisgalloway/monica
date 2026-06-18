@@ -231,6 +231,22 @@ class ConversionTeacher(ABC):
         """The Q/K/V/O projection weights of decoder `layer` (0-indexed), for #99."""
 
     @abstractmethod
+    def embedding_matrix(self) -> Array:
+        """The token-embedding matrix `(vocab_size, d_model)`, for the #99 init.
+
+        Returned over the *padded* model vocab (padded rows are at the end, above
+        `effective_vocab_size`); the student init crops it to the student shape with
+        `_fit`, so the row-crop drops exactly the padding and the column-crop selects
+        the student's residual subspace. Opaque, stop-gradient-wrapped (frozen teacher)."""
+
+    @abstractmethod
+    def lm_head_matrix(self) -> Array:
+        """The output (unembedding) matrix `(vocab_size, d_model)`, for the #99 init.
+
+        Equals `embedding_matrix()` when the teacher ties embeddings. Same convention and
+        cropping contract as `embedding_matrix`."""
+
+    @abstractmethod
     def to_numpy(self, array: Array) -> Any:
         """Convert an opaque teacher array to a numpy array (the seam converter)."""
 

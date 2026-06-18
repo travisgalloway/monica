@@ -1,7 +1,7 @@
 """MLX conversion teacher (Apple Silicon, below the seam — may import mlx).
 
-A frozen, forward-only **Qwen2** decoder (the DeepSeek-R1-Distill-Qwen-1.5B family) used
-as the distillation conversion teacher. It implements the portable `ConversionTeacher`
+A frozen, forward-only **Qwen2** decoder (open-r1/OpenR1-Distill-7B by default, a
+Qwen2-family R1 reproduction) used as the distillation conversion teacher. It implements the portable `ConversionTeacher`
 protocol (`src/model/teacher.py`) so the precompute (#94) and the distill loss (#100) see
 only opaque arrays + a `to_numpy` converter, and the student init (#99) can read the
 attention Q/K/V/O projections.
@@ -200,6 +200,12 @@ class MLXConversionTeacher(ConversionTeacher):
         g = lambda s: mx.stop_gradient(self._w[p + s])
         return AttnProjections(q=g("q_w"), k=g("k_w"), v=g("v_w"), o=g("o_w"),
                                q_bias=g("q_b"), k_bias=g("k_b"), v_bias=g("v_b"))
+
+    def embedding_matrix(self) -> mx.array:
+        return mx.stop_gradient(self._w["embed"])
+
+    def lm_head_matrix(self) -> mx.array:
+        return mx.stop_gradient(self._lm_head())   # == embed when tied (see _lm_head)
 
     def to_numpy(self, array) -> np.ndarray:
         return np.array(array)
