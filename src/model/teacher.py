@@ -76,6 +76,13 @@ class TeacherConfig:
         embedding; the Qwen2.5 tokenizer vocab is 151646). `from_hf_dict` reads the
         authoritative values from the checkpoint's `config.json` at load time; these
         match that config and serve as the offline fixture.
+
+        NOTE: HF `config.json` carries no `tokenizer_vocab_size`, so a teacher built
+        via `from_pretrained(..., config=None)` gets `from_hf_dict`'s default
+        (`tokenizer_vocab_size=None` -> `effective_vocab_size == vocab_size`, 152064)
+        and would emit logits/top-k over the padded rows the student vocab (151646)
+        cannot represent. When loading real weights, pass this config (or otherwise set
+        `tokenizer_vocab_size`) so outputs are sliced to the tokenizer vocab.
         """
         return cls(
             vocab_size=152064, d_model=3584, n_layers=28, n_heads=28, n_kv_heads=4,
