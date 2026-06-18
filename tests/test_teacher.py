@@ -97,6 +97,24 @@ def test_attention_projection_shapes_gqa():
     assert pr.k_bias.shape == (c.kv_dim,) and pr.v_bias.shape == (c.kv_dim,)
 
 
+def test_embedding_and_lm_head_matrices_tied():
+    t = _tiny()                                            # TeacherConfig.tiny() ties embeddings
+    c = t.config
+    assert t.config.tie_embeddings
+    e, lm = t.embedding_matrix(), t.lm_head_matrix()
+    assert e.shape == (c.vocab_size, c.d_model) and lm.shape == (c.vocab_size, c.d_model)
+    assert mx.array_equal(e, lm).item()                   # tied -> same matrix
+
+
+def test_embedding_and_lm_head_matrices_untied():
+    cfg = TeacherConfig(vocab_size=256, d_model=64, n_layers=2, n_heads=4, n_kv_heads=2,
+                        head_dim=16, intermediate_size=128, tie_embeddings=False)
+    t = MLXConversionTeacher.from_config(cfg, seed=0)
+    e, lm = t.embedding_matrix(), t.lm_head_matrix()
+    assert e.shape == (256, 64) and lm.shape == (256, 64)
+    assert not mx.array_equal(e, lm).item()               # untied -> distinct lm_head
+
+
 # --- frozen contract ---------------------------------------------------------
 def test_no_trainable_parameters():
     assert _tiny().trainable_parameters() == {}
