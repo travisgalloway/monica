@@ -63,6 +63,21 @@ def _teacher_layer_for(i: int, n_student: int, n_teacher: int) -> int:
     return min(n_teacher - 1, int(round(i * (n_teacher - 1) / (n_student - 1))))
 
 
+def _init_embeddings(student, teacher) -> None:
+    """Copy the teacher's token embedding (and, for an untied student, the lm_head) onto the
+    student, cropping with `_fit`. This makes the per-layer projection transfer coherent: the
+    student's residual stream becomes the teacher's first-`d_model` residual coordinates, so the
+    corner-crop in `_init_attention_layer`/`_init_mamba_layer` is a subspace restriction rather
+    than an arbitrary slice. `_fit`'s row-crop drops the teacher's padded vocab rows (they sit
+    above the tokenizer vocab); its column-crop selects the residual subspace. Used by both
+    init methods — embedding transfer helps regardless of which layers are frozen."""
+    cfg = student.config
+    shape = (cfg.vocab_size, cfg.d_model)
+    _set(student.embedding, "weight", _fit(teacher.embedding_matrix(), shape))
+    if not cfg.tie_embeddings:    # student.lm_head exists only when untied (mlx_backend)
+        _set(student.lm_head, "weight", _fit(teacher.lm_head_matrix(), shape))
+
+
 def _init_attention_layer(layer, proj, tcfg) -> None:
     """Copy a teacher attention layer's Q/K/V/O onto a student attention block (`qkv_proj`,
     `o_proj`), expanding GQA to full heads and adaptively fitting to the student's width."""
@@ -103,6 +118,8 @@ def init_student(student, teacher, method: InitMethod) -> InitReport:
     tcfg = teacher.config
     S, T = cfg.n_layers, teacher.n_layers
     dt_rank, d_state = cfg.dt_rank_resolved, cfg.d_state
+
+    _init_embeddings(student, teacher)
 
     frozen_layers: List[int] = []
     n_mapped = 0

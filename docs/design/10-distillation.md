@@ -34,8 +34,17 @@ the mixing matrices, then hidden states, then final logits. Reference:
 Both reuse the teacher's attention projections and layer structure, so a conversion teacher
 **close to the student's size is ideal** and it **fixes the tokenizer**. We trade exact size-match
 for full openness: the chosen teacher is the 7B `open-r1/OpenR1-Distill-7B`, and the 7B→~1B gap is
-bridged by the adaptive `_fit` cropping in student init (`src/model/mlx_student_init.py`) — watch
-the early distillation curve for init quality. The matching runs as the distillation loss + train
+bridged by the adaptive `_fit` cropping in student init (`src/model/mlx_student_init.py`).
+
+To keep that cropping coherent, the init also **transfers the teacher's token embedding and
+lm_head** (`_init_embeddings`, cropped with the same `_fit`), so the student's residual stream *is*
+the teacher's first-`d_model` residual coordinates end-to-end — the per-layer corner-crop becomes a
+subspace restriction rather than an arbitrary slice, and it matches the first-`min(d)` channel
+alignment the hidden-state matching loss already uses (`mlx_distill._hidden_mse`). The subspace is
+the **first** `d_model` coordinates; if the early distillation curve shows that is a poor warm
+start, the alternative is a PCA-of-activations basis (keep the highest-variance directions and apply
+that change of basis consistently across embeddings, every projection, and the matching loss) —
+deferred until the first-k baseline is measured. The matching runs as the distillation loss + train
 step (#100): KL on the teacher's top-k logits combined with cross-entropy, staged per the
 manifest's `stages` list.
 

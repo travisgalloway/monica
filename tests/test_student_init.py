@@ -15,7 +15,7 @@ from src.model.mlx_backend import MLXMambaModel
 from src.model.blocks import MambaConfig
 from src.model.mlx_teacher import MLXConversionTeacher
 from src.model.teacher import TeacherConfig
-from src.model.mlx_student_init import init_student, _teacher_layer_for
+from src.model.mlx_student_init import init_student, _teacher_layer_for, _fit
 from src.train.distill_manifest import InitMethod, InitReport
 
 
@@ -78,6 +78,34 @@ def test_mil_adaptive_fit_wider_student_shapes_finite():
     for _, v in tree_flatten(student.parameters()):
         assert mx.all(mx.isfinite(v)).item()
     assert student.forward(mx.zeros((1, 8), dtype=mx.int32)).shape == (1, 8, 256)
+
+
+# --- embedding / lm_head transfer --------------------------------------------
+def test_embedding_transferred_exact_when_dims_match():
+    teacher, student = _teacher(), _student()         # both d_model 64, vocab 256
+    init_student(student, teacher, InitMethod.MAMBA_IN_THE_LLAMA)
+    assert mx.array_equal(student.embedding.weight, teacher.embedding_matrix()).item()
+
+
+def test_embedding_transferred_adaptive_fit_wider_student():
+    teacher = _teacher(d_model=64)
+    student = _student(d_model=128, n_attn_heads=8)   # student wider than teacher
+    init_student(student, teacher, InitMethod.MOHAWK)
+    e = student.embedding.weight
+    assert e.shape == (256, 128) and mx.all(mx.isfinite(e)).item()
+    # the overlapping block is the teacher embedding; the widened columns are zero-padded
+    assert mx.array_equal(e, _fit(teacher.embedding_matrix(), (256, 128))).item()
+    assert mx.array_equal(e[:, :64], teacher.embedding_matrix()).item()
+
+
+def test_lm_head_transferred_when_student_untied():
+    teacher = _teacher()
+    cfg = MambaConfig(d_model=64, n_layers=4, d_state=16, expand=2, d_conv=4, head_dim=16,
+                      vocab_size=256, seq_len=32, attn_every=2, n_attn_heads=4,
+                      precision="fp32", tie_embeddings=False)
+    student = MLXMambaModel(cfg)
+    init_student(student, teacher, InitMethod.MAMBA_IN_THE_LLAMA)
+    assert mx.array_equal(student.lm_head.weight, _fit(teacher.lm_head_matrix(), (256, 64))).item()
 
 
 # --- freeze gating -----------------------------------------------------------
