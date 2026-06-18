@@ -27,28 +27,8 @@ def _tokens(B, L, vocab):
     return rng.integers(0, vocab, size=(B, L)).astype(np.int32)
 
 
-# --- config ------------------------------------------------------------------
-def test_qwen_1_5b_config_shape():
-    c = TeacherConfig.qwen_1_5b()
-    assert (c.vocab_size, c.d_model, c.n_layers) == (151936, 1536, 28)
-    assert (c.n_heads, c.n_kv_heads, c.head_dim) == (12, 2, 128)
-    assert c.intermediate_size == 8960 and c.tie_embeddings
-    assert c.q_dim == 1536 and c.kv_dim == 256
-    assert c.model_id == "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    assert c.tokenizer_vocab_size == 151646 and c.effective_vocab_size == 151646
-    c.validate()
-
-
-def test_config_validate_rejects_bad_gqa():
-    with pytest.raises(ValueError):
-        TeacherConfig(vocab_size=8, d_model=16, n_layers=1, n_heads=4, n_kv_heads=3,
-                      head_dim=4, intermediate_size=16).validate()
-
-
-def test_config_rejects_tokenizer_vocab_above_model_vocab():
-    with pytest.raises(ValueError):
-        TeacherConfig(vocab_size=256, d_model=16, n_layers=1, n_heads=2, n_kv_heads=1,
-                      head_dim=8, intermediate_size=16, tokenizer_vocab_size=300).validate()
+# Portable `TeacherConfig` shape/validate tests live in `test_teacher_config.py` (no MLX
+# import), so they run on non-Apple/CI hosts where this MLX-guarded module is skipped.
 
 
 def test_make_teacher_requires_config_for_synthetic_path():

@@ -3,8 +3,8 @@
 # SAME teacher_outputs/corpus; only `layout` changes. Changing layout invalidates nothing
 # upstream (docs/design/10-distillation.md). Resolves to a student config via the harness (#98).
 student: 1b-attn12pct
-conversion_teacher: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B   # #91/#93
-tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90)
+conversion_teacher: open-r1/OpenR1-Distill-7B   # fully-open Open-R1 teacher (#91/#93)
+tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — unchanged; teacher shares it
 seq_len: 8192
 layout:
   d_model: 2048

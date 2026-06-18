@@ -1,7 +1,7 @@
 # ~1-1.5B Mamba-2 HYBRID student — distillation sweep seed (epic #65, distillation-first).
 # This is the seed layout the student sweep (#98) searches over: attention fraction,
 # layer placement, and state size are the FREE variables (see docs/design/10-distillation.md).
-# Distilled from DeepSeek-R1-Distill-Qwen-1.5B (#91/#93), NOT pretrained from scratch.
+# Distilled from open-r1/OpenR1-Distill-7B (#91/#93), NOT pretrained from scratch.
 #
 # NOTE: vocab_size 151646 (Qwen2.5) exceeds the uint16 ceiling; it packs as uint32 and
 # MambaConfig.validate() accepts it now that #90 (dtype-aware packing) has landed.

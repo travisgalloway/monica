@@ -2,7 +2,7 @@
 # only the layout differs (lower attention fraction, larger state). Demonstrates that a sweep
 # reuses corpus + teacher_outputs unchanged; the student layout is the only free variable.
 student: 1b-attn8pct
-conversion_teacher: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25
 seq_len: 8192
 layout:

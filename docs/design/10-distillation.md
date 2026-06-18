@@ -31,22 +31,33 @@ Reference: [Mamba in the Llama](https://arxiv.org/abs/2408.15237),
 the mixing matrices, then hidden states, then final logits. Reference:
 [MOHAWK](https://arxiv.org/abs/2408.10189).
 
-Both reuse the teacher's attention projections and layer structure, which is why the **conversion
-teacher must be close to the student's size (~1.5B)** and **fixes the tokenizer**. The matching
-runs as the distillation loss + train step (#100): KL on the teacher's top-k logits combined with
-cross-entropy, staged per the manifest's `stages` list.
+Both reuse the teacher's attention projections and layer structure, so a conversion teacher
+**close to the student's size is ideal** and it **fixes the tokenizer**. We trade exact size-match
+for full openness: the chosen teacher is the 7B `open-r1/OpenR1-Distill-7B`, and the 7B→~1B gap is
+bridged by the adaptive `_fit` cropping in student init (`src/model/mlx_student_init.py`) — watch
+the early distillation curve for init quality. The matching runs as the distillation loss + train
+step (#100): KL on the teacher's top-k logits combined with cross-entropy, staged per the
+manifest's `stages` list.
 
 ## Two teacher roles — keep them separate
 
 | Role | Used for | Constrained by | Choice |
 |---|---|---|---|
-| **Conversion teacher** | init + matching (the student is built from it) | **must** be ~student size + fix the tokenizer | **DeepSeek-R1-Distill-Qwen-1.5B** (MIT, already reasoning, Qwen tokenizer) |
+| **Conversion teacher** | init + matching (the student is built from it) | ideally ~student size + fix the tokenizer | **`open-r1/OpenR1-Distill-7B`** (fully open: SFT of Qwen2.5-Math-7B on open R1 traces, Apache-2.0; already reasoning, Qwen tokenizer) |
 | **Trace-generation teacher** | producing reasoning traces in post-training | **unconstrained** — traces are re-tokenized | the strongest Qwen-tokenizer R1 distill you can run (14B/32B) |
 
-Code/math conversion alternatives on the same tokenizer: Qwen2.5-Coder-1.5B, Qwen2.5-Math-1.5B
-(Apache-2.0). Avoid Qwen2.5 3B/72B (Qwen license, not Apache-2.0) and Llama / StarCoder2 as a
-tokenizer source (use restrictions). The MOHAWK lineage's demonstrated teacher family was Phi
-(Phi-4-mini, MIT) — usable, but on a different tokenizer.
+**Why fully open:** OpenR1-Distill-7B is HuggingFace's Open-R1 reproduction of R1 distillation —
+the reasoning training data and recipe DeepSeek kept closed are openly released here
+(Mixture-of-Thoughts ~350k verified traces, OpenR1-Math-220k, CodeForces-CoTs), Apache-2.0. It
+keeps the Qwen2 architecture and Qwen2.5 tokenizer, so it is a drop-in for the existing teacher
+forward — no re-tokenization, no new architecture. (It does not open Qwen's *pretraining* corpus;
+OLMo 2 would, but as a non-reasoning teacher needing a tokenizer + architecture rewrite.)
+
+Smaller / alternative conversion teachers on the same tokenizer: the original
+DeepSeek-R1-Distill-Qwen-1.5B (MIT, weights-only), Qwen2.5-Coder/-Math-1.5B (Apache-2.0). Avoid
+Qwen2.5 3B/72B (Qwen license, not Apache-2.0) and Llama / StarCoder2 as a tokenizer source (use
+restrictions). The MOHAWK lineage's demonstrated teacher family was Phi (Phi-4-mini, MIT) —
+usable, but on a different tokenizer.
 
 ### The teacher loader behind the seam (#93)
 
@@ -117,8 +128,9 @@ backprop and overflowing steps skip cleanly. The CUDA distill step is deferred.
 ## The tokenizer is fixed by the conversion teacher (#90, #91)
 
 The student must **share a vocabulary with the conversion teacher** for logit and hidden-state
-matching, so the tokenizer is **Qwen2.5 (vocab 151,646)** — shared across Qwen2.5/-Coder/-Math and
-every DeepSeek-R1-Distill-Qwen variant, so those teachers are interchangeable. Adopted for the
+matching, so the tokenizer is **Qwen2.5 (vocab 151,646)** — shared across Qwen2.5/-Coder/-Math,
+OpenR1-Distill-7B, and every DeepSeek-R1-Distill-Qwen variant, so those teachers are
+interchangeable without re-tokenizing. Adopted for the
 production model too, which collapses the POC-to-production tokenizer question (no re-tokenization).
 This exceeds the uint16 bound → **uint32 packing** (#90); see
 [corpus pipeline](08-corpus-pipeline.md).
@@ -137,7 +149,7 @@ Each student trial is then a lightweight **manifest** naming the frozen artifact
 
 ```yaml
 student: 1b-attn12pct
-conversion_teacher: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25               # Qwen2.5 vocab, 151646
 seq_len: 8192
 layout: { d_model: 2048, n_layers: 48, attention_every: 8, state_size: 128 }

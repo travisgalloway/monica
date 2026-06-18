@@ -4,7 +4,7 @@ The packed token dtype follows the tokenizer vocab (`pack.packing_dtype_for`):
 - **OLMo** (``allenai/OLMo-7B-hf``, vocab 50280 < 65536) — the original POC tokenizer,
   packs as uint16. (``allenai/OLMo-2-1124-7B`` at 100278 was rejected at POC scale.)
 - **Qwen2.5** (vocab 151,646) — fixed by the distillation conversion teacher
-  (DeepSeek-R1-Distill-Qwen-1.5B); exceeds uint16, so it packs as **uint32** (#90, see
+  (open-r1/OpenR1-Distill-7B); exceeds uint16, so it packs as **uint32** (#90, see
   docs/design/10-distillation.md). This is the scale-up / distillation default.
 - **StarCoder2** (vocab ~49,152) — a legacy code-corpus tokenizer (the old uint16 scale
   pick, now superseded by Qwen2.5).

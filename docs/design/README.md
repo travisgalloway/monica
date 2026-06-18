@@ -36,7 +36,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 9. [Hybrid architectures](09-hybrid-architectures.md) — why the model is a Mamba-2
    hybrid (config-gated attention) and how it sizes.
 10. [Distillation (teacher → hybrid student)](10-distillation.md) — the **distillation-first
-    pivot**: distil a compact (~1–1.5B) hybrid from a frozen DeepSeek-R1-Distill-Qwen-1.5B
+    pivot**: distil a compact (~1–1.5B) hybrid from a frozen, fully-open `open-r1/OpenR1-Distill-7B`
     teacher (Qwen2.5 tokenizer → uint32 packing, #90), precompute teacher artifacts once,
     sweep student layouts cheaply (#98).
 11. [Post-training](11-post-training.md) — instruct SFT → reasoning-trace SFT → optional
@@ -69,6 +69,6 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | OLMES / lm-eval | deferred (Tier-2) | its own milestone-sized task; not needed for the POC | `src/eval/olmes_adapter.py` |
 | Build method | **distillation** from a frozen teacher (not pretrain) | reaches capability at <1% of from-scratch tokens; cheap layout sweep | `docs/design/10-distillation.md` |
 | Scale-up tokenizer | **Qwen2.5** (vocab 151,646) | fixed by the conversion teacher for logit/hidden matching; uint32 packing (#90). POC stays OLMo. StarCoder2 (the old uint16 pick) superseded. | `docs/design/10-distillation.md` |
-| Conversion teacher | DeepSeek-R1-Distill-Qwen-1.5B (MIT) | reasoning-ready, Qwen tokenizer, ~student size | `docs/design/10-distillation.md` |
+| Conversion teacher | `open-r1/OpenR1-Distill-7B` (Apache-2.0) | fully open (open R1 traces + recipe), reasoning-ready, Qwen2.5 tokenizer; 7B→~1B size gap bridged by adaptive init | `docs/design/10-distillation.md` |
 | Scale-up model | compact ~1–1.5B Mamba-2 hybrid reasoning student | attention layers close the SSM retrieval gap; no-KV-cache local inference | `docs/design/10-distillation.md` |
 | Data framework | `datatrove` + R2 + RunPod | builds the teacher corpus + production-reserve from-scratch data (#75) | `docs/design/08-corpus-pipeline.md` |
