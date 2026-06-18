@@ -26,9 +26,11 @@ def test_teacher_layer_alignment_maps_endpoints():
     assert [_teacher_layer_for(i, 4, 4) for i in range(4)] == [0, 1, 2, 3]   # identity
 
 
-def _teacher(d_model=64, n_layers=4, n_heads=4, n_kv_heads=2, head_dim=16):
-    cfg = TeacherConfig(vocab_size=256, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-                        n_kv_heads=n_kv_heads, head_dim=head_dim, intermediate_size=128)
+def _teacher(d_model=64, n_layers=4, n_heads=4, n_kv_heads=2, head_dim=16, vocab=256,
+             tie_embeddings=True):
+    cfg = TeacherConfig(vocab_size=vocab, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
+                        n_kv_heads=n_kv_heads, head_dim=head_dim, intermediate_size=128,
+                        tie_embeddings=tie_embeddings)
     return MLXConversionTeacher.from_config(cfg, seed=0)
 
 
@@ -85,6 +87,7 @@ def test_embedding_transferred_exact_when_dims_match():
     teacher, student = _teacher(), _student()         # both d_model 64, vocab 256
     init_student(student, teacher, InitMethod.MAMBA_IN_THE_LLAMA)
     assert mx.array_equal(student.embedding.weight, teacher.embedding_matrix()).item()
+    assert not hasattr(student, "lm_head")            # tied student: no separate head set
 
 
 def test_embedding_transferred_adaptive_fit_wider_student():
@@ -98,14 +101,28 @@ def test_embedding_transferred_adaptive_fit_wider_student():
     assert mx.array_equal(e[:, :64], teacher.embedding_matrix()).item()
 
 
+def test_embedding_row_crop_when_teacher_vocab_larger():
+    # The production case: teacher padded vocab (300) > student vocab (256). The student keeps
+    # the first 256 teacher rows (the tokenizer vocab); the padded rows 256..299 are dropped.
+    teacher = _teacher(vocab=300)                     # student vocab is 256
+    student = _student()
+    init_student(student, teacher, InitMethod.MAMBA_IN_THE_LLAMA)
+    e = student.embedding.weight
+    assert e.shape == (256, 64)
+    assert mx.array_equal(e, teacher.embedding_matrix()[:256]).item()   # surviving rows, not zeros
+
+
 def test_lm_head_transferred_when_student_untied():
-    teacher = _teacher()
+    teacher = _teacher(vocab=300, tie_embeddings=False)   # untied + larger vocab exercises the row-crop
     cfg = MambaConfig(d_model=64, n_layers=4, d_state=16, expand=2, d_conv=4, head_dim=16,
                       vocab_size=256, seq_len=32, attn_every=2, n_attn_heads=4,
                       precision="fp32", tie_embeddings=False)
     student = MLXMambaModel(cfg)
     init_student(student, teacher, InitMethod.MAMBA_IN_THE_LLAMA)
     assert mx.array_equal(student.lm_head.weight, _fit(teacher.lm_head_matrix(), (256, 64))).item()
+    assert mx.array_equal(student.lm_head.weight, teacher.lm_head_matrix()[:256]).item()
+    # the untied head actually drives output: forward runs and is finite
+    assert mx.all(mx.isfinite(student.forward(mx.zeros((1, 8), dtype=mx.int32)))).item()
 
 
 # --- freeze gating -----------------------------------------------------------

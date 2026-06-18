@@ -234,10 +234,12 @@ class ConversionTeacher(ABC):
     def embedding_matrix(self) -> Array:
         """The token-embedding matrix `(vocab_size, d_model)`, for the #99 init.
 
-        Returned over the *padded* model vocab (padded rows are at the end, above
-        `effective_vocab_size`); the student init crops it to the student shape with
-        `_fit`, so the row-crop drops exactly the padding and the column-crop selects
-        the student's residual subspace. Opaque, stop-gradient-wrapped (frozen teacher)."""
+        Shape is `(vocab_size, d_model)` — the *full padded* model vocab, NOT pre-clipped
+        to `effective_vocab_size` (padded rows are at the end, above the tokenizer vocab).
+        The student init crops it to the student shape with `_fit`, so the row-crop drops
+        exactly the padding and the column-crop selects the student's residual subspace;
+        an impl that pre-clipped would make `_fit` crop live rows. Opaque,
+        stop-gradient-wrapped (frozen teacher)."""
 
     @abstractmethod
     def lm_head_matrix(self) -> Array:
