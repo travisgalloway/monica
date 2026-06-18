@@ -53,6 +53,7 @@ PORTABLE_MODULES = [
     "src.data.dpo_sources",
     "src.train.dpo_math",
     "src.train.distill_manifest",
+    "src.train.sweep",
     "src.train.grpo",
     "src.train.verifiers",
     "src.train.schedule",
