@@ -194,6 +194,10 @@ class MambaConfig:
         return "uint16" if self.vocab_size < 65536 else "uint32"
 
     def validate(self) -> None:
+        if self.n_layers <= 0:
+            raise ValueError(f"n_layers={self.n_layers} must be >= 1")
+        if self.d_model <= 0:
+            raise ValueError(f"d_model={self.d_model} must be >= 1")
         if self.vocab_size > (1 << 32):     # max id = vocab_size-1 must fit uint32 (2**32-1)
             raise ValueError(
                 f"vocab_size={self.vocab_size} exceeds the uint32 packing capacity "
