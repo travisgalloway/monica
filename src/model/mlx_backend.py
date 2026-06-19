@@ -21,7 +21,7 @@ and allowed: it lives below the seam and nothing portable imports it.
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -546,6 +546,32 @@ class MLXMambaModel(ModelInterface, nn.Module):
             h, st2 = layer.step(h, st)
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
+
+    def verify_block(self, tokens: Sequence[int], state: State):
+        """Speculative-decoding verify pass (#52): consume `tokens` (a HOST-side sequence
+        of int ids) through the `step` recurrence from `state`, returning the per-token
+        next-token logits and the per-token states in a SINGLE graph eval.
+
+        Identical in value to calling `step` token-by-token — but evaluating the whole
+        block at once amortizes the per-token kernel-launch/sync that dominates batch-1
+        decode, which is where speculative decoding's wall-clock win comes from. Returns
+        `(logits_list, state_list)` of length len(tokens); `state_list[i]` is the state
+        after consuming `tokens[:i+1]`, so the caller can roll back to the accepted prefix
+        without recomputing. `tokens` is normalized to host ints ONCE up front so a stray
+        MLX-array argument can't force a per-token host sync inside the loop."""
+        toks = [int(t) for t in tokens]
+        logits_list, state_list = [], []
+        h_state = state
+        for tok in toks:
+            logit, h_state = self.step(mx.array([tok]), h_state)
+            logits_list.append(logit)
+            state_list.append(h_state)
+        # One eval realizes the whole block (logits + every intermediate state) together.
+        leaves = list(logits_list)
+        for st in state_list:
+            leaves.extend(v for _, v in tree_flatten(st))
+        mx.eval(leaves)
+        return logits_list, state_list
 
     # --- distillation matching accessors (#100) ------------------------------
     def hidden_states(self, token_batch: Array) -> Tuple[Array, ...]:
