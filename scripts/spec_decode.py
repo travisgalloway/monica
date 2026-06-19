@@ -125,24 +125,34 @@ def spec_decode(model, prompt, max_new, gamma, max_n, mx):
             continue
 
         block_logits, block_states = model.verify_block(draft, state)   # one eval
-        # verifier greedy token at each draft position given the accepted prefix
-        preds = [_argmax(logits, mx)] + [_argmax(bl, mx) for bl in block_logits[:-1]]
-        m = first_mismatch(draft, preds)            # accepted count in [0, len(draft)]
+        # All greedy verifier predictions for draft positions 0..len(draft) in ONE host
+        # transfer (position i is the token after consuming draft[:i]): pred[0] from the
+        # pre-existing logits, pred[1..] from the block. Vectorized so verify_block's single
+        # eval isn't undone by per-position .item() syncs.
+        all_logits = mx.stack([logits] + block_logits, axis=0)[:, 0, :]   # (γ+1, V)
+        preds = mx.argmax(all_logits, axis=-1).tolist()
+        m = first_mismatch(draft, preds[:len(draft)])   # accepted count in [0, len(draft)]
 
-        # Roll back to the accepted prefix, then emit the verifier's own token there
-        # (a correction if m < γ, the free bonus token if m == γ).
-        base_logits = logits if m == 0 else block_logits[m - 1]
-        base_state = state if m == 0 else block_states[m - 1]
-        x = _argmax(base_logits, mx)
-        emit = draft[:m] + [x]
-
-        logits, state = model.step(mx.array([x]), base_state)
-        mx.eval(logits)
-        generated.extend(emit)
-        context.extend(emit)
+        accept = draft[:m]
         drafted += len(draft)
         accepted += m
         rounds += 1
+        if len(generated) + m >= max_new:
+            # Accepted drafts already fill the budget — stop without the extra
+            # correction/bonus token (and its extra step), so we never compute past max_new.
+            generated.extend(accept)
+            context.extend(accept)
+            break
+
+        # Roll back to the accepted prefix, then emit the verifier's own token there
+        # (a correction if m < len(draft), the free bonus token if all accepted).
+        x = preds[m]
+        base_state = state if m == 0 else block_states[m - 1]
+        logits, state = model.step(mx.array([x]), base_state)
+        mx.eval(logits)
+        emit = accept + [x]
+        generated.extend(emit)
+        context.extend(emit)
 
     elapsed = time.perf_counter() - t0
     stats = {
@@ -164,7 +174,6 @@ def main() -> None:
             "mlx not found — run with the project venv on Apple Silicon:\n"
             "    .venv/bin/python scripts/spec_decode.py ...")
 
-    import numpy as np
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
     from src.data.loader import PackedLoader

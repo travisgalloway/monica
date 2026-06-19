@@ -10,6 +10,15 @@ import pytest
 
 from src.serve.spec_decode import first_mismatch, propose
 
+try:
+    import mlx.core as mx
+    HAVE_MLX = True
+except ImportError:                     # portable drafter/accept tests must run without mlx
+    mx = None
+    HAVE_MLX = False
+
+requires_mlx = pytest.mark.skipif(not HAVE_MLX, reason="requires mlx (Apple Silicon)")
+
 
 # --------------------------------------------------------------------------- #
 # Portable: drafter
@@ -49,10 +58,9 @@ def test_first_mismatch_counts_leading_agreement():
 
 # --------------------------------------------------------------------------- #
 # MLX-guarded: verifier + end-to-end equivalence
+# (each test skips individually when mlx is absent, so the portable tests above
+# still run on a non-Mac host — see the `requires_mlx` marker)
 # --------------------------------------------------------------------------- #
-mx = pytest.importorskip("mlx.core")
-
-
 def _toy_model():
     from src.model.blocks import MambaConfig
     from src.model.mlx_backend import MLXMambaModel
@@ -62,6 +70,7 @@ def _toy_model():
     return MLXMambaModel(cfg)
 
 
+@requires_mlx
 def test_verify_block_matches_sequential_step():
     model = _toy_model()
     tokens = [3, 7, 1, 4, 9]
@@ -95,6 +104,7 @@ def _greedy_plain(model, prompt, max_new):
     return out
 
 
+@requires_mlx
 def test_speculative_decode_equals_plain_greedy():
     import scripts.spec_decode as sd
     model = _toy_model()
@@ -106,6 +116,7 @@ def test_speculative_decode_equals_plain_greedy():
     assert stats["rounds"] >= 1
 
 
+@requires_mlx
 def test_speculative_decode_accepts_on_repetitive_text():
     import scripts.spec_decode as sd
     model = _toy_model()
