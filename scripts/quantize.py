@@ -159,6 +159,9 @@ def main() -> None:
               f"model size {report['model_compression']:.2f}x smaller "
               f"({report['model_orig_bytes']/2**20:.2f}→"
               f"{report['model_packed_bytes']/2**20:.2f} MiB at fp16 baseline)")
+        print("[note] the size figure is the THEORETICAL packed size (bit-packed codes + "
+              "group scales/zeros); the round-trip safetensors written above holds "
+              "fake-quant float32 weights and is not that size.")
 
 
 if __name__ == "__main__":

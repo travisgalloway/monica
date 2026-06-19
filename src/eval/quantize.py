@@ -58,9 +58,13 @@ def quantize_dequantize(w: np.ndarray, bits: int, group_size: int,
     qmax = float(2 ** bits - 1)
 
     if symmetric:
+        # Signed range [-qhalf, qhalf] (e.g. ±127 at 8-bit). Scale and clip MUST use the
+        # same qhalf, else a group's max-magnitude value can't be represented (it would
+        # clip below its own level), inflating symmetric-mode error.
+        qhalf = qmax // 2
         absmax = np.abs(groups).max(axis=1, keepdims=True)
-        scale = np.where(absmax == 0.0, 1.0, absmax / (qmax / 2.0))
-        q = np.clip(np.round(groups / scale), -(qmax // 2), qmax // 2)
+        scale = np.where(absmax == 0.0, 1.0, absmax / qhalf)
+        q = np.clip(np.round(groups / scale), -qhalf, qhalf)
         deq = q * scale
     else:
         lo = groups.min(axis=1, keepdims=True)
@@ -138,8 +142,10 @@ def quantize_state_dict(
     totals (original vs packed bytes over the *targeted* tensors, plus the whole-model
     size with untouched tensors counted at `baseline_dtype_bytes`).
 
-    `keys`, if given, restricts quantization to those names (others pass through);
-    otherwise `is_quantizable` decides.
+    `keys`, if given, further restricts quantization to those names — but only tensors
+    that ALSO satisfy `is_quantizable` are quantized (the allow-list narrows the eligible
+    set, it never overrides the eligibility rules). Without `keys`, `is_quantizable`
+    alone decides.
     """
     selected = set(keys) if keys is not None else None
     out: Dict[str, np.ndarray] = {}
@@ -151,8 +157,11 @@ def quantize_state_dict(
         arr = np.asarray(arr)
         full = original_bytes(arr.shape, baseline_dtype_bytes)
         model_orig += full
-        target = name in selected if selected is not None else is_quantizable(
-            name, arr, min_elems)
+        # `keys` is an allow-list WITHIN the eligibility rules: a named tensor is
+        # quantized only if it is also quantizable (a 2-D float weight). This prevents an
+        # explicit key from silently casting a non-float/1-D tensor through fake-quant.
+        target = is_quantizable(name, arr, min_elems) and (
+            selected is None or name in selected)
         if not target:
             out[name] = arr
             model_after += full
