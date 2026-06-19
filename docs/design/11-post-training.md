@@ -68,7 +68,10 @@ References: ReAct, Toolformer, TinyAgent.
 
 The Qwen base defines **`<|im_end|>`** as the chat EOS. Keep it **identical across SFT, RL, and
 serving** — a mismatch degrades the model at serving time. This is a cross-cutting invariant for
-all three layers and the GRPO pass.
+all three layers and the GRPO pass. `src/data/chat_template.py` is the single source of truth for
+the ChatML render + assistant-span masking (the assistant turn is trained up to and including its
+trailing `<|im_end|>`, so the model learns to stop on it); the shared instruct corpus under
+`shared/sft/` is produced by `src/data/instruct_sft.py` (#95).
 
 ## Shared with production
 

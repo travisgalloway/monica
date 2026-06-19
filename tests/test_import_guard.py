@@ -46,6 +46,8 @@ PORTABLE_MODULES = [
     "src.data.split",
     "src.data.download",
     "src.data.instruct_format",
+    "src.data.chat_template",
+    "src.data.instruct_sft",
     "src.data.sft_data",
     "src.data.sft_loader",
     "src.data.sft_sources",
