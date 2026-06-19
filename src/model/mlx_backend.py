@@ -542,6 +542,30 @@ class MLXMambaModel(ModelInterface, nn.Module):
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
 
+    def verify_block(self, tokens: Array, state: State):
+        """Speculative-decoding verify pass (#52): consume `tokens` (a 1-D id sequence)
+        through the `step` recurrence from `state`, returning the per-token next-token
+        logits and the per-token states in a SINGLE graph eval.
+
+        Identical in value to calling `step` token-by-token — but evaluating the whole
+        block at once amortizes the per-token kernel-launch/sync that dominates batch-1
+        decode, which is where speculative decoding's wall-clock win comes from. Returns
+        `(logits_list, state_list)` of length len(tokens); `state_list[i]` is the state
+        after consuming `tokens[:i+1]`, so the caller can roll back to the accepted prefix
+        without recomputing."""
+        logits_list, state_list = [], []
+        h_state = state
+        for tok in tokens:
+            logit, h_state = self.step(mx.array([int(tok)]), h_state)
+            logits_list.append(logit)
+            state_list.append(h_state)
+        # One eval realizes the whole block (logits + every intermediate state) together.
+        leaves = list(logits_list)
+        for st in state_list:
+            leaves.extend(v for _, v in tree_flatten(st))
+        mx.eval(leaves)
+        return logits_list, state_list
+
     # --- distillation matching accessors (#100) ------------------------------
     def hidden_states(self, token_batch: Array) -> Tuple[Array, ...]:
         """Per-layer hidden states for the `hidden-align` stage: the embedding output

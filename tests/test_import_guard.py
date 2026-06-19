@@ -77,6 +77,7 @@ PORTABLE_MODULES = [
     "src.serve.rewind",
     "src.serve.sampling",
     "src.serve.generate",
+    "src.serve.spec_decode",
 ]
 
 FORBIDDEN_ROOTS = ("mlx", "torch")
