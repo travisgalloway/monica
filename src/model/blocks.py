@@ -88,6 +88,16 @@ class MambaConfig:
     # Must divide d_model. Unused when attn_every is None.
     n_attn_heads: Optional[int] = None
 
+    # --- training-free long-context extension (#54) ---
+    # INFERENCE-TIME receptive-field enlargement (LongMamba). Divides the SSM
+    # discretization step `delta` by this factor, pushing the per-step decay
+    # exp(delta*A) toward 1 so state persists over a longer horizon — the SSM analogue
+    # of RoPE position interpolation. 1.0 = OFF and byte-identical (training + smoke gate
+    # untouched); set > 1.0 only at eval to read a model trained at `seq_len` over
+    # longer sequences. Applied in `SelectiveSSM._project`, so the chunked-scan
+    # (forward) and one-step recurrence (step) stay parity-exact.
+    long_ctx_factor: float = 1.0
+
     # --- dt-projection bias init (LOAD-BEARING) ---
     # Inverse-softplus of a sample in [dt_min, dt_max] initializes the dt bias.
     # Without this the model fails to learn recall. Carry these into every backend.
@@ -207,6 +217,8 @@ class MambaConfig:
             raise ValueError(f"unknown precision {self.precision!r}")
         if self.chunk_size is not None and self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive or None")
+        if self.long_ctx_factor < 1.0:
+            raise ValueError("long_ctx_factor must be >= 1.0 (1.0 = off)")
         if self.d_conv < 1:
             raise ValueError("d_conv must be >= 1")
         if self.head_dim <= 0 or self.d_inner % self.head_dim != 0:

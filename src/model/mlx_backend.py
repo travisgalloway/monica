@@ -187,6 +187,11 @@ class SelectiveSSM(nn.Module):
         B = _f32(proj[..., dt_rank:dt_rank + d_state])
         C = _f32(proj[..., dt_rank + d_state:])
         delta = _softplus(self.dt_proj(dt_pre))   # (..., H) per head, fp32
+        # Long-context extension (#54): divide the discretization step so per-step decay
+        # exp(delta*a) moves toward 1, enlarging the receptive field at inference. Guarded
+        # so factor 1.0 (the default) leaves delta byte-identical — training/smoke untouched.
+        if self.config.long_ctx_factor != 1.0:
+            delta = delta / self.config.long_ctx_factor
         a = -mx.exp(self.A_log)                    # (H,) scalar decay, fp32
         return delta, a, B, C
 
