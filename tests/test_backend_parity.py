@@ -102,6 +102,40 @@ def test_backend_parity_hybrid(tmp_path):
 
 @pytest.mark.skipif(not (HAVE_MLX and HAVE_TORCH),
                     reason="needs both mlx and torch (run on a Mac)")
+def test_backend_parity_seg_ids(tmp_path):
+    """Packed multi-doc forward with seg_ids (#68/#111) agrees MLX<->torch in fp32. Proves
+    the CUDA seg_ids path (inter-chunk mask + boundary-aware conv + block-diagonal attn)
+    matches the MLX reference, not just each backend's own doc-boundary self-consistency."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.cuda_backend import CUDAMambaModel
+
+    cfg = load_config("config/toy-hybrid.yaml")        # exercises both Mamba + attention
+    Q = cfg.chunk_size or 64
+    torch.manual_seed(0)
+    src = CUDAMambaModel(cfg)
+    path = str(tmp_path / "weights.safetensors")
+    src.save(path)
+    mlx_m = MLXMambaModel(cfg); mlx_m.load(path)
+    cuda_m = CUDAMambaModel(cfg); cuda_m.load(path)
+
+    # Pack two chunk-aligned docs into one sequence with seg_ids (doc boundaries on chunks).
+    rng = np.random.default_rng(0)
+    packed, seg = [], []
+    for d, n in enumerate([Q, 2 * Q]):
+        packed.extend(rng.integers(0, cfg.vocab_size, size=n).tolist())
+        seg.extend([d] * n)
+    packed = np.asarray(packed, dtype=np.int32)[None]
+    seg = np.asarray(seg, dtype=np.int32)[None]
+
+    with torch.no_grad():
+        a = _mlx_np(mlx_m.forward(packed, seg)).astype(np.float64)
+        b = _torch_np(cuda_m.forward(packed, seg)).astype(np.float64)
+    max_abs = float(np.abs(a - b).max())
+    assert np.allclose(a, b, rtol=1e-4, atol=1e-5), f"seg_ids parity drift {max_abs:.3e}"
+
+
+@pytest.mark.skipif(not (HAVE_MLX and HAVE_TORCH),
+                    reason="needs both mlx and torch (run on a Mac)")
 def test_portable_weights_roundtrip_both_directions(tmp_path):
     """MLX save -> torch _load_portable -> torch save -> load back into MLX; the MLX
     logits are unchanged. Proves the cross-backend bridge in both directions (a
