@@ -494,6 +494,73 @@ class AttentionBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Sparse Mixture-of-Experts FFN block (#53)
+# --------------------------------------------------------------------------- #
+class _Expert(nn.Module):
+    """A SwiGLU FFN expert: down(silu(gate(x)) * up(x)). Bias-free, matmuls in `cd`."""
+
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.gate = nn.Linear(d_model, d_ff, bias=False)
+        self.up = nn.Linear(d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
+
+    def __call__(self, xn: Array, cd) -> Array:
+        return _linear(self.down, _silu(_linear(self.gate, xn, cd)) * _linear(self.up, xn, cd), cd)
+
+
+class MoEBlock(nn.Module):
+    """Sparse Mixture-of-Experts FFN block (#53), interleaved like `AttentionBlock`.
+
+    pre-norm -> router (softmax over n_experts) -> keep the top_k experts per token,
+    renormalize their gates -> weighted sum of those experts' SwiGLU outputs, with a
+    residual. Same `forward_seq(x)->x` / `step(x, state)->(x, state)` contract as the
+    other blocks; because it is POINTWISE over the sequence (no temporal mixing), forward
+    and step compute the same function by construction (parity is trivial), and it carries
+    no recurrent state (a placeholder state passes through `step` unchanged).
+
+    Toy-scale routing: all experts are evaluated and the top_k gates select the
+    combination (a dense compute, sparse *combination*). This is exact and FLOP-accountable
+    (the active-FLOP count is top_k via `MambaConfig.active_num_parameters`) but does not
+    yet realize the wall-clock saving of a true gathered/grouped matmul — fine for a
+    capacity experiment measuring loss vs active-FLOPs, called out so it is not mistaken
+    for a production MoE kernel."""
+
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.norm = RMSNorm(config.d_model)
+        self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
+        d_ff = config.moe_d_ff_resolved
+        self.experts = [_Expert(config.d_model, d_ff) for _ in range(config.n_experts)]
+
+    def _moe(self, xn: Array) -> Array:
+        cd = _DTYPES[self.config.precision]
+        E, k = self.config.n_experts, self.config.top_k
+        logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
+        probs = mx.softmax(logits, axis=-1)
+        if k < E:                                            # keep EXACTLY top_k per token
+            # Rank each expert by descending prob (double argsort), keep ranks < k. A plain
+            # `probs >= kth` threshold would keep MORE than k experts on ties (e.g. uniform
+            # routing early in training), breaking the top_k contract and the active-FLOP
+            # count; ranking breaks ties by index so exactly k survive.
+            ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
+            gate = mx.where(ranks < k, probs, mx.zeros_like(probs))
+        else:
+            gate = probs
+        gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
+        outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
+        y = mx.sum(gate[..., None] * _f32(outs), axis=-2)    # combine in fp32
+        return _cast(y, cd)
+
+    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+        return x + self._moe(self.norm(x))                   # pointwise: seg_ids irrelevant
+
+    def step(self, x: Array, state: State) -> Tuple[Array, State]:
+        return x + self._moe(self.norm(x)), state            # stateless: pass state through
+
+
+# --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class MLXMambaModel(ModelInterface, nn.Module):
@@ -503,9 +570,10 @@ class MLXMambaModel(ModelInterface, nn.Module):
         self.config = config
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions.
-        self.layers = [AttentionBlock(config) if config.is_attention_layer(i)
-                       else MambaBlock(config) for i in range(config.n_layers)]
+        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions;
+        # MoE (#53): sparse-FFN blocks replace Mamba blocks at their gated positions
+        # (attention takes precedence on a collision, matching `is_moe_layer`).
+        self.layers = [self._make_layer(config, i) for i in range(config.n_layers)]
         self.norm_f = RMSNorm(config.d_model)
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
@@ -518,6 +586,14 @@ class MLXMambaModel(ModelInterface, nn.Module):
             self._layer_fns = [_checkpoint(l, l.forward_seq) for l in self.layers]
         else:
             self._layer_fns = [l.forward_seq for l in self.layers]
+
+    @staticmethod
+    def _make_layer(config: MambaConfig, i: int):
+        if config.is_attention_layer(i):
+            return AttentionBlock(config)
+        if config.is_moe_layer(i):
+            return MoEBlock(config)
+        return MambaBlock(config)
 
     def _head(self, h: Array) -> Array:
         # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is
@@ -608,6 +684,9 @@ class MLXMambaModel(ModelInterface, nn.Module):
             if c.is_attention_layer(i):
                 z = mx.zeros((batch_size, Ha, 0, Dh))
                 return (z, z)
+            if c.is_moe_layer(i):
+                z = mx.zeros((batch_size, 0))     # MoE FFN is stateless; placeholder pair
+                return (z, z)                     # (keeps clone_state's (a, b) unpack valid)
             return (mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, H, P, N)))
         return [layer_state(i) for i in range(self.config.n_layers)]
 

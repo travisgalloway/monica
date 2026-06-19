@@ -1,0 +1,29 @@
+# Toy MoE config (#53): tiny Mamba-2 with config-gated sparse-MoE FFN layers.
+# Used by the parity + sizing tests so they exercise a model with the MoE block type.
+# moe_every 2 over 4 layers -> blocks [Mamba, MoE, Mamba, MoE]. fp32 for exact parity.
+d_model: 64
+n_layers: 4
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
+d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 SSM heads (scalar A per head)
+dt_rank: auto
+
+# Sparse MoE: every 2nd block is a SwiGLU MoE FFN instead of a Mamba block.
+moe_every: 2           # layers 1 and 3 (0-indexed (i+1)%2==0) are MoE
+n_experts: 4           # route each token to top_k of these
+top_k: 2               # 2/4 experts active per token (sparse)
+moe_d_ff: null         # expert hidden width (null -> d_inner = 128)
+
+vocab_size: 256        # byte-fallback tokenizer for offline tests
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32        # correctness first; fp32 makes forward/step parity exact
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny; keep tests cheap
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
