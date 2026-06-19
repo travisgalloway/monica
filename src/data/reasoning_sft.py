@@ -41,8 +41,7 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from . import chat_template
-from .distill_corpus import tokenized_subdir
+from . import chat_template, storage
 
 
 def _valid_rows(rows: Iterable[dict]) -> List[dict]:
@@ -79,9 +78,8 @@ def build_reasoning_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwe
     from .shard import pack_atomic
 
     out_root = Path(out_root)
-    sft_root = out_root / "sft"
-    cleaned_path = sft_root / "cleaned" / "reasoning-traces" / "records.jsonl"
-    tok_dir = sft_root / "tokenized" / tokenized_subdir(tokenizer, seq_len)
+    cleaned_path = storage.sft_cleaned_dir(out_root, "reasoning-traces") / "records.jsonl"
+    tok_dir = storage.sft_tokenized_dir(out_root, tokenizer, seq_len)
     masked_path = tok_dir / "reasoning.jsonl"
     packed_dir = tok_dir / "reasoning-packed"
 

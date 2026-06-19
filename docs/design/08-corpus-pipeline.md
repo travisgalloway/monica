@@ -94,15 +94,27 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 
 ## R2 storage layout
 
+The distillation pivot adopts a **three-class** layout (#97), so the student layout stays
+downstream of every frozen artifact. `src/data/storage.py` is the single source of truth for these
+prefixes; the data drivers (`distill_corpus.py`, `instruct_sft.py`, `reasoning_sft.py`) build their
+paths through it, and #80 points the R2 `s3fs` readers/writers at the same prefixes.
+
 ```
 r2://<bucket>/
-  cleaned/   <source>/*.parquet   # Stage-4/5 output: durable, re-mixable text shards
-  tokens/    <tokenizer>/<seqlen>/*.bin   # Stage-6 output: training shards (uint16, or uint32 for Qwen2.5)
-  ckpt/      <run>/...            # checkpoints synced from RunPod (RunPod is not durable)
+  poc-distill/      corpus/{cleaned, tokenized/<tok>-<k>}/   # distillation corpus (#92)
+                    teacher-outputs/{topk-logits, hidden-states}/   # precomputed teacher signal (#94)
+                    manifests/
+  shared/           sft/{cleaned/<kind>, tokenized/<tok>-<k>}/   # instruct/reasoning/tool SFT (#95/#96/#102)
+                    rl/{math-verifiable, code-verifiable}/   # verifiable RL sets (#103)
+                    eval/
+  reserve-pretrain/ cleaned/  tokenized/<ver>-<tok>-<k>/  manifests/   # from-scratch corpus (#70/#71)
+  ckpt/             <run>/...            # checkpoints synced from RunPod (RunPod is not durable)
 ```
 
-Dedup/decontam produce `cleaned/` once; `tokens/` is cheap to regenerate when the blend,
-tokenizer, or sequence length changes.
+Two rules the layout enforces: **cleaned text and RL problems stay tokenizer-agnostic and durable**
+(re-tokenize cheaply when the blend/tokenizer/seq_len changes), and **every tokenized folder
+name-pins tokenizer + seq_len** (`<tok>-<k>`, e.g. `qwen25-8k`) so multiple tokenized views coexist.
+Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regenerate.
 
 ## Training flow (Phases 4–5, #81 / #75)
 
