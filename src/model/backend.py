@@ -35,8 +35,8 @@ class Backend:
     make_optimizer: Callable[[Any, float], Any]
     seed: Callable[[int], None]
     to_numpy: Callable[[Any], Any]
-    # Post-training (M9) step factories, mirroring `make_train_step`. SFT/DPO are
-    # MLX-only for now; the CUDA branch raises a clear NotImplementedError.
+    # Post-training (M9/#110) step factories, mirroring `make_train_step`. Implemented on
+    # both the MLX and CUDA backends (the CUDA factories are torch mirrors, parity-tested).
     make_sft_train_step: Callable[..., Callable]
     make_dpo_train_step: Callable[..., Callable]
     make_grpo_train_step: Callable[..., Callable]
@@ -169,11 +169,19 @@ def _cuda_backend() -> Backend:
         from .cuda_train_step import load_optimizer
         return load_optimizer(optimizer, path)
 
-    def _post_training_unsupported(*args, **kwargs):
-        raise NotImplementedError(
-            "SFT/DPO (M9) are implemented on the MLX dev backend only; the CUDA "
-            "post-training steps are deferred (run scripts/sft.py / scripts/dpo.py on "
-            "Apple Silicon).")
+    # Post-training (#110): the SFT/DPO/GRPO step factories now exist on the CUDA backend
+    # too (torch mirrors of the MLX factories), imported lazily like make_train_step.
+    def _make_sft_train_step(*args, **kwargs):
+        from .cuda_train_step import make_sft_train_step
+        return make_sft_train_step(*args, **kwargs)
+
+    def _make_dpo_train_step(*args, **kwargs):
+        from .cuda_train_step import make_dpo_train_step
+        return make_dpo_train_step(*args, **kwargs)
+
+    def _make_grpo_train_step(*args, **kwargs):
+        from .cuda_train_step import make_grpo_train_step
+        return make_grpo_train_step(*args, **kwargs)
 
     def _teacher_unsupported(*args, **kwargs):
         raise NotImplementedError(
@@ -200,9 +208,9 @@ def _cuda_backend() -> Backend:
             model.parameters(), lr=base_lr),
         seed=lambda value: torch.manual_seed(value),
         to_numpy=lambda a: a.detach().to("cpu").numpy(),
-        make_sft_train_step=_post_training_unsupported,
-        make_dpo_train_step=_post_training_unsupported,
-        make_grpo_train_step=_post_training_unsupported,
+        make_sft_train_step=_make_sft_train_step,
+        make_dpo_train_step=_make_dpo_train_step,
+        make_grpo_train_step=_make_grpo_train_step,
         make_teacher=_teacher_unsupported,
         init_student=_student_init_unsupported,
         make_distill_train_step=_distill_unsupported,
