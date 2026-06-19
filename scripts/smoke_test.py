@@ -44,7 +44,7 @@ def main() -> None:
     from src.model.blocks import load_config
     from src.data.loader import PackedLoader
     from src.train.schedule import CosineSchedule
-    from src.train.checkpoint import save_weights, save_resume, load_resume
+    from src.train.checkpoint import CheckpointStore
     from src.eval.val_loss import evaluate
 
     backend = get_backend(args.backend)
@@ -86,23 +86,21 @@ def main() -> None:
     # --- 2) interrupted run: train half, checkpoint, KILL, rebuild, resume ------
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    weights_path = str(out / "weights.safetensors")
-    bundle_dir = str(out / "resume")
+    store = CheckpointStore(str(out / "resume"))
 
     res = {}
     model_a, opt_a, step_fn_a = fresh_model_opt()
     run_window(model_a, step_fn_a, 0, half, res)
-    model_a.save(weights_path)                                  # portable weights
-    save_resume(bundle_dir, step=half, loss_scale_state=None,
-                optimizer_serializer=lambda p: backend.save_optimizer(opt_a, p))
+    store.save(step=half, loss_scale_state=None,
+               weights_serializer=lambda p: model_a.save(p),    # portable weights
+               optimizer_serializer=lambda p: backend.save_optimizer(opt_a, p))
     del model_a, opt_a, step_fn_a                               # "kill" the process state
 
     backend.seed(args.seed + 999)              # different RNG: weights come from disk
     model_b = backend.model_cls(cfg)
-    model_b.load(weights_path)
     opt_b = backend.make_optimizer(model_b, sched.base_lr)
-    meta = load_resume(bundle_dir,
-                       optimizer_deserializer=lambda p: backend.load_optimizer(opt_b, p))
+    meta = store.load(weights_deserializer=lambda p: model_b.load(p),
+                      optimizer_deserializer=lambda p: backend.load_optimizer(opt_b, p))
     start = meta["step"]
     step_fn_b = backend.make_train_step(model_b, opt_b, grad_clip=1.0)
     run_window(model_b, step_fn_b, start, N, res)

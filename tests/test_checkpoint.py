@@ -1,17 +1,19 @@
-"""Unit tests for portable weight save/load and the within-backend resume bundle.
+"""Unit tests for portable weight save/load and the double-buffered CheckpointStore.
 
-Backend-free: uses numpy weight dicts and dummy optimizer (de)serializers, so it
+Backend-free: uses numpy weight dicts and dummy weight/optimizer (de)serializers, so it
 runs anywhere. Guards the resume bundle against a realistic NumPy RNG state
-(nested dict + np.ndarray + np scalars), which a shallow JSON conversion breaks.
+(nested dict + np.ndarray + np scalars), which a shallow JSON conversion breaks, and the
+crash-safety contract (the previous checkpoint survives a write interrupted mid-flight).
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from src.train.checkpoint import (
-    save_weights, load_weights_dict, save_resume, load_resume, _jsonable,
+    save_weights, load_weights_dict, CheckpointStore, _jsonable,
 )
 
 
@@ -40,63 +42,99 @@ def test_save_weights_writes_config_sidecar(tmp_path):
     assert sidecar == {"d_model": 64, "n_layers": 2}
 
 
-def _dummy_opt_io():
-    def serializer(p):
-        np.save(p + ".npy", np.arange(3))
+def _dummy_io(weights_tag="w0", opt_value=3):
+    """Dummy weight + optimizer (de)serializers writing recognizable content. `seen`
+    captures what `load` deserialized so tests can assert an exact round-trip."""
+    seen = {}
 
-    def deserializer(p):
+    def w_ser(p):
+        Path(p).write_text(weights_tag)
+
+    def o_ser(p):
+        np.save(p + ".npy", np.arange(opt_value))
+
+    def w_deser(p):
+        seen["weights"] = Path(p).read_text()
+
+    def o_deser(p):
         return np.load(p + ".npy")
 
-    return serializer, deserializer
+    return seen, w_ser, o_ser, w_deser, o_deser
 
 
-def test_resume_bundle_roundtrips_nested_state(tmp_path):
-    """A nested NumPy structure (the worst case _jsonable handles) survives exactly."""
-    bundle = tmp_path / "resume"
+def test_store_roundtrips_step_weights_and_nested_state(tmp_path):
+    """A full checkpoint (weights + optimizer + nested loss-scale state) round-trips."""
+    store = CheckpointStore(str(tmp_path / "resume"))
     nested = np.random.default_rng(0).bit_generator.state  # nested dict + np ndarray/scalars
-    ser, deser = _dummy_opt_io()
+    seen, w_ser, o_ser, w_deser, o_deser = _dummy_io(weights_tag="hello")
 
-    save_resume(str(bundle), step=42, loss_scale_state=nested,
-                optimizer_serializer=ser)
-    meta = load_resume(str(bundle), optimizer_deserializer=deser)
+    slot = store.save(step=42, loss_scale_state=nested,
+                      weights_serializer=w_ser, optimizer_serializer=o_ser)
+    assert slot == "slot-a"
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
 
-    assert meta["step"] == 42
+    assert meta["step"] == 42 and meta["slot"] == "slot-a"
+    assert seen["weights"] == "hello"
     assert np.array_equal(meta["optimizer"], np.arange(3))
-    # The restored structure equals the jsonable projection of the original — a real
-    # content check, not just "is serializable".
+    # Restored structure equals the jsonable projection — a real content check.
     assert meta["loss_scale_state"] == _jsonable(nested)
 
 
-def test_resume_bundle_roundtrips_loss_scale_state(tmp_path):
-    """The actual payload: a DynamicLossScaler.state_dict() restores its values."""
-    bundle = tmp_path / "resume"
+def test_store_roundtrips_loss_scale_state(tmp_path):
+    store = CheckpointStore(str(tmp_path / "resume"))
     state = {"scale": 4096.0, "good_steps": 137}
-    ser, deser = _dummy_opt_io()
-
-    save_resume(str(bundle), step=7, loss_scale_state=state, optimizer_serializer=ser)
-    meta = load_resume(str(bundle), optimizer_deserializer=deser)
-
+    _, w_ser, o_ser, w_deser, o_deser = _dummy_io()
+    store.save(step=7, loss_scale_state=state, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
     assert meta["loss_scale_state"] == state
 
 
-def test_load_resume_refuses_bundle_without_commit_marker(tmp_path):
-    """An interrupted checkpoint (no COMMIT) is rejected, not silently resumed."""
-    bundle = tmp_path / "resume"
-    ser, deser = _dummy_opt_io()
-    save_resume(str(bundle), step=5, loss_scale_state=None, optimizer_serializer=ser)
-
-    (bundle / "COMMIT").unlink()  # simulate a mid-write interruption
-
-    with pytest.raises(RuntimeError, match="COMMIT"):
-        load_resume(str(bundle), optimizer_deserializer=deser)
+def test_store_alternates_slots(tmp_path):
+    """Successive checkpoints ping-pong between the two slots."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    _, w_ser, o_ser, _, _ = _dummy_io()
+    slots = [store.save(step=i, loss_scale_state=None, weights_serializer=w_ser,
+                        optimizer_serializer=o_ser) for i in range(3)]
+    assert slots == ["slot-a", "slot-b", "slot-a"]
 
 
-def test_save_resume_leaves_no_temp_files(tmp_path):
-    """Atomic writes clean up after themselves — no stray .tmp/.swap on success."""
-    bundle = tmp_path / "resume"
-    ser, _ = _dummy_opt_io()
-    save_resume(str(bundle), step=1, loss_scale_state=None, optimizer_serializer=ser)
+def test_store_load_without_checkpoint_raises(tmp_path):
+    store = CheckpointStore(str(tmp_path / "resume"))
+    assert not store.has_checkpoint()
+    _, _, _, w_deser, o_deser = _dummy_io()
+    with pytest.raises(RuntimeError, match="no committed checkpoint"):
+        store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
 
-    leftovers = [p.name for p in bundle.iterdir()
-                 if p.name.endswith((".tmp", ".swap")) or p.name.startswith(".tmp-")]
-    assert leftovers == [], f"unexpected temp files left behind: {leftovers}"
+
+def test_store_crash_mid_write_preserves_previous_checkpoint(tmp_path):
+    """The core double-buffering guarantee: a checkpoint interrupted mid-write leaves
+    the PREVIOUS committed checkpoint fully intact and loadable."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    seen, w_ser, o_ser, w_deser, o_deser = _dummy_io(weights_tag="good-step-10")
+    store.save(step=10, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+
+    # Second checkpoint dies mid-write (serializer raises) — LATEST is never flipped.
+    def boom(p):
+        Path(p).write_text("half-written")
+        raise RuntimeError("killed mid-checkpoint")
+
+    with pytest.raises(RuntimeError, match="killed mid-checkpoint"):
+        store.save(step=20, loss_scale_state=None, weights_serializer=boom,
+                   optimizer_serializer=o_ser)
+
+    # The live checkpoint is still step 10, with its original weights.
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
+    assert meta["step"] == 10 and meta["slot"] == "slot-a"
+    assert seen["weights"] == "good-step-10"
+
+
+def test_store_save_leaves_no_temp_files(tmp_path):
+    store = CheckpointStore(str(tmp_path / "resume"))
+    _, w_ser, o_ser, _, _ = _dummy_io()
+    store.save(step=1, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+    stray = [p.name for p in (tmp_path / "resume" / "slot-a").iterdir()
+             if p.name.endswith((".tmp", ".swap")) or p.name.startswith(".tmp-")]
+    assert stray == [], f"unexpected temp files: {stray}"
