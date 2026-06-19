@@ -88,6 +88,19 @@ class MambaConfig:
     # Must divide d_model. Unused when attn_every is None.
     n_attn_heads: Optional[int] = None
 
+    # --- sparse Mixture-of-Experts (#53) ---
+    # Make every Mth block a sparse-MoE FFN block INSTEAD OF a Mamba block (the same
+    # interleave the hybrid uses for attention). MoE-Mamba/ME-Mamba: route each token to
+    # `top_k` of `n_experts` SwiGLU experts, adding capacity (params) at ~constant active
+    # compute. None = OFF (pure Mamba / hybrid; dense path byte-identical). Layer i is MoE
+    # iff `moe_every and (i+1) % moe_every == 0` AND it is not already an attention layer
+    # (attention takes precedence on a collision).
+    moe_every: Optional[int] = None
+    n_experts: int = 0          # experts per MoE block (>= 2 when MoE is on)
+    top_k: int = 2              # experts routed per token (1 <= top_k <= n_experts)
+    # Expert FFN hidden width. None => d_inner (the Mamba inner width), a natural scale.
+    moe_d_ff: Optional[int] = None
+
     # --- dt-projection bias init (LOAD-BEARING) ---
     # Inverse-softplus of a sample in [dt_min, dt_max] initializes the dt bias.
     # Without this the model fails to learn recall. Carry these into every backend.
@@ -132,6 +145,23 @@ class MambaConfig:
             return 0
         return self.n_layers // self.attn_every
 
+    # --- MoE derived params (#53) ---
+    @property
+    def moe_d_ff_resolved(self) -> int:
+        return int(self.moe_d_ff) if self.moe_d_ff is not None else self.d_inner
+
+    def is_moe_layer(self, i: int) -> bool:
+        """True if block `i` is a sparse-MoE FFN block. Attention takes precedence, so a
+        layer the hybrid claims is never also MoE."""
+        return (bool(self.moe_every) and (i + 1) % self.moe_every == 0
+                and not self.is_attention_layer(i))
+
+    @property
+    def n_moe_layers(self) -> int:
+        if not self.moe_every:
+            return 0
+        return sum(self.is_moe_layer(i) for i in range(self.n_layers))
+
     def parameter_breakdown(self) -> dict:
         """Closed-form trainable-parameter count, broken out by named term.
 
@@ -165,7 +195,8 @@ class MambaConfig:
         )
 
         n_attn = self.n_attention_layers
-        n_mamba = self.n_layers - n_attn
+        n_moe = self.n_moe_layers
+        n_mamba = self.n_layers - n_attn - n_moe
 
         bd = {
             "embedding": self.vocab_size * d_model,
@@ -179,14 +210,42 @@ class MambaConfig:
             d_attn = self.n_attn_heads_resolved * self.attn_head_dim
             attn_per_layer = d_model + 3 * d_model * d_attn + d_attn * d_model
             bd["attention"] = n_attn * attn_per_layer
+        # MoE (#53): sparse-FFN blocks REPLACE that many Mamba blocks. Each is a pre-norm
+        # + a bias-free router (d_model -> n_experts) + n_experts SwiGLU experts (gate, up:
+        # d_model -> d_ff; down: d_ff -> d_model; all bias-free). ALL expert params count
+        # toward capacity here; `active_parameter_breakdown` counts only the top_k routed.
+        if n_moe:
+            bd["moe"] = n_moe * self._moe_layer_params(self.n_experts)
         # Tied embedding reuses the input matrix as the LM head -> no extra params.
         if not self.tie_embeddings:
             bd["lm_head"] = self.vocab_size * d_model
         return bd
 
+    def _moe_layer_params(self, n_active_experts: int) -> int:
+        """Params of one MoE block counting `n_active_experts` experts: pre-norm + router
+        + experts (SwiGLU gate+up+down, bias-free). Used both for total capacity
+        (n_active_experts = n_experts) and active compute (= top_k)."""
+        d_model, d_ff = self.d_model, self.moe_d_ff_resolved
+        expert = 3 * d_model * d_ff
+        return d_model + self.n_experts * d_model + n_active_experts * expert
+
     def num_parameters(self) -> int:
         """Total trainable parameters (sum of `parameter_breakdown()`)."""
         return sum(self.parameter_breakdown().values())
+
+    def active_parameter_breakdown(self) -> dict:
+        """Per-token ACTIVE parameters — a FLOP proxy for the MoE capacity experiment
+        (#53). Identical to `parameter_breakdown()` except MoE blocks count only the
+        `top_k` routed experts (the conditional compute), not all `n_experts`. With MoE
+        off this equals `parameter_breakdown()`."""
+        bd = dict(self.parameter_breakdown())
+        if self.n_moe_layers:
+            bd["moe"] = self.n_moe_layers * self._moe_layer_params(self.top_k)
+        return bd
+
+    def active_num_parameters(self) -> int:
+        """Per-token active parameter count (sum of `active_parameter_breakdown()`)."""
+        return sum(self.active_parameter_breakdown().values())
 
     @property
     def packing_dtype(self) -> str:
@@ -222,6 +281,25 @@ class MambaConfig:
                 raise ValueError(
                     f"n_attn_heads={nah} must divide d_model={self.d_model} "
                     "(attn_head_dim = d_model // n_attn_heads)."
+                )
+        if self.moe_every is not None:
+            if self.moe_every <= 0:
+                raise ValueError("moe_every must be a positive int or None")
+            if self.n_experts < 2:
+                raise ValueError(
+                    f"n_experts={self.n_experts} must be >= 2 when moe_every is set "
+                    "(a sparse MoE needs at least two experts to route between)."
+                )
+            if not (1 <= self.top_k <= self.n_experts):
+                raise ValueError(
+                    f"top_k={self.top_k} must be in [1, n_experts={self.n_experts}]."
+                )
+            if self.moe_d_ff_resolved <= 0:
+                raise ValueError("moe_d_ff must be positive or None")
+            if self.n_moe_layers == 0:
+                raise ValueError(
+                    f"moe_every={self.moe_every} selects no layer at n_layers="
+                    f"{self.n_layers} (after attention precedence)."
                 )
 
     def to_dict(self) -> dict:
