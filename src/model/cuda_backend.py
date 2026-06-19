@@ -447,7 +447,8 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             return h @ self.embedding.weight.t()
         return self.lm_head(h)
 
-    def _layer_forward(self, layer: MambaBlock, h: Array, seg_ids: Array = None) -> Array:
+    def _layer_forward(self, layer: "MambaBlock | AttentionBlock", h: Array,
+                       seg_ids: Array = None) -> Array:
         # Gradient checkpointing: recompute the layer's forward in backward instead of
         # retaining its activations. Only meaningful under autograd; use_reentrant=False
         # runs normally in no-grad (eval/parity) contexts.
