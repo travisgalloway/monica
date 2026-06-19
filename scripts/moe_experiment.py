@@ -10,7 +10,7 @@ question MoE-Mamba/ME-Mamba pose: does sparse routing buy better loss-vs-active-
         --dense-config config/toy.yaml --steps 300
 
 The dense and MoE configs should share dims; only the MoE block placement differs. MLX
-imports are local so `--help` works on any host. Numbers post to #30.
+imports are local so `--help` works on any host. Numbers post to #53.
 """
 
 from __future__ import annotations

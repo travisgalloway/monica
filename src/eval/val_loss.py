@@ -72,7 +72,11 @@ def evaluate(model: ModelInterface, loader: PackedLoader,
         n_tokens = int(np.asarray(targets).size)
         total_ce += cross_entropy(logits, targets) * n_tokens
         total_tokens += n_tokens
-    mean_ce = total_ce / max(1, total_tokens)
+    if total_tokens == 0:
+        # Otherwise mean_ce=0 -> perplexity=1.0, a false "perfect model" that silently
+        # masks a misconfigured eval (empty/missing val split, wrong path).
+        raise ValueError("evaluate(): no tokens evaluated — val loader is empty")
+    mean_ce = total_ce / total_tokens
     return {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}
 
 
@@ -94,5 +98,9 @@ def evaluate_masked(model: ModelInterface, loader,
         logits = to_numpy(model.forward(inputs))
         total_ce += masked_cross_entropy(logits, targets, mask) * n_tokens
         total_tokens += n_tokens
-    mean_ce = total_ce / max(1.0, total_tokens)
+    if total_tokens == 0:
+        # No response tokens at all -> a false perplexity=1.0; fail loudly instead.
+        raise ValueError("evaluate_masked(): no response tokens evaluated — "
+                         "val loader is empty or fully masked")
+    mean_ce = total_ce / total_tokens
     return {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}

@@ -74,7 +74,7 @@ decision record** — read them before changing values. Key locked decisions:
 - **toy.yaml** (smoke/correctness): tiny, `fp32` for bit-exact fixed-seed resume,
   `vocab_size 256` (byte-fallback tokenizer, offline).
 - **poc.yaml** (~100M scale run): `vocab_size 50280` (OLMo-7B-hf, confirmed `<65536`, uint16),
-  `precision fp16` + (dynamic) loss scaling (~18% faster than bf16 on Metal per the M1
+  `precision fp16` + (dynamic) loss scaling (~16% faster than bf16 on Metal per the M1
   micro-benchmark — **do not assume bf16**), tied embedding **mandatory** (~38M of
   ~100M params), `grad_checkpoint: true` (required at this depth — see below).
 - **`head_dim`** is the Mamba-2 head width: `d_inner` splits into

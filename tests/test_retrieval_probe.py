@@ -66,9 +66,17 @@ def test_recall_accuracy_perfect_and_chance():
 
 
 # --- end-to-end probe: the hybrid measurably out-recalls pure Mamba (MLX, ~20s) ---
-mx = pytest.importorskip("mlx.core")
+# Per-test skip marker, NOT a module-level `importorskip` (which would skip the whole
+# module on a non-Mac host, dropping the portable MQAR data-contract tests above).
+try:
+    import mlx.core  # noqa: F401
+    HAVE_MLX = True
+except ImportError:
+    HAVE_MLX = False
+requires_mlx = pytest.mark.skipif(not HAVE_MLX, reason="requires mlx (Apple Silicon)")
 
 
+@requires_mlx
 def test_hybrid_outrecalls_pure_mamba():
     """At enough key-value pairs the SSM's fixed-width state saturates and pure Mamba
     stays near chance, while a hybrid with a couple of attention layers recalls almost

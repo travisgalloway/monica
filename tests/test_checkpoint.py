@@ -8,9 +8,10 @@ runs anywhere. Guards the resume bundle against a realistic NumPy RNG state
 import json
 
 import numpy as np
+import pytest
 
 from src.train.checkpoint import (
-    save_weights, load_weights_dict, save_resume, load_resume,
+    save_weights, load_weights_dict, save_resume, load_resume, _jsonable,
 )
 
 
@@ -39,26 +40,63 @@ def test_save_weights_writes_config_sidecar(tmp_path):
     assert sidecar == {"d_model": 64, "n_layers": 2}
 
 
-def test_resume_bundle_with_realistic_rng_state(tmp_path):
-    bundle = tmp_path / "resume"
-    rng_state = np.random.default_rng(0).bit_generator.state  # nested dict + np types
-
-    saved = {}
-
-    def opt_serializer(p):
-        saved["path"] = p
-        # stand in for a backend optimizer dump
+def _dummy_opt_io():
+    def serializer(p):
         np.save(p + ".npy", np.arange(3))
 
-    def opt_deserializer(p):
+    def deserializer(p):
         return np.load(p + ".npy")
 
-    # Must not raise on nested RNG state.
-    save_resume(str(bundle), step=42, rng_state=rng_state,
-                optimizer_serializer=opt_serializer)
+    return serializer, deserializer
 
-    meta = load_resume(str(bundle), optimizer_deserializer=opt_deserializer)
+
+def test_resume_bundle_roundtrips_nested_state(tmp_path):
+    """A nested NumPy structure (the worst case _jsonable handles) survives exactly."""
+    bundle = tmp_path / "resume"
+    nested = np.random.default_rng(0).bit_generator.state  # nested dict + np ndarray/scalars
+    ser, deser = _dummy_opt_io()
+
+    save_resume(str(bundle), step=42, loss_scale_state=nested,
+                optimizer_serializer=ser)
+    meta = load_resume(str(bundle), optimizer_deserializer=deser)
+
     assert meta["step"] == 42
     assert np.array_equal(meta["optimizer"], np.arange(3))
-    # rng_state survived JSON serialization as a plain structure.
-    assert json.dumps(meta["rng_state"])  # serializable
+    # The restored structure equals the jsonable projection of the original — a real
+    # content check, not just "is serializable".
+    assert meta["loss_scale_state"] == _jsonable(nested)
+
+
+def test_resume_bundle_roundtrips_loss_scale_state(tmp_path):
+    """The actual payload: a DynamicLossScaler.state_dict() restores its values."""
+    bundle = tmp_path / "resume"
+    state = {"scale": 4096.0, "good_steps": 137}
+    ser, deser = _dummy_opt_io()
+
+    save_resume(str(bundle), step=7, loss_scale_state=state, optimizer_serializer=ser)
+    meta = load_resume(str(bundle), optimizer_deserializer=deser)
+
+    assert meta["loss_scale_state"] == state
+
+
+def test_load_resume_refuses_bundle_without_commit_marker(tmp_path):
+    """An interrupted checkpoint (no COMMIT) is rejected, not silently resumed."""
+    bundle = tmp_path / "resume"
+    ser, deser = _dummy_opt_io()
+    save_resume(str(bundle), step=5, loss_scale_state=None, optimizer_serializer=ser)
+
+    (bundle / "COMMIT").unlink()  # simulate a mid-write interruption
+
+    with pytest.raises(RuntimeError, match="COMMIT"):
+        load_resume(str(bundle), optimizer_deserializer=deser)
+
+
+def test_save_resume_leaves_no_temp_files(tmp_path):
+    """Atomic writes clean up after themselves — no stray .tmp/.swap on success."""
+    bundle = tmp_path / "resume"
+    ser, _ = _dummy_opt_io()
+    save_resume(str(bundle), step=1, loss_scale_state=None, optimizer_serializer=ser)
+
+    leftovers = [p.name for p in bundle.iterdir()
+                 if p.name.endswith((".tmp", ".swap")) or p.name.startswith(".tmp-")]
+    assert leftovers == [], f"unexpected temp files left behind: {leftovers}"

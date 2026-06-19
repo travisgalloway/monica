@@ -80,7 +80,7 @@ def main() -> None:
 
     backend = get_backend(args.backend)
 
-    cfg = load_config(str(args.config))                 # validates (vocab < 65536, ...)
+    cfg = load_config(str(args.config))                 # validates (vocab < 2**32, head_dim | d_inner, ...)
 
     tokens_per_step = args.batch_size * cfg.seq_len * args.grad_accum
     total_steps = (args.total_steps if args.total_steps is not None
@@ -121,7 +121,7 @@ def main() -> None:
                            optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
         start_step = int(meta["step"])
         if scaler is not None:
-            scaler.load_state_dict(meta.get("rng_state") or {})
+            scaler.load_state_dict(meta.get("loss_scale_state") or {})
         print(f"[resume] from step {start_step} (out={out})")
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resume_dir is not None)
@@ -129,7 +129,7 @@ def main() -> None:
     def on_checkpoint(step: int) -> None:
         model.save(weights_path)                        # portable weights + config
         save_resume(bundle_dir, step=step,
-                    rng_state=(scaler.state_dict() if scaler else None),
+                    loss_scale_state=(scaler.state_dict() if scaler else None),
                     optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
 
     tcfg = TrainConfig(
@@ -148,7 +148,10 @@ def main() -> None:
           start_step=start_step)
 
     # --- final checkpoint + full eval ------------------------------------------
-    on_checkpoint(total_steps)
+    # The loop already checkpoints at `step == total_steps` when total_steps is a
+    # multiple of ckpt_every; guard so we don't write (and re-serialize) it twice.
+    if total_steps % tcfg.ckpt_every != 0:
+        on_checkpoint(total_steps)
     final = evaluate(model, val_loader, max_batches=max_b, to_numpy=np_to)
     logger.close()
     print(f"[done] step={total_steps}  val_loss={final['val_loss']:.4f}  "

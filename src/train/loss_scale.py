@@ -25,12 +25,14 @@ class DynamicLossScaler:
         backoff: float = 0.5,
         growth_interval: int = 2000,
         min_scale: float = 1.0,
+        max_scale: float = 2.0 ** 24,
     ):
         self.scale = float(init_scale)
         self.growth_factor = float(growth_factor)
         self.backoff = float(backoff)
         self.growth_interval = int(growth_interval)
         self.min_scale = float(min_scale)
+        self.max_scale = float(max_scale)
         self._good_steps = 0
 
     def update(self, overflow: bool) -> None:
@@ -41,7 +43,10 @@ class DynamicLossScaler:
             return
         self._good_steps += 1
         if self._good_steps >= self.growth_interval:
-            self.scale *= self.growth_factor
+            # Cap growth: without a ceiling the scale doubles unboundedly until the
+            # scaled loss itself overflows fp16, wasting a step every cycle. 2**24
+            # matches PyTorch AMP / Apex defaults.
+            self.scale = min(self.max_scale, self.scale * self.growth_factor)
             self._good_steps = 0
 
     def state_dict(self) -> dict:

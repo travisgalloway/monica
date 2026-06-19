@@ -116,8 +116,14 @@ class SessionStore:
         return self.model.clone_state(self._states[session_id])
 
     def set_state(self, session_id: str, state: State) -> None:
-        """Restore a session to a previously captured snapshot (e.g. a rewind target)."""
-        self._states[session_id] = state
+        """Restore a session to a previously captured snapshot (e.g. a rewind target).
+
+        Clones on the way in — symmetric with `get_state` — so the store owns an
+        independent copy. Without this, installing a `RewindTree.rewind(...)` result
+        (which aliases the tree node) lets a subsequent in-place `step` mutation on a
+        numpy/CUDA state silently corrupt the retained snapshot.
+        """
+        self._states[session_id] = self.model.clone_state(state)
         self._states.move_to_end(session_id)
 
     # --- introspection ---

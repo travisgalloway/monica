@@ -43,12 +43,16 @@ class DPOLoader:
         full = n // self.batch_size
         return full if self.drop_last else (n + self.batch_size - 1) // self.batch_size
 
-    def epoch(self, reseed: Optional[int] = None) -> Iterator[tuple[np.ndarray, ...]]:
+    def epoch(self, reseed: Optional[int] = None,
+              skip_batches: int = 0) -> Iterator[tuple[np.ndarray, ...]]:
+        """Yield one pass; `skip_batches` fast-forwards on resume (shuffle runs first)."""
         if reseed is not None:
             self.rng = np.random.default_rng(reseed)
         order = np.arange(len(self.records))
         if self.shuffle:
             self.rng.shuffle(order)
+        if skip_batches:
+            order = order[skip_batches * self.batch_size:]
 
         batch: List[dict] = []
         for idx in order:

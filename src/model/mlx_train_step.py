@@ -138,7 +138,15 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
 
 def _masked_seq_logprob(model, inputs, targets, mask) -> mx.array:
-    """Per-sequence summed log-prob of `targets` over masked (response) positions. (B,)."""
+    """Per-sequence SUMMED log-prob of `targets` over masked (response) positions. (B,).
+
+    NOTE: this is the raw sum, not the length-normalized mean. The DPO margin is then
+    proportional to response length, so chosen/rejected pairs of very different lengths
+    bias the objective toward the shorter response. This matches the original DPO paper
+    (sum); it is correct when chosen and rejected have comparable lengths. If you train on
+    length-imbalanced pairs, switch to `/ mx.maximum(m.sum(-1), 1.0)` here AND in
+    `cuda_train_step._masked_seq_logprob` to keep the two backends in parity.
+    """
     logits = model.forward(inputs).astype(mx.float32)        # (B, L, V)
     logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     t = mx.array(targets).astype(mx.int32)

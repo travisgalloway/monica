@@ -2,10 +2,15 @@
 
 Draft-and-verify decoding accelerates autoregressive generation: a cheap drafter
 proposes the next few tokens, the real model verifies them in one batched pass, and
-verification keeps the output distribution exact. This module holds the two BACKEND-FREE
-pieces — the drafter and the accept rule — so they are testable without mlx. The stateful
-verifier pass and the timing live in `scripts/spec_decode.py` (it advances the model's
-`step` recurrence on the backend).
+verification keeps the output identical to plain decoding. This module holds the two
+BACKEND-FREE pieces — the drafter and the accept rule — so they are testable without mlx.
+The stateful verifier pass and the timing live in `scripts/spec_decode.py` (it advances
+the model's `step` recurrence on the backend).
+
+GREEDY ONLY: the accept rule (`first_mismatch`) compares draft tokens against the
+verifier's *argmax*, so the preserved output is the GREEDY decode. It is NOT
+distribution-preserving for temperature>0 / top-p sampling — that needs the Leviathan
+et al. rejection-sampling rule, which this does not implement. Drive it greedily.
 
 The drafter here is **prompt-lookup** (a.k.a. n-gram / self-speculative): it proposes
 continuations by finding where the current context's tail recurred earlier and copying

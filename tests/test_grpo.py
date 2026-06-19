@@ -20,11 +20,14 @@ def test_group_advantages_standardized_per_group():
 
 
 def test_grpo_loss_matches_formula():
+    # Hand-computed reference (NOT a recompute of the function's own expression, which
+    # would be tautological): adv*logp = [1*-1, -1*-2, 0*-0.5] = [-1, 2, 0];
+    # loss = -mean([-1, 2, 0]) = -(1/3); mean|adv| = mean([1, 1, 0]) = 2/3.
     logp = np.array([-1.0, -2.0, -0.5])
     adv = np.array([1.0, -1.0, 0.0])
     loss, mabs = grpo_loss_from_logprobs(logp, adv)
-    assert np.isclose(loss, float(-np.mean(adv * logp)))
-    assert np.isclose(mabs, float(np.mean(np.abs(adv))))
+    assert loss == pytest.approx(-1.0 / 3.0)
+    assert mabs == pytest.approx(2.0 / 3.0)
 
 
 def test_grpo_loss_zero_advantage_is_zero():

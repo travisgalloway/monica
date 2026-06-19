@@ -24,11 +24,12 @@ from ..model.interface import ModelInterface
 def check_doc_boundary_parity(model: ModelInterface, docs: Sequence[Sequence[int]],
                               chunk_size: int, *, to_numpy=np.asarray, pad_id: int = 0,
                               rtol: float = 1e-4, atol: float = 1e-5) -> dict:
-    """Pack `docs` chunk-aligned into one sequence with `seg_ids` and assert each document's
-    logits match its standalone forward. Returns `{max_abs_diff, ok}`; raises on mismatch.
+    """Pack `docs` chunk-aligned into one sequence with `seg_ids` and check each document's
+    logits match its standalone forward. Returns `{max_abs_diff, ok, failed_doc}`.
 
     Each doc is padded up to a multiple of `chunk_size` (padding follows the real tokens, so
-    causality keeps it from affecting them); only the real positions are compared.
+    causality keeps it from affecting them); only the real positions are compared. Returns
+    the verdict rather than raising, so the caller's `assert res["ok"]` is the real gate.
     """
     packed: List[int] = []
     seg: List[int] = []
@@ -48,6 +49,8 @@ def check_doc_boundary_parity(model: ModelInterface, docs: Sequence[Sequence[int
     packed_logits = to_numpy(model.forward(packed_arr, seg_arr))   # (1, Lp, V)
 
     max_abs = 0.0
+    ok = True
+    failed_doc = None
     for d, doc in enumerate(docs):
         solo = to_numpy(model.forward(np.asarray([list(doc)], dtype=np.int64)))  # (1, n, V)
         s, e = spans[d]
@@ -55,7 +58,8 @@ def check_doc_boundary_parity(model: ModelInterface, docs: Sequence[Sequence[int
         diff = np.abs(sub.astype(np.float64) - solo.astype(np.float64))
         max_abs = max(max_abs, float(diff.max()))
         if not np.allclose(sub, solo, rtol=rtol, atol=atol):
-            raise AssertionError(
-                f"doc-boundary parity FAILED for document {d}: max|diff|={diff.max():.3e} "
-                "— state leaked across a packed boundary")
-    return {"max_abs_diff": max_abs, "ok": True}
+            # State leaked across a packed boundary for this document.
+            ok = False
+            if failed_doc is None:
+                failed_doc = d
+    return {"max_abs_diff": max_abs, "ok": ok, "failed_doc": failed_doc}

@@ -45,13 +45,22 @@ class PackedLoader:
         full = self.n_chunks // self.batch_size
         return full if self.drop_last else (self.n_chunks + self.batch_size - 1) // self.batch_size
 
-    def epoch(self, reseed: Optional[int] = None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """Yield (inputs, targets), each (batch, seq_len), for one pass over the data."""
+    def epoch(self, reseed: Optional[int] = None,
+              skip_batches: int = 0) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Yield (inputs, targets), each (batch, seq_len), for one pass over the data.
+
+        `skip_batches` drops that many leading batches WITHOUT reading their chunks
+        — used on resume to fast-forward into a partial epoch. The shuffle is still
+        run first (so the order, and the rng state, are identical to an unskipped
+        epoch); only the already-consumed prefix of `order` is sliced off.
+        """
         if reseed is not None:
             self.rng = np.random.default_rng(reseed)
         order = np.arange(self.n_chunks)
         if self.shuffle:
             self.rng.shuffle(order)
+        if skip_batches:
+            order = order[skip_batches * self.batch_size:]
 
         batch = []
         for idx in order:

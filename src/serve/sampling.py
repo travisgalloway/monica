@@ -71,6 +71,14 @@ def sample(
             if banned.size:
                 logits[banned] = -np.inf
 
+    if not np.any(np.isfinite(logits)):
+        # Every token was banned (e.g. no_repeat_ngram_size covering the whole vocab):
+        # there is no valid next token. Fall back to a uniform draw rather than the
+        # greedy path returning a banned argmax or `_softmax` producing NaN probs that
+        # crash `rng.choice` mid-generation.
+        rng = rng or np.random.default_rng()
+        return int(rng.integers(logits.size))
+
     if temperature == 0:
         return int(logits.argmax())
     if temperature < 0:

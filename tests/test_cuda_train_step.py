@@ -152,7 +152,7 @@ def test_save_kill_resume_exact(tmp_path):
     weights = str(tmp_path / "weights.safetensors")
     bundle = str(tmp_path / "resume")
     ma.save(weights)
-    save_resume(bundle, step=half, rng_state=None,
+    save_resume(bundle, step=half, loss_scale_state=None,
                 optimizer_serializer=lambda p: save_optimizer(oa, p))
     del ma, oa, sfa                                   # "kill"
 

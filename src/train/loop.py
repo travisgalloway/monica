@@ -45,12 +45,24 @@ class TrainConfig:
 TrainStepFn = Callable[[ModelInterface, list, float], dict]
 
 
-def _micro_batch_stream(train_loader: PackedLoader, seed: int):
-    """Infinite stream of (inputs, targets), reseeding the shuffle each epoch."""
-    epoch_idx = 0
+def _micro_batch_stream(train_loader: PackedLoader, seed: int, start_micro: int = 0):
+    """Infinite stream of (inputs, targets), reseeding the shuffle each epoch.
+
+    `start_micro` fast-forwards the stream to the position reached after that many
+    micro-batches — this is what makes resume continue the data sequence instead of
+    replaying the corpus from the top. The stream is fully deterministic given
+    (seed, epoch length), so the position is reconstructed from `start_micro` alone:
+    skip whole epochs for free (just advance the per-epoch reseed) and fast-forward
+    the remainder within the current epoch via `epoch(skip_batches=...)`.
+    """
+    per_epoch = len(train_loader)
+    if per_epoch <= 0:
+        raise ValueError("train_loader yields no batches per epoch")
+    epoch_idx, skip = divmod(start_micro, per_epoch)
     while True:
-        yield from train_loader.epoch(reseed=seed + epoch_idx)
+        yield from train_loader.epoch(reseed=seed + epoch_idx, skip_batches=skip)
         epoch_idx += 1
+        skip = 0
 
 
 def train(
@@ -78,7 +90,8 @@ def train(
     log = logger or (lambda payload: print(payload))
     tokens_per_step = train_loader.batch_size * train_loader.seq_len * cfg.grad_accum
 
-    stream = _micro_batch_stream(train_loader, cfg.seed)
+    stream = _micro_batch_stream(train_loader, cfg.seed,
+                                 start_micro=start_step * cfg.grad_accum)
     t0 = time.perf_counter()
     steps_since_log = 0
 

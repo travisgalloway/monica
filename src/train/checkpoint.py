@@ -15,24 +15,75 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 
 
+# --- durable (crash-safe) writes -------------------------------------------
+# A long run (the poc is ~26 days) WILL be interrupted mid-checkpoint by
+# preemption / OOM / a manual kill. A naive `write_text` or `save_file` leaves a
+# truncated, half-written file that silently corrupts the only checkpoint. Every
+# artifact below is therefore written to a temp file in the same directory,
+# flushed + fsync'd, then `os.replace`d into place (atomic on POSIX): a reader
+# only ever sees the complete old file or the complete new one, never a partial.
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    path = str(path)
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".swap")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
 # --- portable weights -------------------------------------------------------
 def save_weights(state_dict: Dict[str, np.ndarray], path: str,
                  config: Optional[Any] = None) -> None:
-    """Save weights as safetensors + a `<path>.config.json` sidecar."""
+    """Save weights as safetensors + a `<path>.config.json` sidecar (atomically)."""
     from safetensors.numpy import save_file  # lazy
 
     path = str(path)
     tensors = {k: np.asarray(v) for k, v in state_dict.items()}
-    save_file(tensors, path)
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".safetensors")
+    os.close(fd)  # safetensors writes by path, not fd
+    try:
+        save_file(tensors, tmp)
+        _fsync_path(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     if config is not None:
         cfg = config.to_dict() if hasattr(config, "to_dict") else dict(config)
-        Path(path + ".config.json").write_text(json.dumps(cfg, indent=2))
+        _atomic_write_text(path + ".config.json", json.dumps(cfg, indent=2))
 
 
 def load_weights_dict(path: str) -> Dict[str, np.ndarray]:
@@ -53,23 +104,57 @@ def load_weights(model: Any, path: str) -> None:
 
 
 # --- within-backend resume bundle ------------------------------------------
-def save_resume(path: str, *, step: int, rng_state: Any,
+# The COMMIT marker is written LAST, after the optimizer + meta are durably on
+# disk. Its presence is the bundle's "this is complete and consistent" flag:
+# `load_resume` refuses any bundle without it, so a checkpoint interrupted
+# mid-write is detected loudly rather than silently resumed half-formed.
+_COMMIT = "COMMIT"
+
+
+def save_resume(path: str, *, step: int, loss_scale_state: Any,
                 optimizer_serializer: Callable[[str], None]) -> None:
-    """Save a same-backend resume bundle: training step, RNG state, optimizer state.
+    """Save a same-backend resume bundle: step, fp16 loss-scale state, optimizer state.
+
+    Note `loss_scale_state` holds the dynamic fp16 loss scaler's state (or None for
+    fp32/bf16) — NOT an RNG state. The data order on resume is reconstructed
+    deterministically from (seed, step, grad_accum) by the training loop, and the
+    model has no train-time RNG (no dropout; the only random op is weight init,
+    overwritten by the loaded weights), so there is no RNG to persist.
 
     `optimizer_serializer(opt_path)` is supplied by the backend (e.g. MLX/torch),
-    since optimizer state layout is backend-specific.
+    since optimizer state layout is backend-specific. Written via temp+rename so a
+    partial optimizer dump never overwrites the previous good one.
     """
     path = str(path)
     Path(path).mkdir(parents=True, exist_ok=True)
-    meta = {"step": int(step), "rng_state": _jsonable(rng_state)}
-    Path(path, "resume_meta.json").write_text(json.dumps(meta))
+    commit = Path(path, _COMMIT)
+    # Invalidate the bundle for the duration of the write. The backend optimizer
+    # serializer owns its real filename(s) (it appends an extension), so we cannot
+    # temp+rename it ourselves; instead we gate consistency on the COMMIT marker.
+    # If we crash anywhere below before COMMIT is rewritten, `load_resume` refuses
+    # this bundle rather than resuming a half-written optimizer + newer weights.
+    # (Single-slot: a crashed checkpoint is not resumable — double-buffered slots
+    # that preserve the previous checkpoint are a documented follow-up.)
+    if commit.exists():
+        commit.unlink()
     optimizer_serializer(str(Path(path, "optimizer.state")))
+    meta = {"step": int(step), "loss_scale_state": _jsonable(loss_scale_state)}
+    _atomic_write_text(Path(path, "resume_meta.json"), json.dumps(meta))
+    _atomic_write_text(commit, json.dumps({"step": int(step)}))
 
 
 def load_resume(path: str, optimizer_deserializer: Callable[[str], Any]) -> dict:
-    """Restore the resume bundle. Returns {step, rng_state, optimizer}."""
+    """Restore the resume bundle. Returns {step, loss_scale_state, optimizer}.
+
+    Refuses a bundle whose COMMIT marker is missing — that means the checkpoint
+    was interrupted mid-write and is not safe to resume from.
+    """
     path = str(path)
+    if not Path(path, _COMMIT).exists():
+        raise RuntimeError(
+            f"resume bundle at {path!r} has no COMMIT marker — it was written "
+            "partially (interrupted mid-checkpoint) and is unsafe to resume from."
+        )
     meta = json.loads(Path(path, "resume_meta.json").read_text())
     meta["optimizer"] = optimizer_deserializer(str(Path(path, "optimizer.state")))
     return meta

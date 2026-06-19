@@ -142,7 +142,17 @@ def _bench_model(args, cfg, mx) -> None:
 
 def main() -> None:
     args = _parse_args()
-    import mlx.core as mx
+    try:
+        import mlx.core as mx
+    except ModuleNotFoundError as e:
+        if e.name != "mlx":
+            raise
+        raise SystemExit(
+            "mlx not found — run with the project venv on Apple Silicon:\n"
+            "    .venv/bin/python scripts/bench_precision.py ...\n"
+            "(mlx installs only on Apple Silicon via the '[mlx]' extra; a bare "
+            "`python` likely points at a different interpreter.)"
+        ) from e
 
     from src.model.blocks import load_config
 

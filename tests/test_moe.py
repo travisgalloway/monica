@@ -76,9 +76,18 @@ def test_moe_validation():
 # --------------------------------------------------------------------------- #
 # MLX-guarded: dense path unchanged, parity, routing
 # --------------------------------------------------------------------------- #
-mx = pytest.importorskip("mlx.core")
+# Use a per-test skip marker, NOT a module-level `importorskip`: the latter runs at
+# import time and skips the WHOLE module on a non-Mac host, silently dropping the
+# portable config/validation tests above (which need no backend).
+try:
+    import mlx.core as mx
+    HAVE_MLX = True
+except ImportError:
+    HAVE_MLX = False
+requires_mlx = pytest.mark.skipif(not HAVE_MLX, reason="requires mlx (Apple Silicon)")
 
 
+@requires_mlx
 def test_dense_path_byte_identical_with_moe_off():
     """A model built with MoE off must be byte-for-byte the pre-#53 model: same layer
     types, same params, same logits."""
@@ -93,6 +102,7 @@ def test_dense_path_byte_identical_with_moe_off():
     assert np.array_equal(y, np.array(model.forward(tokens)))    # deterministic
 
 
+@requires_mlx
 def test_moe_model_builds_with_expected_block_types():
     from src.model.mlx_backend import MLXMambaModel, MambaBlock, MoEBlock
     cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
@@ -105,6 +115,7 @@ def test_moe_model_builds_with_expected_block_types():
     assert cfg.num_parameters() == actual
 
 
+@requires_mlx
 def test_moe_forward_step_parity():
     """MoE is pointwise, so the chunked forward and the one-step recurrence must agree
     (fp32 ~1e-4), like the Mamba/attention blocks."""
@@ -125,6 +136,7 @@ def test_moe_forward_step_parity():
     assert rel < 1e-4
 
 
+@requires_mlx
 def test_router_selects_top_k():
     """With top_k=1 the combined output must equal the single argmax-routed expert."""
     from src.model.mlx_backend import MLXMambaModel, MoEBlock
@@ -142,6 +154,7 @@ def test_router_selects_top_k():
         assert np.allclose(combined[i], expert_outs[i, e], atol=1e-5)
 
 
+@requires_mlx
 def test_router_keeps_exactly_k_on_ties():
     """A zeroed router makes all experts tie; exactly top_k must be kept (not all of
     them), so the combination is the mean of the first k experts — not all E."""

@@ -93,7 +93,7 @@ def main() -> None:
     model_a, opt_a, step_fn_a = fresh_model_opt()
     run_window(model_a, step_fn_a, 0, half, res)
     model_a.save(weights_path)                                  # portable weights
-    save_resume(bundle_dir, step=half, rng_state=None,
+    save_resume(bundle_dir, step=half, loss_scale_state=None,
                 optimizer_serializer=lambda p: backend.save_optimizer(opt_a, p))
     del model_a, opt_a, step_fn_a                               # "kill" the process state
 

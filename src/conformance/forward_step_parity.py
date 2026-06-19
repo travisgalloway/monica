@@ -1,4 +1,4 @@
-"""forward vs step parity (MILESTONE 1, MLX-only) — SKELETON.
+"""forward vs step parity (MILESTONE 1).
 
 The training path (`forward`, parallel scan) and the inference path (`step`,
 recurrence) are two SEPARATE code paths and must produce the same logits for the
@@ -38,7 +38,8 @@ def check_forward_step_parity(model: ModelInterface, token_batch: np.ndarray,
 
     diff = np.abs(parallel_logits.astype(np.float64) - step_logits.astype(np.float64))
     max_abs = float(diff.max())
-    ok = np.allclose(parallel_logits, step_logits, rtol=rtol, atol=atol)
-    if not ok:
-        raise AssertionError(f"forward/step parity FAILED: max|diff|={max_abs:.3e}")
+    # Return the verdict (don't raise) so the CALLER's `assert result["ok"]` is the
+    # actual gate — otherwise the assertion is decorative (the result could only ever
+    # be ok=True if a raise gated it first).
+    ok = bool(np.allclose(parallel_logits, step_logits, rtol=rtol, atol=atol))
     return {"max_abs_diff": max_abs, "ok": ok}

@@ -44,14 +44,20 @@ class SFTLoader:
         full = n // self.batch_size
         return full if self.drop_last else (n + self.batch_size - 1) // self.batch_size
 
-    def epoch(self, reseed: Optional[int] = None
+    def epoch(self, reseed: Optional[int] = None, skip_batches: int = 0
               ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Yield `(inputs, targets, mask)` for one pass; shuffles per epoch if enabled."""
+        """Yield `(inputs, targets, mask)` for one pass; shuffles per epoch if enabled.
+
+        `skip_batches` drops that many leading batches (resume fast-forward); the
+        shuffle still runs first so the order and rng state are unchanged.
+        """
         if reseed is not None:
             self.rng = np.random.default_rng(reseed)
         order = np.arange(len(self.records))
         if self.shuffle:
             self.rng.shuffle(order)
+        if skip_batches:
+            order = order[skip_batches * self.batch_size:]
 
         batch: List[dict] = []
         for idx in order:
