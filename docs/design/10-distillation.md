@@ -149,7 +149,9 @@ This exceeds the uint16 bound → **uint32 packing** (#90); see
 Everything that depends only on the **teacher + corpus** — not the student — is computed a single
 time and reused by every trial:
 
-- The tokenized distillation corpus (#92).
+- The tokenized distillation corpus (#92): `src/data/distill_corpus.py` orchestrates the existing
+  clean → Qwen2.5-tokenize → uint32-pack stages into `poc-distill/corpus/{cleaned,tokenized/qwen25-8k}`
+  with doc-boundary sidecars and a corpus manifest — the exact path the manifests below name.
 - **Teacher outputs** over it: top-50..100 logits + indices per token (#94); optionally hidden
   states for MOHAWK matching. The teacher forward pass is the dominant cost — paid **once**.
 - The shared SFT corpora and verifiable RL sets ([post-training](11-post-training.md)).

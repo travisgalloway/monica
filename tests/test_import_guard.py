@@ -37,6 +37,7 @@ PORTABLE_MODULES = [
     "src.model.sizing",
     "src.data.loader",
     "src.data.corpus",
+    "src.data.distill_corpus",
     "src.data.filters",
     "src.data.dedup",
     "src.data.blend",
