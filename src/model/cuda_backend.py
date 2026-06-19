@@ -424,6 +424,15 @@ class CUDAMambaModel(ModelInterface, nn.Module):
     def __init__(self, config: MambaConfig, device: str = "cpu"):
         nn.Module.__init__(self)
         config.validate()
+        # Fail fast rather than silently build a DENSE model: the sparse-MoE block (#53) is
+        # MLX-only for now, but MambaConfig.num_parameters()/parameter_breakdown() already
+        # account for MoE capacity — so a `moe_every` config here would disagree with the
+        # formula and skew any cross-backend sizing/comparison.
+        if config.n_moe_layers > 0:
+            raise NotImplementedError(
+                "MoE-Mamba (#53) is not implemented in the CUDA backend; "
+                "build a config without `moe_every` (it is an MLX-only experiment)."
+            )
         self.config = config
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self._device = torch.device(device)

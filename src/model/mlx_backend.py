@@ -539,9 +539,13 @@ class MoEBlock(nn.Module):
         E, k = self.config.n_experts, self.config.top_k
         logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
         probs = mx.softmax(logits, axis=-1)
-        if k < E:                                            # keep top_k, zero the rest
-            kth = mx.sort(probs, axis=-1)[..., -k][..., None]
-            gate = mx.where(probs >= kth, probs, mx.zeros_like(probs))
+        if k < E:                                            # keep EXACTLY top_k per token
+            # Rank each expert by descending prob (double argsort), keep ranks < k. A plain
+            # `probs >= kth` threshold would keep MORE than k experts on ties (e.g. uniform
+            # routing early in training), breaking the top_k contract and the active-FLOP
+            # count; ranking breaks ties by index so exactly k survive.
+            ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
+            gate = mx.where(ranks < k, probs, mx.zeros_like(probs))
         else:
             gate = probs
         gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates

@@ -140,3 +140,21 @@ def test_router_selects_top_k():
     expert_outs = np.stack([np.array(e(xn, cd)) for e in block.experts], axis=1)  # (5,E,d)
     for i, e in enumerate(chosen):
         assert np.allclose(combined[i], expert_outs[i, e], atol=1e-5)
+
+
+def test_router_keeps_exactly_k_on_ties():
+    """A zeroed router makes all experts tie; exactly top_k must be kept (not all of
+    them), so the combination is the mean of the first k experts — not all E."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    block.router.weight = mx.zeros_like(block.router.weight)   # uniform routing -> ties
+    xn = mx.random.normal((3, cfg.d_model))
+    cd = mx.float32
+    combined = np.array(block._moe(xn))
+    expert_outs = np.stack([np.array(e(xn, cd)) for e in block.experts], axis=1)  # (3,E,d)
+    mean_first_k = expert_outs[:, :2, :].mean(axis=1)          # ranks break ties by index
+    assert np.allclose(combined, mean_first_k, atol=1e-5)
+    assert not np.allclose(combined, expert_outs.mean(axis=1), atol=1e-5)  # NOT all 4
