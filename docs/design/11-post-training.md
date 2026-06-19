@@ -38,7 +38,14 @@ FLAN, DPO.
 (#96), then GRPO with verifiable rewards as polish (#103). The primary trace corpus is open-r1
 **Mixture-of-Thoughts** (~350k verified math/code/science traces distilled from R1, already on the
 Qwen tokenizer), topped up from a larger R1 distill (14B/32B) only where coverage is thin. **Trace
-SFT is the main event.** GSM8K + MATH and code-with-executable-tests supply the GRPO rewards and
+SFT is the main event.**
+
+`src/data/reasoning_sft.py` builds the corpus under `shared/sft/cleaned/reasoning-traces/` +
+`shared/sft/tokenized/qwen25-8k/` (`reasoning_traces.py` does the `<think>/<answer>` formatting and
+the Mixture-of-Thoughts / `load_topup` sources). It writes **two** forms: `reasoning.jsonl`
+(response-masked records for `SFTLoader`) and `reasoning-packed/` — the long 8K packing where each
+trace is one chunk-aligned document, so **no trace spans a sequence boundary** and `.bounds` marks
+each start for the SSM reset (#68); over-length traces are dropped, never split. GSM8K + MATH and code-with-executable-tests supply the GRPO rewards and
 evaluation; the [open-r1](https://github.com/huggingface/open-r1) harness provides GRPO with
 code-execution rewards and 1.5B configs that adapt directly. References: Chain-of-Thought,
 DeepSeek-R1.

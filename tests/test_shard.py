@@ -6,8 +6,8 @@ Pure numpy + stdlib. The boundary sidecar (consumed by #68) is the contract here
 import numpy as np
 import pytest
 
-from src.data.shard import (doc_start_offsets, open_shard, pack_sequences, read_manifest,
-                            segment_ids)
+from src.data.shard import (doc_start_offsets, open_shard, pack_atomic, pack_sequences,
+                            read_manifest, segment_ids)
 
 
 def test_pack_sequences_boundaries_and_roundtrip(tmp_path):
@@ -77,6 +77,36 @@ def test_chunk_align_requires_divisible_seq_len(tmp_path):
 def test_pack_sequences_validates_inputs(tmp_path):
     with pytest.raises(ValueError):
         pack_sequences([[1, 2]], tmp_path, seq_len=4, chunk_align=0)   # not ZeroDivisionError
+
+
+def test_pack_atomic_no_doc_spans_a_sequence_boundary(tmp_path):
+    # Two docs of 6 and 4 with seq_len 8: the 6-doc fills seq 0 (padded to 8); the 4-doc would
+    # straddle the seq-0/seq-1 edge under pack_sequences, so it starts seq 1 instead. No split.
+    manifest = pack_atomic([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10]], tmp_path, seq_len=8, pad_id=0)
+    assert manifest["n_documents"] == 2 and manifest["n_sequences"] == 2
+    toks, bnds = open_shard(tmp_path, manifest["shards"][0]["name"])
+    assert list(toks) == [1, 2, 3, 4, 5, 6, 0, 0,   # doc A + pad to seq_len
+                          7, 8, 9, 10, 0, 0, 0, 0]   # doc B starts at the next sequence boundary
+    assert doc_start_offsets(bnds) == [0, 8]          # neither doc crosses the seq_len-8 boundary
+    assert int(np.asarray(bnds).sum()) == 2
+
+
+def test_pack_atomic_drops_overlength_and_keeps_final_partial(tmp_path):
+    # A doc longer than seq_len can't be packed atomically -> dropped; the short doc is kept and
+    # its final partial sequence is padded out (not dropped, unlike pack_sequences).
+    manifest = pack_atomic([[1, 2], [1, 2, 3, 4, 5]], tmp_path, seq_len=4, pad_id=0)
+    assert manifest["n_dropped_overlength"] == 1       # the 5-token doc
+    assert manifest["n_documents"] == 1 and manifest["n_sequences"] == 1
+    toks, _ = open_shard(tmp_path, manifest["shards"][0]["name"])
+    assert list(toks) == [1, 2, 0, 0]                  # kept doc + padding
+
+
+def test_pack_atomic_chunk_align(tmp_path):
+    # chunk_align keeps doc starts on chunk boundaries within the sequence.
+    manifest = pack_atomic([[1, 2, 3], [4, 5]], tmp_path, seq_len=8, chunk_align=4, pad_id=0)
+    toks, bnds = open_shard(tmp_path, manifest["shards"][0]["name"])
+    assert doc_start_offsets(bnds) == [0, 4]           # second doc padded to start at chunk 4
+    assert list(toks) == [1, 2, 3, 0, 4, 5, 0, 0]
     with pytest.raises(ValueError):
         pack_sequences([[1, 2]], tmp_path, seq_len=4, pad_id=70000)    # out of uint16 range
 

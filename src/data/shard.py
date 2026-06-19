@@ -113,6 +113,102 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     return manifest
 
 
+def pack_atomic(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int = 8192,
+                shard_size_mb: int = 512, prefix: str = "part", tokenizer: str = "",
+                chunk_align: int | None = None, pad_id: int = 0, dtype=DTYPE) -> dict:
+    """Pack per-document token lists into fixed `seq_len` sequences such that **no document spans a
+    sequence boundary** — the atomic-packing guarantee #96 needs for reasoning traces.
+
+    Unlike `pack_sequences` (which concatenates docs into a flat stream, so a doc can straddle a
+    `seq_len` edge and be split across two training rows), this greedily bin-packs: a document that
+    will not fit in the current sequence's remaining space pads that sequence to its end with
+    `pad_id` and starts the document at the head of the next sequence. Documents whose
+    (chunk-aligned) length exceeds `seq_len` cannot be packed atomically and are **dropped**
+    (counted in `n_dropped_overlength`); the final partial sequence is padded out and kept (no
+    document is lost to a dropped tail). `chunk_align` still pads each document to a chunk multiple
+    so it starts on a chunk boundary for the SSM reset (#68); writes the same
+    `.bin`/`.bounds`/`manifest.json` artifacts as `pack_sequences`."""
+    dtype = np.dtype(dtype)
+    hi = int(np.iinfo(dtype).max)
+    if chunk_align is not None:
+        if chunk_align <= 0:
+            raise ValueError(f"chunk_align must be positive, got {chunk_align}")
+        if seq_len % chunk_align:
+            raise ValueError(
+                f"seq_len {seq_len} must be a multiple of chunk_align {chunk_align}")
+    if not 0 <= pad_id <= hi:
+        raise ValueError(f"pad_id {pad_id} out of {dtype.name} range [0, {hi}]")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bytes_per_token = dtype.itemsize
+    budget = max(seq_len, (shard_size_mb * (1 << 20)) // bytes_per_token)
+    budget -= budget % seq_len
+
+    tok_buf = array(typecode_for(dtype))
+    bnd_buf = bytearray()
+    cur: List[int] = []                 # the in-progress sequence (< seq_len until flushed)
+    cur_bnd: List[int] = []
+    shards: List[dict] = []
+    state = {"idx": 0, "docs": 0, "seqs": 0, "tokens": 0, "dropped": 0}
+
+    def flush_seq() -> None:
+        """Pad the in-progress sequence out to `seq_len` and append it to the shard buffers."""
+        nonlocal cur, cur_bnd
+        if not cur:
+            return
+        pad = seq_len - len(cur)
+        tok_buf.extend(cur + [pad_id] * pad)         # OverflowError if any id exceeds the dtype
+        bnd_buf.extend(bytes(cur_bnd) + b"\x00" * pad)
+        cur, cur_bnd = [], []
+
+    def emit(n_tokens: int) -> None:
+        name = f"{prefix}-{state['idx']:05d}"
+        toks = np.frombuffer(tok_buf, dtype=dtype, count=n_tokens)
+        toks.tofile(out_dir / f"{name}.bin")
+        del toks
+        (out_dir / f"{name}.bounds").write_bytes(bytes(bnd_buf[:n_tokens]))
+        n_seq = n_tokens // seq_len
+        shards.append({"name": name, "n_sequences": n_seq, "n_tokens": n_tokens})
+        state["idx"] += 1
+        state["seqs"] += n_seq
+        state["tokens"] += n_tokens
+        state["docs"] += int(sum(bnd_buf[:n_tokens]))
+        del tok_buf[:n_tokens]
+        del bnd_buf[:n_tokens]
+
+    for doc in token_docs:
+        ids = list(doc)
+        if not ids:
+            continue
+        if chunk_align is not None:
+            rem = len(ids) % chunk_align
+            if rem:
+                ids = ids + [pad_id] * (chunk_align - rem)
+        if len(ids) > seq_len:                       # cannot fit atomically -> drop
+            state["dropped"] += 1
+            continue
+        if len(cur) + len(ids) > seq_len:            # won't fit -> pad current seq, start a new one
+            flush_seq()
+        cur.extend(ids)
+        cur_bnd.append(1)
+        cur_bnd.extend([0] * (len(ids) - 1))
+        while len(tok_buf) >= budget:
+            emit(budget)
+    flush_seq()                                      # pad + keep the final partial sequence
+    while len(tok_buf) >= budget:
+        emit(budget)
+    if len(tok_buf):                                 # remaining whole sequences (< one shard)
+        emit(len(tok_buf))
+
+    manifest = {"seq_len": seq_len, "dtype": dtype.name, "tokenizer": tokenizer,
+                "n_documents": state["docs"], "n_sequences": state["seqs"],
+                "n_tokens": state["tokens"], "n_dropped_overlength": state["dropped"],
+                "shards": shards}
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return manifest
+
+
 def open_shard(out_dir, name: str) -> Tuple[np.memmap, np.memmap]:
     """Memory-map a shard's (tokens, boundaries uint8) pair, read-only. Token dtype comes
     from the manifest (uint16 / uint32; fallback uint16 for legacy shards)."""
