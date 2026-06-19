@@ -67,6 +67,7 @@ PORTABLE_MODULES = [
     "src.train.loss_scale",
     "src.train.loop",
     "src.eval.val_loss",
+    "src.eval.quantize",
     "src.eval.olmes_adapter",
     "src.eval.retrieval_probe",
     "src.eval.probes",
