@@ -37,18 +37,16 @@ from pathlib import Path
 from typing import Iterable
 
 from . import corpus
+from . import storage
 from .corpus import Record, ingest_dummy, ingest_text_file, iter_shard_texts
 
-#: Default local root for the distillation-corpus prefix. The three-class storage layout
-#: (poc-distill / shared / reserve-pretrain) is formalized separately in #97; here the prefix
-#: is just this default, kept deliberately minimal.
-DEFAULT_OUT_ROOT = Path("data/poc-distill")
+#: Default local root for the distillation-corpus prefix (the `poc-distill` class of the #97
+#: three-class layout, under the default `data/` base).
+DEFAULT_OUT_ROOT = storage.class_root("data", storage.POC_DISTILL)
 
-
-def tokenized_subdir(tokenizer: str, seq_len: int) -> str:
-    """Directory name for the tokenized shards: `<tokenizer>-<seqlen_k>` (e.g. `qwen25-8k`),
-    the exact path the student sweep manifests reference."""
-    return f"{tokenizer}-{seq_len // 1024}k"
+#: Tokenized-folder name-pin (`<tokenizer>-<seqlen_k>`). Canonical definition lives in `storage`
+#: (#97); kept here as an alias because the student sweep manifests + tests reference this name.
+tokenized_subdir = storage.tokenized_dir_name
 
 
 def _load_tokenizer(tokenizer: str, model_id: str | None, byte_fallback: bool):
@@ -83,8 +81,8 @@ def build_distill_corpus(records: Iterable[Record], out_root, *, tokenizer: str 
 
     out_root = Path(out_root)
     corpus_root = out_root / "corpus"
-    cleaned_dir = corpus_root / "cleaned"
-    tokenized_dir = corpus_root / "tokenized" / tokenized_subdir(tokenizer, seq_len)
+    cleaned_dir = storage.corpus_cleaned_dir(out_root)
+    tokenized_dir = storage.corpus_tokenized_dir(out_root, tokenizer, seq_len)
 
     # Stage 1 — cleaned, re-mixable text shards (durable artifact).
     cleaned_shards = corpus.build_corpus(records, cleaned_dir,

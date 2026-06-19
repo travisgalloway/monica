@@ -32,8 +32,7 @@ import json
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
-from . import chat_template
-from .distill_corpus import tokenized_subdir
+from . import chat_template, storage
 from .sft_data import _messages_of
 
 
@@ -115,9 +114,8 @@ def build_instruct_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen
     response-mask them under the Qwen chat template into the `shared/sft/tokenized/<tok>-<k>` prefix
     with a manifest. Returns the manifest dict."""
     out_root = Path(out_root)
-    sft_root = out_root / "sft"
-    cleaned_path = sft_root / "cleaned" / "instruct" / "records.jsonl"
-    tok_dir = sft_root / "tokenized" / tokenized_subdir(tokenizer, seq_len)
+    cleaned_path = storage.sft_cleaned_dir(out_root, "instruct") / "records.jsonl"
+    tok_dir = storage.sft_tokenized_dir(out_root, tokenizer, seq_len)
     tokenized_path = tok_dir / "instruct.jsonl"
 
     cleaned_rows = _write_cleaned(rows, cleaned_path)
