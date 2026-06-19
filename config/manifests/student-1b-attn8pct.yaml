@@ -11,7 +11,7 @@ layout:
   attention_every: 12            # ~8.3% attention (fewer attn layers; lean harder on the SSM)
   state_size: 192                # wider state to compensate for less attention
 init: mamba-in-the-llama
-stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, grpo]
+stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # sibling of attn12pct: same recipe, only `layout` differs
 corpus: poc-distill/corpus/tokenized/qwen25-8k
 teacher_outputs: poc-distill/teacher-outputs/topk-logits
 sft: shared/sft/tokenized/qwen25-8k

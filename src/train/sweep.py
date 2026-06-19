@@ -24,7 +24,7 @@ above the seam.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Union
 
@@ -103,31 +103,43 @@ def resolve_trial(manifest: DistillManifest) -> ResolvedTrial:
     )
 
 
-def shared_signal(manifests: Iterable[DistillManifest]) -> FrozenSignal:
-    """The single frozen teacher signal shared by `manifests`; raise if they diverge.
+# A sweep varies ONLY the student `layout` (and the trial's `student` name). Every other
+# manifest field — the frozen teacher signal AND the student-side recipe (`init`, `stages`,
+# `schedule`) — must be identical across siblings, so the trials are an apples-to-apples
+# architecture comparison over the same precomputed artifacts. `shared_signal` holds these
+# constant; `student` + `layout` are the free variables.
+_SWEEP_INVARIANT_FIELDS = (
+    "conversion_teacher", "tokenizer", "seq_len", "init", "stages", "schedule",
+    "corpus", "teacher_outputs", "sft", "rl",
+)
 
-    This is the guard that makes a set of manifests a valid *sweep*: every sibling must point
-    at the same teacher signal so that varying `layout` reuses the (expensive) corpus +
-    teacher outputs unchanged. On divergence the error names the offending field(s) and their
-    distinct values, so a mis-pointed manifest is easy to spot.
+
+def shared_signal(manifests: Iterable[DistillManifest]) -> FrozenSignal:
+    """Assert `manifests` are sweep siblings (differ only in `layout`); return their signal.
+
+    A valid sweep varies only the student `layout`; everything else — the frozen teacher
+    signal (corpus + teacher outputs + teacher + tokenizer) and the student-side recipe
+    (`init`, `stages`, `schedule`, see `_SWEEP_INVARIANT_FIELDS`) — is held constant so the
+    trials are comparable and reuse the precomputed artifacts unchanged. Raise if any
+    non-layout field diverges, naming the offending field(s) and their distinct values.
+    Returns the shared `FrozenSignal` (the frozen-artifact subset, for the table header).
     """
     manifests = list(manifests)
     if not manifests:
         raise ValueError("shared_signal requires at least one manifest")
-    signals = [frozen_signal(m) for m in manifests]
-    first = signals[0]
+    first = manifests[0]
     diverging = {
-        f.name: sorted({getattr(s, f.name) for s in signals})
-        for f in fields(FrozenSignal)
-        if any(getattr(s, f.name) != getattr(first, f.name) for s in signals)
+        name: [getattr(m, name) for m in manifests]
+        for name in _SWEEP_INVARIANT_FIELDS
+        if any(getattr(m, name) != getattr(first, name) for m in manifests)
     }
     if diverging:
         detail = "; ".join(f"{k}={v}" for k, v in diverging.items())
         raise ValueError(
-            "manifests do not share one frozen teacher signal — a sweep may only vary "
-            f"`layout`. Diverging field(s): {detail}"
+            "manifests are not sweep siblings — a sweep may only vary `layout`. "
+            f"Diverging field(s): {detail}"
         )
-    return first
+    return frozen_signal(first)
 
 
 @dataclass
