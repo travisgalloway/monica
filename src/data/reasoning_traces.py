@@ -1,0 +1,157 @@
+"""Reasoning-trace sources + `<think>`/`<answer>` formatting (#96) — the headline skill's data.
+
+A reasoning trace is rendered as an assistant turn whose content is the chain of thought wrapped
+in `<think>...</think>` followed by the final `<answer>...</answer>` (docs/design/11-post-training.md).
+The trace is the assistant *content*, so it flows through the Qwen ChatML masker
+(`src/data/chat_template.py` / `src/data/instruct_sft.build_chat_sft_records`) unchanged — the
+`<think>`/`<answer>` spans are trained and the turn ends on `<|im_end|>`.
+
+Primary corpus: open-r1 **Mixture-of-Thoughts** (~350k verified math/code/science traces distilled
+from R1, already on the Qwen tokenizer). **Top-up path:** where coverage is thin, generate more
+traces with a larger DeepSeek-R1-Distill-Qwen model (14B/32B — the trace-generation teacher) and
+ingest them through `load_topup`; traces are re-tokenized, so the generator is unconstrained.
+
+ABOVE THE SEAM — stdlib only; `datasets` is imported lazily inside the HF loaders. Offline path:
+the checked-in `handauthored` trace set (always available, no network).
+"""
+
+from __future__ import annotations
+
+from typing import Iterable, Iterator, List, Optional
+
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+ANSWER_OPEN, ANSWER_CLOSE = "<answer>", "</answer>"
+
+# Source -> license (clean-license accounting; MoT is ODC-BY / Apache-mixed, flagged).
+SOURCE_LICENSES = {"mot": "odc-by", "topup": "generated", "handauthored": "cc0"}
+
+
+def format_trace(reasoning: str, answer: str) -> str:
+    """The assistant content for one reasoning trace:
+    `<think>\\n{reasoning}\\n</think>\\n<answer>\\n{answer}\\n</answer>`."""
+    reasoning, answer = reasoning.strip(), answer.strip()
+    return (f"{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}\n"
+            f"{ANSWER_OPEN}\n{answer}\n{ANSWER_CLOSE}")
+
+
+def _tag(messages: List[dict], source: str) -> dict:
+    return {"messages": messages, "source": source,
+            "license": SOURCE_LICENSES.get(source, "unknown")}
+
+
+def trace_to_messages(question: str, reasoning: str, answer: str, *,
+                      system: Optional[str] = None, source: str = "handauthored") -> dict:
+    """A `{messages, source, license}` row: optional system, the user `question`, and an assistant
+    turn whose content is `format_trace(reasoning, answer)`. The chat-template masker then trains
+    only that assistant turn."""
+    messages: List[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system.strip()})
+    messages.append({"role": "user", "content": question.strip()})
+    messages.append({"role": "assistant", "content": format_trace(reasoning, answer)})
+    return _tag(messages, source)
+
+
+def mot_row_to_messages(row: dict, source: str = "mot") -> Optional[dict]:
+    """Map a Mixture-of-Thoughts row into a tagged trace row, or None to skip.
+
+    MoT rows carry a chat `messages` list (the assistant turn already contains the R1-style
+    `<think>...</think>` trace); we pass those through, normalizing roles/content and tagging the
+    source. Falls back to a `problem`/`solution` (or `question`/`answer`) pair, wrapping the
+    solution as the answer when no explicit reasoning field is present."""
+    msgs = row.get("messages")
+    if isinstance(msgs, (list, tuple)):
+        out: List[dict] = []
+        for m in msgs:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("system", "user", "assistant") and content:
+                out.append({"role": role, "content": content})
+        if out and out[0]["role"] in ("system", "user") and out[-1]["role"] == "assistant":
+            return _tag(out, source)
+        return None
+    question = (row.get("problem") or row.get("question") or "").strip()
+    reasoning = (row.get("reasoning") or row.get("think") or "").strip()
+    answer = (row.get("solution") or row.get("answer") or "").strip()
+    if not question or not answer:
+        return None
+    return trace_to_messages(question, reasoning, answer, source=source)
+
+
+def load_mixture_of_thoughts(split: str = "train", max_examples: Optional[int] = None,
+                             config: Optional[str] = None) -> Iterator[dict]:
+    """Stream open-r1/Mixture-of-Thoughts and map rows to tagged trace rows (lazy `datasets`)."""
+    from datasets import load_dataset  # pragma: no cover - network/optional extra
+
+    ds = load_dataset("open-r1/Mixture-of-Thoughts", config, split=split, streaming=True)
+    n = 0
+    for row in ds:
+        rec = mot_row_to_messages(row, source="mot")
+        if rec is None:
+            continue
+        yield rec
+        n += 1
+        if max_examples is not None and n >= max_examples:
+            break
+
+
+def load_topup(dataset: str, split: str = "train",
+               max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Top-up path: stream additional traces from a larger R1-distill trace set (e.g. generated by
+    DeepSeek-R1-Distill-Qwen-14B/32B and uploaded as an HF dataset). Same row mapping as MoT; tagged
+    `topup`. Traces are re-tokenized under Qwen2.5, so the generating model is unconstrained."""
+    from datasets import load_dataset  # pragma: no cover - network/optional extra
+
+    ds = load_dataset(dataset, split=split, streaming=True)
+    n = 0
+    for row in ds:
+        rec = mot_row_to_messages(row, source="topup")
+        if rec is None:
+            continue
+        yield rec
+        n += 1
+        if max_examples is not None and n >= max_examples:
+            break
+
+
+# --------------------------------------------------------------------------- #
+# Hand-authored in-format trace set (checked in, CC0) — offline coverage
+# --------------------------------------------------------------------------- #
+_HANDAUTHORED_TRACES = [
+    ("What is 17 + 25?",
+     "Add the ones: 7 + 5 = 12, write 2 carry 1. Add the tens: 1 + 2 + 1 = 4.",
+     "42"),
+    ("A train travels 60 km in 45 minutes. What is its speed in km/h?",
+     "45 minutes is 0.75 hours. Speed = distance / time = 60 / 0.75 = 80.",
+     "80 km/h"),
+    ("Write a Python function that returns the maximum of two numbers.",
+     "Use a conditional: if a is greater than b return a, otherwise return b.",
+     "def maximum(a, b): return a if a > b else b"),
+    ("Is 91 a prime number?",
+     "Check small factors: 91 = 7 * 13, so it has a divisor other than 1 and itself.",
+     "No, 91 = 7 x 13."),
+]
+
+
+def handauthored_trace_records() -> Iterator[dict]:
+    """The checked-in hand-authored reasoning traces (always available, offline)."""
+    for question, reasoning, answer in _HANDAUTHORED_TRACES:
+        yield trace_to_messages(question, reasoning, answer, source="handauthored")
+
+
+# --------------------------------------------------------------------------- #
+# Aggregator
+# --------------------------------------------------------------------------- #
+_LOADERS = {
+    "handauthored": lambda n: handauthored_trace_records(),
+    "mot": lambda n: load_mixture_of_thoughts(max_examples=n),
+}
+
+
+def iter_reasoning_traces(sources: Iterable[str],
+                          max_per_source: Optional[int] = None) -> Iterator[dict]:
+    """Concatenate tagged trace rows from the named sources (`handauthored` / `mot`)."""
+    for name in sources:
+        if name not in _LOADERS:
+            raise ValueError(f"unknown reasoning source {name!r} (have {sorted(_LOADERS)})")
+        yield from _LOADERS[name](max_per_source)
