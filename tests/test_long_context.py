@@ -5,14 +5,21 @@ model + a tiny packed file, no backend; the MLX-guarded checks confirm the knob 
 parity-exact when off, actually changes the scan when on, and the config validates.
 """
 
-import json
-
 import numpy as np
 import pytest
 
 from src.data.pack import pack_ids
 from src.eval.long_context import format_curve, long_context_eval
 from src.model.blocks import MambaConfig
+
+try:
+    import mlx.core as mx
+    HAVE_MLX = True
+except ImportError:                     # portable tests below must still run without mlx
+    mx = None
+    HAVE_MLX = False
+
+requires_mlx = pytest.mark.skipif(not HAVE_MLX, reason="requires mlx (Apple Silicon)")
 
 
 # --------------------------------------------------------------------------- #
@@ -87,10 +94,9 @@ def test_long_ctx_factor_default_is_off():
 
 # --------------------------------------------------------------------------- #
 # MLX-guarded: the knob is parity-exact off, and changes the scan on
+# (each test skips individually when mlx is absent, so the portable tests above
+# still run on a non-Mac host — see the `requires_mlx` marker)
 # --------------------------------------------------------------------------- #
-mx = pytest.importorskip("mlx.core")
-
-
 def _toy_cfg(**over):
     base = dict(d_model=32, n_layers=2, head_dim=16, d_state=8, vocab_size=32,
                 seq_len=16, precision="fp32")
@@ -98,6 +104,7 @@ def _toy_cfg(**over):
     return MambaConfig(**base)
 
 
+@requires_mlx
 def test_knob_off_is_byte_identical():
     from src.model.mlx_backend import MLXMambaModel
     mx.random.seed(0)
@@ -111,6 +118,7 @@ def test_knob_off_is_byte_identical():
     assert np.array_equal(y, np.array(model.forward(tokens)))
 
 
+@requires_mlx
 def test_knob_on_changes_logits_but_stays_finite():
     from src.model.mlx_backend import MLXMambaModel
     mx.random.seed(0)
@@ -124,6 +132,7 @@ def test_knob_on_changes_logits_but_stays_finite():
     assert not np.allclose(yo, yn)                  # the scan genuinely changed
 
 
+@requires_mlx
 def test_forward_step_parity_holds_with_knob_on():
     """The knob lives in `_project`, shared by parallel (forward) and recurrence (step),
     so the two paths must still agree at the fp32 ~1e-4 tolerance with the knob on."""

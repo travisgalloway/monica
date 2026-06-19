@@ -47,7 +47,9 @@ def long_context_eval(
             continue
         res = evaluate(model, loader, max_batches=max_batches, to_numpy=to_numpy)
         res["seq_len"] = seq_len
-        res["n_batches"] = min(len(loader), max_batches) if max_batches else len(loader)
+        # `is None` (not truthiness): max_batches=0 means 0 batches, not "the whole loader".
+        res["n_batches"] = (len(loader) if max_batches is None
+                            else min(len(loader), max_batches))
         results[mult] = res
     return results
 

@@ -92,7 +92,10 @@ def main() -> None:
     from src.model.mlx_backend import MLXMambaModel
     from src.eval.long_context import long_context_eval, format_curve
 
-    cfg = load_config(str(args.config))
+    # Force the knob OFF for training and the OFF baseline regardless of what the YAML
+    # sets — long_ctx_factor is an inference-time knob the ON path applies explicitly, so
+    # a stray factor in the config must not leak into training or the baseline curve.
+    cfg = dataclasses.replace(load_config(str(args.config)), long_ctx_factor=1.0)
     to_numpy = lambda a: np.array(a)
     val_path = args.data / "val.bin"
     print(f"[long-ctx] config={args.config}  seq_len={cfg.seq_len}  "
