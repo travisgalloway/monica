@@ -4,10 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A proof-of-concept Mamba (selective state-space) language model, developed and
-validated on **Apple Silicon with MLX**, architected behind **one hardware seam** so
-a successful POC can migrate to **CUDA** with minimal rewrite. POC success is defined
-as a smoothly decreasing held-out validation-perplexity curve — not benchmark scores.
+A proof-of-concept **Mamba-2 hybrid** (selective state-space + a few attention layers)
+language model, developed and validated on **Apple Silicon with MLX**, architected behind
+**one hardware seam** so it migrates to **CUDA** for a larger run with minimal rewrite. The
+active program is to **distil** a compact (~1–1.5B) hybrid student from a larger frozen teacher
+(`open-r1/OpenR1-Distill-7B`, Qwen2.5 tokenizer), sweep a few architecture layouts cheaply, then
+post-train the winner for reasoning — tracked in
+[issue #65](https://github.com/travisgalloway/monica/issues/65). The original from-scratch
+pretrain path (OLMo tokenizer) is complete and is the validated foundation / production reserve.
+POC success is a smoothly decreasing held-out validation-perplexity curve plus a local-hardware
+win (context length + tok/s) — not benchmark scores.
 
 ## Commands
 
@@ -129,11 +135,17 @@ The smoke gate stresses exactly this round-trip.
 
 ## Workflow
 
-- Milestones M1–M8 are tracked in **GitHub issue #2** (the milestone tracker); each
-  sub-issue references "Part of #2". M1–M4 are done and verified; M2 data (#10) is done;
-  **M5 infrastructure is done** — the `scripts/train.py` driver (#22) and the Mamba-2/SSD
-  perf migration (#23, PR #25) — with the full 2–5B-token run + dataset generation still
-  pending (user-driven). M6–M8 (OLMES eval, serving/rewind, CUDA backend) are deferred.
+- The POC core **M1–M8 is done** (tracked in **GitHub issue #2**, now closed): seam + MLX
+  model, data pipeline, training loop + smoke gate, the `scripts/train.py` driver, OLMES eval,
+  serving/rewind, and the **CUDA backend (M8, A40-verified)**. **M9 post-training is done** —
+  SFT/DPO/GRPO machinery on MLX with CUDA step-factory parity. The full 2–5B-token from-scratch
+  run is still pending (user-driven).
+- The **active program is M10 — distillation** (**GitHub issue #65**, the live tracker): distil a
+  compact Mamba-2 hybrid student from a frozen teacher, sweep layouts, post-train the winner. The
+  building blocks exist (teacher loader, student init, staged loss, manifest, sweep table); the
+  corpus-scale teacher-logit precompute (#94), R2 + RunPod plumbing (#80), and the end-to-end
+  cloud distill run (#81) are pending. There is **no `scripts/distill.py` yet**.
 - `docs/design/` documents the design choices and rationale (start at
-  `docs/design/README.md`). After completing a milestone, tick its box in issue #2.
+  `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
+  a milestone, tick its box in the relevant tracker (#2 / #65).
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.

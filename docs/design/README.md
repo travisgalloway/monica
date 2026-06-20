@@ -1,12 +1,14 @@
 # Design docs
 
-Why the Mamba POC is built the way it is. These files explain the **design
-choices and their rationale** — the *what* and *why*. M1–M4 are implemented and
-verified, and M5's infrastructure (training driver + Mamba-2/SSD perf migration) has
-landed; the milestone tracking and remaining work (the full M5 run, M6–M8) live in
-[GitHub issue #2](https://github.com/travisgalloway/monica/issues/2). For the
+Why the Mamba-2 Hybrid POC is built the way it is. These files explain the **design
+choices and their rationale** — the *what* and *why*. The POC core (M1–M7), the **CUDA
+backend (M8, A40-verified)**, and the **post-training machinery (M9, SFT/DPO/GRPO)** are
+implemented and verified; the M1–M8 milestones were tracked in
+[issue #2](https://github.com/travisgalloway/monica/issues/2). The **active program is M10 —
+distillation** ([issue #65](https://github.com/travisgalloway/monica/issues/65)). For the
 project overview, see the root [`README.md`](../../README.md); for end-to-end commands
-(install → data → train → serve/chat → eval) see [`../usage.md`](../usage.md).
+(install → data → train → serve/chat → eval) see [`../usage.md`](../usage.md), and for the
+cloud (R2 + RunPod) runbook see [`../infrastructure.md`](../infrastructure.md).
 
 Every claim here is sourced from a docstring or config comment in the code, with a
 `src/...` or `config/...` path so you can jump to the source of truth.
@@ -43,11 +45,13 @@ Every claim here is sourced from a docstring or config comment in the code, with
     tool-use → GRPO, the Qwen `<|im_end|>` chat-template invariant, shared with production.
 
 > Topics 8–11 are the **scale-up / distillation** design record (epic
-> [#65](https://github.com/travisgalloway/monica/issues/65)) — forward-looking decisions,
-> partly implemented (the corpus stages, hybrid attention, post-training machinery, and the
-> #90 uint32 packing exist; the distillation pipeline #92–#104 is pending), unlike the fully
-> verified POC in topics 1–7. The current plan is **distillation-first** (10/11); the
-> from-scratch pretraining in 08 is deferred to a production reserve (#75).
+> [#65](https://github.com/travisgalloway/monica/issues/65)). Much of the machinery now exists —
+> the corpus stages, hybrid attention (#67), #90 uint32 packing, the distillation corpus (#92),
+> teacher loader (#93), student init (#99), staged distill loss (#100), the sweep harness (#98),
+> and the post-training steps (#76/#77/#78). **Pending:** corpus-scale teacher-logit precompute
+> (#94), the R2 + RunPod plumbing (#80), and the end-to-end cloud distill run (#81). The plan is
+> **distillation-first** (10/11); the from-scratch pretraining in 08 is deferred to a production
+> reserve (#75).
 
 ## Locked decisions at a glance
 
@@ -66,7 +70,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Conformance | compare in fp32, ~1e-4 rel | bf16 epsilon (~8e-3) too large to be meaningful | `src/conformance/` |
 | Checkpoints | portable weights + separate resume bundle | weights port across backends; optimizer state doesn't need to | `src/train/checkpoint.py` |
 | Success metric | held-out val perplexity (Tier-1) | a smoothly decreasing curve *is* the POC goal | `src/eval/val_loss.py` |
-| OLMES / lm-eval | deferred (Tier-2) | its own milestone-sized task; not needed for the POC | `src/eval/olmes_adapter.py` |
+| OLMES / lm-eval | implemented (Tier-2); scores near chance at POC scale | loglikelihood + generative tasks run end-to-end | `src/eval/olmes_adapter.py` |
 | Build method | **distillation** from a frozen teacher (not pretrain) | reaches capability at <1% of from-scratch tokens; cheap layout sweep | `docs/design/10-distillation.md` |
 | Scale-up tokenizer | **Qwen2.5** (vocab 151,646) | fixed by the conversion teacher for logit/hidden matching; uint32 packing (#90). POC stays OLMo. StarCoder2 (the old uint16 pick) superseded. | `docs/design/10-distillation.md` |
 | Conversion teacher | `open-r1/OpenR1-Distill-7B` (Apache-2.0) | fully open (open R1 traces + recipe), reasoning-ready, Qwen2.5 tokenizer; 7B→~1B size gap bridged by adaptive init | `docs/design/10-distillation.md` |
