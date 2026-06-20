@@ -136,6 +136,26 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
   4. Sync the ~20 GB subset from R2 to a 50 GB network volume, train via
      `scripts/train.py --backend cuda`, confirm a decreasing val-perplexity curve,
      **checkpoint back to R2** (RunPod is not durable), and run the retrieval probes (#79).
+
+  **Pod spec + fused-kernel pins (#40).** The card must be **Ampere+** for native bf16
+  (the scale configs are bf16) — *not* a T4/Turing — and the image a RunPod **`-devel`** one,
+  which ships `nvcc` so the kernels can source-compile if no prebuilt wheel matches. The fused
+  selective-scan kernels (`mamba-ssm` / `causal-conv1d`) are the #40 perf path and are
+  deliberately **not** in the `[cuda]` extra; install them by hand. The one rule that bites:
+  the torch **minor** version and the **C++-ABI flag** must match across the image and the
+  kernel wheels. Two self-consistent sets (pins as of 2026-06-20):
+  - **Recommended (known-good, what this runbook is validated around):** image
+    `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` +
+    `causal-conv1d==1.5.0.post8`, `mamba-ssm==2.2.4` (wheel tag `cu12torch2.4cxx11abiFALSE-cp311`).
+  - **Newest:** image `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` +
+    `causal-conv1d==1.6.2.post1`, `mamba-ssm==2.3.2.post1` (wheel tag
+    `cu12torch2.8cxx11abiTRUE-cp311` — note the ABI flag flipped to **TRUE** at torch ≥2.7).
+
+  Install with `pip install causal-conv1d mamba-ssm --no-build-isolation` — the flag makes the
+  build see the pod's preinstalled CUDA torch instead of pulling a CPU torch, so on a `-devel`
+  image it produces a torch-matched build (~10–30 min) even when no wheel matches. Re-check the
+  latest wheel tags at launch ([state-spaces/mamba](https://github.com/state-spaces/mamba/releases),
+  [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d/releases)).
 - **Phase 5 (#75):** the 1B → 2B → 4B tiers per the #65 sizing table. **8-bit Adam** when
   VRAM-tight; **spot instances + frequent checkpointing** for 2B/4B; back up intermediate
   checkpoints to R2. Reuses the portable loop + two-concern [checkpointing](05-training.md);
