@@ -179,6 +179,38 @@ def iter_shard_texts(uri) -> Iterator[str]:
         yield r.text
 
 
+def iter_jsonl_texts(uri) -> Iterator[str]:
+    """The `text` field from JSON-lines shard(s) at `uri` — the format the datatrove clean pass
+    (`datatrove_pipeline.py`, #80) writes (`*.jsonl` / gzipped `*.jsonl.gz`). Lets the existing
+    tokenize/pack stages consume datatrove output. `uri` is an fsspec URI (local or `s3://`)."""
+    import gzip
+    import io
+
+    import fsspec
+
+    fs, root = fsspec.core.url_to_fs(str(uri))
+    files = (sorted(fs.glob(f"{root.rstrip('/')}/*.jsonl*")) if fs.isdir(root) else [root])
+    for fp in files:
+        with fs.open(fp, "rb") as raw:
+            stream = (gzip.open(raw, "rt", encoding="utf-8") if str(fp).endswith(".gz")
+                      else io.TextIOWrapper(raw, encoding="utf-8"))
+            for line in stream:
+                line = line.strip()
+                if line:
+                    yield json.loads(line).get("text", "")
+
+
+def has_jsonl_shards(uri) -> bool:
+    """True if `uri` is a directory of JSONL shards (datatrove output) and not Parquet."""
+    import fsspec
+
+    fs, root = fsspec.core.url_to_fs(str(uri))
+    if not fs.isdir(root):
+        return str(root).endswith((".jsonl", ".jsonl.gz"))
+    root = root.rstrip("/")
+    return bool(fs.glob(f"{root}/*.jsonl*")) and not fs.glob(f"{root}/*.parquet")
+
+
 # --------------------------------------------------------------------------- #
 # Orchestrator + CLI
 # --------------------------------------------------------------------------- #

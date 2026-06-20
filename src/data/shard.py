@@ -253,7 +253,7 @@ def main() -> None:
     ap.add_argument("--model-id", default=None)
     args = ap.parse_args()
 
-    from .corpus import iter_shard_texts
+    from .corpus import has_jsonl_shards, iter_jsonl_texts, iter_shard_texts
     from .pack import packing_dtype_for
     from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
                            load_starcoder2_tokenizer, tokenize_docs)
@@ -269,7 +269,9 @@ def main() -> None:
 
     tok_label = "byte" if args.byte_fallback else getattr(tok, "name_or_path", args.tokenizer)
     dtype = packing_dtype_for(tok.vocab_size)          # uint16 (POC) / uint32 (Qwen2.5)
-    docs = tokenize_docs(iter_shard_texts(args.inp), tok)
+    # Auto-detect the cleaned-text format: datatrove writes JSONL (#80), corpus.py writes Parquet.
+    texts = iter_jsonl_texts(args.inp) if has_jsonl_shards(args.inp) else iter_shard_texts(args.inp)
+    docs = tokenize_docs(texts, tok)
     manifest = pack_sequences(docs, args.out, seq_len=args.seq_len,
                               shard_size_mb=args.shard_size_mb, tokenizer=tok_label, dtype=dtype)
     print(f"packed {manifest['n_sequences']} seq x {args.seq_len} "
