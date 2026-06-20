@@ -156,10 +156,11 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
   image it produces a torch-matched build (~10–30 min) even when no wheel matches. Re-check the
   latest wheel tags at launch ([state-spaces/mamba](https://github.com/state-spaces/mamba/releases),
   [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d/releases)).
-- **Phase 5 (#75):** the 1B → 2B → 4B tiers per the #65 sizing table. **8-bit Adam** when
-  VRAM-tight; **spot instances + frequent checkpointing** for 2B/4B; back up intermediate
-  checkpoints to R2. Reuses the portable loop + two-concern [checkpointing](05-training.md);
-  success is a smoothly decreasing held-out val-perplexity curve at scale.
+- **Phase 5 (#75):** the from-scratch **1B** run (the single target size; the 2B/4B tiers were
+  dropped). **8-bit Adam** when VRAM-tight; **spot instances + frequent checkpointing**; back up
+  intermediate checkpoints to R2. Reuses the portable loop + two-concern
+  [checkpointing](05-training.md); success is a smoothly decreasing held-out val-perplexity curve
+  at scale.
 
 ## Post-training (Phase 6, #76–#78)
 
@@ -179,6 +180,6 @@ the licensing reframe is the load-bearing part:
 ## Related
 
 - [Data pipeline](04-data-pipeline.md) — the offline `src/data/` stages this scales up.
-- [Hybrid architectures](09-hybrid-architectures.md) — the 100M/1B/2B/4B model the corpus trains.
+- [Hybrid architectures](09-hybrid-architectures.md) — the ~1B model the corpus trains (100M poc is the validation rung).
 - [Training](05-training.md) — the portable loop + checkpoint/resume the cloud runs reuse.
 - [Architecture: the hardware seam](01-architecture-seam.md) — why the pipeline stays portable.

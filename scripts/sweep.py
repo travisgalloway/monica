@@ -6,7 +6,7 @@ per-trial param/memory + layout table (attention fraction, layer placement, stat
 three swept architecture variables). See `docs/design/10-distillation.md`.
 
   python scripts/sweep.py                                   # all of config/manifests/
-  python scripts/sweep.py config/manifests/student-1b-attn8pct.yaml ...   # explicit set
+  python scripts/sweep.py config/manifests/student-1b-attn-lo.yaml ...   # explicit set
   python scripts/sweep.py --manifest-dir config/manifests   # an explicit directory
 """
 

@@ -3,8 +3,9 @@
 [← Index](README.md)
 
 Why the scale-up model is a **Mamba-2 *hybrid*** — mostly SSD blocks with a small fraction
-of attention layers — and how the **100M → 1B → 2B → 4B** family is sized. This is the model
-companion to the [corpus pipeline](08-corpus-pipeline.md); the GitHub tracker is
+of attention layers — and how it is sized. The target is a **single ~1B model** (the cheap
+100M `poc` is the architecture-validation rung; the earlier 2B/4B tiers were dropped). This is
+the model companion to the [corpus pipeline](08-corpus-pipeline.md); the GitHub tracker is
 [issue #65](https://github.com/travisgalloway/monica/issues/65) (arch children #66–#68). The
 SSD block itself is documented in [model: the Mamba block](02-model-ssm.md); this doc is
 about what to add to it at scale.
@@ -43,32 +44,37 @@ Either **reset the SSM state at document boundaries** or use **packing-aware ker
 conformance-style: two documents packed into one sequence must produce identical per-document
 logits to running them apart (fp32 ~1e-4).
 
-## Sizing the family
+## Sizing the model
 
-Mamba has **no KV cache**, so fp16/bf16 weights ≈ total inference footprint — the ×4 ladder
-maps cleanly to GPU/RAM tiers and to the RunPod [sizing table](08-corpus-pipeline.md). 16B
-(an earlier candidate) is dropped; the series tops out at 4B for this POC.
+Mamba has **no KV cache**, so fp16/bf16 weights ≈ total inference footprint. The target is a
+**single ~1B model**; the 100M `poc` is the cheap architecture-validation rung below it. (The
+earlier 2B/4B scale tiers — and a 16B candidate before them — were dropped for this POC.)
 
 | tier | d_model | n_layers | head_dim | ≈ params | bf16 weights | train GPU |
 |---|---|---|---|---|---|---|
-| **100M** (poc, exists) | 768 | 24 | 64 | ~127M | ~0.25 GB | T4 16 GB / L4 24 GB |
-| **1B** | 2048 | 36 | 64 | ~1.0B | ~2 GB | L4 / A10 24 GB |
-| **2B** | 2560 | 44 | 64 | ~2.0B | ~4 GB | A100 40 GB / L40S 48 GB |
-| **4B** | 3584 | 48 | 64 | ~4.0B | ~8 GB | A100 80 GB / H100 80 GB |
+| **100M** (poc — dev/validation rung) | 768 | 24 | 64 | ~127M | ~0.25 GB | T4 16 GB / L4 24 GB |
+| **1B** (target — from scratch) | 2048 | 36 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
+| **1B** (target — distillation student, hybrid) | 2048 | 28 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
 
-The 100M tier is the validated [`poc.yaml`](07-configs-and-decisions.md); the 2B dims are
-provisional until the sizing tool (#66) sets them to hit the target within ±5%. The sizing
-tool is a portable closed-form param/memory calculator (`src/model/sizing.py` +
-`scripts/model_size.py`, #66), cross-checked against the built model's portable state-dict
-param sum. Training memory ≈ 8 B/param (weights+grad+AdamW), or **~10 B/param with 8-bit
-Adam** — the VRAM-tight lever used in Phase 5 (#75).
+Both ~1B configs land within ±5% of the 1B target (verify with the sizing tool). The
+**distillation student** ([`config/student-1b.yaml`](../../config/student-1b.yaml)) uses **28
+layers** — matching the teacher's 28 transformer layers so the Mamba-in-the-Llama init maps
+layer-to-layer (see [distillation](10-distillation.md)) — while the **from-scratch** 1B
+([`config/1b.yaml`](../../config/1b.yaml), OLMo vocab) uses 36 layers for the same param budget
+(its smaller vocab leaves more room in the layer stack). The 100M tier is the validated
+[`poc.yaml`](07-configs-and-decisions.md). The sizing tool is a portable closed-form
+param/memory calculator (`src/model/sizing.py` + `scripts/model_size.py`, #66), cross-checked
+against the built model's portable state-dict param sum. Training memory ≈ 8 B/param
+(weights+grad+AdamW), or **~10 B/param with 8-bit Adam** — the VRAM-tight lever used in
+Phase 5 (#75).
 
 ### Precision differs from the POC
 
 `poc.yaml` uses **fp16 + loss scaling** because fp16 is ~18% faster than bf16 *on MLX/Metal*
 (see [configs & decisions](07-configs-and-decisions.md)). The scale configs train on **CUDA**,
-where **bf16 is native** and needs no loss scaling — so `config/{1b,2b,4b}.yaml` set
-`precision: bf16` (`scaler_for_precision` already returns `None` for bf16). `tie_embeddings`
+where **bf16 is native** and needs no loss scaling — so `config/1b.yaml` and
+`config/student-1b.yaml` set `precision: bf16` (`scaler_for_precision` already returns `None`
+for bf16). `tie_embeddings`
 and `grad_checkpoint` stay on; vocab follows the chosen tokenizer and sets the packed dtype —
 uint16 below 65536 (POC), uint32 for Qwen2.5 (the distillation student, #90; see
 [distillation](10-distillation.md)).

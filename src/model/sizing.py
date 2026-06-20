@@ -133,7 +133,11 @@ def format_family_table(configs: Iterable[tuple]) -> str:
 
 
 def load_family(config_dir: Union[str, Path] = "config",
-                names: Iterable[str] = ("poc", "1b", "2b", "4b")) -> list:
-    """Load (name, cfg) pairs for the standard ladder from `config/<name>.yaml`."""
+                names: Iterable[str] = ("poc", "1b")) -> list:
+    """Load (name, cfg) pairs for the config family from `config/<name>.yaml`.
+
+    The 100M `poc` is the cheap architecture-validation rung; `1b` is the single
+    target model. (The earlier 2B/4B scale tiers were dropped — see epic #65.)
+    """
     config_dir = Path(config_dir)
     return [(name, load_config(config_dir / f"{name}.yaml")) for name in names]

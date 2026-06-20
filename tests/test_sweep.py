@@ -15,9 +15,9 @@ from src.train.sweep import (FrozenSignal, ResolvedTrial, Sweep, format_sweep_ta
                              frozen_signal, load_sweep, load_sweep_dir, resolve_trial,
                              shared_signal)
 
-ATTN8 = "config/manifests/student-1b-attn8pct.yaml"
-ATTN12 = "config/manifests/student-1b-attn12pct.yaml"
-MANIFESTS = [ATTN8, ATTN12]
+ATTN_LO = "config/manifests/student-1b-attn-lo.yaml"
+ATTN_HI = "config/manifests/student-1b-attn-hi.yaml"
+MANIFESTS = [ATTN_LO, ATTN_HI]
 MANIFEST_DIR = "config/manifests"
 
 
@@ -38,7 +38,7 @@ def test_trial_resolves_to_config_and_artifacts(path):
 # --- acceptance #2: two siblings share one teacher signal, differ only in layout ------------
 
 def test_siblings_share_signal_differ_only_in_layout():
-    m8, m12 = load_manifest(ATTN8), load_manifest(ATTN12)
+    m8, m12 = load_manifest(ATTN_LO), load_manifest(ATTN_HI)
     sig = shared_signal([m8, m12])                # passes only if they are true siblings
     assert isinstance(sig, FrozenSignal)
     assert sig == frozen_signal(m8) == frozen_signal(m12)
@@ -55,7 +55,7 @@ def test_siblings_share_signal_differ_only_in_layout():
 # --- acceptance #3: changing a layout field invalidates nothing upstream -------------------
 
 def test_layout_change_does_not_invalidate_upstream():
-    m = load_manifest(ATTN12)
+    m = load_manifest(ATTN_HI)
     before = frozen_signal(m)
     # walk each swept variable; the frozen teacher signal must not move
     mutated = dataclasses.replace(m, layout={**m.layout, "state_size": 256,
@@ -66,7 +66,7 @@ def test_layout_change_does_not_invalidate_upstream():
 
 
 def test_divergent_teacher_signal_raises():
-    m = load_manifest(ATTN8)
+    m = load_manifest(ATTN_LO)
     other = dataclasses.replace(m, corpus="some/other/corpus")
     with pytest.raises(ValueError, match="corpus"):
         shared_signal([m, other])
@@ -75,7 +75,7 @@ def test_divergent_teacher_signal_raises():
 def test_divergent_recipe_raises():
     # The student-side recipe (init/stages/schedule) is part of the sweep invariant too —
     # a sweep over architecture must hold it constant, else the trials aren't comparable.
-    m = load_manifest(ATTN8)
+    m = load_manifest(ATTN_LO)
     diff_stages = dataclasses.replace(m, stages=m.stages[:-1])         # drop a stage
     with pytest.raises(ValueError, match="stages"):
         shared_signal([m, diff_stages])
@@ -87,7 +87,7 @@ def test_divergent_recipe_raises():
 def test_resolve_rejects_nonpositive_n_layers():
     # A layout typo (n_layers: 0) must be caught by config validation at resolve time, not
     # crash later in attn_pct with a bare ZeroDivisionError.
-    m = dataclasses.replace(load_manifest(ATTN8), layout={**load_manifest(ATTN8).layout,
+    m = dataclasses.replace(load_manifest(ATTN_LO), layout={**load_manifest(ATTN_LO).layout,
                                                           "n_layers": 0})
     with pytest.raises(ValueError, match="n_layers"):
         resolve_trial(m)
@@ -115,9 +115,9 @@ def test_load_sweep_dir_one_row_per_manifest_distinct_params():
     # different layouts produce meaningfully different sizing (the sweep saw real variation)
     assert len({r["params"] for r in rows}) >= 2
     assert len({round(r["attn_pct"], 4) for r in rows}) >= 2
-    # attn8pct (attn_every 12) has a *lower* attention fraction than attn12pct (attn_every 8)
+    # attn-lo (attn_every 14) has a *lower* attention fraction than attn-hi (attn_every 8)
     by_name = {r["tier"]: r for r in rows}
-    assert by_name["1b-attn8pct"]["attn_pct"] < by_name["1b-attn12pct"]["attn_pct"]
+    assert by_name["1b-attn-lo"]["attn_pct"] < by_name["1b-attn-hi"]["attn_pct"]
 
 
 def test_load_sweep_explicit_paths_matches_dir():
@@ -128,5 +128,5 @@ def test_format_sweep_table_renders_signal_and_rows():
     out = format_sweep_table(load_sweep_dir(MANIFEST_DIR))
     assert "Shared frozen teacher signal" in out
     assert "open-r1/OpenR1-Distill-7B" in out
-    assert "1b-attn8pct" in out and "1b-attn12pct" in out
+    assert "1b-attn-lo" in out and "1b-attn-hi" in out
     assert "attn%" in out

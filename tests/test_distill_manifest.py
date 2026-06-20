@@ -6,8 +6,8 @@ from src.train.distill_manifest import (CANONICAL_STAGES, DistillManifest, Disti
                                         InitMethod, distill_stages, load_manifest,
                                         manifest_to_config)
 
-MANIFESTS = ["config/manifests/student-1b-attn12pct.yaml",
-             "config/manifests/student-1b-attn8pct.yaml"]
+MANIFESTS = ["config/manifests/student-1b-attn-hi.yaml",
+             "config/manifests/student-1b-attn-lo.yaml"]
 
 
 @pytest.mark.parametrize("path", MANIFESTS)

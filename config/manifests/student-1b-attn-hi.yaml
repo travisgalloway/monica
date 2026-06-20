@@ -1,15 +1,17 @@
 # Student sweep manifest (#98) — one architecture trial against the FROZEN teacher signal.
-# A sweep is a set of sibling manifests (this + student-1b-attn8pct.yaml ...) pointing at the
+# A sweep is a set of sibling manifests (this + student-1b-attn-lo.yaml ...) pointing at the
 # SAME teacher_outputs/corpus; only `layout` changes. Changing layout invalidates nothing
 # upstream (docs/design/10-distillation.md). Resolves to a student config via the harness (#98).
-student: 1b-attn12pct
+# Named -lo/-hi (relative) rather than by percent: at 28 layers the realized fractions are
+# 10.7% (here) vs 7.1% (sibling), which no integer attn_every renders as a round 12%/8%.
+student: 1b-attn-hi
 conversion_teacher: open-r1/OpenR1-Distill-7B   # fully-open Open-R1 teacher (#91/#93)
 tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — unchanged; teacher shares it
 seq_len: 8192
 layout:
   d_model: 2048
-  n_layers: 48
-  attention_every: 8             # ~12.5% attention
+  n_layers: 28                   # ~1.03B params; matches the teacher's 28 layers (Mamba-in-the-Llama init)
+  attention_every: 8             # 3 of 28 layers attention (~10.7%) — the higher-attention sibling
   state_size: 128                # -> MambaConfig.d_state
 init: mamba-in-the-llama         # or: mohawk  (#99)
 stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # tool-sft optional
