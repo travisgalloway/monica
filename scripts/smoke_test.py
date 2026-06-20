@@ -50,6 +50,14 @@ def main() -> None:
     backend = get_backend(args.backend)
     cfg = load_config(str(args.config))
     assert cfg.precision == "fp32", "smoke test requires fp32 for exact resume"
+    # Pin the CUDA gate to a DENSE config (e.g. config/toy.yaml). MoE-Mamba (#53) is
+    # MLX-only, so CUDAMambaModel refuses to build it — fail here with that reason
+    # rather than deep inside model construction. (toy-moe.yaml is also fp32, so the
+    # precision assert above would not catch it.)
+    if backend.name == "cuda":
+        assert cfg.n_moe_layers == 0, (
+            f"CUDA smoke gate needs a dense config (got {args.config} with "
+            f"{cfg.n_moe_layers} MoE layers); MoE is MLX-only. Use config/toy.yaml.")
     N = args.steps
     half = N // 2
     np_to = backend.to_numpy
