@@ -50,7 +50,17 @@ def _fused_scan():
         try:
             import sys, types, importlib.metadata
             if "mamba_ssm" not in sys.modules:
-                pkg_dir = str(importlib.metadata.distribution("mamba_ssm").locate_file("mamba_ssm"))
+                # Use the canonical PyPI name (hyphen); fall back to underscore for
+                # environments where the dist was installed under the import name.
+                for _distname in ("mamba-ssm", "mamba_ssm"):
+                    try:
+                        pkg_dir = str(importlib.metadata.distribution(_distname).locate_file("mamba_ssm"))
+                        break
+                    except importlib.metadata.PackageNotFoundError:
+                        continue
+                else:
+                    _FUSED_SCAN_FN = False
+                    return None
                 stub = types.ModuleType("mamba_ssm")
                 stub.__path__ = [pkg_dir]
                 stub.__package__ = "mamba_ssm"
