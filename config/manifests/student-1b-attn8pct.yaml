@@ -7,8 +7,8 @@ tokenizer: qwen25
 seq_len: 8192
 layout:
   d_model: 2048
-  n_layers: 48
-  attention_every: 12            # ~8.3% attention (fewer attn layers; lean harder on the SSM)
+  n_layers: 28                   # ~1B params; matches the teacher's 28 layers (Mamba-in-the-Llama init)
+  attention_every: 14            # 2 of 28 layers attention (~7.1%) — the lower-attention sibling
   state_size: 192                # wider state to compensate for less attention
 init: mamba-in-the-llama
 stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # sibling of attn12pct: same recipe, only `layout` differs

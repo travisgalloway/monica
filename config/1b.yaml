@@ -1,8 +1,9 @@
-# ~1B Mamba-2 config (M10 scaling ladder; epic #65). 100M(poc)->1B->2B->4B.
+# ~1B Mamba-2 config (epic #65) — the single target model size (100M poc -> 1B; no 2B/4B ladder).
+# This is the FROM-SCRATCH 1B (OLMo vocab, production reserve #75); the distillation student of
+# the same size class is config/student-1b.yaml (Qwen2.5 vocab, the current focus).
 # d_model 2048 x 36 layers -> ~1.03B params (verify: `python scripts/model_size.py`).
 # bf16 weights ~2.0 GB; Mamba has no KV cache so that ~= the inference footprint.
-# Fits L4 / A10 24GB for training. This is the first RENTED-CUDA scale tier (#75);
-# everything below the seam is validated on the Mac first.
+# Fits L4 / A10 24GB for training; everything below the seam is validated on the Mac first.
 d_model: 2048          # d_inner = expand*d_model = 4096
 n_layers: 36
 d_state: 16            # SSM state width N (per head, shared B/C group)

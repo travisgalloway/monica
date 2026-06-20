@@ -3,8 +3,9 @@
 A proof-of-concept **Mamba-2 hybrid** language model, developed and validated on
 **Apple Silicon with MLX**, architected behind **one hardware seam** so a successful POC
 migrates to **CUDA** for a larger run with minimal rewrite. The current program is to
-**distil** a compact (~1–1.5B) hybrid student from a larger frozen teacher, sweep a few
-architecture layouts cheaply, then post-train the winner for reasoning.
+**distil** a compact **~1B** hybrid student from a larger frozen teacher, sweep a few
+architecture layouts cheaply, then post-train the winner for reasoning. (1B is the single
+target model — the cheap 100M `poc` is just the architecture-validation rung.)
 
 **Usage:** [`docs/usage.md`](docs/usage.md) — end-to-end commands (install → data →
 train/distil → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](docs/infrastructure.md)
@@ -67,9 +68,9 @@ enforces this.
 ```
 config/                    model dims + run params (single source of truth)
   toy.yaml toy-hybrid.yaml toy-moe.yaml      tiny smoke/correctness configs
-  poc.yaml                                   ~100M from-scratch POC (OLMo vocab, fp16)
-  1b/2b/4b.yaml                              scale tiers (OLMo vocab, bf16, CUDA)
-  student-1b.yaml  manifests/student-1b-*.yaml   distillation student + sweep manifests
+  poc.yaml                                   ~127M from-scratch POC / dev rung (OLMo vocab, fp16)
+  1b.yaml                                    ~1B from-scratch target (OLMo vocab, bf16, CUDA)
+  student-1b.yaml  manifests/student-1b-*.yaml   ~1B distillation student + sweep manifests
 src/model/                 interface (seam) · blocks (config + hybrid/MoE gating) · mlx/cuda backends
                            teacher · mlx_teacher · mlx_student_init · mlx_distill (distillation)
 src/data/                  download · tokenize (olmo/qwen2.5) · pack(uint16/uint32) · split · loader
@@ -137,8 +138,8 @@ the distillation rationale is in [`docs/design/10-distillation.md`](docs/design/
 
 Reference configs: `config/poc.yaml` = d_model 768 / 24 layers / d_state 16 / head_dim 64 (24
 heads) / seq 1024 / ~3B tokens / OLMo vocab (pure Mamba). `config/student-1b.yaml` = d_model
-2048 / 48 layers / d_state 128 / `attn_every` 8 / seq 8192 / Qwen2.5 vocab 151,646 / bf16 (the
-distillation student). `config/toy*.yaml` are tiny fp32 smoke configs (`toy-hybrid` adds an
+2048 / 28 layers / d_state 128 / `attn_every` 8 / seq 8192 / Qwen2.5 vocab 151,646 / bf16 (the
+~1B distillation student — 28 layers matches the teacher's depth for the init mapping). `config/toy*.yaml` are tiny fp32 smoke configs (`toy-hybrid` adds an
 attention layer; `toy-moe` adds MoE). Conformance compares **fp32** at ~1e-4 rel.
 
 ## Experimental snapshotting — session rewind

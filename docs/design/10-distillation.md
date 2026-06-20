@@ -163,7 +163,7 @@ student: 1b-attn12pct
 conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25               # Qwen2.5 vocab, 151646
 seq_len: 8192
-layout: { d_model: 2048, n_layers: 48, attention_every: 8, state_size: 128 }
+layout: { d_model: 2048, n_layers: 28, attention_every: 8, state_size: 128 }   # ~1.03B; matches the teacher's 28 layers
 init: mamba-in-the-llama        # or mohawk
 stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]
 corpus: poc-distill/corpus/tokenized/qwen25-8k

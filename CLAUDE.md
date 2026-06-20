@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A proof-of-concept **Mamba-2 hybrid** (selective state-space + a few attention layers)
 language model, developed and validated on **Apple Silicon with MLX**, architected behind
 **one hardware seam** so it migrates to **CUDA** for a larger run with minimal rewrite. The
-active program is to **distil** a compact (~1–1.5B) hybrid student from a larger frozen teacher
+active program is to **distil** a compact **~1B** hybrid student from a larger frozen teacher
 (`open-r1/OpenR1-Distill-7B`, Qwen2.5 tokenizer), sweep a few architecture layouts cheaply, then
 post-train the winner for reasoning — tracked in
 [issue #65](https://github.com/travisgalloway/monica/issues/65). The original from-scratch

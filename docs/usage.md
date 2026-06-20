@@ -7,7 +7,7 @@ serve/chat → eval**. For *why* the project is built this way, see
 
 The project has **two training paths**:
 
-- **Distillation (current focus)** — build a compact ~1–1.5B Mamba-2 hybrid student from a
+- **Distillation (current focus)** — build a compact **~1B** Mamba-2 hybrid student from a
   larger frozen teacher (Qwen2.5 tokenizer → uint32 packing). *In progress:* the building
   blocks exist; the end-to-end run harness is being wired up.
 - **From-scratch pretrain (validated foundation / production reserve)** — train a ~100M POC

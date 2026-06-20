@@ -1,7 +1,8 @@
 """Param-count + sizing tests (portable; runs anywhere, no backend).
 
 Guards the closed-form `MambaConfig.num_parameters()` and the `sizing` memory
-estimates, and pins the scaling-config family (poc/1b/2b/4b) to its targets.
+estimates, and pins the config family (poc/1b) to its targets. The 2B/4B scale
+tiers were dropped — 1B is the single target model (epic #65).
 
 The exact-vs-real-tensors safety net (num_parameters == built model param sum)
 lives in the MLX-gated test below — only a real backend has the actual tensors.
@@ -17,8 +18,8 @@ from src.model import sizing
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
-# (name, approx target params) for the scaling ladder. poc is the existing ~127M.
-FAMILY = [("poc", 127e6), ("1b", 1e9), ("2b", 2e9), ("4b", 4e9)]
+# (name, approx target params). poc is the existing ~127M dev rung; 1b is the target model.
+FAMILY = [("poc", 127e6), ("1b", 1e9)]
 
 
 def _cfg(name):

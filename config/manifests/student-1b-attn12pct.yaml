@@ -8,8 +8,8 @@ tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — unchanged; tea
 seq_len: 8192
 layout:
   d_model: 2048
-  n_layers: 48
-  attention_every: 8             # ~12.5% attention
+  n_layers: 28                   # ~1.03B params; matches the teacher's 28 layers (Mamba-in-the-Llama init)
+  attention_every: 8             # 3 of 28 layers attention (~10.7%) — the higher-attention sibling
   state_size: 128                # -> MambaConfig.d_state
 init: mamba-in-the-llama         # or: mohawk  (#99)
 stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # tool-sft optional
