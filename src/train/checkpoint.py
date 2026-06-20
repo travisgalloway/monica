@@ -58,6 +58,7 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        _fsync_dir(d)   # make the rename itself durable, not just the file data
     except BaseException:
         try:
             os.unlink(tmp)
@@ -85,6 +86,9 @@ def save_weights(state_dict: Dict[str, np.ndarray], path: str,
         save_file(tensors, tmp)
         _fsync_path(tmp)
         os.replace(tmp, path)
+        # Durable rename even when save_weights runs standalone (model.save outside
+        # CheckpointStore), not only when a later CheckpointStore dir-fsync covers it.
+        _fsync_dir(d)
     except BaseException:
         try:
             os.unlink(tmp)
