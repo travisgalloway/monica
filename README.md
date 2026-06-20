@@ -1,4 +1,4 @@
-# monica — Mamba-2 Hybrid POC
+# Monica — Mamba-2 Hybrid POC
 
 A proof-of-concept **Mamba-2 hybrid** language model, developed and validated on
 **Apple Silicon with MLX**, architected behind **one hardware seam** so a successful POC
@@ -14,37 +14,38 @@ train/distil → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](doc
 
 ---
 
-## TL;DR — what is this? (plain-language)
+## TL;DR — what is this?
 
-**The model.** monica is a small language model whose backbone is **Mamba-2**, a
-*state-space model*. Where a normal Transformer re-reads the whole conversation for every
+**The model.** Monica is a small language model whose backbone is **Mamba-2**, a
+_state-space model_. Where a normal Transformer re-reads the whole conversation for every
 new word (a cost and memory footprint that grow with length), a state-space model keeps a
 small fixed-size running summary and updates it one token at a time. That means **constant
 memory per generated token and no growing KV cache** — it stays fast and cheap on a local
 Mac, even for long inputs (whole files, long reasoning traces). Pure state-space models are
-weak at *exact* recall (copying a variable name, quoting a number), so monica is a
-**hybrid**: it mixes in a *few* ordinary attention layers (roughly one in eight) to recover
+weak at _exact_ recall (copying a variable name, quoting a number), so Monica is a
+**hybrid**: it mixes in a _few_ ordinary attention layers (roughly one in eight) to recover
 precise lookup where it matters — math and code.
 
-**How it learns.** Training a model from scratch is enormously expensive. Instead, monica
+**How it learns.** Training a model from scratch is enormously expensive. Instead, Monica
 **learns from a bigger, already-trained "teacher" model** — a technique called
 **distillation**. The student watches what the teacher would predict and learns to match it,
-reaching useful capability for a *tiny fraction* of the data a from-scratch run needs. Because
+reaching useful capability for a _tiny fraction_ of the data a from-scratch run needs. Because
 each student is cheap to train, we can **try several small designs** (how much attention, where
 to place it, how big the state is) and keep the best one.
 
 **The intended process, in order:**
+
 1. **Precompute the teacher's signal once** — tokenize a corpus and record the teacher's
    predictions. This is the expensive part, and it's done a single time.
 2. **Sweep student layouts** — train several cheap candidate students against that frozen
-   signal and pick the layout that wins on math/code *and* on the local speed/long-context
+   signal and pick the layout that wins on math/code _and_ on the local speed/long-context
    advantage.
 3. **Post-train the winner** — teach it to follow instructions and to reason
    (`<think>…</think>` style), with optional tool-use and a final reinforcement-learning polish.
 4. **Run it locally** — serve it on Apple Silicon, where the constant-memory design pays off.
 
 This is a **proof of concept**: success is a smoothly improving learning curve plus a clear
-local-hardware win (context length and tokens/sec a same-size Transformer can't match), not a
+local-hardware win (context length and tokens/sec that a same-size Transformer can't match), not a
 leaderboard score. The from-scratch training path is fully built and validated; the
 **distillation stage is in progress** (the building blocks exist; the end-to-end cloud run is
 being wired up — see [issue #65](https://github.com/travisgalloway/monica/issues/65)).
@@ -95,18 +96,18 @@ done and verified on a rented A40** (full suite green on both). The active progr
 distillation** ([issue #65](https://github.com/travisgalloway/monica/issues/65)); the M1–M8
 core was tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2).
 
-| Milestone | State |
-|---|---|
-| 1 Seam + MLX model | done; MLX backend + forward/step parity verified |
-| 2 Data pipeline | done; FineWeb-Edu / Wikipedia / instruction sources, unit-tested |
-| 3 Minimal training loop | done; `train_step` + loop exercised by the smoke gate |
-| 4 Smoke test (gate) | passing — resume exact, eval runs |
-| 5 POC scale run | infra done; short ~100M-token run reached val-ppl ~77; full 2–5B deferred |
-| 6 OLMES / lm-eval | done — loglikelihood + generative (`generate_until`) tasks |
-| 7 Serving + chat + rewind | done — CLI generate/chat over `SessionStore` + `RewindTree` |
-| 8 CUDA backend | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified |
-| 9 Post-training | **done** — SFT / DPO / GRPO machinery on MLX (+ CUDA step-factory parity) |
-| 10 Distillation | **in progress** — teacher loader, student init, staged loss, sweep harness built |
+| Milestone                 | State                                                                             |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| 1 Seam + MLX model        | done; MLX backend + forward/step parity verified                                  |
+| 2 Data pipeline           | done; FineWeb-Edu / Wikipedia / instruction sources, unit-tested                  |
+| 3 Minimal training loop   | done; `train_step` + loop exercised by the smoke gate                             |
+| 4 Smoke test (gate)       | passing — resume exact, eval runs                                                 |
+| 5 POC scale run           | infra done; short ~100M-token run reached val-ppl ~77; full 2–5B deferred         |
+| 6 OLMES / lm-eval         | done — loglikelihood + generative (`generate_until`) tasks                        |
+| 7 Serving + chat + rewind | done — CLI generate/chat over `SessionStore` + `RewindTree`                       |
+| 8 CUDA backend            | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified |
+| 9 Post-training           | **done** — SFT / DPO / GRPO machinery on MLX (+ CUDA step-factory parity)         |
+| 10 Distillation           | **in progress** — teacher loader, student init, staged loss, sweep harness built  |
 
 **M10 distillation — where it stands.** The frozen-artifact strategy and its building blocks
 are in place: the conversion teacher loader (`src/model/mlx_teacher.py`), student

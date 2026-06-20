@@ -61,9 +61,10 @@ durable Parquet, then Qwen2.5-tokenizes and packs it into fixed-length training 
 new logic over the stages below — only the `poc-distill/` layout and a corpus-level manifest.
 
 ```bash
-# From a one-document-per-line text file (use --source dummy for an offline smoke):
+# From a one-document-per-line text file (use --source dummy for an offline smoke).
+# --out-root is the poc-distill class root; it defaults to data/poc-distill (omit to use it):
 .venv/bin/python -m src.data.distill_corpus --source text --in data/raw/slice.txt \
-    --tokenizer qwen25 --seq-len 8192 --out-root data
+    --tokenizer qwen25 --seq-len 8192 --out-root data/poc-distill
 ```
 
 This writes:

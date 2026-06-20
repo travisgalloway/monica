@@ -99,16 +99,19 @@ invalidates **nothing** — fix the teacher and tokenizer first, then sweep stud
 R2 is our durable store — **S3-compatible with no egress fees**, which suits the repeated
 train-time pulls. Concretely:
 
-- **Access:** the `datatrove`/`fsspec` S3 reader/writer point at the R2 endpoint through
-  **`s3fs`** (R2 exposes an S3 API). The `poc-distill/` · `shared/` · `reserve-pretrain/` ·
-  `ckpt/` prefixes above are exactly the strings from `src/data/storage.py` — no translation.
+- **Access:** the `datatrove`/`fsspec` S3 reader/writer address R2 through the **`s3://`**
+  scheme (R2 exposes an S3 API; point the S3 client at the R2 endpoint). The three artifact
+  prefixes — `poc-distill/` · `shared/` · `reserve-pretrain/` — are exactly the strings from
+  `src/data/storage.py`. `ckpt/` is a separate checkpoint-sync prefix (a run-output convention,
+  not a `storage.py` constant).
 - **Secrets:** R2 key/secret + HF token live in the pod's secrets/env, never in the repo.
 - **Sizing:** target ~1–2 TB working set, growing with the reserve corpus. Few large shards
   (R2 Class A ops cost per million).
-- **Checkpoints:** synced to `r2://<bucket>/ckpt/<run>/` from the GPU host on a cadence — the
-  durable copy, since the pod is ephemeral.
-- **Install:** the data extras pull the storage deps — `pip install -e ".[data]"` (adds
-  `fsspec`/`pyarrow`); the cloud corpus engine adds `pip install -e ".[datatrove]"`.
+- **Checkpoints:** synced to `s3://<bucket>/ckpt/<run>/` (the R2 bucket) from the GPU host on a
+  cadence — the durable copy, since the pod is ephemeral.
+- **Install:** the data extras pull `fsspec`/`pyarrow` — `pip install -e ".[data]"` — but the
+  S3 filesystem backend is separate: also `pip install s3fs` so `s3://` URLs resolve. The cloud
+  corpus engine adds `pip install -e ".[datatrove]"`.
 
 ---
 
@@ -124,9 +127,13 @@ RunPod provides the on-demand compute. Two roles, kept separate:
 **Region:** RunPod network volumes are region-locked — keep the pod region network-close to R2
 so the pull is fast and free.
 
-**GPU pod spec (training).** Use an **Ampere-or-newer** card (the scale configs are bf16-native;
-*not* a T4/Turing) and a RunPod **`-devel`** image so the build sees the preinstalled CUDA torch
-(e.g. `runpod/pytorch:2.4.0-...-devel-ubuntu22.04` or the `2.8.0-...-cudnn-devel` image). Then:
+**GPU pod spec.** The card choice is driven by **precision**, not a blanket rule: the **1B
+training** configs (`config/student-1b.yaml`, `config/1b.yaml`) are **bf16**, which needs an
+**Ampere-or-newer** card (a T4/Turing has no bf16). The cheaper **smoke gate** (`config/toy.yaml`,
+fp32) and **train-step bench** (`config/poc.yaml`, fp16) below run fine on a **T4/L4** — so a
+T4/L4 is enough to dry-run the flow, and you only need Ampere+ for the actual bf16 run. Use a
+RunPod **`-devel`** image so the build sees the preinstalled CUDA torch (e.g.
+`runpod/pytorch:2.4.0-...-devel-ubuntu22.04` or the `2.8.0-...-cudnn-devel` image). Then:
 
 ```bash
 # 1. Backend install (the [cuda] extra pulls torch; mlx is Mac-only).
