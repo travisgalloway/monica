@@ -155,7 +155,9 @@ tail -f runs/poc/metrics.jsonl     # {step, lr, loss, grad_norm, val_perplexity,
 ```
 
 **POC success = a smoothly decreasing `val_perplexity`** with stable `grad_norm`. (A reference
-~100M-param run on ~100M tokens reached val-perplexity ~77.)
+~127M-param OLMo run on ~100M tokens reached val-perplexity ~77; the active POC run is ~205M via
+`config/poc-qwen.yaml` — Qwen2.5 vocab, embedding-dominated — trained on the ~1.9B-token corpus
+at `s3://monica-training/reserve-pretrain`.)
 
 The smaller `config/toy.yaml` (vocab 256, fp32) backs the exact-resume smoke gate:
 

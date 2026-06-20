@@ -45,13 +45,59 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
     return train_path, val_path
 
 
+def split_shards(shard_dir: Path, out_dir: Path, val_tokens: int) -> Tuple[Path, Path]:
+    """Make a `train.bin`/`val.bin` split (the `PackedLoader` format) from a tokenized SHARD
+    directory (`shard.py`'s `part-*.bin` + `manifest.json`) — the bridge from the datatrove/scale
+    corpus to the trainer, with NO re-tokenize. The shards are a flat token stream; the last
+    `val_tokens` are held out for val, the rest concatenated into train (disjoint by construction).
+
+    Streams shard-by-shard (memmap -> file), so it is bounded in memory regardless of corpus size.
+    Drops the `.bounds` sidecars — `PackedLoader` packs flat `seq_len` windows and ignores doc
+    boundaries (the #68 boundary-aware path is separate)."""
+    from .shard import open_shard, read_manifest
+
+    shard_dir = Path(shard_dir)
+    man = read_manifest(shard_dir)
+    total, dtype = int(man["n_tokens"]), np.dtype(man["dtype"])
+    if val_tokens >= total:
+        raise ValueError(f"val_tokens={val_tokens} >= total tokens={total}")
+    train_n = total - val_tokens                       # val is the contiguous tail
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_path, val_path = out_dir / "train.bin", out_dir / "val.bin"
+    written = 0
+    with open(train_path, "wb") as ftr, open(val_path, "wb") as fva:
+        for sh in man["shards"]:
+            toks, _ = open_shard(shard_dir, sh["name"])     # uint32 memmap (dtype from manifest)
+            arr = np.asarray(toks)
+            if written >= train_n:                          # whole shard is val
+                arr.tofile(fva)
+            elif written + len(arr) <= train_n:             # whole shard is train
+                arr.tofile(ftr)
+            else:                                           # shard straddles the cut
+                cut = train_n - written
+                arr[:cut].tofile(ftr)
+                arr[cut:].tofile(fva)
+            written += len(arr)
+    for p, n in ((train_path, train_n), (val_path, val_tokens)):
+        with open(p.with_suffix(".meta.json"), "w") as f:
+            json.dump({"dtype": dtype.name, "n_tokens": int(n)}, f)
+    return train_path, val_path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--packed", type=Path, required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--packed", type=Path, help="a single packed .bin (pack.py output)")
+    src.add_argument("--shards", type=Path, help="a tokenized shard dir (shard.py output)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--val-tokens", type=int, required=True)
     args = ap.parse_args()
-    tr, va = split_packed(args.packed, args.out, args.val_tokens)
+    if args.shards:
+        tr, va = split_shards(args.shards, args.out, args.val_tokens)
+    else:
+        tr, va = split_packed(args.packed, args.out, args.val_tokens)
     print(f"train -> {tr}\nval   -> {va}")
 
 

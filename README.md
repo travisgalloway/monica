@@ -5,7 +5,9 @@ A proof-of-concept **Mamba-2 hybrid** language model, developed and validated on
 migrates to **CUDA** for a larger run with minimal rewrite. The current program is to
 **distil** a compact **~1B** hybrid student from a larger frozen teacher, sweep a few
 architecture layouts cheaply, then post-train the winner for reasoning. (1B is the single
-target model — the cheap 100M `poc` is just the architecture-validation rung.)
+target model — the `poc` is the cheap architecture-validation rung, run at ~205M with the
+Qwen2.5 tokenizer (`config/poc-qwen.yaml`) to mirror the student's data path; a ~127M OLMo
+variant, `config/poc.yaml`, stays in reserve.)
 
 **Usage:** [`docs/usage.md`](docs/usage.md) — end-to-end commands (install → data →
 train/distil → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](docs/infrastructure.md)
@@ -102,7 +104,7 @@ core was tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2
 | 2 Data pipeline           | done; FineWeb-Edu / Wikipedia / instruction sources, unit-tested                  |
 | 3 Minimal training loop   | done; `train_step` + loop exercised by the smoke gate                             |
 | 4 Smoke test (gate)       | passing — resume exact, eval runs                                                 |
-| 5 POC scale run           | infra done; short ~100M-token run reached val-ppl ~77; full 2–5B deferred         |
+| 5 POC scale run           | infra done; ~1.9B-token Qwen2.5 corpus built → R2; ~205M `poc-qwen` run on RunPod; prior OLMo run hit val-ppl ~77 |
 | 6 OLMES / lm-eval         | done — loglikelihood + generative (`generate_until`) tasks                        |
 | 7 Serving + chat + rewind | done — CLI generate/chat over `SessionStore` + `RewindTree`                       |
 | 8 CUDA backend            | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified |

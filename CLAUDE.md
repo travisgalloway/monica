@@ -83,10 +83,17 @@ decision record** — read them before changing values. Key locked decisions:
 
 - **toy.yaml** (smoke/correctness): tiny, `fp32` for bit-exact fixed-seed resume,
   `vocab_size 256` (byte-fallback tokenizer, offline).
-- **poc.yaml** (~100M scale run): `vocab_size 50280` (OLMo-7B-hf, confirmed `<65536`, uint16),
-  `precision fp16` + (dynamic) loss scaling (~16% faster than bf16 on Metal per the M1
-  micro-benchmark — **do not assume bf16**), tied embedding **mandatory** (~38M of
-  ~100M params), `grad_checkpoint: true` (required at this depth — see below).
+- **poc.yaml** (~127M OLMo scale run, from-scratch/reserve): `vocab_size 50280` (OLMo-7B-hf,
+  confirmed `<65536`, uint16), `precision fp16` + (dynamic) loss scaling (~16% faster than bf16
+  on Metal per the M1 micro-benchmark — **do not assume bf16**), tied embedding **mandatory**
+  (~38M of ~127M params), `grad_checkpoint: true` (required at this depth — see below).
+- **poc-qwen.yaml** (the **active ~205M POC run**): `poc.yaml`'s layers retargeted to
+  `vocab_size 151646` (Qwen2.5, uint32) so it trains on the distillation corpus
+  (`s3://monica-training/reserve-pretrain`) and mirrors the ~1B student's tokenizer/data path.
+  Layers are unchanged (~88M); the larger tied embedding (~116M) dominates → **~205M total**,
+  embedding-heavy (a deliberate trade for tokenizer alignment, not a clean 100M). Runs on CUDA
+  via RunPod (see `config/poc-qwen.yaml`'s header runbook); split the R2 shard corpus into
+  train/val with `python -m src.data.split --shards <dir> --out <split> --val-tokens N`.
 - **`head_dim`** is the Mamba-2 head width: `d_inner` splits into
   `n_heads = d_inner // head_dim` heads, each with a **scalar** decay A (the SSD
   restriction that makes the scan a matmul). `validate()` requires `head_dim | d_inner`

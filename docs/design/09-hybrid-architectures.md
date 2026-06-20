@@ -52,7 +52,8 @@ earlier 2B/4B scale tiers — and a 16B candidate before them — were dropped f
 
 | tier | d_model | n_layers | head_dim | ≈ params | bf16 weights | train GPU |
 |---|---|---|---|---|---|---|
-| **100M** (poc — dev/validation rung) | 768 | 24 | 64 | ~127M | ~0.25 GB | T4 16 GB / L4 24 GB |
+| **100M** (poc — OLMo, reserve) | 768 | 24 | 64 | ~127M | ~0.25 GB | T4 16 GB / L4 24 GB |
+| **205M** (poc-qwen — Qwen2.5, active POC run) | 768 | 24 | 64 | ~205M | ~0.4 GB | T4 16 GB / L4 24 GB |
 | **1B** (target — from scratch) | 2048 | 36 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
 | **1B** (target — distillation student, hybrid) | 2048 | 28 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
 
@@ -62,7 +63,12 @@ layers** — matching the teacher's 28 transformer layers so the Mamba-in-the-Ll
 layer-to-layer (see [distillation](10-distillation.md)) — while the **from-scratch** 1B
 ([`config/1b.yaml`](../../config/1b.yaml), OLMo vocab) uses 36 layers for the same param budget
 (its smaller vocab leaves more room in the layer stack). The 100M tier is the validated
-[`poc.yaml`](07-configs-and-decisions.md). The sizing tool is a portable closed-form
+[`poc.yaml`](07-configs-and-decisions.md) (OLMo). The **active POC run** uses
+[`poc-qwen.yaml`](../../config/poc-qwen.yaml) — the same layers retargeted to the Qwen2.5 vocab
+(151,646) so the POC exercises the distillation student's exact tokenizer/data path; the larger
+tied embedding (~116M) then dominates, making it ~205M, embedding-heavy. (At the student's
+d_model 2048 that same embedding is a negligible ~11%, so the vocab is "free" there — it only
+dominates a narrow 768-wide model.) The sizing tool is a portable closed-form
 param/memory calculator (`src/model/sizing.py` + `scripts/model_size.py`, #66), cross-checked
 against the built model's portable state-dict param sum. Training memory ≈ 8 B/param
 (weights+grad+AdamW), or **~10 B/param with 8-bit Adam** — the VRAM-tight lever used in
