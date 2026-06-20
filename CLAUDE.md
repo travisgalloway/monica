@@ -13,7 +13,11 @@ as a smoothly decreasing held-out validation-perplexity curve — not benchmark 
 
 ```bash
 # Install (Apple Silicon — the normal dev environment):
-pip install -e ".[dev,data,mlx]"   # mlx requires Apple Silicon; omit on Linux/CUDA hosts
+pip install -e ".[dev,data,mlx]"
+
+# Install (Linux/CUDA host — e.g. RunPod):
+pip install -e ".[dev,data,cuda]"          # base CUDA backend (pure-PyTorch)
+pip install -e ".[dev,data,cuda-fast]"     # + mamba-ssm Triton scan + causal-conv1d (#40)
 
 # Tests (uses the venv at .venv):
 .venv/bin/python -m pytest                                   # full suite (36 tests)

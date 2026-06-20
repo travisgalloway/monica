@@ -145,6 +145,36 @@ def test_forward_step_parity_hybrid():
     assert result["ok"], result
 
 
+def test_fused_scan_matches_vanilla():
+    """Fused mamba_chunk_scan_combined (#40) agrees with pure-PyTorch scan on CUDA.
+
+    Skipped when CUDA is unavailable or mamba-ssm is not installed. Compares in fp32
+    at the same ~1e-4 rel tolerance used for cross-backend parity."""
+    from src.model.cuda_backend import _fused_scan
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    if _fused_scan() is None:
+        pytest.skip("mamba-ssm fused kernel not available")
+
+    torch.manual_seed(42)
+    cfg = load_config("config/toy.yaml")
+    dev = torch.device("cuda")
+    ssm = SelectiveSSM(cfg).to(dev)
+    B, L, di = 2, cfg.seq_len, cfg.d_inner
+    x_cpu = torch.randn(B, L, di) * 0.1
+
+    with torch.no_grad():
+        # GPU path — dispatches to fused kernel
+        y_fused = ssm.parallel(x_cpu.to(dev)).cpu().numpy()
+        # CPU path — pure-PyTorch fallback
+        y_vanilla = ssm.to("cpu").parallel(x_cpu).numpy()
+        ssm.to(dev)   # restore
+
+    max_abs = float(np.abs(y_fused.astype(np.float64) - y_vanilla.astype(np.float64)).max())
+    assert np.allclose(y_fused, y_vanilla, rtol=1e-4, atol=1e-5), (
+        f"fused scan differs from vanilla: max|diff|={max_abs:.3e}")
+
+
 def test_portable_roundtrip(tmp_path):
     """save -> reload into a fresh instance -> identical logits (the portable bridge)."""
     torch.manual_seed(0)

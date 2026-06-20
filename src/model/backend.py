@@ -201,9 +201,14 @@ def _cuda_backend() -> Backend:
             "The distillation train step (M10/#100) is implemented on the MLX dev backend "
             "only; the CUDA distill step is deferred.")
 
+    _dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    def _model_cls(cfg):
+        return CUDAMambaModel(cfg, device=_dev)
+
     return Backend(
         name="cuda",
-        model_cls=CUDAMambaModel,
+        model_cls=_model_cls,
         make_train_step=_make_train_step,
         save_optimizer=_save_optimizer,
         load_optimizer=_load_optimizer,

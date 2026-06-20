@@ -26,8 +26,13 @@ datatrove = ["datatrove>=0.6"]
 # Apple Silicon backend (NOT installable on Linux/CUDA hosts).
 mlx = ["mlx>=0.18"]
 # CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
-# The optional mamba-ssm fused selective-scan kernel is a separate perf extra (#40).
 cuda = ["torch>=2.0"]
+# Optional fused CUDA kernels (#40): mamba-ssm provides the Triton SSD chunked scan
+# (mamba_chunk_scan_combined) and causal-conv1d the depthwise conv fast path.
+# Both are auto-detected at runtime and degrade gracefully when absent.
+# Note: mamba-ssm 2.x top-level package requires a compatible transformers version;
+# the ops submodule used here (mamba_ssm.ops.triton) works independently.
+cuda-fast = ["torch>=2.0", "mamba-ssm>=2.0", "causal-conv1d>=1.0"]
 # Experiment logging.
 logging = ["wandb>=0.16"]
 # Tier-2 OLMES/lm-eval benchmark harness. A heavy optional dependency (some
