@@ -97,16 +97,21 @@ This separation is the crux of the migration story:
 
 - **`save_weights`** writes safetensors + a `<path>.config.json` sidecar — portable,
   the bridge between backends.
-- **`save_resume` / `load_resume`** write a same-backend bundle (step, RNG state,
-  optimizer state) using a backend-supplied serializer — because optimizer-state
-  layout *is* backend-specific, and you never need to resume a half-finished MLX run
-  on CUDA.
+- **`CheckpointStore`** writes the same-backend resume bundle (portable weights +
+  optimizer state + step + fp16 loss-scale state) via a backend-supplied serializer —
+  optimizer-state layout *is* backend-specific, and you never need to resume a
+  half-finished MLX run on CUDA. It is **double-buffered and crash-safe**: two slots plus
+  an atomically-flipped `LATEST` pointer, so a checkpoint interrupted mid-write (a spot
+  preemption on a multi-week run) leaves the *previous* checkpoint fully intact. The data
+  order on resume is reconstructed deterministically from `(seed, step, grad_accum)` — no
+  RNG is persisted, because the model has no train-time randomness (dropout-free; weight
+  init is overwritten by the loaded weights).
 
 `safetensors` is imported lazily so the module loads without the dependency present.
 
-The [smoke gate](06-smoke-gate-and-eval.md) exercises exactly this: save portable
-weights + a resume bundle, tear everything down, rebuild, load, and continue — then
-assert the trajectory matches bit-for-bit.
+The [smoke gate](06-smoke-gate-and-eval.md) exercises exactly this: save a full
+checkpoint, tear everything down, rebuild, load, and continue — then assert the
+trajectory matches bit-for-bit.
 
 ## The scale run (M5)
 

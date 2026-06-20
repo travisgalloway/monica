@@ -118,10 +118,24 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
 
 ## Training flow (Phases 4–5, #81 / #75)
 
-- **Phase 4 (#81):** the 100M smoke run — sync the ~20 GB subset from R2 to a 50 GB network
-  volume on a cheap GPU pod (T4/L4), train via `scripts/train.py --backend cuda`, confirm a
-  decreasing val-perplexity curve, **checkpoint back to R2**, and run the retrieval probes
-  (#79). Validates the whole plumbing before paying for big cards.
+- **Phase 4 (#81):** the 100M smoke run on a cheap GPU pod (T4/L4). Bring the pod up in
+  this order so a config or throughput problem surfaces *before* the long run:
+  1. `pip install -e '.[cuda]'` (the `[cuda]` extra pulls torch; `mlx` is Mac-only).
+  2. **CUDA smoke gate** — build a tiny toy split on the pod and run
+     `scripts/smoke_test.py --backend cuda --data <toy split>`. This proves the torch
+     backend resumes bit-exactly through the [double-buffered `CheckpointStore`](05-training.md)
+     end to end. Use `config/toy.yaml` (a dense config) — the gate refuses a MoE config,
+     since MoE-Mamba (#53) is MLX-only.
+  3. **Train-step bench** — `scripts/bench_cuda_train_step.py --config config/poc.yaml
+     --batch 32 --grad-accum 4` reports s/step, tokens/s, and **peak GPU memory** for the
+     production path (`CUDAMambaModel` + AdamW + `make_train_step`, wired exactly as
+     `train.py --backend cuda`). Confirms the card fits the step and gives a throughput
+     baseline to plan the run against — *before paying for big cards*. The same script
+     dry-runs on the Mac via torch-CPU (`--device cpu`, slow but the identical code path),
+     so the pod run is a no-surprise repeat. The MLX counterpart is `bench_train_step.py`.
+  4. Sync the ~20 GB subset from R2 to a 50 GB network volume, train via
+     `scripts/train.py --backend cuda`, confirm a decreasing val-perplexity curve,
+     **checkpoint back to R2** (RunPod is not durable), and run the retrieval probes (#79).
 - **Phase 5 (#75):** the 1B → 2B → 4B tiers per the #65 sizing table. **8-bit Adam** when
   VRAM-tight; **spot instances + frequent checkpointing** for 2B/4B; back up intermediate
   checkpoints to R2. Reuses the portable loop + two-concern [checkpointing](05-training.md);
