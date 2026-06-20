@@ -194,10 +194,16 @@ def iter_jsonl_texts(uri) -> Iterator[str]:
         with fs.open(fp, "rb") as raw:
             stream = (gzip.open(raw, "rt", encoding="utf-8") if str(fp).endswith(".gz")
                       else io.TextIOWrapper(raw, encoding="utf-8"))
-            for line in stream:
-                line = line.strip()
-                if line:
-                    yield json.loads(line).get("text", "")
+            try:                                   # close explicitly so gzip CRC/EOF is validated
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    text = json.loads(line).get("text")
+                    if text:                       # skip missing/empty text (no empty docs injected)
+                        yield text
+            finally:
+                stream.close()
 
 
 def has_jsonl_shards(uri) -> bool:

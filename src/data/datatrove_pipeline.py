@@ -112,6 +112,8 @@ def _custom_blocks(thresholds: QualityThresholds = DEFAULT_THRESHOLDS):
                 scrubbed, n = scrub_secrets(doc.text)
                 if n:
                     doc.text = scrubbed
+                    if doc.metadata is None:                # datatrove docs may carry metadata=None
+                        doc.metadata = {}
                     doc.metadata["secrets_scrubbed"] = doc.metadata.get("secrets_scrubbed", 0) + n
                     self.stat_update("docs_scrubbed")
                     self.stat_update("secrets_scrubbed", value=n)

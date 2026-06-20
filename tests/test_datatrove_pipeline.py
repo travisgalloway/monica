@@ -22,8 +22,11 @@ GOOD = ("The selective state space model processes long sequences with linear me
         "very long context windows affordable on modest hardware during both training and serving. "
         "Because the recurrence is linear in sequence length, the model scales to documents that a "
         "quadratic attention transformer of the same size could never hold in memory at once.")
+# Constructed at runtime so the full AWS-key pattern is never a literal in the repo (avoids
+# tripping secret scanners) while still matching the scrubber's `\bAKIA[0-9A-Z]{16}\b`.
+FAKE_AWS_KEY = "AKIA" + "1234567890ABCDEF"
 SECRET = ("Configure the deployment with your credentials before the very first run of the worker. "
-          "For example, set the access key id AKIA1234567890ABCDEF in the environment, export the "
+          f"For example, set the access key id {FAKE_AWS_KEY} in the environment, export the "
           "matching region and bucket name, and then start the worker process so it can connect to "
           "object storage and begin streaming the cleaned training shards from the remote prefix.")
 
@@ -68,7 +71,7 @@ def test_clean_pipeline_filters_and_scrubs(tmp_path):
     # Clean text, permissive code, and the (scrubbed) secret doc are kept.
     assert set(kept) == {"good", "mit", "secret"}
     # The planted AWS key is redacted to the placeholder.
-    assert "AKIA1234567890ABCDEF" not in kept["secret"]["text"]
+    assert FAKE_AWS_KEY not in kept["secret"]["text"]
     assert "[AWS_KEY]" in kept["secret"]["text"]
     assert kept["secret"]["metadata"].get("secrets_scrubbed", 0) >= 1
 

@@ -75,14 +75,16 @@ def main() -> None:
                              logging_dir=f"{logging_dir}/dedup")
         print(f"dedup complete -> {str(args.out).rstrip('/')}/dedup/deduplicated")
 
-    # All shards + completion markers are flushed by executor.run(); force a clean exit because a
-    # streaming HF reader truncated by --limit leaves a non-daemon prefetch thread alive, which
-    # otherwise hangs the interpreter at teardown (harmless, but it never returns).
-    import os
-    import sys
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    # A streaming HF reader truncated by --limit leaves a non-daemon prefetch thread alive, which
+    # hangs the interpreter at teardown after all shards/markers are already flushed. Force a clean
+    # exit ONLY in that case; a full (unbounded) run drains the reader and exits normally, so it
+    # keeps normal teardown (finally blocks, atexit, FS cleanup).
+    if args.limit and args.limit > 0:
+        import os
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
