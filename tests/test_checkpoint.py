@@ -1,8 +1,10 @@
 """Unit tests for portable weight save/load and the double-buffered CheckpointStore.
 
 Backend-free: uses numpy weight dicts and dummy weight/optimizer (de)serializers, so it
-runs anywhere. Guards the resume bundle against a realistic NumPy RNG state
-(nested dict + np.ndarray + np scalars), which a shallow JSON conversion breaks, and the
+runs anywhere. The resume metadata persists `step` + the fp16 `loss_scale_state` (NOT an
+RNG state — the data order on resume is reconstructed deterministically); these tests
+guard `_jsonable` against a realistic nested NumPy structure (nested dict + np.ndarray +
+np scalars — the worst case it handles), which a shallow JSON conversion breaks, plus the
 crash-safety contract (the previous checkpoint survives a write interrupted mid-flight).
 """
 
