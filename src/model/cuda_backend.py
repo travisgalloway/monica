@@ -33,6 +33,41 @@ from .interface import ModelInterface, State, Array
 _DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
+# --------------------------------------------------------------------------- #
+# Optional fused fast paths (#40): mamba-ssm SSD kernel + causal-conv1d.
+# Both degrade gracefully to the plain-PyTorch path when the package is absent
+# or the tensor is on CPU (kernels require CUDA). mamba-ssm's top-level
+# __init__.py has a stale transformers import; stub the package so only the ops
+# submodule is loaded.
+# --------------------------------------------------------------------------- #
+_FUSED_SCAN_FN = None          # sentinel: None = not yet tried; False = unavailable
+
+
+def _fused_scan():
+    """Return mamba_chunk_scan_combined, or None if unavailable."""
+    global _FUSED_SCAN_FN
+    if _FUSED_SCAN_FN is None:
+        try:
+            import sys, types, importlib.metadata
+            if "mamba_ssm" not in sys.modules:
+                pkg_dir = str(importlib.metadata.distribution("mamba_ssm").locate_file("mamba_ssm"))
+                stub = types.ModuleType("mamba_ssm")
+                stub.__path__ = [pkg_dir]
+                stub.__package__ = "mamba_ssm"
+                sys.modules["mamba_ssm"] = stub
+            from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+            _FUSED_SCAN_FN = mamba_chunk_scan_combined
+        except Exception:
+            _FUSED_SCAN_FN = False
+    return _FUSED_SCAN_FN if _FUSED_SCAN_FN else None
+
+
+try:
+    from causal_conv1d import causal_conv1d_fn as _CAUSAL_CONV1D
+except Exception:
+    _CAUSAL_CONV1D = None
+
+
 def _silu(x: Array) -> Array:
     return F.silu(x)
 
@@ -173,6 +208,9 @@ class SelectiveSSM(nn.Module):
     def parallel(self, x: Array, seg_ids: Array = None) -> Array:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
+        Dispatches to `mamba_chunk_scan_combined` (#40) when the tensor is on CUDA and
+        mamba-ssm is installed; otherwise falls back to the pure-PyTorch path.
+
         Pads L up to a multiple of the chunk length Q (padded steps carry zero input and
         are trimmed). All decays are exp of non-positive sums, so it is overflow-safe.
 
@@ -184,6 +222,25 @@ class SelectiveSSM(nn.Module):
         Q = self.config.chunk_size or 64
         cd = _DTYPES[self.config.precision]
         delta, a, Bm, Cm = self._project(x)          # delta (B,L,H); Bm,Cm (B,L,N) — fp32
+
+        # --- fused CUDA fast path (#40) -------------------------------------------
+        fn = _fused_scan()
+        if fn is not None and x.device.type == "cuda":
+            # mamba_chunk_scan_combined expects:
+            #   x    (B,L,H,P) fp32    — raw head-shaped input (kernel handles dt*x)
+            #   dt   (B,L,H)   fp32    — softplus(dt_proj(dt_pre)), already computed
+            #   A    (H,)      fp32    — negative scalar decay (-exp(A_log))
+            #   B    (B,L,G,N) fp32    — G=ngroups=1
+            #   C    (B,L,G,N) fp32
+            #   D    (H,)             — per-head skip (added inside kernel)
+            #   seq_idx (B,L) int32   — maps each position to its document id (#68)
+            X = _f32(x).reshape(B_, L, H, P)
+            si = (seg_ids.to(torch.int32) if seg_ids is not None else None)
+            Y = fn(X, delta, a, Bm[:, :, None, :], Cm[:, :, None, :], Q,
+                   D=self.D, seq_idx=si, dt_softplus=False)    # (B,L,H,P) fp32
+            return _cast(Y.reshape(B_, L, d_inner), cd)
+
+        # --- pure-PyTorch fallback ------------------------------------------------
         X = _f32(x).reshape(B_, L, H, P)             # whole scan runs in fp32
 
         pad = (-L) % Q
@@ -257,9 +314,16 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(d_inner, config.d_model, bias=False)
 
     def _conv_seq(self, x_main: Array, cd) -> Array:
-        """Causal depthwise conv in `cd`. torch Conv1d is channels-first, so transpose
-        (B,L,di) <-> (B,di,L) around it; the caller slices to the first L outputs."""
+        """Causal depthwise conv in `cd`. Uses causal_conv1d_fn (#40) on CUDA when
+        available; falls back to F.conv1d. The caller slices to the first L outputs."""
         c = self.conv
+        if _CAUSAL_CONV1D is not None and x_main.device.type == "cuda":
+            # causal_conv1d_fn: (B, C, L) x (C, K) -> (B, C, L), no extra padding needed.
+            # Our weight is (d_inner, 1, K) in torch Conv1d format; squeeze the group dim.
+            w = c.weight.to(cd).squeeze(1)             # (d_inner, K)
+            y = _CAUSAL_CONV1D(x_main.transpose(1, 2).to(cd), w,
+                               c.bias.to(cd), activation=None)
+            return y.transpose(1, 2)
         y = F.conv1d(x_main.transpose(1, 2).to(cd), c.weight.to(cd), c.bias.to(cd),
                      c.stride, c.padding, c.dilation, c.groups)
         return y.transpose(1, 2)
