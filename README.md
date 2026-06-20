@@ -221,7 +221,7 @@ size:
 
 ```bash
 python scripts/sweep.py                    # all of config/manifests/
-python scripts/sweep.py config/manifests/student-1b-attn8pct.yaml config/manifests/student-1b-attn12pct.yaml
+python scripts/sweep.py config/manifests/student-1b-attn-lo.yaml config/manifests/student-1b-attn-hi.yaml
 ```
 
 See [`docs/usage.md`](docs/usage.md#3-train) and

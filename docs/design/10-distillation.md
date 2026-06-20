@@ -159,7 +159,7 @@ time and reused by every trial:
 Each student trial is then a lightweight **manifest** naming the frozen artifacts + the layout:
 
 ```yaml
-student: 1b-attn12pct
+student: 1b-attn-hi
 conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25               # Qwen2.5 vocab, 151646
 seq_len: 8192

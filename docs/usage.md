@@ -185,7 +185,7 @@ state size). Sibling manifests must share one frozen teacher signal:
 ```bash
 .venv/bin/python scripts/sweep.py                    # all of config/manifests/
 .venv/bin/python scripts/sweep.py \
-    config/manifests/student-1b-attn8pct.yaml config/manifests/student-1b-attn12pct.yaml
+    config/manifests/student-1b-attn-lo.yaml config/manifests/student-1b-attn-hi.yaml
 ```
 
 A manifest names the frozen artifacts (corpus, teacher outputs, SFT/RL sets) and the swept

@@ -1,7 +1,9 @@
-# Sibling sweep manifest (#98) — same frozen teacher signal as student-1b-attn12pct.yaml,
+# Sibling sweep manifest (#98) — same frozen teacher signal as student-1b-attn-hi.yaml,
 # only the layout differs (lower attention fraction, larger state). Demonstrates that a sweep
 # reuses corpus + teacher_outputs unchanged; the student layout is the only free variable.
-student: 1b-attn8pct
+# Named -lo/-hi (relative) rather than by percent: at 28 layers the realized fractions are
+# 7.1% (here) vs 10.7% (sibling), which no integer attn_every renders as a round 8%/12%.
+student: 1b-attn-lo
 conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25
 seq_len: 8192
@@ -11,7 +13,7 @@ layout:
   attention_every: 14            # 2 of 28 layers attention (~7.1%) — the lower-attention sibling
   state_size: 192                # wider state to compensate for less attention
 init: mamba-in-the-llama
-stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # sibling of attn12pct: same recipe, only `layout` differs
+stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # sibling of attn-hi: same recipe, only `layout` differs
 corpus: poc-distill/corpus/tokenized/qwen25-8k
 teacher_outputs: poc-distill/teacher-outputs/topk-logits
 sft: shared/sft/tokenized/qwen25-8k
