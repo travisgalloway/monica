@@ -71,7 +71,7 @@ def main() -> None:
     from src.train.loss_scale import scaler_for_precision
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import save_resume, load_resume
+    from src.train.checkpoint import CheckpointStore
     from src.train.dpo_math import evaluate_dpo
 
     backend = get_backend(args.backend)
@@ -105,30 +105,29 @@ def main() -> None:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     weights_path = str(out / "weights.safetensors")
-    bundle_dir = str(out / "resume")
-    resume_dir = args.resume if args.resume is not None else (
-        Path(bundle_dir) if Path(bundle_dir, "resume_meta.json").exists() else None)
+    store = CheckpointStore(str(args.resume) if args.resume is not None
+                            else str(out / "resume"))
+    resuming = store.has_checkpoint()
 
     start_step = 0
-    if resume_dir is not None:
-        policy.load(weights_path)                        # resume the policy
-        meta = load_resume(str(resume_dir),
-                           optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
+    if resuming:
+        meta = store.load(weights_deserializer=lambda p: policy.load(p),  # resume the policy
+                          optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
         start_step = int(meta["step"])
         if scaler is not None:
-            scaler.load_state_dict(meta.get("rng_state") or {})
-        print(f"[resume] from step {start_step} (out={out})")
+            scaler.load_state_dict(meta.get("loss_scale_state") or {})
+        print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
     else:
         policy.load(str(args.init))                      # init policy from SFT weights
         print(f"[init] policy + reference from {args.init}")
 
-    logger = JsonlLogger(str(out / "metrics.jsonl"), append=resume_dir is not None)
+    logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 
     def on_checkpoint(step: int) -> None:
-        policy.save(weights_path)                        # checkpoint the POLICY
-        save_resume(bundle_dir, step=step,
-                    rng_state=(scaler.state_dict() if scaler else None),
-                    optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
+        store.save(step=step,
+                   loss_scale_state=(scaler.state_dict() if scaler else None),
+                   weights_serializer=lambda p: policy.save(p),  # checkpoint the POLICY
+                   optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
 
     tcfg = TrainConfig(
         total_steps=total_steps, base_lr=args.base_lr, warmup_steps=warmup,
@@ -145,7 +144,10 @@ def main() -> None:
           val_eval=val_eval, logger=logger, on_checkpoint=on_checkpoint,
           start_step=start_step)
 
-    on_checkpoint(total_steps)
+    # Skip the terminal checkpoint if the loop already wrote one at total_steps.
+    if total_steps % tcfg.ckpt_every != 0:
+        on_checkpoint(total_steps)
+    policy.save(weights_path)           # canonical portable policy weights for downstream
     final = evaluate_dpo(policy, ref, val_loader, beta=args.beta, max_batches=max_b,
                          to_numpy=np_to)
     logger.close()

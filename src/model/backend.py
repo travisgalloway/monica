@@ -59,11 +59,14 @@ def get_backend(name: str = "auto") -> Backend:
     in a hardware library.
     """
     if name == "auto":
-        try:
+        # Decide by whether mlx is importable, NOT by catching SystemExit from
+        # `_mlx_backend()` — that would also swallow an unrelated SystemExit raised
+        # while mlx IS present and mis-route to the torch backend (a confusing
+        # "torch not found" on an Apple-Silicon box).
+        import importlib.util
+        if importlib.util.find_spec("mlx") is not None:
             return _mlx_backend()
-        except SystemExit:
-            # mlx absent on this host — fall back to the torch backend.
-            return _cuda_backend()
+        return _cuda_backend()
     if name == "mlx":
         return _mlx_backend()
     if name == "cuda":

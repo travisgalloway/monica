@@ -18,7 +18,7 @@ from src.model.cuda_backend import CUDAMambaModel
 from src.model.cuda_train_step import make_train_step, save_optimizer, load_optimizer
 from src.train.loss_scale import DynamicLossScaler
 from src.train.loop import TrainConfig, train
-from src.train.checkpoint import save_resume, load_resume
+from src.train.checkpoint import CheckpointStore
 from src.data.pack import pack_ids
 from src.data.loader import PackedLoader
 
@@ -149,18 +149,17 @@ def test_save_kill_resume_exact(tmp_path):
     res = {}
     ma, oa, sfa = fresh()
     run(ma, sfa, 0, half, res)
-    weights = str(tmp_path / "weights.safetensors")
-    bundle = str(tmp_path / "resume")
-    ma.save(weights)
-    save_resume(bundle, step=half, rng_state=None,
-                optimizer_serializer=lambda p: save_optimizer(oa, p))
+    store = CheckpointStore(str(tmp_path / "resume"))
+    store.save(step=half, loss_scale_state=None,
+               weights_serializer=lambda p: ma.save(p),
+               optimizer_serializer=lambda p: save_optimizer(oa, p))
     del ma, oa, sfa                                   # "kill"
 
     torch.manual_seed(999)
     mb = CUDAMambaModel(cfg)
-    mb.load(weights)
     ob = _adam(mb)
-    meta = load_resume(bundle, optimizer_deserializer=lambda p: load_optimizer(ob, p))
+    meta = store.load(weights_deserializer=lambda p: mb.load(p),
+                      optimizer_deserializer=lambda p: load_optimizer(ob, p))
     sfb = make_train_step(mb, ob, grad_clip=1.0, scaler=None)
     run(mb, sfb, meta["step"], N, res)
 

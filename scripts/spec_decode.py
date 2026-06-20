@@ -13,8 +13,8 @@ per-token sync that bounds batch-1 SSM decode (the #30 ~94.7 tok/s record).
         --max-new 256 --gamma 4
 
     # Real model:
-    .venv/bin/python scripts/spec_decode.py --config config/toy.yaml \\
-        --weights run/weights.safetensors --data data/<toy split> --max-new 256
+    .venv/bin/python scripts/spec_decode.py --config config/poc.yaml \\
+        --weights runs/poc/weights.safetensors --data data/split --max-new 256
 
 Numbers (tokens/s plain vs speculative, acceptance rate) post to #30. MLX imports are
 local so `--help` works on any host.

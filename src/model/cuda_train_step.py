@@ -146,9 +146,11 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
 
 def _masked_seq_logprob(model, inputs, targets, mask) -> torch.Tensor:
-    """Per-sequence summed log-prob of `targets` over masked (response) positions. (B,).
+    """Per-sequence SUMMED log-prob of `targets` over masked (response) positions. (B,).
 
-    Torch port of `mlx_train_step._masked_seq_logprob`."""
+    Torch port of `mlx_train_step._masked_seq_logprob` — see its note on the summed (not
+    length-normalized) convention and the length-bias it implies. Keep the two in parity:
+    if you switch one to a mean (`/ m.sum(-1).clamp_min(1.0)`), switch both."""
     logits = model.forward(inputs).float()                   # (B, L, V)
     device = logits.device
     logp = logits - torch.logsumexp(logits, dim=-1, keepdim=True)

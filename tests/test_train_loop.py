@@ -4,7 +4,11 @@ Uses fakes (no backend) so these run on any host. The loop's contract is exercis
 through an injected `train_step` that records its calls.
 """
 
-from src.train.loop import TrainConfig, train
+import numpy as np
+
+from src.data.loader import PackedLoader
+from src.data.pack import pack_ids
+from src.train.loop import TrainConfig, train, _micro_batch_stream
 
 
 class FakeLoader:
@@ -15,8 +19,11 @@ class FakeLoader:
         self.seq_len = seq_len
         self.n_batches = n_batches
 
-    def epoch(self, reseed=None):
-        for i in range(self.n_batches):
+    def __len__(self):
+        return self.n_batches
+
+    def epoch(self, reseed=None, skip_batches=0):
+        for i in range(skip_batches, self.n_batches):
             yield (("inp", i), ("tgt", i))
 
 
@@ -82,3 +89,48 @@ def test_start_step_resume_runs_only_remaining():
     train(None, loader, cfg, fake_step, start_step=7)
 
     assert len(calls) == 3               # steps 7, 8, 9 only
+
+
+def _hashable(batch):
+    inp, tgt = batch
+    return (inp.tobytes(), tgt.tobytes())
+
+
+def test_resume_stream_continues_data_not_restart(tmp_path):
+    """P0.1 regression: resuming at step K must yield the SAME data the uninterrupted
+    run would see at steps K.., not replay the corpus from the top. Pure numpy — runs
+    without a backend. Uses distinct token values so every batch is identifiable, and a
+    small enough loader that the resume point lands well past the first epoch boundary.
+    """
+    seq_len, batch_size, grad_accum, seed = 4, 2, 1, 123
+    n_chunks = 20                                  # per_epoch = 20 // 2 = 10 micro-batches
+    n_tokens = n_chunks * (seq_len + 1)
+    packed = tmp_path / "train.bin"
+    pack_ids(np.arange(n_tokens, dtype=np.uint16), packed, dtype=np.uint16)
+
+    def fresh_loader():
+        return PackedLoader(packed, seq_len, batch_size, shuffle=True, seed=seed)
+
+    total_micro = 25                               # spans >2 epochs (10 micro/epoch)
+    full = [_hashable(b) for b in
+            _itertools_take(_micro_batch_stream(fresh_loader(), seed, start_micro=0),
+                            total_micro)]
+
+    resume_k = 13                                  # mid second epoch
+    resumed = [_hashable(b) for b in
+               _itertools_take(_micro_batch_stream(fresh_loader(), seed,
+                                                   start_micro=resume_k),
+                               total_micro - resume_k)]
+
+    assert resumed == full[resume_k:], "resumed stream diverged from the uninterrupted one"
+    # And sanity: the stream is NOT just repeating epoch 0 (would make the test vacuous).
+    assert full[:10] != full[10:20]
+
+
+def _itertools_take(it, n):
+    out = []
+    for x in it:
+        out.append(x)
+        if len(out) == n:
+            break
+    return out

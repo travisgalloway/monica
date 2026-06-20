@@ -7,7 +7,7 @@ step. The model generates the solutions; the verifier judges — so only problem
 are needed, no reference solutions (docs/design/08-corpus-pipeline.md lines 120-123).
 
   python scripts/rlvr.py --config config/poc.yaml --init runs/sft/weights.safetensors \
-      --problems math.jsonl --steps 200
+      --problems math.jsonl --steps 200 --out runs/rlvr --ckpt-every 50
 
 `--problems` is JSONL with `{"prompt": "...", "answer": "..."}` per line. `--reward math`
 (default) uses the final-number exact-match; `--reward exact` uses normalized string match.
@@ -56,6 +56,12 @@ def main() -> None:
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
     ap.add_argument("--reward", choices=("math", "exact"), default="math")
+    ap.add_argument("--out", type=Path, default=Path("runs/rlvr"),
+                    help="output dir for weights.safetensors (default runs/rlvr); kept "
+                         "separate from --init so the base checkpoint is never clobbered")
+    ap.add_argument("--ckpt-every", type=int, default=0,
+                    help="save intermediate weights every N steps (0 = only at the end), "
+                         "so a long run that crashes does not lose all progress")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--group-size", type=int, default=8, help="K completions per problem")
     ap.add_argument("--lr", type=float, default=1e-6)
@@ -93,6 +99,10 @@ def main() -> None:
         raise SystemExit(f"no problems in {args.problems}")
     rng = np.random.default_rng(args.seed)
 
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    weights_path = str(out / "weights.safetensors")
+
     for step in range(args.steps):
         prob = problems[step % len(problems)]
         prompt_ids = list(tok.encode(prob["prompt"])) or [eos or 0]
@@ -111,15 +121,17 @@ def main() -> None:
             rewards.append(reward_fn(tok.decode(gen), str(prob.get("answer", ""))))
 
         adv = group_advantages([rewards])[0]            # (K,)
-        out = grpo_step(model, [collate_rollouts(rollouts, adv)], args.lr)
+        metrics = grpo_step(model, [collate_rollouts(rollouts, adv)], args.lr)
         if step % args.log_every == 0:
             stats = reward_stats(rewards)
-            print(f"step {step:4d}  loss {out['loss']:.4f}  "
+            print(f"step {step:4d}  loss {metrics['loss']:.4f}  "
                   f"mean_reward {stats['mean_reward']:.3f}  solved {stats['frac_solved']:.3f}")
+        if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
+            model.save(weights_path)
+            print(f"  [ckpt] step {step} -> {weights_path}")
 
-    save_dir = args.init.parent
-    model.save(str(save_dir / "rlvr_weights.safetensors"))
-    print(f"done — wrote {save_dir / 'rlvr_weights.safetensors'}")
+    model.save(weights_path)
+    print(f"done — wrote {weights_path}")
 
 
 if __name__ == "__main__":

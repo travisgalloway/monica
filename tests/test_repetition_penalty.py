@@ -79,6 +79,18 @@ def test_no_repeat_ngram_size_one_bans_all_seen():
     assert set(banned.tolist()) == {1, 3}
 
 
+def test_all_tokens_banned_falls_back_without_crash():
+    # n=1 bans every previously-seen token; with prev covering the whole vocab there is
+    # no legal next token. Must fall back to a valid draw (not crash on NaN probs under
+    # sampling, nor return a banned argmax under greedy).
+    logits = np.zeros(3)
+    rng = np.random.default_rng(0)
+    for temp in (0.0, 1.0):
+        tok = sample(logits, temperature=temp, previous_tokens=[0, 1, 2],
+                     no_repeat_ngram_size=1, rng=rng)
+        assert 0 <= tok < 3
+
+
 def test_no_repeat_ngram_no_match_is_noop():
     # Trailing 1-gram (2,) never occurred earlier in [0,1,2]; nothing is banned.
     banned = _banned_ngram_tokens(np.array([0, 1, 2]), n=2, vocab_size=8)

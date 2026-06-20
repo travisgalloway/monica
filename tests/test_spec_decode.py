@@ -85,10 +85,16 @@ def test_verify_block_matches_sequential_step():
     block_logits, block_states = model.verify_block(tokens, state)
     for a, b in zip(seq_logits, block_logits):
         assert np.allclose(a, np.array(b), atol=1e-5)
-    # final state from the block must equal the sequential final state
-    final_seq = np.array(h[0][1])           # layer 0 ssm state
-    final_blk = np.array(block_states[-1][0][1])
-    assert np.allclose(final_seq, final_blk, atol=1e-5)
+    # The block's final state must equal the sequential final state for EVERY layer and
+    # BOTH components (conv + ssm) — comparing only layer-0 ssm hid bugs in later layers
+    # or in conv-state accumulation.
+    final_seq, final_blk = h, block_states[-1]
+    assert len(final_seq) == len(final_blk)
+    for li, (seq_layer, blk_layer) in enumerate(zip(final_seq, final_blk)):
+        assert len(seq_layer) == len(blk_layer)
+        for ci, (s, b) in enumerate(zip(seq_layer, blk_layer)):
+            assert np.allclose(np.array(s), np.array(b), atol=1e-5), \
+                f"state mismatch at layer {li} component {ci}"
 
 
 def _greedy_plain(model, prompt, max_new):

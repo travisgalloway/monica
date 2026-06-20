@@ -1,8 +1,21 @@
 """Unit tests for the val-loss numeric core (runs anywhere, numpy only)."""
 
 import numpy as np
+import pytest
 
-from src.eval.val_loss import cross_entropy, perplexity
+from src.eval.val_loss import cross_entropy, perplexity, evaluate
+
+
+class _EmptyLoader:
+    def epoch(self):
+        return iter(())
+
+
+def test_evaluate_empty_loader_raises_not_false_perfect():
+    # An empty val loader must fail loudly, not report perplexity=1.0 (the best possible
+    # score), which would silently mask a misconfigured eval path.
+    with pytest.raises(ValueError, match="empty"):
+        evaluate(model=None, loader=_EmptyLoader())
 
 
 def test_cross_entropy_uniform_logits():

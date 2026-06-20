@@ -118,10 +118,44 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
 
 ## Training flow (Phases 4–5, #81 / #75)
 
-- **Phase 4 (#81):** the 100M smoke run — sync the ~20 GB subset from R2 to a 50 GB network
-  volume on a cheap GPU pod (T4/L4), train via `scripts/train.py --backend cuda`, confirm a
-  decreasing val-perplexity curve, **checkpoint back to R2**, and run the retrieval probes
-  (#79). Validates the whole plumbing before paying for big cards.
+- **Phase 4 (#81):** the 100M smoke run on a cheap GPU pod (T4/L4). Bring the pod up in
+  this order so a config or throughput problem surfaces *before* the long run:
+  1. `pip install -e '.[cuda]'` (the `[cuda]` extra pulls torch; `mlx` is Mac-only).
+  2. **CUDA smoke gate** — build a tiny toy split on the pod and run
+     `scripts/smoke_test.py --backend cuda --data <toy split>`. This proves the torch
+     backend resumes bit-exactly through the [double-buffered `CheckpointStore`](05-training.md)
+     end to end. Use `config/toy.yaml` (a dense config) — the gate refuses a MoE config,
+     since MoE-Mamba (#53) is MLX-only.
+  3. **Train-step bench** — `scripts/bench_cuda_train_step.py --config config/poc.yaml
+     --batch 32 --grad-accum 4` reports s/step, tokens/s, and **peak GPU memory** for the
+     production path (`CUDAMambaModel` + AdamW + `make_train_step`, wired exactly as
+     `train.py --backend cuda`). Confirms the card fits the step and gives a throughput
+     baseline to plan the run against — *before paying for big cards*. The same script
+     dry-runs on the Mac via torch-CPU (`--device cpu`, slow but the identical code path),
+     so the pod run is a no-surprise repeat. The MLX counterpart is `bench_train_step.py`.
+  4. Sync the ~20 GB subset from R2 to a 50 GB network volume, train via
+     `scripts/train.py --backend cuda`, confirm a decreasing val-perplexity curve,
+     **checkpoint back to R2** (RunPod is not durable), and run the retrieval probes (#79).
+
+  **Pod spec + fused-kernel pins (#40).** The card must be **Ampere+** for native bf16
+  (the scale configs are bf16) — *not* a T4/Turing — and the image a RunPod **`-devel`** one,
+  which ships `nvcc` so the kernels can source-compile if no prebuilt wheel matches. The fused
+  selective-scan kernels (`mamba-ssm` / `causal-conv1d`) are the #40 perf path and are
+  deliberately **not** in the `[cuda]` extra; install them by hand. The one rule that bites:
+  the torch **minor** version and the **C++-ABI flag** must match across the image and the
+  kernel wheels. Two self-consistent sets (pins as of 2026-06-20):
+  - **Recommended (known-good, what this runbook is validated around):** image
+    `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` +
+    `causal-conv1d==1.5.0.post8`, `mamba-ssm==2.2.4` (wheel tag `cu12torch2.4cxx11abiFALSE-cp311`).
+  - **Newest:** image `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` +
+    `causal-conv1d==1.6.2.post1`, `mamba-ssm==2.3.2.post1` (wheel tag
+    `cu12torch2.8cxx11abiTRUE-cp311` — note the ABI flag flipped to **TRUE** at torch ≥2.7).
+
+  Install with `pip install causal-conv1d mamba-ssm --no-build-isolation` — the flag makes the
+  build see the pod's preinstalled CUDA torch instead of pulling a CPU torch, so on a `-devel`
+  image it produces a torch-matched build (~10–30 min) even when no wheel matches. Re-check the
+  latest wheel tags at launch ([state-spaces/mamba](https://github.com/state-spaces/mamba/releases),
+  [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d/releases)).
 - **Phase 5 (#75):** the 1B → 2B → 4B tiers per the #65 sizing table. **8-bit Adam** when
   VRAM-tight; **spot instances + frequent checkpointing** for 2B/4B; back up intermediate
   checkpoints to R2. Reuses the portable loop + two-concern [checkpointing](05-training.md);

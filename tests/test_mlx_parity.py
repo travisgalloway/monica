@@ -131,6 +131,21 @@ def test_forward_step_parity_toy():
     assert result["ok"], result
 
 
+def test_forward_step_parity_multichunk():
+    """The toy/hybrid parity cases above use L=32/40 < chunk_size (64), so the SSD scan
+    runs as a single degenerate chunk — the across-chunk state handoff (the likeliest
+    source of a subtle train/infer divergence) is never exercised. Force >=3 chunks.
+    """
+    mx.random.seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = MLXMambaModel(cfg)
+    Q = cfg.chunk_size or 64
+    B, L = 2, 2 * Q + 1                      # 3 chunks: full, full, remainder
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+    result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
+    assert result["ok"], result
+
+
 def test_forward_step_parity_hybrid():
     # The hybrid model interleaves attention blocks (RoPE + KV cache). forward (full
     # causal attention) and step (incremental cache) must still agree — the attention

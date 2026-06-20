@@ -75,12 +75,12 @@ def main() -> None:
     from src.train.loss_scale import scaler_for_precision
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import save_resume, load_resume
+    from src.train.checkpoint import CheckpointStore
     from src.eval.val_loss import evaluate
 
     backend = get_backend(args.backend)
 
-    cfg = load_config(str(args.config))                 # validates (vocab < 65536, ...)
+    cfg = load_config(str(args.config))                 # validates (vocab < 2**32, head_dim | d_inner, ...)
 
     tokens_per_step = args.batch_size * cfg.seq_len * args.grad_accum
     total_steps = (args.total_steps if args.total_steps is not None
@@ -106,31 +106,30 @@ def main() -> None:
     max_b = args.eval_batches or None
     val_eval = lambda m: evaluate(m, val_loader, max_batches=max_b, to_numpy=np_to)
 
-    # --- resume (portable weights + within-backend bundle) ---------------------
+    # --- resume (double-buffered, crash-safe checkpoint store) -----------------
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     weights_path = str(out / "weights.safetensors")
-    bundle_dir = str(out / "resume")
-    resume_dir = args.resume if args.resume is not None else (
-        Path(bundle_dir) if Path(bundle_dir, "resume_meta.json").exists() else None)
+    store = CheckpointStore(str(args.resume) if args.resume is not None
+                            else str(out / "resume"))
+    resuming = store.has_checkpoint()
 
     start_step = 0
-    if resume_dir is not None:
-        model.load(weights_path)
-        meta = load_resume(str(resume_dir),
-                           optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
+    if resuming:
+        meta = store.load(weights_deserializer=lambda p: model.load(p),
+                          optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
         start_step = int(meta["step"])
         if scaler is not None:
-            scaler.load_state_dict(meta.get("rng_state") or {})
-        print(f"[resume] from step {start_step} (out={out})")
+            scaler.load_state_dict(meta.get("loss_scale_state") or {})
+        print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
 
-    logger = JsonlLogger(str(out / "metrics.jsonl"), append=resume_dir is not None)
+    logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 
     def on_checkpoint(step: int) -> None:
-        model.save(weights_path)                        # portable weights + config
-        save_resume(bundle_dir, step=step,
-                    rng_state=(scaler.state_dict() if scaler else None),
-                    optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
+        store.save(step=step,
+                   loss_scale_state=(scaler.state_dict() if scaler else None),
+                   weights_serializer=lambda p: model.save(p),  # portable weights + config
+                   optimizer_serializer=lambda p: backend.save_optimizer(opt, p))
 
     tcfg = TrainConfig(
         total_steps=total_steps, base_lr=args.base_lr, warmup_steps=warmup,
@@ -148,7 +147,13 @@ def main() -> None:
           start_step=start_step)
 
     # --- final checkpoint + full eval ------------------------------------------
-    on_checkpoint(total_steps)
+    # The loop already checkpoints at `step == total_steps` when total_steps is a
+    # multiple of ckpt_every; guard so we don't write (and re-serialize) it twice.
+    if total_steps % tcfg.ckpt_every != 0:
+        on_checkpoint(total_steps)
+    # Materialize the portable weights at the canonical out/weights.safetensors for
+    # downstream eval/serving/distillation (the live copy otherwise lives in the slot).
+    model.save(weights_path)
     final = evaluate(model, val_loader, max_batches=max_b, to_numpy=np_to)
     logger.close()
     print(f"[done] step={total_steps}  val_loss={final['val_loss']:.4f}  "

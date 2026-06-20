@@ -71,6 +71,14 @@ def sample(
             if banned.size:
                 logits[banned] = -np.inf
 
+    if not np.any(np.isfinite(logits)):
+        # Every token was banned (e.g. no_repeat_ngram_size covering the whole vocab):
+        # there is no valid next token. Fall back to a uniform draw rather than the
+        # greedy path returning a banned argmax or `_softmax` producing NaN probs that
+        # crash `rng.choice` mid-generation.
+        rng = rng or np.random.default_rng()
+        return int(rng.integers(logits.size))
+
     if temperature == 0:
         return int(logits.argmax())
     if temperature < 0:
@@ -78,7 +86,10 @@ def sample(
 
     logits = logits / temperature
 
-    # top-k: keep only the k highest logits.
+    # top-k: keep only the k highest logits. NOTE: on ties at the cutoff this keeps
+    # MORE than k tokens (every logit >= the k-th largest survives) — the same
+    # tie-inclusive behavior as HF Transformers' top_k. Exact-k would need an argsort
+    # tiebreak; the inclusive form is intentional here.
     if top_k is not None and 0 < top_k < logits.size:
         kth = np.partition(logits, -top_k)[-top_k]
         logits = np.where(logits < kth, -np.inf, logits)

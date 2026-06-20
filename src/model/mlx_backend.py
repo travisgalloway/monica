@@ -546,9 +546,9 @@ class MoEBlock(nn.Module):
             # count; ranking breaks ties by index so exactly k survive.
             ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
             gate = mx.where(ranks < k, probs, mx.zeros_like(probs))
+            gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
         else:
-            gate = probs
-        gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
+            gate = probs                                          # softmax already sums to 1
         outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
         y = mx.sum(gate[..., None] * _f32(outs), axis=-2)    # combine in fp32
         return _cast(y, cd)
@@ -656,8 +656,11 @@ class MLXMambaModel(ModelInterface, nn.Module):
         (`mlx_teacher.MLXConversionTeacher.forward(return_hidden=True)`)."""
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)
         hs = [h]
-        for layer in self.layers:
-            h = layer.forward_seq(h)
+        # Use the checkpointed layer closures (not raw forward_seq) so the hidden-align
+        # distill stage respects grad_checkpoint — otherwise every layer's activations
+        # are retained in backward at student depth and the run swaps.
+        for layer_fn in self._layer_fns:
+            h = layer_fn(h)
             hs.append(h)
         return tuple(hs)
 
@@ -667,10 +670,12 @@ class MLXMambaModel(ModelInterface, nn.Module):
         the teacher's attention they were matched against)."""
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)
         out: List[Tuple[int, Array]] = []
-        for i, layer in enumerate(self.layers):
+        # Advance through the checkpointed closures (grad_checkpoint-aware); the mixing
+        # matrix itself is read off the layer input separately.
+        for i, (layer, layer_fn) in enumerate(zip(self.layers, self._layer_fns)):
             if not self.config.is_attention_layer(i):
                 out.append((i, layer.mixing_matrix(h).mean(axis=1)))    # head-average -> (B,L,L)
-            h = layer.forward_seq(h)
+            h = layer_fn(h)
         return out
 
     def init_state(self, batch_size: int) -> State:
