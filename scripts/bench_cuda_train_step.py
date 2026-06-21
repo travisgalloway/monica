@@ -93,14 +93,29 @@ def main() -> None:
             "MoE-Mamba (#53) is MLX-only; the CUDA backend can't build it. Bench a dense "
             "config (e.g. config/poc.yaml / config/toy.yaml).")
 
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" \
-        else args.device
-    if device == "cuda" and not torch.cuda.is_available():
+    # Fail fast on the one request the backend cannot satisfy.
+    if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but torch.cuda.is_available() is False.")
-    on_cuda = device == "cuda"
 
     seq = args.seq if args.seq is not None else cfg.seq_len
     tokens_per_step = args.batch * seq * args.grad_accum
+
+    # The exact wiring of scripts/train.py --backend cuda — measures the production path.
+    backend = get_backend("cuda")
+    backend.seed(args.seed)
+    model = backend.model_cls(cfg)  # backend picks cuda:0 / cpu internally (mirrors train.py)
+    opt = backend.make_optimizer(model, args.lr)
+
+    # Derive device/on_cuda from where the model ACTUALLY lives, not from --device: the cuda
+    # backend's model_cls auto-selects (cuda:0 if available, else cpu) exactly as train.py
+    # does and ignores an arbitrary --device, so trusting the CLI here would let the
+    # sync/peak-mem reporting diverge from reality (e.g. --device cpu on a CUDA host would
+    # still build a cuda model but skip synchronize/peak-mem and print misleading numbers).
+    on_cuda = next(model.parameters()).is_cuda
+    device = "cuda" if on_cuda else "cpu"
+    if args.device != "auto" and args.device != device:
+        print(f"[bench/cuda] note: --device {args.device} requested, but the cuda backend "
+              f"built the model on {device} (it auto-selects like train.py); reporting {device}.")
 
     print(f"[bench/cuda] torch {torch.__version__}  device={device}  {platform.platform()}")
     if on_cuda:
@@ -111,11 +126,6 @@ def main() -> None:
     print(f"[bench/cuda] batch={args.batch} x seq={seq} x grad_accum={args.grad_accum} "
           f"= {tokens_per_step} tokens/step  iters={args.iters} (+{args.warmup} warmup)\n")
 
-    # The exact wiring of scripts/train.py --backend cuda — measures the production path.
-    backend = get_backend("cuda")
-    backend.seed(args.seed)
-    model = backend.model_cls(cfg)  # backend picks cuda:0 / cpu internally (mirrors train.py)
-    opt = backend.make_optimizer(model, args.lr)
     scaler = scaler_for_precision(cfg.precision)
     train_step = backend.make_train_step(model, opt, grad_clip=1.0, scaler=scaler)
 

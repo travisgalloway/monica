@@ -15,6 +15,13 @@ import numpy as np
 from ..model.interface import ModelInterface
 from ..data.loader import PackedLoader
 
+# Bound a single stable-softmax temporary — `blk` and the `exp(blk - m)` it spawns are
+# each (chunk, V) in float64 — to this many bytes, so eval memory scales with vocab, not
+# batch size. The cap keeps small/test vocabs (where the budget far exceeds the row count)
+# in a single block, so their result stays bit-identical to the full-array float64 reduction.
+_CE_CHUNK_BYTES = 256 * 1024 * 1024  # ~256 MiB per float64 (chunk, V) temporary
+_CE_CHUNK_CAP = 4096                 # upper bound on rows/chunk
+
 
 def _ce_sum_chunked(flat: np.ndarray, targets: np.ndarray,
                     weights: Optional[np.ndarray] = None) -> tuple[float, float]:
@@ -22,12 +29,16 @@ def _ce_sum_chunked(flat: np.ndarray, targets: np.ndarray,
     (rows = tokens, cols = vocab), plus the total weight. Computed in float64 over
     row-chunks so the stable-softmax temporaries are bounded to (chunk, V) instead of
     the full (B*T, V): at the Qwen2.5 vocab (151,646) a single eval batch's logits are
-    ~40 GB in float64, which made eval thrash/OOM on the host. Chunked, the result is
-    bit-identical to the full-array float64 computation for chunk >= n (the test sizes),
-    so the numeric contract with `masked_cross_entropy` is preserved.
+    ~40 GB in float64, which made eval thrash/OOM on the host. `chunk` shrinks with V so
+    each (chunk, V) float64 temporary stays under `_CE_CHUNK_BYTES` regardless of vocab
+    (~221 rows at the Qwen2.5 vocab), capped at `_CE_CHUNK_CAP`. For chunk >= n (small /
+    test vocabs, where the byte budget exceeds the row count) the whole array is one block,
+    so the result is bit-identical to the full-array float64 computation and the numeric
+    contract with `masked_cross_entropy` is preserved.
     """
     n = flat.shape[0]
-    chunk = 4096
+    vocab = flat.shape[1]
+    chunk = min(_CE_CHUNK_CAP, max(1, _CE_CHUNK_BYTES // (vocab * 8)))
     total, wsum = 0.0, 0.0
     for s in range(0, n, chunk):
         blk = np.asarray(flat[s:s + chunk], dtype=np.float64)
