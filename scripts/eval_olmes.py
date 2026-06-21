@@ -6,10 +6,12 @@ end": with random-init or 100M-scale weights the accuracies will sit near
 chance — that is expected and fine for the POC.
 
 Needs the eval extra (pip install -e ".[eval]") and network for the HF
-datasets + OLMo tokenizer. If `datasets` refuses
-piqa's script-based loader, set HF_DATASETS_TRUST_REMOTE_CODE=1 or drop piqa.
+datasets + the model tokenizer. Pick the tokenizer that matches the config with
+`--tokenizer` (default `qwen25`, the active distillation program; use `olmo` for
+the original OLMo-vocab `config/poc.yaml`). If `datasets` refuses piqa's
+script-based loader, set HF_DATASETS_TRUST_REMOTE_CODE=1 or drop piqa.
 
-    .venv/bin/python scripts/eval_olmes.py --config config/poc.yaml --tasks piqa --limit 10
+    .venv/bin/python scripts/eval_olmes.py --config config/poc-qwen.yaml --tasks piqa --limit 10
 """
 
 from __future__ import annotations
@@ -30,8 +32,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None,
                     help="examples per task (small values for smoke runs)")
     ap.add_argument("--output", type=Path, default=None, help="write results JSON here")
+    ap.add_argument("--tokenizer", choices=("qwen25", "olmo"), default="qwen25",
+                    help="tokenizer matching the config's vocab (default: qwen25; "
+                         "use olmo for the OLMo-vocab config/poc.yaml)")
     ap.add_argument("--byte-fallback", action="store_true",
-                    help="offline ByteTokenizer (toy config only; not OLMo-compatible)")
+                    help="offline ByteTokenizer (toy config only; not OLMo/Qwen-compatible)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -56,7 +61,11 @@ def main() -> None:
             "lm-eval not found — install the eval extra:\n"
             "    .venv/bin/pip install -e \".[eval]\""
         ) from e
-    from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
+    from src.data.tokenize import (
+        ByteTokenizer,
+        load_olmo_tokenizer,
+        load_qwen25_tokenizer,
+    )
     from src.eval.olmes_adapter import make_lm_eval_adapter
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
@@ -72,7 +81,12 @@ def main() -> None:
         print("RANDOM INIT — no --weights given; scores will be chance level.")
         print("=" * 70)
 
-    tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer()
+    if args.byte_fallback:
+        tok = ByteTokenizer()
+    elif args.tokenizer == "qwen25":
+        tok = load_qwen25_tokenizer()
+    else:
+        tok = load_olmo_tokenizer()
     # A tokenizer that can emit ids >= the model vocab would crash deep in the
     # embedding lookup; fail here with a clear message instead.
     if tok.vocab_size > cfg.vocab_size:
