@@ -25,7 +25,7 @@ import numpy as np
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
+    ap.add_argument("--config", type=Path, default=Path("config/poc-qwen.yaml"))
     ap.add_argument("--weights", type=Path, default=None,
                     help="portable .safetensors checkpoint; RANDOM INIT if omitted")
     ap.add_argument("--tasks", default="hellaswag,arc_easy,arc_challenge,piqa")

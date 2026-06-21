@@ -36,7 +36,7 @@ from src.serve.sessions import SessionStore
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
+    ap.add_argument("--config", type=Path, default=Path("config/poc-qwen.yaml"))
     ap.add_argument("--weights", type=Path, default=None,
                     help="portable .safetensors checkpoint; RANDOM INIT if omitted")
     ap.add_argument("--prompt", default=None, help="completion-mode prompt")
