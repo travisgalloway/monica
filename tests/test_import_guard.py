@@ -39,6 +39,7 @@ PORTABLE_MODULES = [
     "src.data.corpus",
     "src.data.storage",
     "src.data.distill_corpus",
+    "src.data.teacher_outputs",
     "src.data.r2_sync",
     "src.data.datatrove_pipeline",
     "src.data.filters",
