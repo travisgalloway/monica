@@ -114,7 +114,7 @@ def main() -> None:
     # The exact wiring of scripts/train.py --backend cuda — measures the production path.
     backend = get_backend("cuda")
     backend.seed(args.seed)
-    model = backend.model_cls(cfg, device=device)
+    model = backend.model_cls(cfg)  # backend picks cuda:0 / cpu internally (mirrors train.py)
     opt = backend.make_optimizer(model, args.lr)
     scaler = scaler_for_precision(cfg.precision)
     train_step = backend.make_train_step(model, opt, grad_clip=1.0, scaler=scaler)

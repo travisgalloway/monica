@@ -16,16 +16,43 @@ from ..model.interface import ModelInterface
 from ..data.loader import PackedLoader
 
 
+def _ce_sum_chunked(flat: np.ndarray, targets: np.ndarray,
+                    weights: Optional[np.ndarray] = None) -> tuple[float, float]:
+    """Sum of per-token cross-entropy (optionally `weights`-weighted) over `flat`
+    (rows = tokens, cols = vocab), plus the total weight. Computed in float64 over
+    row-chunks so the stable-softmax temporaries are bounded to (chunk, V) instead of
+    the full (B*T, V): at the Qwen2.5 vocab (151,646) a single eval batch's logits are
+    ~40 GB in float64, which made eval thrash/OOM on the host. Chunked, the result is
+    bit-identical to the full-array float64 computation for chunk >= n (the test sizes),
+    so the numeric contract with `masked_cross_entropy` is preserved.
+    """
+    n = flat.shape[0]
+    chunk = 4096
+    total, wsum = 0.0, 0.0
+    for s in range(0, n, chunk):
+        blk = np.asarray(flat[s:s + chunk], dtype=np.float64)
+        tgt = targets[s:s + chunk]
+        # log-softmax in a numerically stable way
+        m = blk.max(axis=-1, keepdims=True)
+        logZ = m[:, 0] + np.log(np.exp(blk - m).sum(axis=-1))
+        tok_ce = logZ - blk[np.arange(blk.shape[0]), tgt]
+        if weights is None:
+            total += float(tok_ce.sum())
+            wsum += tok_ce.shape[0]
+        else:
+            w = weights[s:s + chunk]
+            total += float((tok_ce * w).sum())
+            wsum += float(w.sum())
+    return total, wsum
+
+
 def cross_entropy(logits: np.ndarray, targets: np.ndarray) -> float:
     """Mean token-level cross-entropy (nats). logits (..., V), targets (...,)."""
-    logits = np.asarray(logits, dtype=np.float64)
+    flat = np.asarray(logits)
+    flat = flat.reshape(-1, flat.shape[-1])
     targets = np.asarray(targets).reshape(-1)
-    flat = logits.reshape(-1, logits.shape[-1])
-    # log-softmax in a numerically stable way
-    m = flat.max(axis=-1, keepdims=True)
-    logZ = m[:, 0] + np.log(np.exp(flat - m).sum(axis=-1))
-    chosen = flat[np.arange(flat.shape[0]), targets]
-    return float(np.mean(logZ - chosen))
+    total, n = _ce_sum_chunked(flat, targets)
+    return total / n
 
 
 def masked_cross_entropy(logits: np.ndarray, targets: np.ndarray,
@@ -37,18 +64,14 @@ def masked_cross_entropy(logits: np.ndarray, targets: np.ndarray,
     read for the loss value (they still index the logits, so pass in-range pad ids).
     Returns 0.0 for an all-zero mask (an all-padding batch contributes nothing).
     """
-    logits = np.asarray(logits, dtype=np.float64)
+    flat = np.asarray(logits)
+    flat = flat.reshape(-1, flat.shape[-1])
     targets = np.asarray(targets).reshape(-1)
     mask = np.asarray(mask, dtype=np.float64).reshape(-1)
-    flat = logits.reshape(-1, logits.shape[-1])
-    m = flat.max(axis=-1, keepdims=True)
-    logZ = m[:, 0] + np.log(np.exp(flat - m).sum(axis=-1))
-    chosen = flat[np.arange(flat.shape[0]), targets]
-    tok_ce = logZ - chosen
-    denom = mask.sum()
+    total, denom = _ce_sum_chunked(flat, targets, weights=mask)
     if denom == 0:
         return 0.0
-    return float((tok_ce * mask).sum() / denom)
+    return total / denom
 
 
 def perplexity(mean_ce_nats: float) -> float:
