@@ -97,12 +97,15 @@ def _init_mamba_layer(layer, proj, dt_rank: int, d_state: int) -> None:
     d_inner = layer.out_proj.weight.shape[1]
     # x_proj: rows are [dt(dt_rank) | B(d_state) | C(d_state)] -> set B from K, C from Q.
     xw = layer.ssm.x_proj.weight
-    B_new = _fit(_to_t(proj.k), (d_state, d_inner))
-    C_new = _fit(_to_t(proj.q), (d_state, d_inner))
+    # `.to(xw.device)`: the teacher tensors and the student param can be on different devices
+    # (e.g. teacher cuda, student cuda:0 — or any cross-device mix on GPU). `torch.cat` requires
+    # one device, so place the teacher-derived blocks on the param's device before concatenating.
+    B_new = _fit(_to_t(proj.k), (d_state, d_inner)).to(xw.device)
+    C_new = _fit(_to_t(proj.q), (d_state, d_inner)).to(xw.device)
     _copy(layer.ssm.x_proj.weight, torch.cat([xw[:dt_rank], B_new, C_new], dim=0))
     # in_proj: rows are [main(d_inner) | gate(d_inner)] -> set main from V, keep gate.
     iw = layer.in_proj.weight
-    main_new = _fit(_to_t(proj.v), (d_inner, iw.shape[1]))
+    main_new = _fit(_to_t(proj.v), (d_inner, iw.shape[1])).to(iw.device)
     _copy(layer.in_proj.weight, torch.cat([main_new, iw[d_inner:]], dim=0))
     # out_proj <- O.
     _copy(layer.out_proj.weight, _fit(_to_t(proj.o), tuple(layer.out_proj.weight.shape)))

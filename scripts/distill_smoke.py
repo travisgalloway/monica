@@ -58,12 +58,15 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=Path("runs/distill-smoke"))
     ap.add_argument("--steps-per-stage", type=int, default=12)
+    ap.add_argument("--backend", choices=("mlx", "cuda"), default="mlx",
+                    help="backend to gate on (mlx: Apple-Silicon dev; cuda: torch GPU/CPU)")
     args = ap.parse_args()
 
+    probe = "mlx.core" if args.backend == "mlx" else "torch"
     try:
-        import mlx.core  # noqa: F401
+        __import__(probe)
     except ImportError:
-        raise SystemExit("distill_smoke requires the MLX backend (Apple Silicon dev host)")
+        raise SystemExit(f"distill_smoke --backend {args.backend} requires {probe!r}")
 
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -73,12 +76,13 @@ def main() -> None:
 
     # 1) cache the synthetic teacher's top-k, aligned to the split corpus.
     _run(["scripts/precompute_teacher.py", "--manifest", str(MANIFEST), "--data", str(split_dir),
-          "--out", str(teacher_out), "--backend", "mlx", "--k", "8", "--batch-size", "2",
+          "--out", str(teacher_out), "--backend", args.backend, "--k", "8", "--batch-size", "2",
           "--synthetic"], "precompute")
 
-    # 2) run the full distill flow (all three stages) on MLX.
+    # 2) run the full distill flow (all three stages).
     distill_argv = ["scripts/distill.py", "--manifest", str(MANIFEST), "--corpus", str(split_dir),
-                    "--teacher-outputs", str(teacher_out), "--out", str(run_out), "--backend", "mlx",
+                    "--teacher-outputs", str(teacher_out), "--out", str(run_out),
+                    "--backend", args.backend,
                     "--synthetic", "--vocab", str(VOCAB), "--precision", "fp32",
                     "--base-lr", "1e-2", "--steps-per-stage", str(args.steps_per_stage),
                     "--batch-size", "2", "--grad-accum", "1", "--log-every", "1",
