@@ -198,15 +198,14 @@ def _cuda_backend() -> Backend:
                              "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
         return CUDATeacher.from_config(config, seed=seed)
 
-    def _student_init_unsupported(*args, **kwargs):
-        raise NotImplementedError(
-            "Student init (M10/#99) is implemented on the MLX dev backend only; "
-            "the CUDA initializer is deferred.")
+    def _init_student(student, teacher, method):
+        """Initialize a student from a teacher (#99), torch port; `method` is an `InitMethod`."""
+        from .cuda_student_init import init_student
+        return init_student(student, teacher, method)
 
-    def _distill_unsupported(*args, **kwargs):
-        raise NotImplementedError(
-            "The distillation train step (M10/#100) is implemented on the MLX dev backend "
-            "only; the CUDA distill step is deferred.")
+    def _make_distill_train_step(*args, **kwargs):
+        from .cuda_distill import make_distill_train_step
+        return make_distill_train_step(*args, **kwargs)
 
     _dev = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -227,6 +226,6 @@ def _cuda_backend() -> Backend:
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
         make_teacher=_make_teacher,
-        init_student=_student_init_unsupported,
-        make_distill_train_step=_distill_unsupported,
+        init_student=_init_student,
+        make_distill_train_step=_make_distill_train_step,
     )

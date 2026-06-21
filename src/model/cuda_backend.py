@@ -294,6 +294,23 @@ class SelectiveSSM(nn.Module):
         Y = Y + X[:, :L] * self.D[None, None, :, None]       # skip
         return _cast(Y.reshape(B_, L, d_inner), cd)          # back to compute dtype
 
+    def mixing_matrix(self, x: Array) -> Array:
+        """Materialize the dense (B, H, L, L) 1-semiseparable mixing matrix M such that
+        `einsum('bhij,bjhp->bihp', M, X) == parallel(x)` (X = head-split input) in the
+        single-segment case — torch port of `mlx_backend.SelectiveSSM.mixing_matrix`. This is
+        the matrix the SSD scan applies; the distillation `mixing-match` stage (#100) matches it
+        against the teacher's attention. Folds in the per-step `delta` scaling and per-head `D`
+        skip; does NOT model the `seg_ids` path. Dense O(L^2) — a training-time auxiliary."""
+        B_, L, _ = x.shape
+        delta, a, Bm, Cm = self._project(x)          # delta (B,L,H); Bm,Cm (B,L,N) — fp32
+        gh = (delta * a).permute(0, 2, 1)            # (B,H,L) log-decay (<= 0)
+        decay = torch.exp(_segsum(gh))               # (B,H,L,L): exp(cumA_i-cumA_j), causal
+        CB = torch.einsum("bin,bjn->bij", Cm, Bm)    # (B,L,L) shared B/C group
+        delta_col = delta.permute(0, 2, 1)[:, :, None, :]            # (B,H,1,L) delta_j
+        M = decay * CB[:, None] * delta_col                          # (B,H,L,L)
+        eye = torch.eye(L, dtype=M.dtype, device=M.device)
+        return M + self.D[None, :, None, None] * eye[None, None]     # + D skip on the diagonal
+
     def recurrence(self, x: Array, state: State) -> Tuple[Array, State]:
         """One timestep. x: (B, d_inner), state h: (B, H, P, N) -> y: (B, d_inner)."""
         B_ = x.shape[0]
@@ -382,6 +399,18 @@ class MambaBlock(nn.Module):
         y = self.ssm.parallel(xc, seg_ids)
         y = y * _silu(z)
         return x + _linear(self.out_proj, y, cd)
+
+    def mixing_matrix(self, x: Array) -> Array:
+        """This block's head-split SSM mixing matrix (B, H, L, L), for distillation
+        `mixing-match` (#100). Runs the block front-end (norm -> in_proj main -> causal conv
+        -> SiLU) then materializes the SSM matrix on that input. Torch port of
+        `mlx_backend.MambaBlock.mixing_matrix`."""
+        L = x.shape[1]
+        cd = _DTYPES[self.config.precision]
+        xn = self.norm(x)
+        x_main, _ = torch.chunk(_linear(self.in_proj, xn, cd), 2, dim=-1)
+        xc = _silu(self._conv_seq(x_main, cd)[:, :L])
+        return self.ssm.mixing_matrix(xc)
 
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
         conv_state, ssm_state = state                        # (B,k-1,di), (B,H,P,N)
@@ -565,6 +594,33 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             h, st2 = layer.step(h, st)
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
+
+    # --- distillation matching accessors (#100) ------------------------------
+    def hidden_states(self, token_batch: Array) -> Tuple[Array, ...]:
+        """Per-layer hidden states for the `hidden-align` stage: the embedding output followed
+        by each layer's output (length n_layers + 1) — the HF/teacher convention. Uses
+        `_layer_forward` so grad_checkpoint is respected (torch port of
+        `mlx_backend.MLXMambaModel.hidden_states`)."""
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        h = _cast(self.embedding(ids), self._cd)
+        hs = [h]
+        for layer in self.layers:
+            h = self._layer_forward(layer, h)
+            hs.append(h)
+        return tuple(hs)
+
+    def mixing_matrices(self, token_batch: Array) -> List[Tuple[int, Array]]:
+        """For the `mixing-match` stage: each Mamba layer's head-averaged mixing matrix
+        `(B, L, L)` paired with its layer index. Attention layers are skipped. Torch port of
+        `mlx_backend.MLXMambaModel.mixing_matrices`."""
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        h = _cast(self.embedding(ids), self._cd)
+        out: List[Tuple[int, Array]] = []
+        for i, layer in enumerate(self.layers):
+            if not self.config.is_attention_layer(i):
+                out.append((i, layer.mixing_matrix(h).mean(dim=1)))     # head-average -> (B,L,L)
+            h = self._layer_forward(layer, h)
+        return out
 
     def init_state(self, batch_size: int) -> State:
         c = self.config
