@@ -186,10 +186,17 @@ def _cuda_backend() -> Backend:
         from .cuda_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
-    def _teacher_unsupported(*args, **kwargs):
-        raise NotImplementedError(
-            "The conversion teacher (M10/#93) is implemented on the MLX dev backend only; "
-            "the CUDA teacher loader is deferred.")
+    def _make_teacher(config=None, *, pretrained=None, seed=0):
+        """Frozen conversion teacher (#93/#94), torch port. `pretrained` (an HF checkpoint dir /
+        repo id) loads real weights — this is how the dominant teacher precompute runs on the
+        cloud GPU; otherwise a synthetic teacher is built from `config`."""
+        from .cuda_teacher import CUDATeacher
+        if pretrained is not None:
+            return CUDATeacher.from_pretrained(pretrained, config)
+        if config is None:
+            raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
+                             "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
+        return CUDATeacher.from_config(config, seed=seed)
 
     def _student_init_unsupported(*args, **kwargs):
         raise NotImplementedError(
@@ -219,7 +226,7 @@ def _cuda_backend() -> Backend:
         make_sft_train_step=_make_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
-        make_teacher=_teacher_unsupported,
+        make_teacher=_make_teacher,
         init_student=_student_init_unsupported,
         make_distill_train_step=_distill_unsupported,
     )
