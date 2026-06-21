@@ -36,7 +36,7 @@ from src.serve.sessions import SessionStore
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
+    ap.add_argument("--config", type=Path, default=Path("config/poc-qwen.yaml"))
     ap.add_argument("--weights", type=Path, default=None,
                     help="portable .safetensors checkpoint; RANDOM INIT if omitted")
     ap.add_argument("--prompt", default=None, help="completion-mode prompt")
@@ -51,8 +51,11 @@ def main() -> None:
     ap.add_argument("--no-repeat-ngram-size", type=int, default=None,
                     help="hard-ban repeating any n-gram of this size (e.g. 3)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tokenizer", choices=("qwen25", "olmo"), default="qwen25",
+                    help="tokenizer matching the config's vocab (default: qwen25; "
+                         "use olmo for the OLMo-vocab config/poc.yaml)")
     ap.add_argument("--byte-fallback", action="store_true",
-                    help="offline ByteTokenizer (toy config only; not OLMo-compatible)")
+                    help="offline ByteTokenizer (toy config only; not OLMo/Qwen-compatible)")
     args = ap.parse_args()
     if not args.chat and args.prompt is None:
         ap.error("provide --prompt for completion mode, or --chat for the REPL")
@@ -65,7 +68,11 @@ def main() -> None:
         raise SystemExit(
             "mlx not found — run with the project venv on Apple Silicon:\n"
             "    .venv/bin/python scripts/generate.py ...")
-    from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
+    from src.data.tokenize import (
+        ByteTokenizer,
+        load_olmo_tokenizer,
+        load_qwen25_tokenizer,
+    )
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
 
@@ -78,7 +85,12 @@ def main() -> None:
     else:
         print("RANDOM INIT — no --weights; output will be gibberish.", file=sys.stderr)
 
-    tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer()
+    if args.byte_fallback:
+        tok = ByteTokenizer()
+    elif args.tokenizer == "qwen25":
+        tok = load_qwen25_tokenizer()
+    else:
+        tok = load_olmo_tokenizer()
     if tok.vocab_size > cfg.vocab_size:
         raise SystemExit(
             f"tokenizer vocab {tok.vocab_size} exceeds model vocab {cfg.vocab_size} "
