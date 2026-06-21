@@ -1,0 +1,52 @@
+# ~205M POC config — config/poc.yaml retargeted to the Qwen2.5 tokenizer so it trains on the
+# distillation corpus (s3://monica-training/reserve-pretrain, ~1.9B Qwen2.5 tokens, #80).
+#
+# SIZE NOTE: identical layers to poc.yaml (~88M), but Qwen2.5's vocab makes the tied embedding
+# (151646 x 768 ~= 116M) the dominant term -> ~205M total, ~57% of it the embedding/softmax.
+# This is deliberate: the POC then exercises the EXACT tokenizer + data path as the ~1B
+# distillation student (where the same embedding is a negligible ~11%). It is no longer a clean
+# "100M" model and the head matmul/softmax cost ~3x poc.yaml's (vocab 50280 -> 151646).
+d_model: 768           # d_inner = expand*d_model = 1536
+n_layers: 24
+d_state: 16            # SSM state width N (per head, shared B/C group)
+expand: 2
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 1536/64 = 24 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 151646     # Qwen/Qwen2.5 — exceeds uint16, so the corpus packs uint32 (#90)
+seq_len: 1024
+tie_embeddings: true   # mandatory: the ~116M embedding is shared with the output head
+
+# fp16 + dynamic loss scaling (mirrors poc.yaml; the Metal bench result carries to a fp16 CUDA
+# run on T4/L4). On an Ampere+ pod you may switch to bf16 (the 1b/student configs do).
+precision: fp16
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: true  # REQUIRED at this depth (recompute layers in backward)
+
+# dt-projection bias init (load-bearing; identical across all configs)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
+
+# --- Recommended scale run on a RunPod GPU pod (run params are CLI flags, not model config) ---
+#
+# 0. Install the CUDA backend (py3.11 -devel image): pip install -e ".[dev,data,cuda]"
+#    Set R2 creds (AWS_*) + AWS_ENDPOINT_URL_S3 in the pod env (see .env.example).
+#
+# 1. Pull the Qwen2.5 corpus from R2 and make a train/val split (NO re-tokenize):
+#      python -m src.data.r2_sync down \
+#          s3://monica-training/reserve-pretrain/tokenized/v1-qwen25-1k /vol/corpus
+#      python -m src.data.split --shards /vol/corpus --out /vol/split --val-tokens 10000000
+#
+# 2. CUDA smoke gate + train-step bench BEFORE the long run (catch config/throughput issues):
+#      python scripts/smoke_test.py --backend cuda --data <toy-split>
+#      python scripts/bench_cuda_train_step.py --config config/poc-qwen.yaml --batch 32 --grad-accum 4
+#
+# 3. Train (~1.9B tokens ~ Chinchilla for ~100M-class layers; checkpoints synced to R2):
+#      python scripts/train.py --backend cuda --config config/poc-qwen.yaml --data /vol/split \
+#          --out /vol/runs/poc-qwen --total-tokens 1900000000 --batch-size 32 --grad-accum 4 \
+#          --eval-every 200 --ckpt-every 500
+#      python -m src.data.r2_sync up /vol/runs/poc-qwen s3://monica-training/ckpt/poc-qwen
+#
+# Success = a smoothly decreasing val_perplexity in metrics.jsonl with stable grad_norm.

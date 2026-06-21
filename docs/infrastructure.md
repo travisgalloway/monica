@@ -110,8 +110,50 @@ train-time pulls. Concretely:
 - **Checkpoints:** synced to `s3://<bucket>/ckpt/<run>/` (the R2 bucket) from the GPU host on a
   cadence — the durable copy, since the pod is ephemeral.
 - **Install:** the data extras pull `fsspec`/`pyarrow` — `pip install -e ".[data]"` — but the
-  S3 filesystem backend is separate: also `pip install s3fs` so `s3://` URLs resolve. The cloud
-  corpus engine adds `pip install -e ".[datatrove]"`.
+  S3 filesystem backend is separate: also `pip install "s3fs==<fsspec-pin>"` so `s3://` URLs
+  resolve (pin `s3fs` to the same release as `fsspec`, since `datasets` caps `fsspec<=2026.2.0`;
+  a bare `pip install s3fs` upgrades `fsspec` and breaks `datasets`). The cloud corpus engine
+  adds `pip install -e ".[datatrove]"`.
+
+### Syncing an artifact tree to R2 (#80, first piece)
+
+The builders write **local directory trees**; `src/data/r2_sync.py` mirrors one to/from any
+fsspec backend (`file://` locally, `s3://` on R2), reading R2 creds from the env and the endpoint
+from `AWS_ENDPOINT_URL_S3` (see `.env.example`). Build locally, then push:
+
+```bash
+set -a; . ./.env; set +a                                   # load HF/R2 secrets
+python -m src.data.distill_corpus --source text --in <slice> --tokenizer qwen25 \
+    --push s3://<bucket>/poc-distill                        # build, then mirror out-root to R2
+python -m src.data.r2_sync down s3://<bucket>/poc-distill data/poc-distill   # pull on a pod
+```
+
+### Building the scale corpus with datatrove (#80)
+
+The full-source build (FineWeb-Edu + supplements, cross-source MinHash) runs the datatrove port
+in `src/data/datatrove_pipeline.py` + `scripts/build_corpus.py`. It reuses the project filter/dedup
+*logic* (`filters.py`/`dedup.py`) as datatrove blocks and writes **cleaned text shards**; the
+existing `src/data/shard.py` tokenizes them to the Qwen2.5 uint32 trainer shards.
+
+**Environment caveat.** datatrove supports Python ≤3.12 and pulls C-extension/`spacy` deps, so it
+runs in a **dedicated py3.11 venv** matching the RunPod `py3.11` images — *not* the main py3.14
+`.venv`:
+
+```bash
+python3.11 -m venv .venv-dt && .venv-dt/bin/pip install -e ".[dev,data,datatrove]" && .venv-dt/bin/pip install spacy
+set -a; . ./.env; set +a
+# CPU pod: clean + cross-source MinHash dedup straight to R2 (cleaned/ and dedup/deduplicated/):
+.venv-dt/bin/python scripts/build_corpus.py --source fineweb-edu \
+    --out s3://monica-training/reserve-pretrain --executor slurm --tasks 200 \
+    --quality --license-filter --scrub --dedup
+# then tokenize the cleaned shards (trainer format unchanged):
+.venv-dt/bin/python -m src.data.shard --in <out>/dedup/deduplicated \
+    --out <out>/tokenized/v1-qwen25-8k --tokenizer qwen25 --seq-len 8192
+```
+
+A bounded local smoke (`--limit N --executor local`) validates the wiring; note that `--limit`
+truncates the HF streaming reader early, which leaves the process hanging at interpreter exit
+(a non-daemon datasets thread) — harmless, and absent on full (no-`limit`) pod runs.
 
 ---
 

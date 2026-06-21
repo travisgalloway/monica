@@ -8,6 +8,9 @@
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
 
+# Wrangler (Cloudflare CLI) local state.
+.wrangler/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -161,6 +164,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-dt/
 env/
 venv/
 ENV/

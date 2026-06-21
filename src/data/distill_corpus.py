@@ -140,6 +140,9 @@ def main() -> None:
                          "start on a chunk boundary for the SSM reset (#68)")
     ap.add_argument("--shard-size-mb", type=int, default=512, help="tokenized shard roll size")
     ap.add_argument("--clean-shard-size-mb", type=int, default=128, help="cleaned shard roll size")
+    ap.add_argument("--push", default=None,
+                    help="after building, mirror <out-root> to this fsspec URI / R2 prefix "
+                         "(e.g. s3://monica/poc-distill); R2 endpoint from AWS_ENDPOINT_URL_S3 (#80)")
     # Stage-3/4 cleaning passthrough (default-off keeps the local gate path unchanged)
     ap.add_argument("--min-chars", type=int, default=1)
     ap.add_argument("--quality", action="store_true", help="Stage-3 text-quality heuristics")
@@ -164,6 +167,10 @@ def main() -> None:
           f"({manifest['dtype']}, {manifest['n_documents']} docs, "
           f"{manifest['n_sequences']} seq x {manifest['seq_len']}, "
           f"tokenizer={manifest['tokenizer']}) -> {manifest['tokenized_dir']}")
+    if args.push:
+        from .r2_sync import upload_dir
+        written = upload_dir(args.out_root, args.push)
+        print(f"pushed {len(written)} file(s): {args.out_root} -> {args.push}")
 
 
 if __name__ == "__main__":
