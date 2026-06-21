@@ -140,8 +140,9 @@ def test_mixing_match_step_decreases():
 
 
 def test_mixing_match_requires_teacher():
+    s = _student()
     with pytest.raises(ValueError, match="requires a teacher"):
-        make_distill_train_step(_student(), _opt(_student()), stage=DistillStage.MIXING_MATCH)
+        make_distill_train_step(s, _opt(s), stage=DistillStage.MIXING_MATCH)
 
 
 def test_mixing_match_rejects_pure_attention():

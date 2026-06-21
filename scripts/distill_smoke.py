@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -96,7 +97,7 @@ def main() -> None:
     for stage in STAGES:
         metrics_path = run_out / stage / "metrics.jsonl"
         losses = [json.loads(line)["loss"] for line in metrics_path.read_text().splitlines() if line]
-        assert losses and all(l == l for l in losses), f"{stage}: non-finite loss {losses}"
+        assert losses and all(math.isfinite(l) for l in losses), f"{stage}: non-finite loss {losses}"
         assert min(losses) < losses[0], f"{stage}: loss never dropped below start {losses}"
         assert (run_out / stage / "resume").exists(), f"{stage}: no resume bundle"
         print(f"[{stage}] loss {losses[0]:.4f} -> min {min(losses):.4f}  ✓")

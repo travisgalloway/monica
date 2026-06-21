@@ -98,7 +98,7 @@ def main() -> None:
     from src.model.backend import get_backend
     from src.model.teacher import TeacherConfig
     from src.data.loader import PackedLoader
-    from src.data.teacher_outputs import DistillLoader
+    from src.data.teacher_outputs import DistillLoader, read_teacher_meta
     from src.train.distill_manifest import (DistillStage, distill_stages, load_manifest,
                                             manifest_to_config)
     from src.train.loss_scale import scaler_for_precision
@@ -177,9 +177,21 @@ def main() -> None:
             grad_clip=args.grad_clip, scaler=scaler)
 
         if stage == DistillStage.LOGIT_DISTILL:
+            # Fail fast on a vocab mismatch: if the teacher-outputs were cached over a wider vocab
+            # than the student's (e.g. an unknown conversion_teacher so the precompute used the
+            # padded model vocab), the cached top-k indices can exceed cfg.vocab_size and the KL
+            # gather would later fail with a cryptic index error. Passing vocab_size also makes the
+            # loader's token guard catch out-of-range ids.
+            tmeta = read_teacher_meta(args.teacher_outputs, "train")
+            if tmeta["vocab_size"] > cfg.vocab_size:
+                raise SystemExit(
+                    f"teacher-outputs vocab_size {tmeta['vocab_size']} > student vocab "
+                    f"{cfg.vocab_size}: cached top-k indices can exceed the student vocab. Re-run "
+                    f"precompute_teacher with a teacher whose effective_vocab_size matches the "
+                    f"student tokenizer (the #94 precompute guard enforces this for real runs).")
             loader = DistillLoader(args.corpus / "train.bin", args.teacher_outputs, "train",
                                    cfg.seq_len, args.batch_size, k=args.k, shuffle=True,
-                                   seed=args.seed)
+                                   seed=args.seed, vocab_size=cfg.vocab_size)
         else:
             loader = _InputsLoader(PackedLoader(args.corpus / "train.bin", cfg.seq_len,
                                                 args.batch_size, shuffle=True, seed=args.seed))
