@@ -1,0 +1,24 @@
+# Toy distillation manifest — drives the offline smoke gate (scripts/distill_smoke.py) and the
+# driver tests. Tiny dims, all three distillation stages, the MOHAWK init (freezes nothing, so the
+# whole student trains). `conversion_teacher: synthetic` tells the precompute/distill drivers to
+# build a random TeacherConfig.tiny() instead of loading HF weights (no network).
+#
+# manifest_to_config() forces the qwen25 vocab (151646) + bf16; the offline gate overrides those
+# with `--vocab 256 --precision fp32` (byte-fallback corpus, bit-faithful fp32) — this manifest is
+# NOT a real run config. Layout mirrors tests/test_distill_train_step.py's toy student so the
+# shapes are known-good (head_dim 16 | d_inner=96 -> 6 heads; attn every 2nd layer).
+student: toy-distill
+conversion_teacher: synthetic
+tokenizer: qwen25
+seq_len: 16
+init: mohawk
+stages: [mixing-match, hidden-align, logit-distill]
+layout:
+  d_model: 48
+  n_layers: 4
+  attention_every: 2
+  state_size: 16
+  head_dim: 16
+  n_attn_heads: 4
+corpus: ""
+teacher_outputs: ""

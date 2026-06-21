@@ -16,7 +16,7 @@ backend import stays behind `src.model.backend.get_backend`, so `--help` works o
         --push s3://monica-training/poc-distill/teacher-outputs/topk-logits
 
     # offline smoke (byte vocab, synthetic teacher — no network/weights):
-    .venv/bin/python scripts/precompute_teacher.py --manifest config/manifests/toy-distill.yaml \\
+    .venv/bin/python scripts/precompute_teacher.py --manifest config/toy-distill.yaml \\
         --data /tmp/toy-split --out /tmp/teacher-outputs --backend mlx --k 8 --synthetic
 """
 
