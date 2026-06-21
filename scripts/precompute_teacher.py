@@ -37,7 +37,9 @@ def _parse_args() -> argparse.Namespace:
                     help="teacher-outputs dir (default: <data>/teacher-outputs/topk-logits)")
     ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                     help="hardware backend (the 7B precompute uses cuda on the cloud GPU)")
-    ap.add_argument("--k", type=int, default=50, help="logits cached per token (footprint ~6k B/token)")
+    ap.add_argument("--k", type=int, default=50,
+                    help="logits cached per token; footprint 6*k B/token (fp16 vals + uint32 idx), "
+                         "e.g. k=50 -> ~300 B/token")
     ap.add_argument("--batch-size", type=int, default=8, help="chunks per teacher forward")
     ap.add_argument("--pretrained", default=None,
                     help="HF checkpoint dir / repo id (default: manifest.conversion_teacher)")
@@ -94,12 +96,27 @@ def main() -> None:
         teacher = backend.make_teacher(config=_teacher_config_for(model_id), pretrained=model_id)
         teacher_info = {"model_id": model_id, "synthetic": False,
                         "vocab_size": teacher.config.vocab_size}
+        # Guard the foot-gun: if the teacher emits logits over a wider vocab than the student's
+        # tokenizer vocab (e.g. `from_pretrained(config=None)` builds a TeacherConfig from HF
+        # config.json, which omits `tokenizer_vocab_size`, so effective_vocab includes padded
+        # rows), the cached top-k indices can point at rows the student cannot represent. Fail
+        # loudly instead of silently writing unusable artifacts.
+        if teacher.config.effective_vocab_size != manifest.vocab_size:
+            raise SystemExit(
+                f"teacher effective_vocab_size {teacher.config.effective_vocab_size} != manifest "
+                f"tokenizer vocab {manifest.vocab_size} ({manifest.tokenizer}); the student cannot "
+                f"consume these top-k indices. Use a --pretrained id known to _teacher_config_for "
+                f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.openr1_distill_7b.")
 
     eff_vocab = teacher.config.effective_vocab_size
     out_dir = args.out or storage.teacher_outputs_dir(args.data)
     out_dir = Path(out_dir)
     splits = [s for s in args.splits.split(",") if s]
 
+    # The teacher clamps k to min(k, effective_vocab) in topk_logits, so the actual cached k can
+    # be smaller than args.k; record THAT (from the per-split meta) in the manifest so it agrees
+    # with the per-split meta files downstream consumers read.
+    actual_k = args.k
     for split in splits:
         data = open_packed(args.data / f"{split}.bin")
         n_tokens = int(data.shape[0])
@@ -113,10 +130,11 @@ def main() -> None:
                                   seq_len=seq_len, vocab_size=eff_vocab,
                                   src_packed=str(args.data / f"{split}.bin"),
                                   src_n_tokens=n_tokens)
+        actual_k = meta["k"]
         print(f"teacher top-k [{split}]: {meta['n_rows']} rows x k={meta['k']} "
               f"({n_chunks} chunks x {seq_len}) -> {out_dir}")
 
-    write_manifest(out_dir, k=args.k, seq_len=seq_len, effective_vocab_size=eff_vocab,
+    write_manifest(out_dir, k=actual_k, seq_len=seq_len, effective_vocab_size=eff_vocab,
                    corpus_manifest=str(args.data), teacher=teacher_info, splits=splits)
 
     if args.push:

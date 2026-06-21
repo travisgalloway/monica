@@ -194,7 +194,10 @@ class DistillLoader:
         vals = np.stack([b[2] for b in batch])        # (B, seq_len, k)
         idx = np.stack([b[3] for b in batch])
         if self.vocab_size is not None:
-            top = int(inputs.max())
+            # Check inputs AND targets (targets are inputs shifted by one, so a bad/overflow id
+            # in the last position appears only in targets) — mirrors PackedLoader, which checks
+            # the max over the full seq_len+1 chunk before the input/target split.
+            top = int(max(int(inputs.max()), int(targets.max())))
             if top >= self.vocab_size:
                 raise ValueError(
                     f"token id {top} >= vocab_size {self.vocab_size} in {self.path}. "
