@@ -7,10 +7,11 @@
 # layout are unchanged. corpus/teacher_outputs are supplied via the distill.py / precompute_teacher.py
 # CLI args, so they are left empty here.
 #
-# Validated 2026-06-21 on an A100 80GB (batch 2, expandable_segments): all three stages' losses
-# decreased and a portable student weights.safetensors was written. NOTE: MOHAWK stage 1
-# (mixing-match) materializes a per-layer (B, H, L, L) mixing matrix for both student and teacher —
-# O(L^2) memory — so keep the micro-batch small at seq 1024 (batch 8 OOMs an 80GB card; batch 2 fits).
+# Validated 2026-06-21 on an A100 80GB (batch 2, env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True):
+# all three stages' losses decreased and a portable student weights.safetensors was written. NOTE:
+# MOHAWK stage 1 (mixing-match) materializes a per-layer (B, H, L, L) mixing matrix for both student
+# and teacher — O(L^2) memory — so keep the micro-batch small at seq 1024 (batch 8 OOMs an 80GB card;
+# batch 2 fits) and set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to limit fragmentation.
 student: 1b-attn-hi-1k
 conversion_teacher: open-r1/OpenR1-Distill-7B
 tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — teacher shares it
