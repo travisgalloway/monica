@@ -204,6 +204,10 @@ A40); the fused kernels auto-detect at runtime and degrade gracefully when absen
 
 ## End-to-end intended flow (once #80/#81 land)
 
+For the concrete, command-by-command Path B execution of this flow (the full-scale ~1B distillation
+run — exact commands, pod sizing, R2 paths, cost, and the Path A gotchas), see
+[`path-b-run.md`](path-b-run.md). The steps below are the generic shape.
+
 1. **Local (Mac):** build + unit-test the data pipeline on a slice, the teacher loader, student
    init, distillation loss, and the manifest/sweep — all at toy scale.
 2. **CPU pod:** build the frozen distillation corpus and SFT/RL sets to `poc-distill/` and
