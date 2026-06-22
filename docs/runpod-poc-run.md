@@ -112,5 +112,6 @@ end-to-end (#13), and the **local-hardware headline metric** vs a same-size tran
 - **RunPod auth / provisioning** is not yet done (`RUNPOD_API_KEY` is still a placeholder in `.env`).
 - This POC validates the **architecture + the Qwen2.5 data path**; the real program is **M10
   distillation** (#65) — teacher-logit precompute (#94) is the next GPU-heavy step after this.
+  The full-scale execution runbook for that program is [`path-b-run.md`](path-b-run.md).
 - Background memories that load automatically: `poc-corpus-r2`, `datatrove-venv`, `s3fs-fsspec-pin`,
   `poc-step-time-baseline` (the ~99 s/step figure is the MLX baseline — CUDA differs; trust the bench).
