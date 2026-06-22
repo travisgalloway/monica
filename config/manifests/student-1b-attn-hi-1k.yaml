@@ -1,24 +1,25 @@
 # Path A validation variant of student-1b-attn-hi.yaml (#65 / M10).
 #
 # Purpose: prove the real distillation pipeline (#94 teacher top-k precompute + #81 distill driver)
-# works end-to-end on cloud — with the REAL 7B teacher and the REAL ~1B student — cheaply, before
-# building the full 8k corpus. Only seq_len (8192 -> 1024, reusing the existing 1k Qwen corpus) and
+# works end-to-end on cloud — with the REAL Qwen3-4B teacher and the REAL ~1B student — cheaply,
+# before building the full 8k corpus. Only seq_len (8192 -> 1024, reusing the existing 1k corpus) and
 # the stage list (distillation stages only) differ from student-1b-attn-hi.yaml; the teacher and
 # layout are unchanged. corpus/teacher_outputs are supplied via the distill.py / precompute_teacher.py
 # CLI args, so they are left empty here.
 #
-# Validated 2026-06-21 on an A100 80GB (batch 2, env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True):
-# all three stages' losses decreased and a portable student weights.safetensors was written. NOTE:
-# MOHAWK stage 1 (mixing-match) materializes a per-layer (B, H, L, L) mixing matrix for both student
-# and teacher — O(L^2) memory — so keep the micro-batch small at seq 1024 (batch 8 OOMs an 80GB card;
-# batch 2 fits) and set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to limit fragmentation.
+# NOTE: the 2026-06-21 A100 80GB validation run predates the teacher switch (it used the old 7B
+# OpenR1 teacher); re-validate with the Qwen3-4B teacher before relying on its memory envelope. The
+# Qwen3-4B teacher is smaller (4B vs 7B), so the teacher forward is lighter, but the recorded batch
+# sizes were tuned for the 7B. MOHAWK stage 1 (mixing-match) still materializes a per-layer
+# (B, H, L, L) mixing matrix for both student and teacher — O(L^2) memory — so keep the micro-batch
+# small at seq 1024 and set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to limit fragmentation.
 student: 1b-attn-hi-1k
-conversion_teacher: open-r1/OpenR1-Distill-7B
-tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — teacher shares it
+conversion_teacher: Qwen/Qwen3-4B-Thinking-2507
+tokenizer: qwen3                 # Qwen3 vocab ~151669 (#65) — teacher shares it
 seq_len: 1024
 layout:
   d_model: 2048
-  n_layers: 28                   # ~1.03B params; matches the teacher's 28 layers (Mamba-in-the-Llama init)
+  n_layers: 28                   # ~1.03B params; teacher is 36 layers — depth mismatch bridged by the adaptive Mamba-in-the-Llama init
   attention_every: 8             # 3 of 28 layers attention (~10.7%) — mirrors student-1b-attn-hi
   state_size: 128                # -> MambaConfig.d_state
 init: mamba-in-the-llama

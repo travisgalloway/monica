@@ -248,15 +248,15 @@ def main() -> None:
     ap.add_argument("--seq-len", type=int, default=8192)
     ap.add_argument("--shard-size-mb", type=int, default=512)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--tokenizer", choices=("qwen25", "starcoder2", "olmo"),
-                    default="qwen25")
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "starcoder2", "olmo"),
+                    default="qwen3")
     ap.add_argument("--model-id", default=None)
     args = ap.parse_args()
 
     from .corpus import has_jsonl_shards, iter_jsonl_texts, iter_shard_texts
     from .pack import packing_dtype_for
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
-                           load_starcoder2_tokenizer, tokenize_docs)
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                           load_qwen25_tokenizer, load_starcoder2_tokenizer, tokenize_docs)
 
     if args.byte_fallback:
         tok = ByteTokenizer()
@@ -264,8 +264,10 @@ def main() -> None:
         tok = load_olmo_tokenizer(args.model_id)
     elif args.tokenizer == "starcoder2":
         tok = load_starcoder2_tokenizer(args.model_id)
-    else:
+    elif args.tokenizer == "qwen25":
         tok = load_qwen25_tokenizer(args.model_id)
+    else:
+        tok = load_qwen3_tokenizer(args.model_id)
 
     tok_label = "byte" if args.byte_fallback else getattr(tok, "name_or_path", args.tokenizer)
     dtype = packing_dtype_for(tok.vocab_size)          # uint16 (POC) / uint32 (Qwen2.5)

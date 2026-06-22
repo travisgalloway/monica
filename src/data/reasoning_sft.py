@@ -5,7 +5,7 @@ chat template, written as the `shared/sft/` layout, in two complementary forms:
 
     <out_root>/sft/
         cleaned/reasoning-traces/records.jsonl        # tokenizer-agnostic {messages,source,license}
-        tokenized/qwen25-8k/
+        tokenized/qwen3-8k/
             reasoning.jsonl                           # masked {input_ids,target_ids,loss_mask} (SFTLoader)
             reasoning-packed/                         # the atomic 8K packing (the #96 deliverable)
                 part-*.bin   uint32 trace tokens
@@ -31,7 +31,7 @@ is lazy inside the loaders. Offline path: the checked-in handauthored traces + `
 
 CLI:
     python -m src.data.reasoning_sft --sources handauthored --byte-fallback --out-root /tmp/shared
-    python -m src.data.reasoning_sft --sources mot --tokenizer qwen25         # real run
+    python -m src.data.reasoning_sft --sources mot --tokenizer qwen3          # real run
 """
 
 from __future__ import annotations
@@ -60,16 +60,16 @@ def _valid_rows(rows: Iterable[dict]) -> List[dict]:
 
 
 def _load_tokenizer(tokenizer: str, model_id: Optional[str], byte_fallback: bool):
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
-                           load_starcoder2_tokenizer)
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                           load_qwen25_tokenizer, load_starcoder2_tokenizer)
     if byte_fallback:
         return ByteTokenizer()
-    loaders = {"qwen25": load_qwen25_tokenizer, "olmo": load_olmo_tokenizer,
-               "starcoder2": load_starcoder2_tokenizer}
+    loaders = {"qwen3": load_qwen3_tokenizer, "qwen25": load_qwen25_tokenizer,
+               "olmo": load_olmo_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     return loaders[tokenizer](model_id)
 
 
-def build_reasoning_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen25",
+def build_reasoning_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
                         model_id: Optional[str] = None, seq_len: int = 8192,
                         chunk_align: int = 64, byte_fallback: bool = False) -> dict:
     """Build the reasoning-trace SFT corpus: cleaned rows, masked JSONL records, and the atomic
@@ -169,7 +169,8 @@ def main() -> None:
     ap.add_argument("--sources", nargs="+", default=["handauthored"],
                     choices=tuple(_LOADERS), help="reasoning-trace sources (handauthored / mot)")
     ap.add_argument("--out-root", type=Path, default=Path("data/shared"))
-    ap.add_argument("--tokenizer", choices=("qwen25", "olmo", "starcoder2"), default="qwen25")
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "olmo", "starcoder2"),
+                    default="qwen3")
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
     ap.add_argument("--seq-len", type=int, default=8192,

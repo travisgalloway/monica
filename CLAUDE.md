@@ -8,8 +8,8 @@ A proof-of-concept **Mamba-2 hybrid** (selective state-space + a few attention l
 language model, developed and validated on **Apple Silicon with MLX**, architected behind
 **one hardware seam** so it migrates to **CUDA** for a larger run with minimal rewrite. The
 active program is to **distil** a compact **~1B** hybrid student from a larger frozen teacher
-(`open-r1/OpenR1-Distill-7B`, Qwen2.5 tokenizer), sweep a few architecture layouts cheaply, then
-post-train the winner for reasoning — tracked in
+(`Qwen/Qwen3-4B-Thinking-2507`, Qwen3 tokenizer ~151,669; thinking-mode CoT is the headline lever),
+sweep a few architecture layouts cheaply, then post-train the winner for reasoning — tracked in
 [issue #65](https://github.com/travisgalloway/monica/issues/65). The original from-scratch
 pretrain path (OLMo tokenizer) is complete and is the validated foundation / production reserve.
 POC success is a smoothly decreasing held-out validation-perplexity curve plus a local-hardware
@@ -77,7 +77,7 @@ Model dims and run params live in `config/toy.yaml` and `config/poc.yaml`, loade
 `MambaConfig` (`src/model/blocks.py`). `MambaConfig.validate()` enforces cross-cutting
 invariants; **token packing is dtype-aware (#90)** — `vocab < 65536` packs as **uint16**
 (the original POC: OLMo-7B-hf), at/above it packs as **uint32** (the distillation student:
-Qwen2.5, vocab 151,646 — see `config/student-1b.yaml` and `docs/design/10-distillation.md`).
+Qwen3, vocab 151,669 — see `config/student-1b.yaml` and `docs/design/10-distillation.md`).
 The ceiling `validate()` enforces is now uint32 (`2**32`). The YAML **comments are the
 decision record** — read them before changing values. Key locked decisions:
 

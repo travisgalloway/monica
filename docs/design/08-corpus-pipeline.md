@@ -73,12 +73,13 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 ## Tokenize + shard (Phase 3, #74)
 
 > **Superseded by the distillation pivot ([10](10-distillation.md)).** The tokenizer is now
-> **fixed to Qwen2.5 (vocab 151,646)** by the conversion teacher — it intentionally *exceeds*
-> the uint16 bound, so packing is **uint32** (#90, now implemented: dtype-aware `pack.py` +
-> relaxed `MambaConfig.validate()`). The StarCoder2/uint16 reasoning below is the historical
-> record of the from-scratch plan; the #75 production-reserve corpus reuses these
-> clean-corpus *stages* but under the **same Qwen2.5 tokenizer + uint32 packing** — the
-> tokenizer lock is POC *and* production, so StarCoder2/uint16 is fully superseded.
+> **fixed to Qwen3 (vocab ~151,669)** by the conversion teacher (token-aligned with Qwen2.5 plus
+> the `<think>`/`</think>` ids) — it intentionally *exceeds* the uint16 bound, so packing is
+> **uint32** (#90, now implemented: dtype-aware `pack.py` + relaxed `MambaConfig.validate()`). The
+> StarCoder2/uint16 reasoning below is the historical record of the from-scratch plan; the #75
+> production-reserve corpus reuses these clean-corpus *stages* under **uint32 packing** (the
+> already-built reserve corpus uses Qwen2.5; re-tokenize to Qwen3 to match the student) — so
+> StarCoder2/uint16 is fully superseded.
 
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
   (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`
@@ -113,7 +114,7 @@ r2://<bucket>/
 
 Two rules the layout enforces: **cleaned text and RL problems stay tokenizer-agnostic and durable**
 (re-tokenize cheaply when the blend/tokenizer/seq_len changes), and **every tokenized folder
-name-pins tokenizer + seq_len** (`<tok>-<k>`, e.g. `qwen25-8k`) so multiple tokenized views coexist.
+name-pins tokenizer + seq_len** (`<tok>-<k>`, e.g. `qwen3-8k`) so multiple tokenized views coexist.
 Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regenerate.
 
 ## Training flow (Phases 4–5, #81 / #75)

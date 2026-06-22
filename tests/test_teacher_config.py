@@ -1,12 +1,24 @@
 """Portable `TeacherConfig` tests (#93). NO backend import — `teacher.py` is above the
 seam, so these run on non-Apple/CI hosts where the MLX-guarded `test_teacher.py` is skipped,
-and they actually protect the conversion-teacher fixtures (`openr1_distill_7b`, `qwen_1_5b`)
-and the cross-cutting `validate()` invariants.
+and they actually protect the conversion-teacher fixtures (`qwen3_4b_thinking`,
+`openr1_distill_7b`, `qwen_1_5b`) and the cross-cutting `validate()` invariants.
 """
 
 import pytest
 
 from src.model.teacher import TeacherConfig
+
+
+def test_qwen3_4b_thinking_config_shape():
+    c = TeacherConfig.qwen3_4b_thinking()
+    assert (c.vocab_size, c.d_model, c.n_layers) == (151936, 2560, 36)
+    assert (c.n_heads, c.n_kv_heads, c.head_dim) == (32, 8, 128)
+    assert c.intermediate_size == 9728 and c.tie_embeddings
+    assert c.rope_theta == 5000000.0
+    assert c.q_dim == 4096 and c.kv_dim == 1024     # head_dim 128 != d_model/n_heads (2560/32=80)
+    assert c.model_id == "Qwen/Qwen3-4B-Thinking-2507"
+    assert c.tokenizer_vocab_size == 151669 and c.effective_vocab_size == 151669
+    c.validate()
 
 
 def test_openr1_distill_7b_config_shape():

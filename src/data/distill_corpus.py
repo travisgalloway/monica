@@ -1,4 +1,4 @@
-"""Build the FROZEN distillation corpus (#92): the cleaned + Qwen2.5-tokenized,
+"""Build the FROZEN distillation corpus (#92): the cleaned + Qwen3-tokenized,
 uint32-packed token corpus every student trial consumes.
 
 This is a thin **orchestrator** over the existing data stages — it adds no new cleaning or
@@ -7,8 +7,8 @@ two artifacts together:
 
     <out_root>/corpus/
         cleaned/    part-*.parquet          # durable, re-mixable text (corpus.build_corpus)
-        tokenized/  qwen25-8k/              # training shards (shard.pack_sequences)
-            part-*.bin     uint32 tokens (Qwen2.5 vocab 151,646 -> uint32, #90)
+        tokenized/  qwen3-8k/               # training shards (shard.pack_sequences)
+            part-*.bin     uint32 tokens (Qwen3 vocab ~151,669 -> uint32, #90)
             part-*.bounds  uint8 doc-start flags  (SSM state reset, #68)
             manifest.json  {seq_len, dtype, tokenizer, n_tokens, ...}
         manifest.json       # the two-stage summary (the artifact #94 freezes against)
@@ -16,15 +16,15 @@ two artifacts together:
 The corpus is **precomputed once** (docs/design/10-distillation.md): the teacher logit
 precompute (#94) and every student layout sweep (#98/#100) read it unchanged. The student
 manifests (`config/manifests/student-1b-*.yaml`) already name
-`poc-distill/corpus/tokenized/qwen25-8k`; `tokenized_subdir` produces exactly that name.
+`poc-distill/corpus/tokenized/qwen3-8k`; `tokenized_subdir` produces exactly that name.
 
 ABOVE THE SEAM — no `mlx`/`torch`. Heavy data deps (pyarrow via `corpus`, `transformers` via
 the tokenizer loaders) are imported LAZILY, so importing this module stays cheap and the seam
 guard (tests/test_import_guard.py) needs nothing extra.
 
 CLI (mirrors download/tokenize/pack/corpus):
-    # real run (needs the HF Qwen2.5 tokenizer): a few-B-token slice
-    python -m src.data.distill_corpus --source text --in data/raw/slice.txt --tokenizer qwen25
+    # real run (needs the HF Qwen3 tokenizer): a few-B-token slice
+    python -m src.data.distill_corpus --source text --in data/raw/slice.txt --tokenizer qwen3
     # offline smoke (no network/tokenizer; byte fallback):
     python -m src.data.distill_corpus --source dummy --byte-fallback --out-root /tmp/pd
 """
@@ -51,29 +51,29 @@ tokenized_subdir = storage.tokenized_dir_name
 
 def _load_tokenizer(tokenizer: str, model_id: str | None, byte_fallback: bool):
     """Resolve the tokenizer, reusing the `tokenize.py` loaders. `byte_fallback` is the
-    offline-only path (vocab 256 -> uint16); a real run uses `qwen25` (vocab 151,646 -> uint32)."""
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
-                           load_starcoder2_tokenizer)
+    offline-only path (vocab 256 -> uint16); a real run uses `qwen3` (vocab ~151,669 -> uint32)."""
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                           load_qwen25_tokenizer, load_starcoder2_tokenizer)
 
     if byte_fallback:
         return ByteTokenizer()
-    loaders = {"qwen25": load_qwen25_tokenizer, "olmo": load_olmo_tokenizer,
-               "starcoder2": load_starcoder2_tokenizer}
+    loaders = {"qwen3": load_qwen3_tokenizer, "qwen25": load_qwen25_tokenizer,
+               "olmo": load_olmo_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     return loaders[tokenizer](model_id)
 
 
-def build_distill_corpus(records: Iterable[Record], out_root, *, tokenizer: str = "qwen25",
+def build_distill_corpus(records: Iterable[Record], out_root, *, tokenizer: str = "qwen3",
                          model_id: str | None = None, seq_len: int = 8192,
                          byte_fallback: bool = False, chunk_align: int | None = None,
                          shard_size_mb: int = 512, clean_shard_size_mb: int = 128,
                          **clean_kwargs) -> dict:
-    """Build the distillation corpus end to end: clean text shards, then Qwen2.5-tokenize +
+    """Build the distillation corpus end to end: clean text shards, then Qwen3-tokenize +
     uint32-pack into fixed `seq_len` sequences with doc-boundary sidecars, under `out_root`.
 
     Stage 1 reuses `corpus.build_corpus` (normalize -> filter/dedup -> Parquet text shards);
     `clean_kwargs` are forwarded to it (e.g. `quality=True`, `dedup="minhash"`). Stage 2 reuses
     `shard.pack_sequences`; the packed dtype follows the tokenizer vocab via `packing_dtype_for`
-    (uint16 for the byte/OLMo path, uint32 for Qwen2.5). Returns the corpus-level manifest dict.
+    (uint16 for the byte/OLMo path, uint32 for Qwen3). Returns the corpus-level manifest dict.
     """
     from .pack import packing_dtype_for
     from .shard import pack_sequences
@@ -89,9 +89,9 @@ def build_distill_corpus(records: Iterable[Record], out_root, *, tokenizer: str 
                                          shard_size_mb=clean_shard_size_mb, **clean_kwargs)
 
     # Stage 2 — tokenize + pack the cleaned text. Pass the short tokenizer label so the pack
-    # manifest records `tokenizer: qwen25` (the acceptance criterion), not the HF repo path.
+    # manifest records `tokenizer: qwen3` (the acceptance criterion), not the HF repo path.
     tok = _load_tokenizer(tokenizer, model_id, byte_fallback)
-    dtype = packing_dtype_for(tok.vocab_size)          # uint16 (byte/OLMo) / uint32 (Qwen2.5)
+    dtype = packing_dtype_for(tok.vocab_size)          # uint16 (byte/OLMo) / uint32 (Qwen3)
     docs = tokenize_docs(iter_shard_texts(cleaned_dir), tok)
     pack_manifest = pack_sequences(docs, tokenized_dir, seq_len=seq_len,
                                    shard_size_mb=shard_size_mb, tokenizer=tokenizer,
@@ -130,7 +130,8 @@ def main() -> None:
     ap.add_argument("--license", default="unknown")
     ap.add_argument("--max-docs", type=int, default=1000, help="--source dummy: #synthetic docs")
     # Tokenize + pack
-    ap.add_argument("--tokenizer", choices=("qwen25", "olmo", "starcoder2"), default="qwen25",
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "olmo", "starcoder2"),
+                    default="qwen3",
                     help="HF tokenizer; the packed dtype is uint16/uint32 per its vocab")
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")

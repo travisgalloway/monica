@@ -64,9 +64,12 @@ CANONICAL_STAGES = (
     "grpo",                                              # verifiable RL (#78)
 )
 
-# Tokenizer name -> vocab size. Qwen2.5 is fixed by the conversion teacher (#90); the value
-# matches config/student-1b.yaml (151646, the tokenizer vocab, < the teacher's padded 151936).
-_TOKENIZER_VOCAB = {"qwen25": 151646}
+# Tokenizer name -> vocab size, fixed by the conversion teacher (#90). `qwen3` (151669) is the
+# active tokenizer for the Qwen3-4B-Thinking-2507 teacher — the unified Qwen3 BPE, token-aligned
+# with Qwen2.5 (151646) but with a few added control tokens incl. the <think>/</think> pair, so
+# the student can emit thinking-mode delimiters as native ids. `qwen25` is kept for back-compat.
+# Both exceed the uint16 bound -> uint32 packing (#90); see config/student-1b.yaml.
+_TOKENIZER_VOCAB = {"qwen3": 151669, "qwen25": 151646}
 
 
 @dataclass

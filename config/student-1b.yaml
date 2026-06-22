@@ -1,14 +1,15 @@
 # ~1B Mamba-2 HYBRID student — distillation sweep seed (epic #65, distillation-first).
 # This is the seed layout the student sweep (#98) searches over: attention fraction,
 # layer placement, and state size are the FREE variables (see docs/design/10-distillation.md).
-# Distilled from open-r1/OpenR1-Distill-7B (#91/#93), NOT pretrained from scratch.
+# Distilled from Qwen/Qwen3-4B-Thinking-2507 (#65/#91/#93), NOT pretrained from scratch.
 #
 # 2048 x 28 -> ~1.03B params (verify: `python scripts/model_size.py --config config/student-1b.yaml`).
-# Depth 28 is deliberate: it MATCHES the teacher's 28 transformer layers (Qwen2.5-7B), which is
-# what the Mamba-in-the-Llama layer-to-layer init (#99) maps onto. 1B is the single target model
-# (the 2B/4B ladder was dropped); the from-scratch config/1b.yaml is the same ~1B size class.
+# Depth 28 is a sweep seed (the size ladder is an open question, #65): the teacher is 36 layers, so
+# the Mamba-in-the-Llama layer-to-layer init (#99) maps endpoint-to-endpoint via the adaptive
+# `_teacher_layer_for` bridge (it does NOT require 1:1 depth). 1B is the single target model;
+# the from-scratch config/1b.yaml is the same ~1B size class.
 #
-# NOTE: vocab_size 151646 (Qwen2.5) exceeds the uint16 ceiling; it packs as uint32 and
+# NOTE: vocab_size 151669 (Qwen3) exceeds the uint16 ceiling; it packs as uint32 and
 # MambaConfig.validate() accepts it now that #90 (dtype-aware packing) has landed.
 d_model: 2048          # d_inner = expand*d_model = 4096
 n_layers: 28           # ~1 attn per 8 -> 3 attention layers (~10.7%); swept by #98
@@ -23,8 +24,8 @@ dt_rank: auto
 attn_every: 8
 n_attn_heads: 16       # must divide d_model 2048 -> attn_head_dim = 128
 
-vocab_size: 151646     # Qwen2.5 — FIXED by the conversion teacher for logit/hidden matching.
-                       # Exceeds uint16 (65536) -> uint32 packing (#90). Same vocab POC+prod.
+vocab_size: 151669     # Qwen3 — FIXED by the conversion teacher for logit/hidden matching;
+                       # includes the <think>/</think> ids. Exceeds uint16 (65536) -> uint32 (#90).
 seq_len: 8192          # long context: reasoning traces + multi-file code (pack traces atomically, #68)
 tie_embeddings: true   # vocab x d_model ~= 311M (~30% of the 1B budget) — tied head mandatory here.
 

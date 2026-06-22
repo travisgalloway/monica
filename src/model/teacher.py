@@ -6,8 +6,8 @@ stages depend on; each backend provides a concrete `ConversionTeacher` (the MLX
 one is `mlx_teacher.MLXConversionTeacher`).
 
 The conversion teacher is the transformer the student is *built from*
-(`open-r1/OpenR1-Distill-7B` by default — a fully-open R1 reproduction on the
-Qwen2.5 tokenizer; see `docs/design/10-distillation.md`).
+(`Qwen/Qwen3-4B-Thinking-2507` by default — a thinking-mode reasoning model on the
+token-aligned Qwen3 vocab; see `docs/design/10-distillation.md`).
 It is run **forward only** — never trained — so it follows the same frozen-reference
 pattern DPO already uses (`mlx_train_step.make_dpo_train_step` holds a distinct
 `ref_model` the optimizer never touches). Two distillation issues consume it:
@@ -36,13 +36,19 @@ Array = Any
 
 @dataclass
 class TeacherConfig:
-    """Architecture of a Qwen2-family conversion teacher.
+    """Architecture of a Qwen2/Qwen3-family conversion teacher.
 
-    The default teacher is `open-r1/OpenR1-Distill-7B` (a Qwen2 decoder built on
-    Qwen2.5-Math-7B — see `openr1_distill_7b`). `qwen_1_5b` is retained as a
-    smaller, back-compat fixture. The fields are exactly what the MLX forward pass
-    and the #99 projection mapping need; nothing here imports a backend, so the
-    config is shared across backends like `MambaConfig`.
+    The default teacher is `Qwen/Qwen3-4B-Thinking-2507` (a Qwen3 decoder — see
+    `qwen3_4b_thinking`). The older Qwen2 fixtures `openr1_distill_7b` /
+    `qwen_1_5b` are retained for back-compat. The fields are exactly what the
+    forward pass and the #99 projection mapping need; nothing here imports a
+    backend, so the config is shared across backends like `MambaConfig`.
+
+    Qwen3 differs from Qwen2 in two ways the backend forward honors: per-head
+    RMSNorm on Q and K before RoPE, and **no** QKV bias (so a Qwen3 teacher's
+    `AttnProjections` carry `None` biases). This config does not encode those
+    flags — the backend keys off the absence of bias/norm weights in its
+    checkpoint mapping — but `tie_embeddings` (true for Qwen3-4B) is a field.
     """
 
     vocab_size: int              # MODEL embedding width (may be padded above the tokenizer vocab)
@@ -61,6 +67,31 @@ class TeacherConfig:
     # logits/indices over `effective_vocab_size`, so a student with the tokenizer vocab can
     # consume them — the padded rows are never emitted as teacher targets.
     tokenizer_vocab_size: Optional[int] = None
+
+    @classmethod
+    def qwen3_4b_thinking(cls) -> "TeacherConfig":
+        """`Qwen/Qwen3-4B-Thinking-2507` — the default conversion teacher.
+
+        Qwen's 4B thinking-mode reasoning model (Apache-2.0). It carries
+        thinking-mode CoT (the main above-weight-class lever for the student) and
+        sits on the unified Qwen3 BPE vocab, which is token-aligned with Qwen2.5 —
+        so logit KD stays aligned (Qwen3.5-4B was rejected: it moved to a new 250k
+        vocab that breaks aligned KD and bloats the student embedding).
+
+        Architecture (Qwen3): vocab 151936 is the padded *model* embedding; the
+        Qwen3 tokenizer vocab is 151669 (Qwen2.5's 151646 plus a few added control
+        tokens incl. the `<think>`/`</think>` pair). `head_dim` 128 is NOT
+        `d_model // n_heads` (2560/32 = 80), so the explicit field matters
+        (`q_dim` 4096, `kv_dim` 1024). Qwen3 has per-head Q/K RMSNorm before RoPE
+        and no QKV bias; `from_hf_dict` reads the authoritative values from the
+        checkpoint's `config.json` at load — these are the offline fixture.
+        """
+        return cls(
+            vocab_size=151936, d_model=2560, n_layers=36, n_heads=32, n_kv_heads=8,
+            head_dim=128, intermediate_size=9728, rms_norm_eps=1e-6, rope_theta=5000000.0,
+            tie_embeddings=True, model_id="Qwen/Qwen3-4B-Thinking-2507",
+            tokenizer_vocab_size=151669,   # Qwen3 tokenizer vocab; padded rows 151669..151936 unused
+        )
 
     @classmethod
     def openr1_distill_7b(cls) -> "TeacherConfig":
@@ -175,8 +206,12 @@ class AttnProjections:
 
     Weights are opaque backend arrays in the HF row-major convention (`y = x @ W.T`):
     `q` is (q_dim, d_model), `k`/`v` are (kv_dim, d_model), `o` is (d_model, q_dim).
-    Qwen2 has biases on q/k/v and none on o. The #99 init maps Q/K/V/O onto the
-    student SSM's C/B/input/output projections.
+    Qwen2 has biases on q/k/v and none on o; **Qwen3 has no QKV bias**, so a Qwen3
+    teacher leaves the `*_bias` fields `None`. Qwen3's per-head Q/K RMSNorm is part
+    of the frozen attention block and is NOT carried here — the #99 init maps only
+    the Q/K/V/O projections onto the student SSM's C/B/input/output (so a kept-and-
+    frozen attention layer drops the teacher's QK-norm; acceptable for the POC, the
+    init is judged by the distillation curve, not exactness).
     """
 
     q: Array

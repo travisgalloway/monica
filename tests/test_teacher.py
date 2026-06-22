@@ -93,8 +93,7 @@ def test_attention_projection_shapes_gqa():
     assert pr.v.shape == (c.kv_dim, c.d_model)
     assert pr.o.shape == (c.d_model, c.q_dim)
     assert c.n_kv_heads < c.n_heads                        # exercising the GQA path
-    assert pr.q_bias.shape == (c.q_dim,)
-    assert pr.k_bias.shape == (c.kv_dim,) and pr.v_bias.shape == (c.kv_dim,)
+    assert pr.q_bias is None and pr.k_bias is None and pr.v_bias is None   # Qwen3: no QKV bias
 
 
 def test_embedding_and_lm_head_matrices_tied():
@@ -157,8 +156,9 @@ def _write_hf_checkpoint(t: MLXConversionTeacher, path):
         hf[ip + "input_layernorm.weight"] = w[p + "input_ln"]
         hf[ip + "post_attention_layernorm.weight"] = w[p + "post_ln"]
         for proj, src in (("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v")):
-            hf[ip + f"self_attn.{proj}.weight"] = w[p + src + "_w"]
-            hf[ip + f"self_attn.{proj}.bias"] = w[p + src + "_b"]
+            hf[ip + f"self_attn.{proj}.weight"] = w[p + src + "_w"]   # Qwen3: no QKV bias
+        hf[ip + "self_attn.q_norm.weight"] = w[p + "q_norm"]          # Qwen3 per-head Q/K RMSNorm
+        hf[ip + "self_attn.k_norm.weight"] = w[p + "k_norm"]
         hf[ip + "self_attn.o_proj.weight"] = w[p + "o_w"]
         hf[ip + "mlp.gate_proj.weight"] = w[p + "gate_w"]
         hf[ip + "mlp.up_proj.weight"] = w[p + "up_w"]

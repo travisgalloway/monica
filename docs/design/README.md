@@ -38,8 +38,8 @@ Every claim here is sourced from a docstring or config comment in the code, with
 9. [Hybrid architectures](09-hybrid-architectures.md) — why the model is a Mamba-2
    hybrid (config-gated attention) and how it sizes.
 10. [Distillation (teacher → hybrid student)](10-distillation.md) — the **distillation-first
-    pivot**: distil a compact **~1B** hybrid from a frozen, fully-open `open-r1/OpenR1-Distill-7B`
-    teacher (Qwen2.5 tokenizer → uint32 packing, #90), precompute teacher artifacts once,
+    pivot**: distil a compact **~1B** hybrid from a frozen `Qwen/Qwen3-4B-Thinking-2507`
+    teacher (Qwen3 tokenizer ~151,669 → uint32 packing, #90), precompute teacher artifacts once,
     sweep student layouts cheaply (#98).
 11. [Post-training](11-post-training.md) — instruct SFT → reasoning-trace SFT → optional
     tool-use → GRPO, the Qwen `<|im_end|>` chat-template invariant, shared with production.
@@ -72,7 +72,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Success metric | held-out val perplexity (Tier-1) | a smoothly decreasing curve *is* the POC goal | `src/eval/val_loss.py` |
 | OLMES / lm-eval | implemented (Tier-2); scores near chance at POC scale | loglikelihood + generative tasks run end-to-end | `src/eval/olmes_adapter.py` |
 | Build method | **distillation** from a frozen teacher (not pretrain) | reaches capability at <1% of from-scratch tokens; cheap layout sweep | `docs/design/10-distillation.md` |
-| Scale-up tokenizer | **Qwen2.5** (vocab 151,646) | fixed by the conversion teacher for logit/hidden matching; uint32 packing (#90). POC stays OLMo. StarCoder2 (the old uint16 pick) superseded. | `docs/design/10-distillation.md` |
-| Conversion teacher | `open-r1/OpenR1-Distill-7B` (Apache-2.0) | fully open (open R1 traces + recipe), reasoning-ready, Qwen2.5 tokenizer; 7B→~1B size gap bridged by adaptive init | `docs/design/10-distillation.md` |
-| Scale-up model | single **~1B** Mamba-2 hybrid student (28 layers, teacher-depth-aligned) | attention layers close the SSM retrieval gap; no-KV-cache local inference; 2B/4B tiers dropped | `docs/design/10-distillation.md` |
+| Scale-up tokenizer | **Qwen3** (vocab ~151,669) | fixed by the conversion teacher for logit/hidden matching; token-aligned with Qwen2.5 + the `<think>`/`</think>` ids; uint32 packing (#90). POC stays OLMo. | `docs/design/10-distillation.md` |
+| Conversion teacher | `Qwen/Qwen3-4B-Thinking-2507` (Apache-2.0) | thinking-mode CoT (the above-weight-class lever), token-aligned Qwen3 vocab; 4B→~1B size gap bridged by adaptive init (Qwen3.5-4B rejected: 250k vocab breaks aligned KD) | `docs/design/10-distillation.md` |
+| Scale-up model | single **~1B** Mamba-2 hybrid student (28 layers; teacher is 36, bridged by adaptive init) | attention layers close the SSM retrieval gap; no-KV-cache local inference; size ladder is an open question (#65) | `docs/design/10-distillation.md` |
 | Data framework | `datatrove` + R2 + RunPod | builds the teacher corpus + production-reserve from-scratch data (#75) | `docs/design/08-corpus-pipeline.md` |

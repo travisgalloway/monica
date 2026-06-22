@@ -8,7 +8,7 @@ serve/chat → eval**. For *why* the project is built this way, see
 The project has **two training paths**:
 
 - **Distillation (current focus)** — build a compact **~1B** Mamba-2 hybrid student from a
-  larger frozen teacher (Qwen2.5 tokenizer → uint32 packing). *In progress:* the building
+  larger frozen teacher (Qwen3 tokenizer → uint32 packing). *In progress:* the building
   blocks exist; the end-to-end run harness is being wired up.
 - **From-scratch pretrain (validated foundation / production reserve)** — train a ~100M POC
   from scratch (OLMo tokenizer → uint16). Complete and exercised by the smoke gate.
@@ -39,8 +39,8 @@ needs network once):
 
 - **OLMo** (`allenai/OLMo-7B-hf`, vocab 50,280 < 65,536) → **uint16** packing — the
   from-scratch POC path.
-- **Qwen2.5** (vocab 151,646 ≥ 65,536) → **uint32** packing — the distillation path, fixed by
-  the conversion teacher (`open-r1/OpenR1-Distill-7B`).
+- **Qwen3** (vocab ~151,669 ≥ 65,536) → **uint32** packing — the distillation path, fixed by
+  the conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`).
 
 Run the tests to confirm the install (on Linux the MLX-only tests skip, not fail):
 
@@ -52,11 +52,11 @@ Run the tests to confirm the install (on Linux the MLX-only tests skip, not fail
 
 ## 2. Build a corpus
 
-### 2a. Distillation corpus (current focus — Qwen2.5, uint32)
+### 2a. Distillation corpus (current focus — Qwen3, uint32)
 
 [`src/data/distill_corpus.py`](../src/data/distill_corpus.py) is a thin orchestrator that
 builds the **frozen** distillation corpus every student trial consumes: it cleans text into
-durable Parquet, then Qwen2.5-tokenizes and packs it into fixed-length training shards with a
+durable Parquet, then Qwen3-tokenizes and packs it into fixed-length training shards with a
 **document-boundary sidecar** (`.bounds`, for SSM state reset at doc edges, #68). It adds no
 new logic over the stages below — only the `poc-distill/` layout and a corpus-level manifest.
 
@@ -64,7 +64,7 @@ new logic over the stages below — only the `poc-distill/` layout and a corpus-
 # From a one-document-per-line text file (use --source dummy for an offline smoke).
 # --out-root is the poc-distill class root; it defaults to data/poc-distill (omit to use it):
 .venv/bin/python -m src.data.distill_corpus --source text --in data/raw/slice.txt \
-    --tokenizer qwen25 --seq-len 8192 --out-root data/poc-distill
+    --tokenizer qwen3 --seq-len 8192 --out-root data/poc-distill
 ```
 
 This writes:
@@ -72,8 +72,8 @@ This writes:
 ```
 data/poc-distill/corpus/
   cleaned/      part-*.parquet          durable, re-mixable text
-  tokenized/qwen25-8k/
-    part-*.bin      uint32 tokens (Qwen2.5 vocab 151,646 → uint32, #90)
+  tokenized/qwen3-8k/
+    part-*.bin      uint32 tokens (Qwen3 vocab ~151,669 → uint32, #90)
     part-*.bounds   uint8 doc-start flags
     manifest.json   {seq_len, dtype, tokenizer, n_tokens, ...}
   manifest.json     two-stage summary (the artifact teacher-logit precompute freezes against)
