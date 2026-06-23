@@ -1,0 +1,48 @@
+# poc-small.yaml — ~97M, REAL-BUT-SLOW local POC (the "<=100M trained locally" target).
+#
+# Purpose: the largest model you can plausibly TRAIN on Apple Silicon and still call a model —
+# a real-tokenizer (~97M) run for local POC experiments, distinct from small.yaml (fast code-path
+# iteration) and poc.yaml (~127M, the cloud/reserve scale run). It is poc.yaml's layout dialed
+# down to land just under 100M total: same head width and SSM, fewer/narrower layers.
+#
+# COST EXPECTATION (set before you start): MEASURED on an M-series part via
+# `scripts/bench_train_step.py --config config/poc-small.yaml --batch 16 --grad-accum 2` ->
+# ~18.8 s/step at 32,768 tok/step, peak ~12.9 GB (first step ~21 s incl. init). That is ~75 s/step
+# if scaled to poc.yaml's 131,072-tok protocol — comparable per-token to poc's ~99 s/step baseline
+# (issue #31) but well under half the memory. So a Chinchilla-ish ~2B-token run is on the order of
+# DAYS of local compute: this config is for SHORT local POC runs, not a from-scratch pretrain. For
+# real scale, train on CUDA cloud (poc.yaml / the distillation path).
+d_model: 768           # d_inner = expand*d_model = 1536
+n_layers: 16           # poc.yaml is 24; 16 lands ~97M total (see below)
+d_state: 16            # SSM state width N (per head, shared B/C group)
+expand: 2
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 1536/64 = 24 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 50280      # allenai/OLMo-7B-hf (<65536 -> uint16). OLMo (not Qwen3) keeps the tied
+                       # embedding (50280*768 ~= 38.6M) from dominating, so layers ~= 58.7M and the
+                       # total is a clean ~97.4M. (Qwen3's 151k vocab would make embedding ~116M and
+                       # blow the <=100M budget — the documented poc-qwen embedding-heavy tradeoff.)
+seq_len: 1024
+tie_embeddings: true   # MANDATORY: the embedding is a large share of the budget at this vocab.
+
+# fp16 + dynamic loss scaling — the Metal-friendly precision path (#3; ~16% over bf16).
+precision: fp16
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: true  # 16 layers is lighter than poc's 24, but keep recompute on by default so
+                       # the fp16 backward stays within unified memory. Safe to set false if you
+                       # have headroom and want a faster step (measure peak with bench_train_step).
+
+# dt-projection bias init (load-bearing — identical across the config family)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
+
+# --- Local POC run (decision record; run params are CLI flags, not model config) -----
+#   # Build a real OLMo-tokenized corpus (or reuse one); then a short local run:
+#   .venv/bin/python scripts/train.py --config config/poc-small.yaml --data data/split \
+#       --out runs/poc-small --total-tokens 200000000 --batch-size 16 --grad-accum 2 \
+#       --eval-every 200 --ckpt-every 500
+# Success = a smoothly decreasing val_perplexity in runs/poc-small/metrics.jsonl with a stable
+# grad_norm (the POC bar, not benchmark scores — issue #13).

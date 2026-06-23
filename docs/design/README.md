@@ -7,8 +7,10 @@ implemented and verified; the M1–M8 milestones were tracked in
 [issue #2](https://github.com/travisgalloway/monica/issues/2). The **active program is M10 —
 distillation** ([issue #65](https://github.com/travisgalloway/monica/issues/65)). For the
 project overview, see the root [`README.md`](../../README.md); for end-to-end commands
-(install → data → train → serve/chat → eval) see [`../usage.md`](../usage.md), and for the
-cloud (R2 + RunPod) runbook see [`../infrastructure.md`](../infrastructure.md).
+(install → data → train → serve/chat → eval) see [`../usage.md`](../usage.md), for the
+cloud (R2 + RunPod) runbook see [`../infrastructure.md`](../infrastructure.md), and for the
+local Apple-Silicon dev loop (one-command validation, small training configs, local Qwen3
+teacher) see [`../local-development.md`](../local-development.md).
 
 Every claim here is sourced from a docstring or config comment in the code, with a
 `src/...` or `config/...` path so you can jump to the source of truth.

@@ -49,6 +49,37 @@ def test_logits_sliced_to_tokenizer_vocab():
     assert mx.all(idx < 50).item()
 
 
+# --- local precompute levers: mx.compile + fp16 (default-off) -----------------
+def test_compiled_forward_matches_eager():
+    """The opt-in `compile=True` (mx.compile of the logits-only forward) must agree with the
+    eager path: top-k INDICES identical (the cached signal's alignment) and values within fp
+    tolerance (compile may reorder fused ops by ~1e-6 — well inside the 1e-4 conformance bar)."""
+    cfg = TeacherConfig.tiny()
+    toks = _tokens(2, 8, cfg.vocab_size)
+    eager = MLXConversionTeacher.from_config(cfg, seed=0)
+    comp = MLXConversionTeacher.from_config(cfg, seed=0, compile=True)
+    ve, ie = (np.array(a) for a in eager.topk_logits(toks, 5))
+    vc, ic = (np.array(a) for a in comp.topk_logits(toks, 5))
+    assert np.array_equal(ie, ic)
+    assert np.max(np.abs(ve - vc)) < 1e-4
+
+
+def test_fp16_teacher_runs_and_is_close():
+    """`compute_dtype="fp16"` (local memory lever) produces finite logits close to fp32."""
+    cfg = TeacherConfig.tiny()
+    toks = _tokens(2, 8, cfg.vocab_size)
+    lf = np.array(MLXConversionTeacher.from_config(cfg, seed=0).forward(toks).logits)
+    l16 = np.array(MLXConversionTeacher.from_config(cfg, seed=0, compute_dtype="fp16")
+                   .forward(toks).logits)
+    assert np.all(np.isfinite(l16)) and l16.shape == lf.shape
+    assert np.max(np.abs(lf - l16)) < 0.1
+
+
+def test_invalid_compute_dtype_rejected():
+    with pytest.raises(ValueError):
+        MLXConversionTeacher.from_config(TeacherConfig.tiny(), seed=0, compute_dtype="int8")
+
+
 # --- forward / shapes --------------------------------------------------------
 def test_forward_logits_shape():
     t = _tiny()

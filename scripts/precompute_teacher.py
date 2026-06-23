@@ -45,6 +45,18 @@ def _parse_args() -> argparse.Namespace:
                     help="HF checkpoint dir / repo id (default: manifest.conversion_teacher)")
     ap.add_argument("--synthetic", action="store_true",
                     help="build a synthetic toy teacher (TeacherConfig.tiny) — offline tests only")
+    ap.add_argument("--teacher-endpoint", default=None,
+                    help="OpenAI-compatible base URL (e.g. LM Studio http://localhost:1234/v1) to use "
+                         "as a top-k-logit-only teacher. PARTIAL: feeds logit-distill only — no "
+                         "hidden-align/mixing-match/init. Prefer --pretrained for full fidelity.")
+    ap.add_argument("--endpoint-model", default=None,
+                    help="model name to request from --teacher-endpoint (default: server's loaded model)")
+    ap.add_argument("--teacher-dtype", choices=("fp32", "fp16"), default="fp32",
+                    help="MLX teacher compute dtype; fp16 halves teacher memory for the local "
+                         "Apple-Silicon precompute (default fp32 — the bit-identical path)")
+    ap.add_argument("--compile", action="store_true",
+                    help="mx.compile the MLX teacher's logits-only forward (fuses the per-layer "
+                         "op stream; opt-in, eager fp32 stays the default for conformance)")
     ap.add_argument("--push", default=None,
                     help="after writing, mirror --out to this fsspec URI / R2 prefix (#80)")
     return ap.parse_args()
@@ -86,13 +98,26 @@ def main() -> None:
     seq_len = manifest.seq_len
     backend = get_backend(args.backend)
 
-    if args.synthetic:
-        teacher = backend.make_teacher(config=TeacherConfig.tiny())
+    # MLX-local precompute levers (no-ops on the cuda backend, which has its own #145 path).
+    mlx_opts = {"compute_dtype": args.teacher_dtype, "compile": args.compile}
+
+    if args.teacher_endpoint:
+        # Backend-free, top-k-logit-only teacher over an OpenAI-compatible server (LM Studio etc.).
+        # PARTIAL: supports the logit-distill stage only; bypasses backend.make_teacher.
+        from src.model.api_teacher import ApiTopkTeacher
+        teacher = ApiTopkTeacher(base_url=args.teacher_endpoint, vocab_size=manifest.vocab_size,
+                                 tokenizer=manifest.tokenizer, model=args.endpoint_model)
+        teacher_info = {"model_id": args.endpoint_model, "endpoint": args.teacher_endpoint,
+                        "synthetic": False, "partial": "logit-distill only",
+                        "vocab_size": teacher.config.vocab_size}
+    elif args.synthetic:
+        teacher = backend.make_teacher(config=TeacherConfig.tiny(), **mlx_opts)
         teacher_info = {"model_id": None, "synthetic": True,
                         "vocab_size": teacher.config.vocab_size}
     else:
         model_id = args.pretrained or manifest.conversion_teacher
-        teacher = backend.make_teacher(config=_teacher_config_for(model_id), pretrained=model_id)
+        teacher = backend.make_teacher(config=_teacher_config_for(model_id), pretrained=model_id,
+                                       **mlx_opts)
         teacher_info = {"model_id": model_id, "synthetic": False,
                         "vocab_size": teacher.config.vocab_size}
         # Guard the foot-gun: if the teacher emits logits over a wider vocab than the student's

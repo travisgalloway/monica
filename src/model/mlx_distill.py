@@ -45,11 +45,20 @@ def _kl_topk(student_logits: mx.array, topk_vals: mx.array, topk_idx: mx.array,
     softmaxed over the SAME k indices at temperature T, so the KL is computed on the shared
     support the cached signal (#94) provides."""
     T = temperature
-    p = mx.softmax(topk_vals.astype(mx.float32) / T, axis=-1)            # teacher over support
+    tv = topk_vals.astype(mx.float32)
+    p = mx.softmax(tv / T, axis=-1)                                      # teacher over support
     sg = mx.take_along_axis(student_logits, topk_idx.astype(mx.int32), axis=-1) / T
     logq = sg - mx.logsumexp(sg, axis=-1, keepdims=True)                 # student log-softmax/k
     kl = (p * (mx.log(p + 1e-9) - logq)).sum(axis=-1)                    # (B,L)
-    return (T * T) * kl.mean()
+    # Mask fully-padded teacher positions: a row whose entire top-k is padding (all _NEG_INF,
+    # or -inf after an fp16 cache round-trip — see ApiTopkTeacher) carries NO teacher signal.
+    # Its softmax is uniform (fp32) or NaN (fp16), which would inject a spurious target, so
+    # average KL over valid rows only. No-op for white-box teachers (every row has real values
+    # above the threshold) -> identical to the prior .mean() and parity-exact.
+    valid = mx.max(tv, axis=-1) > -1e30                                  # (B,L)
+    kl = mx.where(valid, kl, 0.0)
+    denom = mx.maximum(valid.astype(mx.float32).sum(), 1.0)
+    return (T * T) * (kl.sum() / denom)
 
 
 def _ce(logits: mx.array, targets) -> mx.array:

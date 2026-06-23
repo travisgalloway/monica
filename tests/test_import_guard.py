@@ -34,6 +34,7 @@ PORTABLE_MODULES = [
     "src.model.blocks",
     "src.model.backend",
     "src.model.teacher",
+    "src.model.api_teacher",
     "src.model.sizing",
     "src.data.loader",
     "src.data.corpus",

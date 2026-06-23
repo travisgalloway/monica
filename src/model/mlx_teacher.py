@@ -33,7 +33,7 @@ import numpy as np
 
 from .teacher import (AttnProjections, ConversionTeacher, TeacherConfig,
                       TeacherForward)
-from .mlx_backend import _rotate_half, _silu, _softmax_lastdim
+from .mlx_backend import _DTYPES, _rotate_half, _silu, _softmax_lastdim
 
 
 def _rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -62,16 +62,36 @@ def _apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
 class MLXConversionTeacher(ConversionTeacher):
     """Frozen Qwen3 conversion teacher on MLX. See module docstring."""
 
-    def __init__(self, config: TeacherConfig, weights: Dict[str, mx.array]):
+    def __init__(self, config: TeacherConfig, weights: Dict[str, mx.array], *,
+                 compute_dtype: str = "fp32", compile: bool = False):
         config.validate()
         self.config = config
-        # All compute in fp32: teacher logits feed a KL term, so stability beats speed at
-        # POC scale and the teacher forward is a one-time precompute (#94) anyway.
-        self._w = {k: v.astype(mx.float32) for k, v in weights.items()}
+        if compute_dtype not in _DTYPES:
+            raise ValueError(f"compute_dtype must be one of {sorted(_DTYPES)}, got {compute_dtype!r}")
+        # Default fp32: teacher logits feed a KL term, so stability beats speed at POC scale and
+        # the forward is a one-time precompute (#94). `compute_dtype="fp16"` is a LOCAL opt-in
+        # (Apple-Silicon dev loop): it ~halves teacher memory (a 4B teacher ~16 GB -> ~8 GB) and
+        # speeds the precompute, at some numeric cost. RMSNorm/softmax stay fp32 (cast at the
+        # matmul site, mirroring mlx_backend's mixed-precision policy), and every cast is guarded
+        # so the fp32 path stays bit-identical to before (conformance/smoke untouched).
+        self._cd = _DTYPES[compute_dtype]
+        self._w = {k: v.astype(self._cd) for k, v in weights.items()}
+        # Opt-in mx.compile of the (logits-only) forward — fuses the per-layer op stream into one
+        # Metal graph. OFF by default so the eager path the conformance/parity tests exercise is
+        # untouched. NB this is the TEACHER PRECOMPUTE forward (fixed-shape, forward-only, not in
+        # the parity test path) — a different surface from the student forward/eval compile that
+        # issue #30 rejected (retrace on eval's trailing batch + lands in the parity path).
+        self._compiled_logits = mx.compile(self._logits) if compile else None
+
+    def _cast(self, t: mx.array) -> mx.array:
+        """Cast to the compute dtype; no-op (no identity node) when already there."""
+        return t if t.dtype == self._cd else t.astype(self._cd)
 
     # --- constructors --------------------------------------------------------
     @classmethod
-    def from_config(cls, config: TeacherConfig, *, seed: int = 0) -> "MLXConversionTeacher":
+    def from_config(cls, config: TeacherConfig, *, seed: int = 0,
+                    compute_dtype: str = "fp32", compile: bool = False
+                    ) -> "MLXConversionTeacher":
         """Random-init synthetic teacher (offline tests / small local checks)."""
         config.validate()
         key = mx.random.key(seed)
@@ -101,10 +121,11 @@ class MLXConversionTeacher(ConversionTeacher):
         if not c.tie_embeddings:
             w["lm_head"] = rand((c.vocab_size, c.d_model), next(ki))
         mx.eval(list(w.values()))
-        return cls(config, w)
+        return cls(config, w, compute_dtype=compute_dtype, compile=compile)
 
     @classmethod
-    def from_pretrained(cls, path, config: Optional[TeacherConfig] = None
+    def from_pretrained(cls, path, config: Optional[TeacherConfig] = None, *,
+                        compute_dtype: str = "fp32", compile: bool = False
                         ) -> "MLXConversionTeacher":
         """Load a local HuggingFace Qwen3 checkpoint directory (config.json + safetensors).
 
@@ -127,26 +148,44 @@ class MLXConversionTeacher(ConversionTeacher):
             with open(p / "config.json") as f:
                 config = TeacherConfig.from_hf_dict(json.load(f))
         hf = _load_safetensors_dir(p)
-        return cls(config, _hf_to_internal(hf, config))
+        return cls(config, _hf_to_internal(hf, config),
+                   compute_dtype=compute_dtype, compile=compile)
 
     # --- ConversionTeacher ---------------------------------------------------
-    def forward(self, token_batch, *, return_hidden: bool = False) -> TeacherForward:
-        tokens = mx.array(token_batch)
+    def _logits(self, tokens: mx.array) -> mx.array:
+        """Logits-only forward (the #94 precompute path) — a pure fn of `tokens` over the frozen
+        weight dict, so it is the `mx.compile` target. The hidden-states path stays in `forward`."""
         c = self.config
         h = self._w["embed"][tokens]                          # (B, L, D)
         L = h.shape[1]
         cos, sin = _rope_cos_sin(mx.arange(L), c.head_dim, c.rope_theta)
-        mask = mx.tril(mx.ones((L, L), dtype=mx.bool_))       # causal mask, built once
-        hidden: List[mx.array] = [h] if return_hidden else []
+        mask = self._causal_mask(L)
         for i in range(c.n_layers):
             h = h + self._attn(h, i, cos, sin, mask)
             h = h + self._mlp(h, i)
-            if return_hidden:
-                hidden.append(h)
         # Emit logits over the tokenizer vocab (padded embedding rows are never teacher targets).
-        logits = (_rms_norm(h, self._w["final_ln"], c.rms_norm_eps)
+        return (self._cast(_rms_norm(h, self._w["final_ln"], c.rms_norm_eps))
+                @ self._lm_head().T)[..., :c.effective_vocab_size]
+
+    def forward(self, token_batch, *, return_hidden: bool = False) -> TeacherForward:
+        tokens = mx.array(token_batch)
+        if not return_hidden:
+            fn = self._compiled_logits or self._logits   # compiled when enabled, else eager
+            return TeacherForward(logits=mx.stop_gradient(fn(tokens)), hidden_states=None)
+        # Hidden-states path (MOHAWK hidden-align #100) stays eager — not the precompute hot path.
+        c = self.config
+        h = self._w["embed"][tokens]                          # (B, L, D)
+        L = h.shape[1]
+        cos, sin = _rope_cos_sin(mx.arange(L), c.head_dim, c.rope_theta)
+        mask = self._causal_mask(L)
+        hidden: List[mx.array] = [h]
+        for i in range(c.n_layers):
+            h = h + self._attn(h, i, cos, sin, mask)
+            h = h + self._mlp(h, i)
+            hidden.append(h)
+        logits = (self._cast(_rms_norm(h, self._w["final_ln"], c.rms_norm_eps))
                   @ self._lm_head().T)[..., :c.effective_vocab_size]
-        hs = tuple(mx.stop_gradient(t) for t in hidden) if return_hidden else None
+        hs = tuple(mx.stop_gradient(t) for t in hidden)
         return TeacherForward(logits=mx.stop_gradient(logits), hidden_states=hs)
 
     def topk_logits(self, token_batch, k: int) -> Tuple[mx.array, mx.array]:
@@ -184,9 +223,9 @@ class MLXConversionTeacher(ConversionTeacher):
         p = f"layer.{i}."
         B, L, _ = x.shape
         Hq, Hkv, Dh = c.n_heads, c.n_kv_heads, c.head_dim
-        xn = _rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps)
-        q = xn @ self._w[p + "q_w"].T                                # (B,L,q_dim), Qwen3: no bias
-        k = xn @ self._w[p + "k_w"].T                                # (B,L,kv_dim)
+        xc = self._cast(_rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps))
+        q = xc @ self._w[p + "q_w"].T                                # (B,L,q_dim), Qwen3: no bias
+        k = xc @ self._w[p + "k_w"].T                                # (B,L,kv_dim)
 
         def heads(t, H):
             return t.reshape(B, L, H, Dh).transpose(0, 2, 1, 3)
@@ -229,10 +268,10 @@ class MLXConversionTeacher(ConversionTeacher):
         p = f"layer.{i}."
         B, L, _ = x.shape
         Hq, Hkv, Dh = c.n_heads, c.n_kv_heads, c.head_dim
-        xn = _rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps)
-        q = xn @ self._w[p + "q_w"].T                         # (B,L,q_dim), Qwen3: no bias
-        k = xn @ self._w[p + "k_w"].T                         # (B,L,kv_dim)
-        v = xn @ self._w[p + "v_w"].T
+        xc = self._cast(_rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps))
+        q = xc @ self._w[p + "q_w"].T                         # (B,L,q_dim), Qwen3: no bias
+        k = xc @ self._w[p + "k_w"].T                         # (B,L,kv_dim)
+        v = xc @ self._w[p + "v_w"].T
 
         def heads(t, H):
             return t.reshape(B, L, H, Dh).transpose(0, 2, 1, 3)   # (B,H,L,Dh)
@@ -245,16 +284,16 @@ class MLXConversionTeacher(ConversionTeacher):
             k, v = mx.repeat(k, rep, axis=1), mx.repeat(v, rep, axis=1)
         scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(Dh)   # (B,Hq,L,L)
         scores = mx.where(mask, scores, mx.array(float("-inf"), dtype=scores.dtype))
-        out = _softmax_lastdim(scores) @ v                   # (B,Hq,L,Dh)
+        out = self._cast(_softmax_lastdim(scores)) @ v       # (B,Hq,L,Dh)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, Hq * Dh)
         return out @ self._w[p + "o_w"].T                    # (B,L,D), o has no bias
 
     def _mlp(self, x: mx.array, i: int) -> mx.array:
         c = self.config
         p = f"layer.{i}."
-        xn = _rms_norm(x, self._w[p + "post_ln"], c.rms_norm_eps)
-        gate = _silu(xn @ self._w[p + "gate_w"].T)
-        up = xn @ self._w[p + "up_w"].T
+        xc = self._cast(_rms_norm(x, self._w[p + "post_ln"], c.rms_norm_eps))
+        gate = _silu(xc @ self._w[p + "gate_w"].T)
+        up = xc @ self._w[p + "up_w"].T
         return (gate * up) @ self._w[p + "down_w"].T
 
 

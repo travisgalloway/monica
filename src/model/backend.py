@@ -102,16 +102,22 @@ def _mlx_backend() -> Backend:
         from .mlx_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
-    def _make_teacher(config=None, *, pretrained=None, seed=0):
+    def _make_teacher(config=None, *, pretrained=None, seed=0,
+                      compute_dtype="fp32", compile=False):
         """Frozen conversion teacher (#93): `pretrained` (an HF checkpoint dir / repo id)
-        loads real weights; otherwise a synthetic teacher is built from `config`."""
+        loads real weights; otherwise a synthetic teacher is built from `config`.
+
+        `compute_dtype` ("fp32" default; "fp16" a local Apple-Silicon opt-in that halves teacher
+        memory) and `compile` (opt-in `mx.compile` of the logits-only forward) are MLX-local
+        precompute levers — both default to the bit-identical eager fp32 path."""
         from .mlx_teacher import MLXConversionTeacher
+        opts = dict(compute_dtype=compute_dtype, compile=compile)
         if pretrained is not None:
-            return MLXConversionTeacher.from_pretrained(pretrained, config)
+            return MLXConversionTeacher.from_pretrained(pretrained, config, **opts)
         if config is None:
             raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
                              "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
-        return MLXConversionTeacher.from_config(config, seed=seed)
+        return MLXConversionTeacher.from_config(config, seed=seed, **opts)
 
     def _init_student(student, teacher, method):
         """Initialize a student from a teacher (#99); `method` is an `InitMethod`."""
@@ -186,10 +192,14 @@ def _cuda_backend() -> Backend:
         from .cuda_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
-    def _make_teacher(config=None, *, pretrained=None, seed=0):
+    def _make_teacher(config=None, *, pretrained=None, seed=0,
+                      compute_dtype="fp32", compile=False):
         """Frozen conversion teacher (#93/#94), torch port. `pretrained` (an HF checkpoint dir /
         repo id) loads real weights — this is how the dominant teacher precompute runs on the
-        cloud GPU; otherwise a synthetic teacher is built from `config`."""
+        cloud GPU; otherwise a synthetic teacher is built from `config`.
+
+        `compute_dtype`/`compile` are accepted for a uniform `make_teacher` signature but are
+        MLX-local levers; the CUDA teacher's own dtype/torch.compile path is separate (#145)."""
         from .cuda_teacher import CUDATeacher
         if pretrained is not None:
             return CUDATeacher.from_pretrained(pretrained, config)
