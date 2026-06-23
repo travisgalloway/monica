@@ -1,0 +1,44 @@
+# small.yaml — FAST LOCAL ITERATION config (~2.6M params, byte vocab).
+#
+# Purpose: exercise the REAL training/distill code paths end-to-end on Apple Silicon in
+# seconds, not validate a usable model. It sits in the gap between toy.yaml (~64K, 2 layers —
+# pure correctness/exact-resume) and poc*.yaml (~100-205M, 24 layers, ~99 s/step — too slow to
+# iterate on locally). Use it to sanity-check a change to the loop, the SSD scan, mixed
+# precision / loss scaling, checkpoint round-trip, or the distill stages before paying for a
+# cloud run. `scripts/local_validate.sh` trains this on the offline byte corpus.
+#
+# Real Mamba-2/SSD architecture (multi-head scalar-A SSM), just narrow + shallow.
+d_model: 256
+n_layers: 6
+d_state: 16            # SSM state width N (per head, shared B/C group)
+expand: 2              # d_inner = 512
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 512/64 = 8 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 256        # byte-fallback tokenizer -> runs fully offline (no HF download); matches
+                       # `tokenize --byte-fallback`. Bump to your tokenizer vocab to train on text.
+seq_len: 256
+tie_embeddings: true
+
+# fp16 + dynamic loss scaling on purpose: this is the precision path the real scale run uses
+# (#3), so the fast loop exercises the loss-scaler / overflow-skip stage too. Switch to fp32 if
+# you need bit-exact resume here (toy.yaml is the dedicated exact-resume gate).
+precision: fp16
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny + shallow -> activations fit easily; keep the step cheap
+
+# dt-projection bias init (load-bearing — identical across the config family)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
+
+# --- Quick local smoke (a handful of steps on the offline byte corpus) ---------------
+#   python -m src.data.download --dummy --out data/raw --max-docs 2000
+#   python -m src.data.tokenize --in data/raw/dummy.txt --out data/ids.npy --byte-fallback
+#   python -m src.data.pack  --in data/ids.npy --out data/packed.bin
+#   python -m src.data.split --packed data/packed.bin --out data/small-split --val-tokens 2000
+#   .venv/bin/python scripts/train.py --config config/small.yaml --data data/small-split \
+#       --out runs/small --total-tokens 2000000 --batch-size 8 --grad-accum 1 --eval-every 50
+# MEASURED (M-series, `bench_train_step.py --config config/small.yaml --batch 8 --grad-accum 1`):
+# ~0.08 s/step at 2,048 tok/step, peak ~0.8 GB — sub-second iteration for code-path validation.

@@ -189,7 +189,14 @@ python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 
 
 For a **real corpus** and the full train → serve → eval flow, see
 [`docs/usage.md`](docs/usage.md); for the **cloud** (R2 + RunPod) pipeline, see
-[`docs/infrastructure.md`](docs/infrastructure.md).
+[`docs/infrastructure.md`](docs/infrastructure.md). To **validate every stage locally** in one
+offline command — and for the small local-training configs (`config/small.yaml`,
+`config/poc-small.yaml`) and the local Qwen3 teacher — see
+[`docs/local-development.md`](docs/local-development.md):
+
+```bash
+scripts/local_validate.sh      # data → smoke gate → small.yaml train → distill smoke → teacher precompute
+```
 
 Run the smoke gate (the M4 gate) to confirm the backend, training loop, and exact-resume all
 pass before scaling:
