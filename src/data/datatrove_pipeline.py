@@ -17,7 +17,7 @@ CPU pod, while **reusing** the project filter/dedup *logic* rather than re-deriv
     [then] datatrove-native MinHash dedup (the distributed win) -> <out>/dedup
 
 The datatrove/our-code boundary stops at **cleaned text**: the existing `tokenize.py`/`pack.py`/
-`shard.py` turn cleaned shards into the Qwen2.5 uint32 trainer shards (trainer format unchanged).
+`shard.py` turn cleaned shards into the Qwen3 uint32 trainer shards (trainer format unchanged).
 
 ABOVE THE SEAM — datatrove has **no torch dependency**, and every datatrove import here is **lazy**
 (inside functions / a block factory) so the module imports cleanly on the main py3.14 env where

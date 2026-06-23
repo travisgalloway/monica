@@ -28,10 +28,10 @@ def _ce_sum_chunked(flat: np.ndarray, targets: np.ndarray,
     """Sum of per-token cross-entropy (optionally `weights`-weighted) over `flat`
     (rows = tokens, cols = vocab), plus the total weight. Computed in float64 over
     row-chunks so the stable-softmax temporaries are bounded to (chunk, V) instead of
-    the full (B*T, V): at the Qwen2.5 vocab (151,646) a single eval batch's logits are
+    the full (B*T, V): at the Qwen3 vocab (151,669) a single eval batch's logits are
     ~40 GB in float64, which made eval thrash/OOM on the host. `chunk` shrinks with V so
     each (chunk, V) float64 temporary stays under `_CE_CHUNK_BYTES` regardless of vocab
-    (~221 rows at the Qwen2.5 vocab), capped at `_CE_CHUNK_CAP`. For chunk >= n (small /
+    (~221 rows at the Qwen3 vocab), capped at `_CE_CHUNK_CAP`. For chunk >= n (small /
     test vocabs, where the byte budget exceeds the row count) the whole array is one block,
     so the result is bit-identical to the full-array float64 computation and the numeric
     contract with `masked_cross_entropy` is preserved.

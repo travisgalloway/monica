@@ -78,6 +78,37 @@ except Exception:
     _CAUSAL_CONV1D = None
 
 
+_FAST_PATH_REPORTED = False
+
+
+def fast_path_status() -> "tuple[bool, bool]":
+    """(fused SSD scan available?, causal-conv1d available?) — the two #40 `cuda-fast`
+    kernels. Both gate the fused paths; absent, the SSD scan + conv run in pure PyTorch."""
+    return (_fused_scan() is not None, _CAUSAL_CONV1D is not None)
+
+
+def _report_fast_path_once(device: "torch.device") -> None:
+    """On the first CUDA model built, log whether the fused Mamba kernels are active. A
+    silent pure-PyTorch fallback on a GPU is a (large) throughput trap during a sweep — make
+    it loud so a missing `pip install -e .[cuda-fast]` is caught before a long run, not after."""
+    global _FAST_PATH_REPORTED
+    if _FAST_PATH_REPORTED or device.type != "cuda":
+        return
+    _FAST_PATH_REPORTED = True
+    scan_ok, conv_ok = fast_path_status()
+    if scan_ok and conv_ok:
+        print("[cuda] fused Mamba kernels ACTIVE (mamba-ssm SSD scan + causal-conv1d).")
+    else:
+        import warnings
+        missing = ", ".join(n for n, ok in
+                            (("mamba-ssm (SSD scan)", scan_ok), ("causal-conv1d", conv_ok)) if not ok)
+        warnings.warn(
+            f"[cuda] running on GPU WITHOUT fused Mamba kernels — missing: {missing}. "
+            "The SSD scan/conv fall back to pure PyTorch (much slower). Install the fast "
+            "path with: pip install -e \".[dev,data,cuda-fast]\" (#40).",
+            RuntimeWarning, stacklevel=2)
+
+
 def _silu(x: Array) -> Array:
     return F.silu(x)
 
@@ -555,6 +586,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self._state = None
         self.to(self._device)
+        _report_fast_path_once(self._device)
 
     def _head(self, h: Array) -> Array:
         # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is upcast

@@ -43,7 +43,7 @@ def class_root(base, cls: str) -> Path:
 
 
 def tokenized_dir_name(tokenizer: str, seq_len: int) -> str:
-    """The name-pin for a tokenized folder: `<tokenizer>-<seqlen_k>` (e.g. `qwen25-8k`). This is the
+    """The name-pin for a tokenized folder: `<tokenizer>-<seqlen_k>` (e.g. `qwen3-8k`). This is the
     one place the tokenizer + seq_len naming convention is defined."""
     return f"{tokenizer}-{seq_len // 1024}k"
 

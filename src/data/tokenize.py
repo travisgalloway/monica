@@ -164,7 +164,7 @@ def main() -> None:
     _loaders = {"olmo": load_olmo_tokenizer, "qwen3": load_qwen3_tokenizer,
                 "qwen25": load_qwen25_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     tok = ByteTokenizer() if args.byte_fallback else _loaders[args.tokenizer](args.model_id)
-    dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen2.5)
+    dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen3)
     # Input is either a one-doc-per-line text file or corpus Parquet shards (dir/.parquet).
     with _open_texts(args.inp) as texts:
         stream = _capped(tokenize_texts(texts, tok), args.max_tokens)

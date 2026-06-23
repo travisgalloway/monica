@@ -179,9 +179,13 @@ RunPod **`-devel`** image so the build sees the preinstalled CUDA torch (e.g.
 
 ```bash
 # 1. Backend install (the [cuda] extra pulls torch; mlx is Mac-only).
-pip install -e ".[dev,data,cuda]"
-#    Optional fused kernels (#40) — mamba-ssm Triton SSD scan + causal-conv1d:
+#    For any GPU TRAINING/precompute run use the [cuda-fast] extra — it adds the fused
+#    mamba-ssm Triton SSD scan + causal-conv1d (#40). Without them the SSD scan/conv fall
+#    back to pure PyTorch (much slower); the CUDA backend logs a RuntimeWarning at model
+#    build if it's running on GPU without them, so you catch a missing install early.
 pip install -e ".[dev,data,cuda-fast]"
+#    [cuda] alone (no fused kernels) is fine only for CPU-parity tests / data-prep:
+#    pip install -e ".[dev,data,cuda]"
 
 # 2. CUDA smoke gate — prove the torch backend resumes bit-exactly through the
 #    double-buffered CheckpointStore. Build a tiny toy split on the pod, then:

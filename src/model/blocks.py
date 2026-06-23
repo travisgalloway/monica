@@ -54,7 +54,7 @@ class MambaConfig:
 
     # --- vocab / sequence ---
     # Tokenizer vocab. Determines the packed token dtype (see `packing_dtype`): < 65536
-    # packs as uint16 (POC: OLMo 50280), otherwise uint32 (Qwen2.5 151646, #90). Bounded
+    # packs as uint16 (POC: OLMo 50280), otherwise uint32 (Qwen3 151669, #90). Bounded
     # by the uint32 ceiling (2**32).
     vocab_size: int = 50280
     seq_len: int = 1024

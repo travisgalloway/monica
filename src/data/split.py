@@ -26,7 +26,7 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     data = open_packed(packed_path)
-    dtype = packed_dtype(packed_path)          # uint16 (POC) / uint32 (Qwen2.5) — preserved
+    dtype = packed_dtype(packed_path)          # uint16 (POC) / uint32 (Qwen3) — preserved
     n = data.shape[0]
     if val_tokens >= n:
         raise ValueError(f"val_tokens={val_tokens} >= total tokens={n}")

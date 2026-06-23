@@ -8,7 +8,7 @@ to low-GB) to keep R2 Class-A op counts down. Alongside each token shard we writ
 across packed docs.
 
 ABOVE THE SEAM — numpy + stdlib only. Token shards are the same flat format as ``pack.py``
-(uint16 for the POC vocab, uint32 for the Qwen2.5 distillation vocab, #90 — the dtype is
+(uint16 for the POC vocab, uint32 for the Qwen3 distillation vocab, #90 — the dtype is
 recorded in the manifest, so ``PackedLoader``/``open_shard`` read them back correctly); the
 `.bounds` sidecar is the new artifact a boundary-aware loader consumes.
 
@@ -46,7 +46,7 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     requirement for the SSM's packing-aware boundary reset (#68). `seq_len` should be a
     multiple of `chunk_align`.
 
-    `dtype` is the packed token dtype: uint16 (POC default) or uint32 (Qwen2.5 vocab, #90).
+    `dtype` is the packed token dtype: uint16 (POC default) or uint32 (Qwen3 vocab, #90).
     The shards are the same flat format as `pack.py`; the manifest records the dtype."""
     dtype = np.dtype(dtype)
     hi = int(np.iinfo(dtype).max)

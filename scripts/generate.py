@@ -51,9 +51,10 @@ def main() -> None:
     ap.add_argument("--no-repeat-ngram-size", type=int, default=None,
                     help="hard-ban repeating any n-gram of this size (e.g. 3)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--tokenizer", choices=("qwen25", "olmo"), default="qwen25",
-                    help="tokenizer matching the config's vocab (default: qwen25; "
-                         "use olmo for the OLMo-vocab config/poc.yaml)")
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "olmo"), default="qwen25",
+                    help="tokenizer matching the config's vocab (default: qwen25, the "
+                         "from-scratch poc-qwen reserve; use qwen3 for the distillation "
+                         "student config/student-1b.yaml, olmo for config/poc.yaml)")
     ap.add_argument("--byte-fallback", action="store_true",
                     help="offline ByteTokenizer (toy config only; not OLMo/Qwen-compatible)")
     args = ap.parse_args()
@@ -72,6 +73,7 @@ def main() -> None:
         ByteTokenizer,
         load_olmo_tokenizer,
         load_qwen25_tokenizer,
+        load_qwen3_tokenizer,
     )
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
@@ -87,6 +89,8 @@ def main() -> None:
 
     if args.byte_fallback:
         tok = ByteTokenizer()
+    elif args.tokenizer == "qwen3":
+        tok = load_qwen3_tokenizer()
     elif args.tokenizer == "qwen25":
         tok = load_qwen25_tokenizer()
     else:

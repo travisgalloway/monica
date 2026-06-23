@@ -36,9 +36,11 @@ def _build_corpus(root: Path) -> Path:
     from src.data.split import split_shards
 
     out_root = root / "pd"
-    build_distill_corpus(ingest_dummy(400, source="smoke"), out_root, tokenizer="qwen25",
+    # tokenizer label only names the storage subdir here (byte_fallback uses the 256-vocab
+    # ByteTokenizer); kept as qwen3 to match toy-distill.yaml's `tokenizer: qwen3`.
+    build_distill_corpus(ingest_dummy(400, source="smoke"), out_root, tokenizer="qwen3",
                          seq_len=SEQ_LEN, byte_fallback=True)
-    tok_dir = storage.corpus_tokenized_dir(out_root, "qwen25", SEQ_LEN)
+    tok_dir = storage.corpus_tokenized_dir(out_root, "qwen3", SEQ_LEN)
     split_dir = root / "split"
     split_shards(tok_dir, split_dir, val_tokens=SEQ_LEN * 4)
     return split_dir

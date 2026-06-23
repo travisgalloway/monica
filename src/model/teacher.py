@@ -149,7 +149,7 @@ class TeacherConfig:
 
     @classmethod
     def from_hf_dict(cls, hf: Dict[str, Any]) -> "TeacherConfig":
-        """Build from a HuggingFace Qwen2 `config.json` dict."""
+        """Build from a HuggingFace Qwen2/Qwen3 `config.json` dict (same field schema)."""
         n_heads = int(hf["num_attention_heads"])
         d_model = int(hf["hidden_size"])
         head_dim = int(hf.get("head_dim", d_model // n_heads))

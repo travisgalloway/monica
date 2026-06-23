@@ -58,7 +58,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Decision | Choice | Why | Source |
 |---|---|---|---|
 | Hardware isolation | one seam (`ModelInterface`) | clean MLX→CUDA migration | `src/model/interface.py` |
-| Token storage | uint16/uint32 packing (per vocab, #90) | uint16 when vocab < 65536 (POC), uint32 for Qwen2.5 (151,646) | `src/data/pack.py` |
+| Token storage | uint16/uint32 packing (per vocab, #90) | uint16 when vocab < 65536 (POC), uint32 for the Qwen3 distillation vocab (151,669) | `src/data/pack.py` |
 | Tokenizer (POC) | `allenai/OLMo-7B-hf` (vocab 50280) | fits uint16; matches AI2 for comparison | `src/data/tokenize.py` |
 | Embedding | tied (input = output) | ~38M of ~100M budget at POC scale | `config/poc.yaml` |
 | dt-bias init | inverse-softplus, log-uniform (per head) | **load-bearing** — model can't learn recall without it | `src/model/mlx_backend.py` |

@@ -92,7 +92,7 @@ def build_reasoning_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwe
             f.write(json.dumps(row) + "\n")
 
     tok = _load_tokenizer(tokenizer, model_id, byte_fallback)
-    dtype = packing_dtype_for(tok.vocab_size)          # uint16 (byte) / uint32 (Qwen2.5)
+    dtype = packing_dtype_for(tok.vocab_size)          # uint16 (byte) / uint32 (Qwen3)
     vocab = getattr(tok, "vocab_size", None)
 
     # Masked JSONL records + the per-trace token streams for atomic packing (kept in lockstep, so
