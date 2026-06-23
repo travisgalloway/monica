@@ -594,6 +594,12 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self._state = None
         self.to(self._device)
         _report_fast_path_once(self._device)
+        # torch.compile (#145): fuse the pure-tensor forward (layer loop + head) via inductor.
+        # Opt-in (default off) so the eager path — and every parity/conformance run — is
+        # untouched. We compile the inner `_forward_compute` rather than `forward`, which
+        # opens with a numpy->tensor boundary that isn't cleanly traceable. A no-op when off.
+        if config.torch_compile:
+            self._forward_compute = torch.compile(self._forward_compute)
 
     def _head(self, h: Array) -> Array:
         # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is upcast
@@ -614,6 +620,13 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             return _checkpoint(layer.forward_seq, h, seg_ids, use_reentrant=False)
         return layer.forward_seq(h, seg_ids)
 
+    def _forward_compute(self, h: Array, seg: Array = None) -> Array:
+        """Pure-tensor forward (layer loop + final norm + head) — the region torch.compile
+        wraps (#145). Split out of `forward` so the numpy->tensor boundary stays eager."""
+        for layer in self.layers:
+            h = self._layer_forward(layer, h, seg)
+        return self._head(self.norm_f(h))
+
     # --- ModelInterface ---
     def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
         ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
@@ -621,9 +634,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         seg = None
         if seg_ids is not None:                      # (B, L) document ids -> boundary-aware (#68)
             seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
-        for layer in self.layers:
-            h = self._layer_forward(layer, h, seg)
-        return self._head(self.norm_f(h))
+        return self._forward_compute(h, seg)
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
         ids = torch.as_tensor(np.asarray(token), dtype=torch.long, device=self._device)

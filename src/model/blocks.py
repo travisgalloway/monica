@@ -77,6 +77,13 @@ class MambaConfig:
     # 32GB and swaps). Off for toy/smoke (tiny; keep exact-resume cheap).
     grad_checkpoint: bool = False
 
+    # CUDA-only (#145): compile the student forward with torch.compile (inductor) to fuse
+    # the SSD scan + hybrid forward's many small ops (~1.3-2x on GPU). Opt-in and default
+    # OFF so every parity/conformance/smoke path runs the eager code unchanged. A no-op on
+    # MLX (the MLX backend never reads it) and on the eager torch path. The optional
+    # mamba-ssm/causal-conv1d kernels (#40) graph-break inductor around them (safe).
+    torch_compile: bool = False
+
     # --- hybrid attention (#67) ---
     # Make the model a Mamba-2 HYBRID: every Nth block is a causal multi-head
     # attention block INSTEAD OF a Mamba block (n_layers unchanged). Pure SSMs lag on
