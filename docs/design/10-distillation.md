@@ -67,8 +67,10 @@ rejected:** it moved to a new 250k vocab that breaks aligned logit KD and bloats
 embedding.
 
 Smaller / alternative conversion teachers on the Qwen tokenizer family: `open-r1/OpenR1-Distill-7B`
-(Apache-2.0, Qwen2 arch — the prior choice, retained as a `TeacherConfig` fixture), the original
-DeepSeek-R1-Distill-Qwen-1.5B (MIT, weights-only), Qwen2.5-Coder/-Math-1.5B (Apache-2.0). Avoid
+(Apache-2.0, Qwen2 arch — the prior choice), the original DeepSeek-R1-Distill-Qwen-1.5B (MIT,
+weights-only), Qwen2.5-Coder/-Math-1.5B (Apache-2.0). These are **Qwen2** models; the teacher loader
+is now Qwen3-only (per-head Q/K RMSNorm, no QKV bias), so adopting one means restoring dual
+Qwen2/Qwen3 checkpoint mapping + forward math first. Avoid
 Llama / StarCoder2 as a tokenizer source (use restrictions). The MOHAWK lineage's demonstrated
 teacher family was Phi (Phi-4-mini, MIT) — usable, but on a different tokenizer.
 

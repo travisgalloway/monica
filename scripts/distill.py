@@ -67,9 +67,7 @@ def _parse_args() -> argparse.Namespace:
 def _teacher_config_for(model_id: str):
     """Known teacher repo id -> TeacherConfig (so logits slice to the tokenizer vocab)."""
     from src.model.teacher import TeacherConfig
-    known = {"Qwen/Qwen3-4B-Thinking-2507": TeacherConfig.qwen3_4b_thinking,
-             "open-r1/OpenR1-Distill-7B": TeacherConfig.openr1_distill_7b,
-             "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": TeacherConfig.qwen_1_5b}
+    known = {"Qwen/Qwen3-4B-Thinking-2507": TeacherConfig.qwen3_4b_thinking}
     return known[model_id]() if model_id in known else None
 
 

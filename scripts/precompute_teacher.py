@@ -55,9 +55,7 @@ def _teacher_config_for(model_id: str):
     vocab — see `TeacherConfig.qwen3_4b_thinking`'s note). None lets `from_pretrained` read
     the checkpoint's `config.json`."""
     from src.model.teacher import TeacherConfig
-    known = {"Qwen/Qwen3-4B-Thinking-2507": TeacherConfig.qwen3_4b_thinking,
-             "open-r1/OpenR1-Distill-7B": TeacherConfig.openr1_distill_7b,
-             "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": TeacherConfig.qwen_1_5b}
+    known = {"Qwen/Qwen3-4B-Thinking-2507": TeacherConfig.qwen3_4b_thinking}
     return known[model_id]() if model_id in known else None
 
 
@@ -107,7 +105,7 @@ def main() -> None:
                 f"teacher effective_vocab_size {teacher.config.effective_vocab_size} != manifest "
                 f"tokenizer vocab {manifest.vocab_size} ({manifest.tokenizer}); the student cannot "
                 f"consume these top-k indices. Use a --pretrained id known to _teacher_config_for "
-                f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.openr1_distill_7b.")
+                f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.qwen3_4b_thinking.")
 
     eff_vocab = teacher.config.effective_vocab_size
     out_dir = args.out or storage.teacher_outputs_dir(args.data)
