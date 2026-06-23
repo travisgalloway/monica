@@ -526,17 +526,24 @@ class AttentionBlock(nn.Module):
         q, k, v = self._qkv(xn, cd)                          # (B,H,L,Dh) fp32
         cos, sin = _rope_cos_sin(torch.arange(L, device=x.device), self.Dh)
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
-        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.Dh)      # (B,H,L,L)
-        causal = torch.tril(torch.ones((L, L), dtype=torch.bool, device=x.device))
+        # SDPA (#144): fuses QKᵀ/softmax/AV and never materializes the (B,H,L,L) score
+        # tensor — the O(L²) memory hot spot at seq 8192. GEMMs run in the compute dtype
+        # (cd); softmax stays fp32-stable inside SDPA. In an fp32 config cd==fp32, so this
+        # matches the old eager path within reduction order (parity holds at ~1e-4); a
+        # bf16 run becomes FlashAttention-eligible.
+        q, k, v = q.to(cd), k.to(cd), v.to(cd)
+        scale = 1.0 / math.sqrt(self.Dh)
         if seg_ids is None:
-            scores = scores.masked_fill(~causal, float("-inf"))
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
         else:
             # Block-diagonal: a token only attends within its own document (#68). Exact for
             # arbitrary boundaries (attention needs no chunk-alignment, unlike the SSM scan).
+            # The causal diagonal keeps each row's self-key, so no row is fully masked (no NaN).
+            causal = torch.tril(torch.ones((L, L), dtype=torch.bool, device=x.device))
             same = seg_ids[:, :, None] == seg_ids[:, None, :]        # (B,L,L)
             allow = causal[None] & same                             # (B,L,L)
-            scores = scores.masked_fill(~allow[:, None], float("-inf"))
-        out = _softmax_lastdim(scores) @ v                   # (B,H,L,Dh)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=allow[:, None], scale=scale)      # (B,H,L,Dh)
         out = out.permute(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
         return x + _linear(self.o_proj, _cast(out, cd), cd)
 
