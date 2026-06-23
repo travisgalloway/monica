@@ -21,9 +21,10 @@ SFT and GRPO refines it.
 **What.** Turn a text-continuer into a model that follows instructions, adopts a chat template,
 and respects a system prompt — the foundation every later layer assumes.
 
-**Why a stage at all.** The conversion teacher (`open-r1/OpenR1-Distill-7B`) is already
-instruction-tuned, so the hybrid inherits much of this through the matching — but the architecture
-conversion can blur instruction-following, so an explicit instruct SFT stage re-establishes it.
+**Why a stage at all.** The conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`) is already
+instruction-tuned (and reasoning/thinking-tuned), so the hybrid inherits much of this through the
+matching — but the architecture conversion can blur instruction-following, so an explicit instruct
+SFT stage re-establishes it.
 
 **Method.** SFT on general instruction–response pairs under the Qwen chat template (a set such as
 UltraChat plus the reasoning traces, which also carry instruction-following), optionally DPO (#77)
@@ -41,7 +42,7 @@ Qwen tokenizer), topped up from a larger R1 distill (14B/32B) only where coverag
 SFT is the main event.**
 
 `src/data/reasoning_sft.py` builds the corpus under `shared/sft/cleaned/reasoning-traces/` +
-`shared/sft/tokenized/qwen25-8k/` (`reasoning_traces.py` does the `<think>/<answer>` formatting and
+`shared/sft/tokenized/qwen3-8k/` (`reasoning_traces.py` does the `<think>/<answer>` formatting and
 the Mixture-of-Thoughts / `load_topup` sources). It writes **two** forms: `reasoning.jsonl`
 (response-masked records for `SFTLoader`) and `reasoning-packed/` — the long 8K packing where each
 trace is one chunk-aligned document, so **no trace spans a sequence boundary** and `.bounds` marks

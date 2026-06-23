@@ -1,7 +1,7 @@
 """CUDA / PyTorch conversion teacher (below the seam — may import torch).
 
-A faithful torch port of `mlx_teacher.MLXConversionTeacher`: a frozen, forward-only Qwen2
-decoder (open-r1/OpenR1-Distill-7B by default) implementing the portable `ConversionTeacher`
+A faithful torch port of `mlx_teacher.MLXConversionTeacher`: a frozen, forward-only Qwen3
+decoder (Qwen/Qwen3-4B-Thinking-2507 by default) implementing the portable `ConversionTeacher`
 protocol (`src/model/teacher.py`). It exists so the dominant teacher precompute (#94) can run
 on the cloud GPU via `--backend cuda`; the MLX teacher remains the Apple-Silicon dev path.
 
@@ -11,8 +11,9 @@ the teacher exposes no parameter tree — it can never be handed to an optimizer
 `mx.stop_gradient`): even composed into a student loss, no gradient reaches the teacher. All
 compute is fp32 (teacher logits feed a KL term; stability beats speed and the forward is a
 one-time precompute). Runs on CUDA when available, else CPU (so parity is testable on a Mac/Linux
-box). RoPE/attention idioms mirror `cuda_backend.py` but with a theta-configurable RoPE (Qwen2
-`rope_theta`, up to 300k for Open-R1's 32k context).
+box). RoPE/attention idioms mirror `cuda_backend.py` but with a theta-configurable RoPE (Qwen3
+`rope_theta`, 5e6 for Qwen3-4B-Thinking-2507's long context). Qwen3 vs Qwen2: per-head RMSNorm
+on Q and K before RoPE (`q_norm`/`k_norm`), and no QKV bias.
 
 This file imports `torch`, so it lives BELOW the seam — nothing portable imports it.
 """
@@ -78,7 +79,7 @@ def _silu(x: torch.Tensor) -> torch.Tensor:
 
 
 class CUDATeacher(ConversionTeacher):
-    """Frozen Qwen2 conversion teacher on PyTorch. See module docstring."""
+    """Frozen Qwen3 conversion teacher on PyTorch. See module docstring."""
 
     def __init__(self, config: TeacherConfig, weights: Dict[str, torch.Tensor]):
         config.validate()
@@ -106,11 +107,10 @@ class CUDATeacher(ConversionTeacher):
             p = f"layer.{i}."
             w[p + "input_ln"] = torch.ones(c.d_model)
             w[p + "q_w"] = rand(c.q_dim, c.d_model)
-            w[p + "q_b"] = torch.zeros(c.q_dim)
+            w[p + "q_norm"] = torch.ones(c.head_dim)   # Qwen3 per-head Q RMSNorm
             w[p + "k_w"] = rand(c.kv_dim, c.d_model)
-            w[p + "k_b"] = torch.zeros(c.kv_dim)
+            w[p + "k_norm"] = torch.ones(c.head_dim)   # Qwen3 per-head K RMSNorm
             w[p + "v_w"] = rand(c.kv_dim, c.d_model)
-            w[p + "v_b"] = torch.zeros(c.kv_dim)
             w[p + "o_w"] = rand(c.d_model, c.q_dim)
             w[p + "post_ln"] = torch.ones(c.d_model)
             w[p + "gate_w"] = rand(c.intermediate_size, c.d_model)
@@ -123,11 +123,11 @@ class CUDATeacher(ConversionTeacher):
 
     @classmethod
     def from_pretrained(cls, path, config: Optional[TeacherConfig] = None) -> "CUDATeacher":
-        """Load a local HuggingFace Qwen2 checkpoint (config.json + safetensors), or an HF repo id.
+        """Load a local HuggingFace Qwen3 checkpoint (config.json + safetensors), or an HF repo id.
 
         Mirrors `mlx_teacher.from_pretrained`: a bare 'owner/name' is fetched lazily via
         `huggingface_hub.snapshot_download`; `config.json` resolves to a `TeacherConfig` when
-        none is passed (but pass `openr1_distill_7b()` so logits are sliced to the tokenizer
+        none is passed (but pass `qwen3_4b_thinking()` so logits are sliced to the tokenizer
         vocab — see that config's note)."""
         p = Path(path)
         if not p.exists():
@@ -189,8 +189,8 @@ class CUDATeacher(ConversionTeacher):
     def attention_projection(self, layer: int) -> AttnProjections:
         p = f"layer.{layer}."
         g = lambda s: self._w[p + s].detach()
-        return AttnProjections(q=g("q_w"), k=g("k_w"), v=g("v_w"), o=g("o_w"),
-                               q_bias=g("q_b"), k_bias=g("k_b"), v_bias=g("v_b"))
+        # Qwen3 has no QKV bias -> bias fields stay None (see AttnProjections docstring).
+        return AttnProjections(q=g("q_w"), k=g("k_w"), v=g("v_w"), o=g("o_w"))
 
     def embedding_matrix(self) -> torch.Tensor:
         return self._w["embed"].detach()
@@ -216,12 +216,14 @@ class CUDATeacher(ConversionTeacher):
         B, L, _ = x.shape
         Hq, Hkv, Dh = c.n_heads, c.n_kv_heads, c.head_dim
         xn = _rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps)
-        q = xn @ self._w[p + "q_w"].t() + self._w[p + "q_b"]
-        k = xn @ self._w[p + "k_w"].t() + self._w[p + "k_b"]
+        q = xn @ self._w[p + "q_w"].t()                          # Qwen3: no bias
+        k = xn @ self._w[p + "k_w"].t()
 
         def heads(t, H):
             return t.reshape(B, L, H, Dh).permute(0, 2, 1, 3)
         q, k = heads(q, Hq), heads(k, Hkv)
+        q = _rms_norm(q, self._w[p + "q_norm"], c.rms_norm_eps)  # Qwen3 per-head Q/K norm,
+        k = _rms_norm(k, self._w[p + "k_norm"], c.rms_norm_eps)  # applied before RoPE
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
         if Hkv != Hq:
             k = k.repeat_interleave(Hq // Hkv, dim=1)
@@ -236,13 +238,15 @@ class CUDATeacher(ConversionTeacher):
         B, L, _ = x.shape
         Hq, Hkv, Dh = c.n_heads, c.n_kv_heads, c.head_dim
         xn = _rms_norm(x, self._w[p + "input_ln"], c.rms_norm_eps)
-        q = xn @ self._w[p + "q_w"].t() + self._w[p + "q_b"]    # (B,L,q_dim)
-        k = xn @ self._w[p + "k_w"].t() + self._w[p + "k_b"]    # (B,L,kv_dim)
-        v = xn @ self._w[p + "v_w"].t() + self._w[p + "v_b"]
+        q = xn @ self._w[p + "q_w"].t()                         # (B,L,q_dim), Qwen3: no bias
+        k = xn @ self._w[p + "k_w"].t()                         # (B,L,kv_dim)
+        v = xn @ self._w[p + "v_w"].t()
 
         def heads(t, H):
             return t.reshape(B, L, H, Dh).permute(0, 2, 1, 3)   # (B,H,L,Dh)
         q, k, v = heads(q, Hq), heads(k, Hkv), heads(v, Hkv)
+        q = _rms_norm(q, self._w[p + "q_norm"], c.rms_norm_eps)  # Qwen3 per-head Q/K norm,
+        k = _rms_norm(k, self._w[p + "k_norm"], c.rms_norm_eps)  # applied before RoPE
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
         if Hkv != Hq:                                          # GQA: repeat kv across groups
             rep = Hq // Hkv
@@ -276,7 +280,7 @@ def _load_safetensors_dir(p: Path) -> Dict[str, torch.Tensor]:
 
 
 def _hf_to_internal(hf: Dict[str, torch.Tensor], cfg: TeacherConfig) -> Dict[str, torch.Tensor]:
-    """Map HuggingFace Qwen2 parameter names onto the internal weight-dict layout (mirrors
+    """Map HuggingFace Qwen3 parameter names onto the internal weight-dict layout (mirrors
     `mlx_teacher._hf_to_internal`)."""
     w: Dict[str, torch.Tensor] = {"embed": hf["model.embed_tokens.weight"]}
     for i in range(cfg.n_layers):
@@ -284,8 +288,9 @@ def _hf_to_internal(hf: Dict[str, torch.Tensor], cfg: TeacherConfig) -> Dict[str
         w[p + "input_ln"] = hf[hp + "input_layernorm.weight"]
         w[p + "post_ln"] = hf[hp + "post_attention_layernorm.weight"]
         for proj, dst in (("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v")):
-            w[p + dst + "_w"] = hf[hp + f"self_attn.{proj}.weight"]
-            w[p + dst + "_b"] = hf[hp + f"self_attn.{proj}.bias"]
+            w[p + dst + "_w"] = hf[hp + f"self_attn.{proj}.weight"]   # Qwen3: no q/k/v bias
+        w[p + "q_norm"] = hf[hp + "self_attn.q_norm.weight"]          # Qwen3 per-head Q/K RMSNorm
+        w[p + "k_norm"] = hf[hp + "self_attn.k_norm.weight"]
         w[p + "o_w"] = hf[hp + "self_attn.o_proj.weight"]
         w[p + "gate_w"] = hf[hp + "mlp.gate_proj.weight"]
         w[p + "up_w"] = hf[hp + "mlp.up_proj.weight"]

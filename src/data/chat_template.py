@@ -1,7 +1,7 @@
 """Qwen ChatML template — the single source of truth for the distillation student's chat
 format (#95), mirroring the role `instruct_format.py` plays for the OLMo POC.
 
-The student shares the **Qwen2.5 tokenizer** with the conversion teacher, so its chat format is
+The student shares the **Qwen3 tokenizer** with the conversion teacher, so its chat format is
 Qwen **ChatML**:
 
     <|im_start|>system\\n{system}<|im_end|>\\n
@@ -13,8 +13,8 @@ as the chat EOS. It MUST be identical across SFT, RL, and serving — a mismatch
 at serving time. So this module is the one place the format is defined, both the data builders
 (#95/#96) and (later) serving import it, and `response_spans` trains the assistant turn **up to
 and including its trailing `<|im_end|>`** so the model learns to stop on it. No separate
-`eos_token_id` is appended — `<|im_end|>` already plays that role (and for Qwen2.5 it *is* the
-`eos_token_id`, id 151645).
+`eos_token_id` is appended — `<|im_end|>` already plays that role (and for Qwen3, token-aligned
+with Qwen2.5, it *is* the `eos_token_id`, id 151645).
 
 Unlike `instruct_format` (newline-free, because the pretraining corpus is one-doc-per-line and
 appends EOS per line), ChatML is multi-line — that is fine here because SFT records are stored as

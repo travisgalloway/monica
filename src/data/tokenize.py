@@ -3,9 +3,12 @@
 The packed token dtype follows the tokenizer vocab (`pack.packing_dtype_for`):
 - **OLMo** (``allenai/OLMo-7B-hf``, vocab 50280 < 65536) — the original POC tokenizer,
   packs as uint16. (``allenai/OLMo-2-1124-7B`` at 100278 was rejected at POC scale.)
-- **Qwen2.5** (vocab 151,646) — fixed by the distillation conversion teacher
-  (open-r1/OpenR1-Distill-7B); exceeds uint16, so it packs as **uint32** (#90, see
-  docs/design/10-distillation.md). This is the scale-up / distillation default.
+- **Qwen3** (vocab ~151,669) — fixed by the distillation conversion teacher
+  (Qwen/Qwen3-4B-Thinking-2507); the unified Qwen3 BPE, token-aligned with Qwen2.5 plus
+  a few added control tokens (incl. <think>/</think>). Exceeds uint16, so it packs as
+  **uint32** (#90, see docs/design/10-distillation.md). This is the distillation default.
+- **Qwen2.5** (vocab 151,646) — the prior teacher's tokenizer; uint32. Kept for back-compat
+  (the DeepSeek-R1-Distill-Qwen variants share it).
 - **StarCoder2** (vocab ~49,152) — a legacy code-corpus tokenizer (the old uint16 scale
   pick, now superseded by Qwen2.5).
 
@@ -22,7 +25,10 @@ from typing import Iterable, Iterator, List
 
 # OLMo — the POC tokenizer (uint16-compatible, vocab < 65536).
 OLMO_TOKENIZER_CANDIDATES = ("allenai/OLMo-7B-hf",)
-# Qwen2.5 (#90) — fixed by the conversion teacher; vocab 151,646 -> uint32 packing. The
+# Qwen3 (#65) — fixed by the conversion teacher (Qwen3-4B-Thinking-2507); vocab ~151,669 ->
+# uint32 packing. Token-aligned with Qwen2.5 plus the added <think>/</think> control tokens.
+QWEN3_TOKENIZER_CANDIDATES = ("Qwen/Qwen3-4B-Thinking-2507", "Qwen/Qwen3-4B")
+# Qwen2.5 (#90) — the prior teacher's tokenizer; vocab 151,646 -> uint32. The
 # DeepSeek-R1-Distill-Qwen variants share this exact tokenizer.
 QWEN25_TOKENIZER_CANDIDATES = ("Qwen/Qwen2.5-1.5B",
                                "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
@@ -57,9 +63,16 @@ def load_olmo_tokenizer(model_id: str | None = None):
     return _load_hf_tokenizer(OLMO_TOKENIZER_CANDIDATES, model_id, "OLMo")
 
 
+def load_qwen3_tokenizer(model_id: str | None = None):
+    """Load the Qwen3 tokenizer — the distillation-student default (vocab ~151,669 ->
+    uint32 packing, #65), shared with the Qwen3-4B-Thinking-2507 teacher. Raises if
+    unavailable."""
+    return _load_hf_tokenizer(QWEN3_TOKENIZER_CANDIDATES, model_id, "Qwen3")
+
+
 def load_qwen25_tokenizer(model_id: str | None = None):
-    """Load the Qwen2.5 tokenizer — the distillation-student default (vocab 151,646 ->
-    uint32 packing, #90), shared with the conversion teacher. Raises if unavailable."""
+    """Load the Qwen2.5 tokenizer — the prior teacher's tokenizer (vocab 151,646 ->
+    uint32 packing, #90). Kept for back-compat. Raises if unavailable."""
     return _load_hf_tokenizer(QWEN25_TOKENIZER_CANDIDATES, model_id, "Qwen2.5")
 
 
@@ -137,7 +150,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True, help="uint16/uint32 ids; .bin streams "
                     "straight into the packed format, .npy goes through `pack` separately")
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--tokenizer", choices=("olmo", "qwen25", "starcoder2"), default="olmo",
+    ap.add_argument("--tokenizer", choices=("olmo", "qwen3", "qwen25", "starcoder2"),
+                    default="olmo",
                     help="HF tokenizer; the packed dtype is uint16/uint32 per its vocab")
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--max-tokens", type=int, default=None,
@@ -147,10 +161,10 @@ def main() -> None:
         ap.error("--max-tokens must be positive (a value <= 0 silently yields 0 tokens)")
 
     from .pack import packing_dtype_for
-    _loaders = {"olmo": load_olmo_tokenizer, "qwen25": load_qwen25_tokenizer,
-                "starcoder2": load_starcoder2_tokenizer}
+    _loaders = {"olmo": load_olmo_tokenizer, "qwen3": load_qwen3_tokenizer,
+                "qwen25": load_qwen25_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     tok = ByteTokenizer() if args.byte_fallback else _loaders[args.tokenizer](args.model_id)
-    dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen2.5)
+    dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen3)
     # Input is either a one-doc-per-line text file or corpus Parquet shards (dir/.parquet).
     with _open_texts(args.inp) as texts:
         stream = _capped(tokenize_texts(texts, tok), args.max_tokens)

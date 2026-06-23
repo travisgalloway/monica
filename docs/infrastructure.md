@@ -28,7 +28,7 @@ Rent a pod only for the handful of stages that genuinely need one:
 
 | Paid stage | Why it needs a pod | Issue |
 |---|---|---|
-| Teacher top-k logit precompute (corpus scale) | the dominant compute cost; runs the 7B teacher over the whole corpus | [#94](https://github.com/travisgalloway/monica/issues/94) |
+| Teacher top-k logit precompute (corpus scale) | the dominant compute cost; runs the Qwen3-4B teacher over the whole corpus | [#94](https://github.com/travisgalloway/monica/issues/94) |
 | R2 + storage plumbing | wiring the `s3fs` readers/writers + secrets | [#80](https://github.com/travisgalloway/monica/issues/80) |
 | Cloud distill smoke run | full flow dress-rehearsal on a cheap GPU | [#81](https://github.com/travisgalloway/monica/issues/81) |
 | ≥1B distill / pretrain runs | throughput needs the card; relies on the `state-spaces/mamba` CUDA kernels | [#75](https://github.com/travisgalloway/monica/issues/75) |
@@ -77,8 +77,8 @@ Two invariants the layout enforces (encoded in `storage.py`):
 
 - **Cleaned text and RL problems are tokenizer-agnostic and durable** — re-tokenize cheaply when
   the tokenizer or `seq_len` changes; never re-clean.
-- **Every tokenized folder name-pins `<tokenizer>-<seqlen_k>`** (e.g. `qwen25-8k`), so multiple
-  tokenized views coexist without collision.
+- **Every tokenized folder name-pins `<tokenizer>-<seqlen_k>`** (e.g. `qwen3-8k`), so multiple
+  tokenized views coexist without collision (the reserve-pretrain corpus stays `qwen25`).
 
 **What invalidates what:** changing the **teacher** invalidates `teacher-outputs/`; changing the
 **tokenizer** invalidates the tokenized views (ids shift); changing the **student layout**
@@ -123,7 +123,7 @@ from `AWS_ENDPOINT_URL_S3` (see `.env.example`). Build locally, then push:
 
 ```bash
 set -a; . ./.env; set +a                                   # load HF/R2 secrets
-python -m src.data.distill_corpus --source text --in <slice> --tokenizer qwen25 \
+python -m src.data.distill_corpus --source text --in <slice> --tokenizer qwen3 \
     --push s3://<bucket>/poc-distill                        # build, then mirror out-root to R2
 python -m src.data.r2_sync down s3://<bucket>/poc-distill data/poc-distill   # pull on a pod
 ```
@@ -179,9 +179,13 @@ RunPod **`-devel`** image so the build sees the preinstalled CUDA torch (e.g.
 
 ```bash
 # 1. Backend install (the [cuda] extra pulls torch; mlx is Mac-only).
-pip install -e ".[dev,data,cuda]"
-#    Optional fused kernels (#40) — mamba-ssm Triton SSD scan + causal-conv1d:
+#    For any GPU TRAINING/precompute run use the [cuda-fast] extra — it adds the fused
+#    mamba-ssm Triton SSD scan + causal-conv1d (#40). Without them the SSD scan/conv fall
+#    back to pure PyTorch (much slower); the CUDA backend logs a RuntimeWarning at model
+#    build if it's running on GPU without them, so you catch a missing install early.
 pip install -e ".[dev,data,cuda-fast]"
+#    [cuda] alone (no fused kernels) is fine only for CPU-parity tests / data-prep:
+#    pip install -e ".[dev,data,cuda]"
 
 # 2. CUDA smoke gate — prove the torch backend resumes bit-exactly through the
 #    double-buffered CheckpointStore. Build a tiny toy split on the pod, then:

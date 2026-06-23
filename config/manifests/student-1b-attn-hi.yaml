@@ -5,18 +5,18 @@
 # Named -lo/-hi (relative) rather than by percent: at 28 layers the realized fractions are
 # 10.7% (here) vs 7.1% (sibling), which no integer attn_every renders as a round 12%/8%.
 student: 1b-attn-hi
-conversion_teacher: open-r1/OpenR1-Distill-7B   # fully-open Open-R1 teacher (#91/#93)
-tokenizer: qwen25                # Qwen2.5 vocab 151646 (#90) — unchanged; teacher shares it
+conversion_teacher: Qwen/Qwen3-4B-Thinking-2507   # Qwen3 thinking-mode teacher (#65/#91/#93)
+tokenizer: qwen3                 # Qwen3 vocab ~151669 (#65) — teacher shares it; uint32 packing
 seq_len: 8192
 layout:
   d_model: 2048
-  n_layers: 28                   # ~1.03B params; matches the teacher's 28 layers (Mamba-in-the-Llama init)
+  n_layers: 28                   # ~1.03B params; teacher is 36 layers — depth mismatch bridged by the adaptive Mamba-in-the-Llama init
   attention_every: 8             # 3 of 28 layers attention (~10.7%) — the higher-attention sibling
   state_size: 128                # -> MambaConfig.d_state
 init: mamba-in-the-llama         # or: mohawk  (#99)
 stages: [mixing-match, hidden-align, logit-distill, instruct-sft, reasoning-sft, tool-sft, grpo]  # tool-sft optional
-corpus: poc-distill/corpus/tokenized/qwen25-8k        # #92
+corpus: poc-distill/corpus/tokenized/qwen3-8k         # #92
 teacher_outputs: poc-distill/teacher-outputs/topk-logits   # #94
-sft: shared/sft/tokenized/qwen25-8k                   # #95/#96/#102
+sft: shared/sft/tokenized/qwen3-8k                    # #95/#96/#102
 rl: shared/rl                                          # #103
 schedule: { lr: 3.0e-4, warmup: 0.02, batch_tokens: 1_000_000 }

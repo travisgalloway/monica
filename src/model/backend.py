@@ -212,14 +212,20 @@ def _cuda_backend() -> Backend:
     def _model_cls(cfg):
         return CUDAMambaModel(cfg, device=_dev)
 
+    def _make_optimizer(model, base_lr):
+        # Fused AdamW fuses the per-parameter update into one CUDA kernel — free throughput
+        # on H100 (fewer kernel launches), no numerical change. It requires all params on a
+        # CUDA device, so gate on it; on CPU (torch-CPU parity runs) fall back to the default.
+        fused = _dev.startswith("cuda")
+        return torch.optim.AdamW(model.parameters(), lr=base_lr, fused=fused)
+
     return Backend(
         name="cuda",
         model_cls=_model_cls,
         make_train_step=_make_train_step,
         save_optimizer=_save_optimizer,
         load_optimizer=_load_optimizer,
-        make_optimizer=lambda model, base_lr: torch.optim.AdamW(
-            model.parameters(), lr=base_lr),
+        make_optimizer=_make_optimizer,
         seed=lambda value: torch.manual_seed(value),
         to_numpy=lambda a: a.detach().to("cpu").numpy(),
         make_sft_train_step=_make_sft_train_step,

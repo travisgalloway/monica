@@ -10,7 +10,7 @@ below (an fsspec URI) is exactly where that swap happens: `file://` now, `s3://`
 
 Under the distillation-first plan (docs/design/10-distillation.md) this corpus builds the
 **teacher corpus + the production-reserve from-scratch data (#75)**, not the distillation
-student's training data — the student consumes pre-tokenized Qwen2.5 artifacts + teacher
+student's training data — the student consumes pre-tokenized Qwen3 artifacts + teacher
 top-k logits (#92/#94), which are precomputed once, not re-derived through these stages.
 
 ABOVE THE SEAM — no `mlx`/`torch`. Heavy data deps (pyarrow, fsspec) are imported

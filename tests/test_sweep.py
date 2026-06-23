@@ -30,7 +30,7 @@ def test_trial_resolves_to_config_and_artifacts(path):
     trial.config.validate()                       # a runnable student config
     # the frozen artifacts it trains against are named and non-empty
     assert trial.signal.corpus and trial.signal.teacher_outputs
-    assert trial.signal.conversion_teacher == "open-r1/OpenR1-Distill-7B"
+    assert trial.signal.conversion_teacher == "Qwen/Qwen3-4B-Thinking-2507"
     # a param/memory estimate accompanies the layout (#66 sizing)
     assert trial.sizing_row["params"] > 0 and trial.sizing_row["train_gb"] > 0
 
@@ -127,6 +127,6 @@ def test_load_sweep_explicit_paths_matches_dir():
 def test_format_sweep_table_renders_signal_and_rows():
     out = format_sweep_table(load_sweep_dir(MANIFEST_DIR))
     assert "Shared frozen teacher signal" in out
-    assert "open-r1/OpenR1-Distill-7B" in out
+    assert "Qwen/Qwen3-4B-Thinking-2507" in out
     assert "1b-attn-lo" in out and "1b-attn-hi" in out
     assert "attn%" in out

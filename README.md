@@ -76,7 +76,7 @@ config/                    model dims + run params (single source of truth)
   student-1b.yaml  manifests/student-1b-*.yaml   ~1B distillation student + sweep manifests
 src/model/                 interface (seam) · blocks (config + hybrid/MoE gating) · mlx/cuda backends
                            teacher · mlx_teacher · mlx_student_init · mlx_distill (distillation)
-src/data/                  download · tokenize (olmo/qwen2.5) · pack(uint16/uint32) · split · loader
+src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint16/uint32) · split · loader
                            corpus · shard (doc-boundary bounds) · distill_corpus · storage (R2 layout)
                            sft_*/dpo_*/reasoning_* (post-training corpora)
 src/train/                 loop · schedule (warmup+cosine) · checkpoint · loss_scale
@@ -112,20 +112,21 @@ core was tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2
 | 10 Distillation           | **in progress** — teacher loader, student init, staged loss, sweep harness built  |
 
 **M10 distillation — where it stands.** The frozen-artifact strategy and its building blocks
-are in place: the conversion teacher loader (`src/model/mlx_teacher.py`), student
-initialization (`src/model/mlx_student_init.py` — Mamba-in-the-Llama / MOHAWK), the staged
-distillation loss (`src/model/mlx_distill.py` — mixing-match → hidden-align → logit-distill),
-the manifest parser (`src/train/distill_manifest.py`), and the sweep table
-(`scripts/sweep.py`). **Pending:** corpus-scale teacher-logit precompute
-([#94](https://github.com/travisgalloway/monica/issues/94)), the R2 + RunPod plumbing
-([#80](https://github.com/travisgalloway/monica/issues/80)), and the end-to-end cloud distill
-run ([#81](https://github.com/travisgalloway/monica/issues/81)). There is **no single
-`scripts/distill.py` yet** — the run harness is the next build.
+are in place: the frozen conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`, loaded by
+`src/model/mlx_teacher.py` / `cuda_teacher.py`), student initialization
+(`src/model/mlx_student_init.py` — Mamba-in-the-Llama / MOHAWK), the staged distillation loss
+(`src/model/mlx_distill.py` — mixing-match → hidden-align → logit-distill), the manifest parser
+(`src/train/distill_manifest.py`), the sweep table (`scripts/sweep.py`), and the run driver
+(`scripts/distill.py`). **Pending:** the corpus re-tokenize to the Qwen3 vocab + corpus-scale
+teacher-logit precompute ([#94](https://github.com/travisgalloway/monica/issues/94)), the R2 +
+RunPod plumbing ([#80](https://github.com/travisgalloway/monica/issues/80)), and the end-to-end
+cloud distill run at full scale ([#81](https://github.com/travisgalloway/monica/issues/81); the
+runbook is [`docs/path-b-run.md`](docs/path-b-run.md)).
 
 **Two training paths.** The original **from-scratch pretrain** path (`scripts/train.py`,
 OLMo tokenizer, uint16) is complete and validated — it's the POC's foundation and the
 production-reserve route ([#75](https://github.com/travisgalloway/monica/issues/75)). The
-**distillation** path (Qwen2.5 tokenizer, uint32, `config/student-1b.yaml`) is the current
+**distillation** path (Qwen3 tokenizer, uint32, `config/student-1b.yaml`) is the current
 focus and the cheaper route to a capable model.
 
 ## Hybrid architecture
@@ -141,8 +142,9 @@ the distillation rationale is in [`docs/design/10-distillation.md`](docs/design/
 
 Reference configs: `config/poc.yaml` = d_model 768 / 24 layers / d_state 16 / head_dim 64 (24
 heads) / seq 1024 / ~3B tokens / OLMo vocab (pure Mamba). `config/student-1b.yaml` = d_model
-2048 / 28 layers / d_state 128 / `attn_every` 8 / seq 8192 / Qwen2.5 vocab 151,646 / bf16 (the
-~1B distillation student — 28 layers matches the teacher's depth for the init mapping). `config/toy*.yaml` are tiny fp32 smoke configs (`toy-hybrid` adds an
+2048 / 28 layers / d_state 128 / `attn_every` 8 / seq 8192 / Qwen3 vocab 151,669 / bf16 (the
+~1B distillation student — a sweep seed, not a locked size; the 36-layer teacher's depth is
+bridged by the adaptive Mamba-in-the-Llama init mapping). `config/toy*.yaml` are tiny fp32 smoke configs (`toy-hybrid` adds an
 attention layer; `toy-moe` adds MoE). Conformance compares **fp32** at ~1e-4 rel.
 
 ## Experimental snapshotting — session rewind

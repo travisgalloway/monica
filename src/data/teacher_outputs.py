@@ -36,7 +36,7 @@ import numpy as np
 
 from .pack import open_packed
 
-#: On-disk dtypes. idx is uint32 (Qwen2.5 effective vocab 151646 overflows uint16); vals are
+#: On-disk dtypes. idx is uint32 (Qwen3 effective vocab 151669 overflows uint16); vals are
 #: fp16 — the KL is a softmax over the k-support after `/T`, so fp16 logit precision is ample.
 VALS_DTYPE = np.dtype(np.float16)
 IDX_DTYPE = np.dtype(np.uint32)

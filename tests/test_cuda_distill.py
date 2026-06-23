@@ -49,9 +49,10 @@ def _numpy_teacher_weights(cfg, seed=0):
     for i in range(cfg.n_layers):
         p = f"layer.{i}."
         w[p + "input_ln"] = np.ones(cfg.d_model, np.float32)
-        w[p + "q_w"] = f(cfg.q_dim, cfg.d_model); w[p + "q_b"] = f(cfg.q_dim)
-        w[p + "k_w"] = f(cfg.kv_dim, cfg.d_model); w[p + "k_b"] = f(cfg.kv_dim)
-        w[p + "v_w"] = f(cfg.kv_dim, cfg.d_model); w[p + "v_b"] = f(cfg.kv_dim)
+        # Qwen3: no QKV bias; per-head Q/K RMSNorm weights.
+        w[p + "q_w"] = f(cfg.q_dim, cfg.d_model); w[p + "q_norm"] = f(cfg.head_dim)
+        w[p + "k_w"] = f(cfg.kv_dim, cfg.d_model); w[p + "k_norm"] = f(cfg.head_dim)
+        w[p + "v_w"] = f(cfg.kv_dim, cfg.d_model)
         w[p + "o_w"] = f(cfg.d_model, cfg.q_dim)
         w[p + "post_ln"] = np.ones(cfg.d_model, np.float32)
         w[p + "gate_w"] = f(cfg.intermediate_size, cfg.d_model)

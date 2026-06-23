@@ -8,7 +8,7 @@ to low-GB) to keep R2 Class-A op counts down. Alongside each token shard we writ
 across packed docs.
 
 ABOVE THE SEAM — numpy + stdlib only. Token shards are the same flat format as ``pack.py``
-(uint16 for the POC vocab, uint32 for the Qwen2.5 distillation vocab, #90 — the dtype is
+(uint16 for the POC vocab, uint32 for the Qwen3 distillation vocab, #90 — the dtype is
 recorded in the manifest, so ``PackedLoader``/``open_shard`` read them back correctly); the
 `.bounds` sidecar is the new artifact a boundary-aware loader consumes.
 
@@ -46,7 +46,7 @@ def pack_sequences(token_docs: Iterable[Sequence[int]], out_dir, *, seq_len: int
     requirement for the SSM's packing-aware boundary reset (#68). `seq_len` should be a
     multiple of `chunk_align`.
 
-    `dtype` is the packed token dtype: uint16 (POC default) or uint32 (Qwen2.5 vocab, #90).
+    `dtype` is the packed token dtype: uint16 (POC default) or uint32 (Qwen3 vocab, #90).
     The shards are the same flat format as `pack.py`; the manifest records the dtype."""
     dtype = np.dtype(dtype)
     hi = int(np.iinfo(dtype).max)
@@ -248,15 +248,15 @@ def main() -> None:
     ap.add_argument("--seq-len", type=int, default=8192)
     ap.add_argument("--shard-size-mb", type=int, default=512)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--tokenizer", choices=("qwen25", "starcoder2", "olmo"),
-                    default="qwen25")
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "starcoder2", "olmo"),
+                    default="qwen3")
     ap.add_argument("--model-id", default=None)
     args = ap.parse_args()
 
     from .corpus import has_jsonl_shards, iter_jsonl_texts, iter_shard_texts
     from .pack import packing_dtype_for
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
-                           load_starcoder2_tokenizer, tokenize_docs)
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                           load_qwen25_tokenizer, load_starcoder2_tokenizer, tokenize_docs)
 
     if args.byte_fallback:
         tok = ByteTokenizer()
@@ -264,8 +264,10 @@ def main() -> None:
         tok = load_olmo_tokenizer(args.model_id)
     elif args.tokenizer == "starcoder2":
         tok = load_starcoder2_tokenizer(args.model_id)
-    else:
+    elif args.tokenizer == "qwen25":
         tok = load_qwen25_tokenizer(args.model_id)
+    else:
+        tok = load_qwen3_tokenizer(args.model_id)
 
     tok_label = "byte" if args.byte_fallback else getattr(tok, "name_or_path", args.tokenizer)
     dtype = packing_dtype_for(tok.vocab_size)          # uint16 (POC) / uint32 (Qwen2.5)

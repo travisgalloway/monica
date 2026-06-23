@@ -112,4 +112,4 @@ def test_mambaconfig_packing_dtype_and_validate():
 def test_student_1b_config_validates():
     cfg = load_config("config/student-1b.yaml")
     cfg.validate()
-    assert cfg.vocab_size == 151646 and cfg.packing_dtype == "uint32"
+    assert cfg.vocab_size == 151669 and cfg.packing_dtype == "uint32"   # Qwen3 vocab

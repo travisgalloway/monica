@@ -6,8 +6,8 @@ loss, written as the two-artifact `shared/sft/` layout the student manifests ref
 
     <out_root>/sft/
         cleaned/instruct/records.jsonl              # tokenizer-agnostic {messages,source,license}
-        tokenized/qwen25-8k/instruct.jsonl          # response-masked {input_ids,target_ids,loss_mask}
-        tokenized/qwen25-8k/manifest.json           # tokenizer, template, chat_eos, counts
+        tokenized/qwen3-8k/instruct.jsonl           # response-masked {input_ids,target_ids,loss_mask}
+        tokenized/qwen3-8k/manifest.json            # tokenizer, template, chat_eos, counts
 
 The cleaned rows are durable + re-tokenizable; the tokenized records drop straight into the M9
 `SFTLoader` / `make_sft_train_step` the instruct SFT layer (#101) reuses. The chat EOS is
@@ -21,8 +21,8 @@ the checked-in `handauthored` set + `--byte-fallback`.
 CLI (mirrors sft_sources):
     # offline smoke:
     python -m src.data.instruct_sft --sources handauthored --byte-fallback --out-root /tmp/shared
-    # real run (HF Qwen2.5 tokenizer + datasets):
-    python -m src.data.instruct_sft --sources oasst1 flan handauthored --tokenizer qwen25
+    # real run (HF Qwen3 tokenizer + datasets):
+    python -m src.data.instruct_sft --sources oasst1 flan handauthored --tokenizer qwen3
 """
 
 from __future__ import annotations
@@ -98,16 +98,16 @@ def _write_cleaned(rows: Iterable[dict], path: Path) -> List[dict]:
 
 
 def _load_tokenizer(tokenizer: str, model_id: Optional[str], byte_fallback: bool):
-    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen25_tokenizer,
-                           load_starcoder2_tokenizer)
+    from .tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                           load_qwen25_tokenizer, load_starcoder2_tokenizer)
     if byte_fallback:
         return ByteTokenizer()
-    loaders = {"qwen25": load_qwen25_tokenizer, "olmo": load_olmo_tokenizer,
-               "starcoder2": load_starcoder2_tokenizer}
+    loaders = {"qwen3": load_qwen3_tokenizer, "qwen25": load_qwen25_tokenizer,
+               "olmo": load_olmo_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     return loaders[tokenizer](model_id)
 
 
-def build_instruct_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen25",
+def build_instruct_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
                        model_id: Optional[str] = None, seq_len: int = 8192,
                        byte_fallback: bool = False, max_seq_len: int = 8192) -> dict:
     """Build the shared instruct SFT corpus end to end: write cleaned chat rows, then tokenize +
@@ -171,10 +171,11 @@ def main() -> None:
                     choices=tuple(_LOADERS), help="clean-license SFT sources to include")
     ap.add_argument("--out-root", type=Path, default=Path("data/shared"),
                     help="root for the shared prefix (writes <root>/sft/...)")
-    ap.add_argument("--tokenizer", choices=("qwen25", "olmo", "starcoder2"), default="qwen25")
+    ap.add_argument("--tokenizer", choices=("qwen3", "qwen25", "olmo", "starcoder2"),
+                    default="qwen3")
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--seq-len", type=int, default=8192, help="tokenized-prefix dir width (qwen25-8k)")
+    ap.add_argument("--seq-len", type=int, default=8192, help="tokenized-prefix dir width (qwen3-8k)")
     ap.add_argument("--max-seq-len", type=int, default=8192,
                     help="drop examples longer than this (truncation would teach mid-answer stops)")
     ap.add_argument("--max-per-source", type=int, default=None)

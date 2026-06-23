@@ -13,7 +13,9 @@ context. Related: [`infrastructure.md`](infrastructure.md) (general pod flow),
   - `cleaned/` — durable tokenizer-agnostic JSONL (3.54 GB), for cheap OLMo re-tokenization later.
 - **Config** — `config/poc-qwen.yaml`: ~205M (Qwen2.5 vocab 151,646, fp16). `poc.yaml` (OLMo
   ~127M) is the reserve variant. The ~205M is embedding-dominated by design (tokenizer alignment
-  with the 1B distillation student) — accepted.
+  with the 1B distillation student) — accepted. (The distillation student has since moved to the
+  Qwen3 vocab ~151,669, #65; Qwen3 is token-aligned with Qwen2.5, so this from-scratch POC run
+  stays on its already-built Qwen2.5 corpus.)
 - **Code** — in **PR #134** (branch `feature/80-r2-datatrove-corpus-pipeline`): `r2_sync`,
   datatrove pipeline, `split.py --shards`, `poc-qwen.yaml`. CUDA backend is A40-verified.
 - **R2 creds** work (bucket-scoped read/write on `monica-training`). **RunPod auth not yet set up.**

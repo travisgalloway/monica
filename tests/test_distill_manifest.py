@@ -14,7 +14,7 @@ MANIFESTS = ["config/manifests/student-1b-attn-hi.yaml",
 def test_real_manifests_load(path):
     m = load_manifest(path)
     assert m.init == InitMethod.MAMBA_IN_THE_LLAMA       # both seeds default to MiL
-    assert m.tokenizer == "qwen25" and m.vocab_size == 151646
+    assert m.tokenizer == "qwen3" and m.vocab_size == 151669
     assert m.stages and all(s in CANONICAL_STAGES for s in m.stages)
     assert m.stages[:3] == ["mixing-match", "hidden-align", "logit-distill"]
 
@@ -28,7 +28,7 @@ def test_manifest_to_config(path):
     assert cfg.n_layers == m.layout["n_layers"]
     assert cfg.attn_every == m.layout["attention_every"]    # sweep-schema -> model field
     assert cfg.d_state == m.layout["state_size"]
-    assert cfg.vocab_size == 151646 and cfg.seq_len == m.seq_len
+    assert cfg.vocab_size == 151669 and cfg.seq_len == m.seq_len
 
 
 @pytest.mark.parametrize("path", MANIFESTS)

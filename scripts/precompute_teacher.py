@@ -4,13 +4,13 @@ Runs the FROZEN conversion teacher over the flat packed distill corpus (`<data>/
 `<data>/val.bin` — `src/data/split.py`'s output) and caches, per token, the top-`k` logits +
 vocab indices, aligned positionally to the corpus tokens. Every student trial then reads these
 back with ZERO teacher inference (`src.data.teacher_outputs.DistillLoader`), so the expensive
-7B forward is paid once and reused across the layout sweep (docs/design/10-distillation.md).
+teacher forward is paid once and reused across the layout sweep (docs/design/10-distillation.md).
 
 The teacher forward is the program's heaviest GPU job, so this runs on the cloud GPU via
 `--backend cuda` (the torch `CUDATeacher`); `--backend mlx` is the Apple-Silicon path. The
 backend import stays behind `src.model.backend.get_backend`, so `--help` works on any host.
 
-    # real run (cloud GPU): cache top-50 for the OpenR1-Distill-7B teacher, push to R2
+    # real run (cloud GPU): cache top-50 for the Qwen3-4B-Thinking-2507 teacher, push to R2
     .venv/bin/python scripts/precompute_teacher.py --manifest config/manifests/student-1b-attn-hi.yaml \\
         --data data/poc-distill/split --backend cuda --k 50 \\
         --push s3://monica-training/poc-distill/teacher-outputs/topk-logits
@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--out", type=Path, default=None,
                     help="teacher-outputs dir (default: <data>/teacher-outputs/topk-logits)")
     ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
-                    help="hardware backend (the 7B precompute uses cuda on the cloud GPU)")
+                    help="hardware backend (the teacher precompute uses cuda on the cloud GPU)")
     ap.add_argument("--k", type=int, default=50,
                     help="logits cached per token; footprint 6*k B/token (fp16 vals + uint32 idx), "
                          "e.g. k=50 -> ~300 B/token")
@@ -52,11 +52,10 @@ def _parse_args() -> argparse.Namespace:
 
 def _teacher_config_for(model_id: str):
     """Map a known teacher repo id to its `TeacherConfig` (so logits slice to the tokenizer
-    vocab — see `TeacherConfig.openr1_distill_7b`'s note). None lets `from_pretrained` read
+    vocab — see `TeacherConfig.qwen3_4b_thinking`'s note). None lets `from_pretrained` read
     the checkpoint's `config.json`."""
     from src.model.teacher import TeacherConfig
-    known = {"open-r1/OpenR1-Distill-7B": TeacherConfig.openr1_distill_7b,
-             "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": TeacherConfig.qwen_1_5b}
+    known = {"Qwen/Qwen3-4B-Thinking-2507": TeacherConfig.qwen3_4b_thinking}
     return known[model_id]() if model_id in known else None
 
 
@@ -106,7 +105,7 @@ def main() -> None:
                 f"teacher effective_vocab_size {teacher.config.effective_vocab_size} != manifest "
                 f"tokenizer vocab {manifest.vocab_size} ({manifest.tokenizer}); the student cannot "
                 f"consume these top-k indices. Use a --pretrained id known to _teacher_config_for "
-                f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.openr1_distill_7b.")
+                f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.qwen3_4b_thinking.")
 
     eff_vocab = teacher.config.effective_vocab_size
     out_dir = args.out or storage.teacher_outputs_dir(args.data)

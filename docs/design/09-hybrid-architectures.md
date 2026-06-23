@@ -65,7 +65,8 @@ layer-to-layer (see [distillation](10-distillation.md)) — while the **from-scr
 (its smaller vocab leaves more room in the layer stack). The 100M tier is the validated
 [`poc.yaml`](07-configs-and-decisions.md) (OLMo). The **active POC run** uses
 [`poc-qwen.yaml`](../../config/poc-qwen.yaml) — the same layers retargeted to the Qwen2.5 vocab
-(151,646) so the POC exercises the distillation student's exact tokenizer/data path; the larger
+(151,646) so the POC exercises a tokenizer/data path token-aligned with the distillation student's
+(the student is on the Qwen3 vocab 151,669, which is token-aligned with Qwen2.5); the larger
 tied embedding (~116M) then dominates, making it ~205M, embedding-heavy. (At the student's
 d_model 2048 that same embedding is a negligible ~11%, so the vocab is "free" there — it only
 dominates a narrow 768-wide model.) The sizing tool is a portable closed-form
@@ -82,7 +83,7 @@ where **bf16 is native** and needs no loss scaling — so `config/1b.yaml` and
 `config/student-1b.yaml` set `precision: bf16` (`scaler_for_precision` already returns `None`
 for bf16). `tie_embeddings`
 and `grad_checkpoint` stay on; vocab follows the chosen tokenizer and sets the packed dtype —
-uint16 below 65536 (POC), uint32 for Qwen2.5 (the distillation student, #90; see
+uint16 below 65536 (POC), uint32 for Qwen3 (the distillation student, #90; see
 [distillation](10-distillation.md)).
 
 ## Verifying the attention fraction
