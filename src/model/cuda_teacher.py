@@ -151,10 +151,9 @@ class CUDATeacher(ConversionTeacher):
         h = self._w["embed"][tokens]                          # (B, L, D)
         L = h.shape[1]
         cos, sin = _rope_cos_sin(torch.arange(L, device=self._device), c.head_dim, c.rope_theta)
-        mask = self._causal_mask(L)
         hidden: List[torch.Tensor] = [h] if return_hidden else []
         for i in range(c.n_layers):
-            h = h + self._attn(h, i, cos, sin, mask)
+            h = h + self._attn(h, i, cos, sin)
             h = h + self._mlp(h, i)
             if return_hidden:
                 hidden.append(h)
@@ -178,11 +177,11 @@ class CUDATeacher(ConversionTeacher):
         h = self._w["embed"][tokens]
         L = h.shape[1]
         cos, sin = _rope_cos_sin(torch.arange(L, device=self._device), c.head_dim, c.rope_theta)
-        mask = self._causal_mask(L)
+        mask = self._causal_mask(L)                           # still needed by _attn_probs
         mats = []
         for i in range(c.n_layers):
             mats.append(self._attn_probs(h, i, cos, sin, mask).detach())
-            h = h + self._attn(h, i, cos, sin, mask)
+            h = h + self._attn(h, i, cos, sin)
             h = h + self._mlp(h, i)
         return tuple(mats)
 
@@ -231,8 +230,8 @@ class CUDATeacher(ConversionTeacher):
         scores = scores.masked_fill(~mask, float("-inf"))
         return _softmax_lastdim(scores).mean(dim=1)              # head-average -> (B,L,L)
 
-    def _attn(self, x: torch.Tensor, i: int, cos: torch.Tensor, sin: torch.Tensor,
-              mask: torch.Tensor) -> torch.Tensor:
+    def _attn(self, x: torch.Tensor, i: int, cos: torch.Tensor,
+              sin: torch.Tensor) -> torch.Tensor:
         c = self.config
         p = f"layer.{i}."
         B, L, _ = x.shape
@@ -251,9 +250,14 @@ class CUDATeacher(ConversionTeacher):
         if Hkv != Hq:                                          # GQA: repeat kv across groups
             rep = Hq // Hkv
             k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        scores = (q @ k.transpose(-1, -2)) / math.sqrt(Dh)      # (B,Hq,L,L)
-        scores = scores.masked_fill(~mask, float("-inf"))
-        out = _softmax_lastdim(scores) @ v                     # (B,Hq,L,Dh)
+        # SDPA (#144): attention here is pure-causal (the teacher has no seg_ids path), so
+        # `is_causal=True` reproduces `mask` without materializing the (B,Hq,L,L) score
+        # tensor — the dominant #94 precompute hot spot at seq 8192. SDPA inherits q/k/v
+        # dtype (fp32 — weights load fp32) and keeps the softmax fp32-stable internally. The
+        # mixing-matrix path (`_attn_probs`) stays eager: it needs the softmax weights, which
+        # SDPA does not expose.
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                             scale=1.0 / math.sqrt(Dh))   # (B,Hq,L,Dh)
         out = out.permute(0, 2, 1, 3).reshape(B, L, Hq * Dh)
         return out @ self._w[p + "o_w"].t()                    # (B,L,D), o has no bias
 
