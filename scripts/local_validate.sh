@@ -23,6 +23,12 @@ DATA="$WORK/data"
 
 cd "$(dirname "$0")/.."   # repo root
 echo "== local_validate :: python=$PY  work=$WORK  steps=$STEPS =="
+# Safety: WORK is rm -rf'd, so refuse empty / root / home / any absolute path — a mis-set
+# WORK (e.g. WORK=/) must never nuke the system. Keep it a relative path under the repo.
+case "$WORK" in
+  ""|"/"|"."|"./"|"~"*) echo "local_validate: refusing to rm unsafe WORK='$WORK'" >&2; exit 1 ;;
+  /*) echo "local_validate: refusing to rm absolute WORK='$WORK' (use a repo-relative path)" >&2; exit 1 ;;
+esac
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 echo "== [1/5] data pipeline (offline byte fallback) =="

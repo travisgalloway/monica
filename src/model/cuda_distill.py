@@ -41,11 +41,19 @@ def _kl_topk(student_logits: torch.Tensor, topk_vals: torch.Tensor, topk_idx: to
     `student_logits` (B,L,V) fp32; `topk_vals`/`topk_idx` (B,L,k). Teacher and student are each
     softmaxed over the SAME k indices at temperature T. Torch port of `mlx_distill._kl_topk`."""
     T = temperature
-    p = F.softmax(topk_vals.float() / T, dim=-1)                # teacher over support
+    tv = topk_vals.float()
+    p = F.softmax(tv / T, dim=-1)                               # teacher over support
     sg = torch.gather(student_logits, -1, topk_idx.long()) / T  # student logits at the k indices
     logq = sg - torch.logsumexp(sg, dim=-1, keepdim=True)       # student log-softmax / k
     kl = (p * (torch.log(p + 1e-9) - logq)).sum(dim=-1)         # (B,L)
-    return (T * T) * kl.mean()
+    # Mask fully-padded teacher positions (all _NEG_INF, or -inf after an fp16 cache round-trip
+    # — see ApiTopkTeacher): no teacher signal there, so don't let a uniform/NaN softmax inject
+    # a spurious target. No-op for white-box teachers (every row above threshold) -> parity-exact
+    # with the prior .mean(). Mirrors mlx_distill._kl_topk.
+    valid = tv.amax(dim=-1) > -1e30                             # (B,L)
+    kl = torch.where(valid, kl, torch.zeros_like(kl))
+    denom = valid.sum().clamp(min=1)
+    return (T * T) * (kl.sum() / denom)
 
 
 def _ce(logits: torch.Tensor, targets) -> torch.Tensor:

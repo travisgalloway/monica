@@ -24,6 +24,10 @@ KNOWN APPROXIMATIONS (all documented, none silent):
   * **re-tokenization alignment.** We must send the prompt as TEXT (ids are detokenized first),
     and the server re-tokenizes; if its segmentation differs from the packed ids the per-position
     alignment drifts. We align by position up to `seq_len`, padding/truncating, and warn once.
+  * **fully-padded positions.** When the server returns fewer positions than `seq_len` (or maps
+    no tokens at a position), that row is left entirely `_NEG_INF`. Such rows carry no teacher
+    signal; the distill loss (`_kl_topk` in mlx/cuda_distill) detects them (max over k below a
+    threshold) and EXCLUDES them from the KL average, so they inject no spurious gradient.
 """
 
 from __future__ import annotations
