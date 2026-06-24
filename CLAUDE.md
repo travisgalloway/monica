@@ -149,9 +149,10 @@ The smoke gate stresses exactly this round-trip.
   run is still pending (user-driven).
 - The **active program is M10 — distillation** (**GitHub issue #65**, the live tracker): distil a
   compact Mamba-2 hybrid student from a frozen teacher, sweep layouts, post-train the winner. The
-  building blocks exist (teacher loader, student init, staged loss, manifest, sweep table); the
-  corpus-scale teacher-logit precompute (#94), R2 + RunPod plumbing (#80), and the end-to-end
-  cloud distill run (#81) are pending. There is **no `scripts/distill.py` yet**.
+  core machinery is implemented — teacher loader (#93), student init (#99), staged distill loss
+  (#100), sweep harness (#98), and the distillation driver `scripts/distill.py` (#81). The
+  **remaining work is pod-gated runs**, not builds: the 8k corpus build, the teacher top-k
+  precompute (#94), the two-layout sweep (#81), and post-training/eval — per the #65 ordered chain.
 - `docs/design/` documents the design choices and rationale (start at
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
   a milestone, tick its box in the relevant tracker (#2 / #65).
