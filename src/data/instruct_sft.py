@@ -36,6 +36,15 @@ from . import chat_template, storage
 from .sft_data import _messages_of
 
 
+def _effective_vocab_size(tokenizer) -> Optional[int]:
+    """The largest valid token id + 1, using len() when available (covers added special tokens
+    like Qwen3's <|im_start|>/<|im_end|> whose ids exceed tokenizer.vocab_size)."""
+    try:
+        return len(tokenizer)
+    except TypeError:
+        return getattr(tokenizer, "vocab_size", None)
+
+
 def build_chat_sft_records(rows: Iterable[dict], tokenizer, *, max_seq_len: Optional[int] = 8192,
                            stats: Optional[dict] = None) -> Iterator[dict]:
     """Yield `{input_ids, target_ids, loss_mask}` records from chat rows, masked to the assistant
@@ -43,7 +52,7 @@ def build_chat_sft_records(rows: Iterable[dict], tokenizer, *, max_seq_len: Opti
     appends **no** extra EOS — `<|im_end|>` is already the last token of each assistant span and is
     trained as the stop token. Rows whose tokenized length exceeds `max_seq_len` are dropped
     (truncating a response would teach the model to stop mid-answer)."""
-    vocab = getattr(tokenizer, "vocab_size", None)
+    vocab = _effective_vocab_size(tokenizer)
     for rec in rows:
         messages = _messages_of(rec)
         out = _record_from_messages(messages, tokenizer, max_seq_len, vocab)
@@ -153,7 +162,7 @@ def build_instruct_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen
 def _records_with_source(cleaned_rows: List[dict], tok, max_seq_len: int, stats: dict):
     """Yield `(cleaned_row, masked_record)` for rows that survive masking — pairs the kept record
     with its source row so per-source counts stay accurate."""
-    vocab = getattr(tok, "vocab_size", None)
+    vocab = _effective_vocab_size(tok)
     for row in cleaned_rows:
         out = _record_from_messages(row["messages"], tok, max_seq_len, vocab)
         if out is None:
