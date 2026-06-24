@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from . import chat_template, storage
+from .instruct_sft import _effective_vocab_size
 from .tool_sources import TOOL_CALL_OPEN, TOOLS_OPEN, TOOLS_CLOSE
 
 
@@ -141,7 +142,7 @@ def build_tool_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
             f.write(json.dumps(row) + "\n")
 
     tok = _load_tokenizer(tokenizer, model_id, byte_fallback)
-    vocab = getattr(tok, "vocab_size", None)
+    vocab = _effective_vocab_size(tok)
     tok_dir.mkdir(parents=True, exist_ok=True)
 
     n_records = n_tokens = n_skipped = n_abstention = n_with_distractors = 0

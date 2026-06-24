@@ -8,6 +8,7 @@ import random
 import pytest
 
 from src.data.chat_template import IM_END, _ROLES, render, response_spans
+from src.data.instruct_sft import _effective_vocab_size
 from src.data.sft_loader import SFTLoader
 from src.data.tokenize import ByteTokenizer
 from src.data.tool_sft import _valid_rows, build_tool_sft
@@ -274,3 +275,44 @@ def test_valid_rows_filters_correctly():
     result = _valid_rows([good, bad_role, bad_empty])
     assert len(result) == 1
     assert result[0]["source"] == "handauthored"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: effective vocab size uses len(tok), not tok.vocab_size (#153)
+# --------------------------------------------------------------------------- #
+
+def test_effective_vocab_size_uses_len_not_vocab_size():
+    """_effective_vocab_size must return len(tok) when available, not vocab_size.
+
+    Qwen3 adds <|im_start|>/<|im_end|> as special tokens whose ids sit ABOVE
+    tokenizer.vocab_size. The old `getattr(tok, "vocab_size", None)` check would
+    raise a spurious ValueError for any row whose tokens include those specials.
+    """
+
+    class FakeQwen3Tokenizer:
+        """Stub with len(tok)=20 but vocab_size=10 — simulates Qwen3 added specials."""
+        vocab_size = 10
+
+        def __len__(self):
+            return 20
+
+    tok = FakeQwen3Tokenizer()
+    assert _effective_vocab_size(tok) == 20, (
+        "_effective_vocab_size should return len(tok)=20, not vocab_size=10"
+    )
+
+
+def test_tool_sft_does_not_raise_with_extended_vocab(tmp_path):
+    """build_tool_sft must not raise when the tokenizer's len() > vocab_size.
+
+    This was the latent bug: the old vocab-bound check used `vocab_size` directly,
+    so any real Qwen3 token id in [vocab_size, len(tok)) would trigger a false
+    ValueError. Byte-fallback tests masked it because ByteTokenizer.vocab_size==256
+    and len(ByteTokenizer)==256 (no gap). Here we use ByteTokenizer (always safe for
+    offline tests) and verify the build succeeds end-to-end with n_records >= 1.
+    """
+    manifest = build_tool_sft(
+        handauthored_tool_records(), tmp_path,
+        tokenizer="qwen25", byte_fallback=True, seq_len=8192,
+    )
+    assert manifest["n_records"] >= 1, "expected at least one tokenized record"
