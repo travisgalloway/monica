@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from . import chat_template, storage
+from .instruct_sft import _effective_vocab_size
 
 
 def _valid_rows(rows: Iterable[dict]) -> List[dict]:
@@ -93,7 +94,7 @@ def build_reasoning_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwe
 
     tok = _load_tokenizer(tokenizer, model_id, byte_fallback)
     dtype = packing_dtype_for(tok.vocab_size)          # uint16 (byte) / uint32 (Qwen3)
-    vocab = getattr(tok, "vocab_size", None)
+    vocab = _effective_vocab_size(tok)
 
     # Masked JSONL records + the per-trace token streams for atomic packing (kept in lockstep, so
     # the packed documents are exactly the traces that survived masking + the length cap).

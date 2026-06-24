@@ -79,8 +79,11 @@ def mot_row_to_messages(row: dict, source: str = "mot") -> Optional[dict]:
 
 
 def load_mixture_of_thoughts(split: str = "train", max_examples: Optional[int] = None,
-                             config: Optional[str] = None) -> Iterator[dict]:
-    """Stream open-r1/Mixture-of-Thoughts and map rows to tagged trace rows (lazy `datasets`)."""
+                             config: Optional[str] = "all") -> Iterator[dict]:
+    """Stream open-r1/Mixture-of-Thoughts and map rows to tagged trace rows (lazy `datasets`).
+
+    `config` selects the dataset sub-split ("all", "math", "code", "science"). The upstream
+    dataset now requires an explicit config (previously None was valid; changed on HF Hub)."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     ds = load_dataset("open-r1/Mixture-of-Thoughts", config, split=split, streaming=True)
