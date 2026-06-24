@@ -55,6 +55,8 @@ PORTABLE_MODULES = [
     "src.data.instruct_sft",
     "src.data.reasoning_traces",
     "src.data.reasoning_sft",
+    "src.data.tool_sources",
+    "src.data.tool_sft",
     "src.data.sft_data",
     "src.data.sft_loader",
     "src.data.sft_sources",
