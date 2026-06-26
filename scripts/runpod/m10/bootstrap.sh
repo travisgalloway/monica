@@ -24,9 +24,14 @@ fi
 cd "$WORKSPACE"
 echo "[bootstrap] repo at $(git rev-parse --short HEAD)"
 
-# --- 2. Install: cuda-fast for fused Mamba Triton scan + causal-conv1d (#40) ---
-echo "[bootstrap] pip install cuda-fast"
-pip install -e ".[dev,data,cuda-fast]"
+# --- 2. Install: base first, then mamba-ssm/causal-conv1d with --no-build-isolation.
+#    mamba-ssm's setup.py imports torch at build time; pip's isolated build env lacks it,
+#    so the plain `pip install -e ".[cuda-fast]"` form fails. Installing the base first
+#    (which resolves torch from the image) then building the Triton kernels against it works.
+echo "[bootstrap] pip install base (cuda)"
+pip install -e ".[dev,data,cuda]" -q
+echo "[bootstrap] pip install mamba-ssm + causal-conv1d (no-build-isolation)"
+pip install "mamba-ssm>=2.0" "causal-conv1d>=1.0" --no-build-isolation
 
 # --- 3. s3fs pin — a bare install upgrades fsspec and breaks datasets (#memory: s3fs-fsspec-pin) ---
 echo "[bootstrap] pin s3fs==2026.2.0"
