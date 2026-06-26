@@ -196,3 +196,49 @@ def test_portable_roundtrip(tmp_path):
 
     max_abs = float(np.abs(before.astype(np.float64) - after.astype(np.float64)).max())
     assert np.allclose(before, after, rtol=0, atol=0), f"round-trip drift max|diff|={max_abs:.3e}"
+
+
+def test_backend_parity_mlx_cuda(tmp_path):
+    """MLX <-> CUDA backend agreement in fp32 at ~1e-4 rel (the cross-backend conformance check).
+
+    Skipped unless BOTH backends are present — no CUDA on Mac, no MLX on a CUDA pod.
+    Deferred to the CUDA scale-up per the runbook (section C of scripts/runpod/m10/preflight.sh).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    try:
+        import mlx.core as mx  # noqa: F401
+        from src.model.mlx_backend import MLXMambaModel
+    except ImportError:
+        pytest.skip("mlx not available")
+
+    from src.conformance.backend_parity import check_backend_parity
+    from src.train.checkpoint import save_weights, load_weights  # noqa: F401
+
+    cfg = load_config("config/toy.yaml")
+
+    torch.manual_seed(42)
+    cuda_model = CUDAMambaModel(cfg)
+    cuda_model.eval()
+
+    weights_path = str(tmp_path / "weights.safetensors")
+    cuda_model.save(weights_path)
+
+    mlx_model = MLXMambaModel(cfg)
+    mlx_model.load(weights_path)
+
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(2, 16)).astype(np.int32)
+
+    def to_np_cuda(t):
+        return t.detach().cpu().numpy()
+
+    def to_np_mlx(a):
+        return np.asarray(a)
+
+    with torch.no_grad():
+        result = check_backend_parity(
+            cuda_model, mlx_model, tokens,
+            to_numpy_a=to_np_cuda, to_numpy_b=to_np_mlx,
+            rtol=1e-4, atol=1e-5,
+        )
+    assert result["ok"], result
