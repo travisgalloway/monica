@@ -36,6 +36,7 @@ PORTABLE_MODULES = [
     "src.model.teacher",
     "src.model.api_teacher",
     "src.model.sizing",
+    "src.model.train_time",
     "src.data.loader",
     "src.data.corpus",
     "src.data.storage",
