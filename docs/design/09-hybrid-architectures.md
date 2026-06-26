@@ -75,6 +75,36 @@ against the built model's portable state-dict param sum. Training memory ≈ 8 B
 (weights+grad+AdamW), or **~10 B/param with 8-bit Adam** — the VRAM-tight lever used in
 Phase 5 (#75).
 
+### Estimating training time
+
+Sizing answers "does it fit?"; the companion estimator answers "how long?".
+`src/model/train_time.py` + `scripts/train_time.py` turn a param count and a token
+budget into estimated wall-clock via the standard `6·N·D` training-FLOPs model
+divided by each machine's achieved throughput. The **M1 Pro** figure is *calibrated*
+from the one measured point we have — ~99 s/step at 131,072 tokens/step for `poc`
+(~1.0 TFLOP/s effective), which reproduces the "3B tokens ≈ 26 days" rule of thumb.
+The **H100** figures are bf16 dense peak (~990 TFLOPS) × an assumed 40% MFU (single)
+and ×85% scaling (8-GPU); there is no in-repo H100 bench yet, so treat them as
+planning estimates and retune with `--mfu` / `--scaling`.
+
+Example (`python scripts/train_time.py`, Chinchilla-optimal 20 tokens/param budget):
+
+| model | params | tokens (20×) | M1 Pro | 1× H100 | 8× H100 |
+|---|---|---|---|---|---|
+| poc | ~127M | 2.53B | 22.2 d | 1.4 h | 11.9 m |
+| — | 270M | 5.40B | 100.6 d | 6.1 h | 54.1 m |
+| 1b | ~1.03B | 20.67B | 4.0 y | 3.7 d | 13.2 h |
+| — | 3B | 60.00B | 34.0 y | 31.6 d | 4.6 d |
+| — | 7B | 140.00B | 185.2 y | 171.9 d | 25.3 d |
+
+The spread is the headline: a from-scratch 1B run is years on the laptop but days on
+a single H100, and the laptop is only viable at the `poc` rung (or for the short
+distillation runs, which need ≪ Chinchilla tokens — see [distillation](10-distillation.md)).
+Pass `--tokens 3B` for a fixed budget across sizes, or `--config <yaml>` to estimate
+an exact config. These are first-principles estimates (generic `6·N·D`, not the
+SSM/attention split); the real per-step cost is what `scripts/bench_train_step.py`
+(MLX) and `scripts/bench_cuda_train_step.py` (CUDA) measure.
+
 ### Precision differs from the POC
 
 `poc.yaml` uses **fp16 + loss scaling** because fp16 is ~18% faster than bf16 *on MLX/Metal*
