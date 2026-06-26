@@ -120,6 +120,15 @@ def train_seconds(params: int, tokens: float, hw: Hardware) -> float:
     return training_flops(params, tokens) / hw.effective_flops
 
 
+def tokens_trainable(params: int, seconds: float, hw: Hardware) -> float:
+    """Inverse of `train_seconds`: tokens trainable in `seconds` on `hw`.
+
+    The natural laptop question — "what can I train in a day?" — and the right
+    lens for exploratory POC runs, which run far fewer than Chinchilla tokens.
+    """
+    return hw.effective_flops * seconds / (FLOPS_PER_PARAM_PER_TOKEN * params)
+
+
 def parse_count(text: str) -> int:
     """Parse a human count with a K/M/B/G/T suffix: '270M' -> 270_000_000."""
     s = text.strip().upper()
@@ -205,4 +214,45 @@ def format_report(sizes: Iterable[tuple], hardware: Iterable[Hardware],
             f"{label:<{name_w}} {format_count(params):>8} {format_count(tokens):>9}  "
             + "  ".join(cells)
         )
+    if fixed_tokens is None:
+        lines.append("")
+        lines.append("note: 20×params is compute-optimal — an UPPER BOUND, not a POC run.")
+        lines.append("      Exploratory runs use far fewer tokens; use --hours N for what a")
+        lines.append("      fixed wall-clock buys (e.g. a 200M model trains ~72M tokens in 24h on M1).")
+    return "\n".join(lines)
+
+
+def format_trainable_report(sizes: Iterable[tuple], hardware: Iterable[Hardware],
+                            seconds: float) -> str:
+    """Inverse report: tokens trainable in a fixed wall-clock window per machine.
+
+    The lens that matches how POC runs are actually planned ("what fits in a
+    day?"). `sizes` is an iterable of (label, params); `seconds` is the budget.
+    """
+    sizes = list(sizes)
+    hardware = list(hardware)
+
+    lines = [
+        "Tokens trainable in a fixed wall-clock  (PLANNING ESTIMATE — not a benchmark)",
+        f"  compute model : {FLOPS_PER_PARAM_PER_TOKEN}·N·D FLOPs  (fwd+bwd)",
+        f"  wall-clock    : {format_time(seconds)}",
+        "  throughput    :",
+    ]
+    for hw in hardware:
+        tag = "measured-calibrated" if hw.calibrated else "estimate"
+        lines.append(f"    {hw.name:<8} {hw.effective_flops / TFLOP:>8.1f} TFLOP/s  "
+                     f"({tag}: {hw.note})")
+    lines.append("")
+
+    name_w = max(5, max(len(label) for label, _ in sizes))
+    col_w = max(9, max(len(hw.name) for hw in hardware))
+    header = (f"{'size':<{name_w}} {'params':>8}  "
+              + "  ".join(f"{hw.name:>{col_w}}" for hw in hardware))
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for label, params in sizes:
+        cells = [f"{format_count(int(tokens_trainable(params, seconds, hw))):>{col_w}}"
+                 for hw in hardware]
+        lines.append(f"{label:<{name_w}} {format_count(params):>8}  " + "  ".join(cells))
     return "\n".join(lines)

@@ -13,6 +13,7 @@ from src.model.train_time import (
     format_count,
     format_time,
     parse_count,
+    tokens_trainable,
     train_seconds,
     training_flops,
 )
@@ -32,6 +33,20 @@ def test_m1pro_3b_run_is_about_26_days():
     hw = default_registry()["m1pro"]
     days = train_seconds(ANCHOR_PARAMS, 3e9, hw) / SECONDS_PER_DAY
     assert days == pytest.approx(26.0, abs=1.0)
+
+
+def test_tokens_trainable_is_inverse_of_train_seconds():
+    """tokens_trainable and train_seconds must round-trip exactly."""
+    hw = default_registry()["m1pro"]
+    secs = train_seconds(500_000_000, 1.2e9, hw)
+    assert tokens_trainable(500_000_000, secs, hw) == pytest.approx(1.2e9, rel=1e-9)
+
+
+def test_200m_in_24h_on_m1_matches_real_run():
+    """Ground-truth reconciliation: a 200M model trains ~72M tokens in 24h on M1."""
+    hw = default_registry()["m1pro"]
+    tokens = tokens_trainable(200_000_000, SECONDS_PER_DAY, hw)
+    assert tokens / 1e6 == pytest.approx(72.0, abs=3.0)
 
 
 def test_cluster_scales_over_single_h100():

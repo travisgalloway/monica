@@ -7,6 +7,7 @@ numbers are planning estimates; see `src/model/train_time.py` for the assumption
 
   python scripts/train_time.py                            # default ladder, all 3 machines
   python scripts/train_time.py --tokens 3B                # fixed budget (m1pro col ≈ 26 d)
+  python scripts/train_time.py --hours 24 --params 200M   # tokens trainable in 24h (M1 ≈ 72M)
   python scripts/train_time.py --params 1B,7B --hardware h100,8xh100
   python scripts/train_time.py --config config/student-1b.yaml
   python scripts/train_time.py --mfu 0.5 --scaling 0.9    # H100 sensitivity
@@ -29,6 +30,7 @@ from src.model.train_time import (  # noqa: E402
     default_sizes,
     format_count,
     format_report,
+    format_trainable_report,
     parse_count,
 )
 
@@ -44,6 +46,8 @@ def main() -> None:
                     help="comma-separated param ladder with K/M/B suffixes, e.g. 270M,3B,7B")
     ap.add_argument("--tokens", type=str, default=None,
                     help="fixed token budget for every size (e.g. 3B); default is Chinchilla 20×params")
+    ap.add_argument("--hours", type=float, default=None,
+                    help="inverse mode: show TOKENS trainable in this many hours instead of time-to-train")
     ap.add_argument("--hardware", type=str, default=None,
                     help="comma-separated subset/order of hardware (default: m1pro,h100,8xh100)")
     ap.add_argument("--mfu", type=float, default=DEFAULT_MFU,
@@ -74,9 +78,11 @@ def main() -> None:
     else:
         hardware = list(registry.values())
 
-    fixed_tokens = parse_count(args.tokens) if args.tokens is not None else None
-
-    print(format_report(sizes, hardware, fixed_tokens=fixed_tokens))
+    if args.hours is not None:
+        print(format_trainable_report(sizes, hardware, args.hours * 3600.0))
+    else:
+        fixed_tokens = parse_count(args.tokens) if args.tokens is not None else None
+        print(format_report(sizes, hardware, fixed_tokens=fixed_tokens))
 
 
 if __name__ == "__main__":

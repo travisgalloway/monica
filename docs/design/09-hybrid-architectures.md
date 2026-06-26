@@ -98,12 +98,26 @@ Example (`python scripts/train_time.py`, Chinchilla-optimal 20 tokens/param budg
 | — | 7B | 140.00B | 185.2 y | 171.9 d | 25.3 d |
 
 The spread is the headline: a from-scratch 1B run is years on the laptop but days on
-a single H100, and the laptop is only viable at the `poc` rung (or for the short
-distillation runs, which need ≪ Chinchilla tokens — see [distillation](10-distillation.md)).
-Pass `--tokens 3B` for a fixed budget across sizes, or `--config <yaml>` to estimate
-an exact config. These are first-principles estimates (generic `6·N·D`, not the
-SSM/attention split); the real per-step cost is what `scripts/bench_train_step.py`
-(MLX) and `scripts/bench_cuda_train_step.py` (CUDA) measure.
+a single H100, and the laptop is only viable at the `poc` rung. Pass `--tokens 3B`
+for a fixed budget across sizes, or `--config <yaml>` to estimate an exact config.
+
+**Chinchilla is an upper bound, not a POC run.** `20×params` is the *compute-optimal*
+budget; exploratory POC runs use **far fewer** tokens (just enough to watch the loss
+curve drop), so the table above over-states what we actually do on the laptop. The
+honest laptop question is the inverse — "how many tokens fit in a day?" — which
+`--hours N` answers and which matches measured experience (a ~200M model trains
+**~72M tokens in 24h on M1 Pro**, a normal short POC, *not* the 4B Chinchilla budget):
+
+| model | params | M1 Pro / 24h | 1× H100 / 24h | 8× H100 / 24h |
+|---|---|---|---|---|
+| poc | ~127M | 114M | 45.0B | 306B |
+| — | 200M | 72M | 28.5B | 194B |
+| 1b | ~1.03B | 14M | 5.5B | 37.5B |
+
+These are first-principles estimates (generic `6·N·D`, not the SSM/attention split);
+the real per-step cost is what `scripts/bench_train_step.py` (MLX) and
+`scripts/bench_cuda_train_step.py` (CUDA) measure. The short distillation runs in
+particular need ≪ Chinchilla tokens — see [distillation](10-distillation.md).
 
 ### Precision differs from the POC
 
