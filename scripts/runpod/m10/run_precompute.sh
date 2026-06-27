@@ -31,7 +31,7 @@ python scripts/precompute_teacher.py \
   --splits train,val \
   --backend cuda \
   --k 50 \
-  --batch-size 8 \
+  --batch-size 1 \
   --out /vol/teacher-outputs/topk-logits \
   --push s3://monica-training/poc-distill/teacher-outputs/topk-logits \
   2>&1 | tee -a "$LOG"

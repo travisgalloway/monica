@@ -15,6 +15,11 @@ backend import stays behind `src.model.backend.get_backend`, so `--help` works o
         --data data/poc-distill/split --backend cuda --k 50 \\
         --push s3://monica-training/poc-distill/teacher-outputs/topk-logits
 
+    # cluster mode (4 pods, each processes 1/4 of the train chunks):
+    #   pod 0: --shard-id 0 --num-shards 4 --push .../topk-logits/shard-0
+    #   pod 1: --shard-id 1 --num-shards 4 --push .../topk-logits/shard-1
+    #   ... then run scripts/merge_teacher_shards.py to combine
+    #
     # offline smoke (byte vocab, synthetic teacher — no network/weights):
     .venv/bin/python scripts/precompute_teacher.py --manifest config/toy-distill.yaml \\
         --data /tmp/toy-split --out /tmp/teacher-outputs --backend mlx --k 8 --synthetic
@@ -59,6 +64,11 @@ def _parse_args() -> argparse.Namespace:
                          "op stream; opt-in, eager fp32 stays the default for conformance)")
     ap.add_argument("--push", default=None,
                     help="after writing, mirror --out to this fsspec URI / R2 prefix (#80)")
+    ap.add_argument("--shard-id", type=int, default=None,
+                    help="0-indexed shard for cluster mode (use with --num-shards); output goes to "
+                         "<out>/shard-<shard-id>/ and push to <push>/shard-<shard-id>/")
+    ap.add_argument("--num-shards", type=int, default=None,
+                    help="total number of cluster pods; splits n_chunks evenly across shards")
     return ap.parse_args()
 
 
@@ -71,12 +81,15 @@ def _teacher_config_for(model_id: str):
     return known[model_id]() if model_id in known else None
 
 
-def _topk_blocks(teacher, backend, data, n_chunks, stride, seq_len, batch_size, k):
+def _topk_blocks(teacher, backend, data, n_chunks, stride, seq_len, batch_size, k,
+                 start_chunk: int = 0):
     """Yield `(vals, idx)` numpy blocks over the packed file in on-disk chunk order (no shuffle
-    — alignment is positional). Each block is `(b, seq_len, k_eff)`."""
+    — alignment is positional). Each block is `(b, seq_len, k_eff)`.
+    `start_chunk` offsets into the file for cluster-mode sharding."""
     import numpy as np
-    for c0 in range(0, n_chunks, batch_size):
-        c1 = min(c0 + batch_size, n_chunks)
+    end_chunk = start_chunk + n_chunks
+    for c0 in range(start_chunk, end_chunk, batch_size):
+        c1 = min(c0 + batch_size, end_chunk)
         rows = [np.asarray(data[c * stride: c * stride + seq_len], dtype=np.int64)
                 for c in range(c0, c1)]
         inputs = np.stack(rows)                         # (b, seq_len)
@@ -133,9 +146,21 @@ def main() -> None:
                 f"(it sets tokenizer_vocab_size), or extend it — see TeacherConfig.qwen3_4b_thinking.")
 
     eff_vocab = teacher.config.effective_vocab_size
-    out_dir = args.out or storage.teacher_outputs_dir(args.data)
-    out_dir = Path(out_dir)
+    base_out = Path(args.out or storage.teacher_outputs_dir(args.data))
     splits = [s for s in args.splits.split(",") if s]
+
+    # Cluster mode: each pod owns one shard of the chunk space. Output goes to
+    # <out>/shard-<id>/; --push suffix gets /shard-<id>/ appended automatically.
+    shard_id = args.shard_id
+    num_shards = args.num_shards
+    if (shard_id is None) != (num_shards is None):
+        raise SystemExit("--shard-id and --num-shards must be used together")
+    cluster = shard_id is not None
+    if cluster and not (0 <= shard_id < num_shards):
+        raise SystemExit(f"--shard-id {shard_id} out of range [0, {num_shards})")
+    out_dir = base_out / f"shard-{shard_id}" if cluster else base_out
+    push = (f"{args.push.rstrip('/')}/shard-{shard_id}" if cluster and args.push
+            else args.push)
 
     # The teacher clamps k to min(k, effective_vocab) in topk_logits, so the actual cached k can
     # be smaller than args.k; record THAT (from the per-split meta) in the manifest so it agrees
@@ -145,26 +170,37 @@ def main() -> None:
         data = open_packed(args.data / f"{split}.bin")
         n_tokens = int(data.shape[0])
         stride = seq_len + 1
-        n_chunks = n_tokens // stride
-        if n_chunks == 0:
+        total_chunks = n_tokens // stride
+        if total_chunks == 0:
             raise ValueError(f"{split}.bin too small for one chunk (seq_len={seq_len})")
-        blocks = _topk_blocks(teacher, backend, data, n_chunks, stride, seq_len,
-                              args.batch_size, args.k)
-        meta = write_teacher_topk(out_dir, split, blocks=blocks, n_chunks=n_chunks,
+
+        if cluster:
+            per_shard, remainder = divmod(total_chunks, num_shards)
+            start_chunk = shard_id * per_shard + min(shard_id, remainder)
+            this_chunks = per_shard + (1 if shard_id < remainder else 0)
+        else:
+            start_chunk, this_chunks = 0, total_chunks
+
+        blocks = _topk_blocks(teacher, backend, data, this_chunks, stride, seq_len,
+                              args.batch_size, args.k, start_chunk=start_chunk)
+        shard_info = {"shard_id": shard_id, "num_shards": num_shards,
+                      "start_chunk": start_chunk} if cluster else {}
+        meta = write_teacher_topk(out_dir, split, blocks=blocks, n_chunks=this_chunks,
                                   seq_len=seq_len, vocab_size=eff_vocab,
                                   src_packed=str(args.data / f"{split}.bin"),
-                                  src_n_tokens=n_tokens)
+                                  src_n_tokens=n_tokens, extra=shard_info)
         actual_k = meta["k"]
-        print(f"teacher top-k [{split}]: {meta['n_rows']} rows x k={meta['k']} "
-              f"({n_chunks} chunks x {seq_len}) -> {out_dir}")
+        shard_label = f" [shard {shard_id}/{num_shards}]" if cluster else ""
+        print(f"teacher top-k [{split}]{shard_label}: {meta['n_rows']} rows x k={meta['k']} "
+              f"({this_chunks} chunks, start={start_chunk}) -> {out_dir}")
 
     write_manifest(out_dir, k=actual_k, seq_len=seq_len, effective_vocab_size=eff_vocab,
                    corpus_manifest=str(args.data), teacher=teacher_info, splits=splits)
 
-    if args.push:
+    if push:
         from src.data.r2_sync import upload_dir
-        written = upload_dir(out_dir, args.push)
-        print(f"pushed {len(written)} file(s): {out_dir} -> {args.push}")
+        written = upload_dir(out_dir, push)
+        print(f"pushed {len(written)} file(s): {out_dir} -> {push}")
 
 
 if __name__ == "__main__":

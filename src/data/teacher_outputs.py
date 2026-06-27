@@ -52,7 +52,8 @@ def topk_outputs_paths(out_dir, split: str) -> dict:
 
 def write_teacher_topk(out_dir, split: str, *, blocks: Iterable[Tuple[np.ndarray, np.ndarray]],
                        n_chunks: int, seq_len: int, vocab_size: int,
-                       src_packed: str, src_n_tokens: Optional[int] = None) -> dict:
+                       src_packed: str, src_n_tokens: Optional[int] = None,
+                       extra: Optional[dict] = None) -> dict:
     """Stream per-batch top-k blocks to disk and write the split's `.meta.json`.
 
     `blocks` yields `(vals_block, idx_block)` in on-disk chunk order; each block is shaped
@@ -85,6 +86,8 @@ def write_teacher_topk(out_dir, split: str, *, blocks: Iterable[Tuple[np.ndarray
             "seq_len": int(seq_len), "vals_dtype": VALS_DTYPE.name, "idx_dtype": IDX_DTYPE.name,
             "vocab_size": int(vocab_size), "src_packed": str(src_packed),
             "src_n_tokens": (int(src_n_tokens) if src_n_tokens is not None else None)}
+    if extra:
+        meta.update(extra)
     paths["meta"].write_text(json.dumps(meta, indent=2))
     return meta
 
