@@ -100,6 +100,18 @@ echo "── B PASS $(date) ──"
 echo ""
 echo "── C. CUDA smoke $(date) ──"
 
+echo "[C0] CUDA availability gate (fail here, not 20 min into smoke)"
+python -c "
+import sys, torch
+if not torch.cuda.is_available():
+    print(f'CUDA NOT AVAILABLE: torch {torch.__version__} (built for cu{(torch.version.cuda or \"\").replace(\".\",\"\")}) is incompatible with this machine driver.', file=sys.stderr)
+    print('Run bootstrap.sh again — it will detect and reinstall torch+cu124.', file=sys.stderr)
+    sys.exit(1)
+name = torch.cuda.get_device_name(0)
+mem_gb = torch.cuda.get_device_properties(0).total_memory // 1024**3
+print(f'  CUDA OK: {name} ({mem_gb} GB) | torch {torch.__version__} cu{(torch.version.cuda or \"\").replace(\".\",\"\")}')
+"
+
 echo "[C1] distill_smoke --backend cuda (student init + all 3 distill stages)"
 python scripts/distill_smoke.py --backend cuda
 
