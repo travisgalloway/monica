@@ -181,6 +181,30 @@ def main() -> None:
         else:
             start_chunk, this_chunks = 0, total_chunks
 
+        # Auto-resume: if output files already exist (e.g. after a pod billing stop),
+        # skip already-written chunks and append from the last complete chunk boundary.
+        _chunks_resume = 0
+        _idx_file = out_dir / f"teacher-{split}.topk_idx"
+        if _idx_file.exists() and _idx_file.stat().st_size > 0:
+            import os as _os
+            _IB = args.k * 4   # bytes per row in idx (uint32 × k)
+            _VB = args.k * 2   # bytes per row in vals (float16 × k)
+            _vf = out_dir / f"teacher-{split}.topk_vals"
+            _isz = _idx_file.stat().st_size
+            _vsz = _vf.stat().st_size if _vf.exists() else 0
+            _chunks_resume = min(_isz // (seq_len * _IB), _vsz // (seq_len * _VB))
+            if 0 < _chunks_resume < this_chunks:
+                _os.truncate(_idx_file, _chunks_resume * seq_len * _IB)
+                _os.truncate(_vf, _chunks_resume * seq_len * _VB)
+                start_chunk += _chunks_resume
+                this_chunks -= _chunks_resume
+                print(f"[resume] {_chunks_resume} chunks already done; "
+                      f"continuing at global chunk {start_chunk}", flush=True)
+            elif _chunks_resume >= this_chunks:
+                print(f"[resume] split={split} already complete ({_chunks_resume} chunks) — skipping",
+                      flush=True)
+                continue
+
         blocks = _topk_blocks(teacher, backend, data, this_chunks, stride, seq_len,
                               args.batch_size, args.k, start_chunk=start_chunk)
         shard_info = {"shard_id": shard_id, "num_shards": num_shards,
@@ -188,7 +212,9 @@ def main() -> None:
         meta = write_teacher_topk(out_dir, split, blocks=blocks, n_chunks=this_chunks,
                                   seq_len=seq_len, vocab_size=eff_vocab,
                                   src_packed=str(args.data / f"{split}.bin"),
-                                  src_n_tokens=n_tokens, extra=shard_info)
+                                  src_n_tokens=n_tokens, extra=shard_info,
+                                  _append=(_chunks_resume > 0),
+                                  _rows_done=_chunks_resume * seq_len)
         actual_k = meta["k"]
         shard_label = f" [shard {shard_id}/{num_shards}]" if cluster else ""
         print(f"teacher top-k [{split}]{shard_label}: {meta['n_rows']} rows x k={meta['k']} "

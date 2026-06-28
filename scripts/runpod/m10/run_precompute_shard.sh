@@ -38,6 +38,14 @@ python -m src.data.r2_sync down \
   s3://monica-training/poc-distill/corpus/tokenized/qwen3-8k /vol/corpus8k \
   2>&1 | tee -a "$LOG"
 
+# Restore any partial precompute output from R2 — enables resume after pod billing stop.
+# precompute_teacher.py's auto-resume logic detects existing bytes and skips done chunks.
+echo "[shard-${SHARD_ID}] r2_sync down partial precompute output (resume checkpoint)" | tee -a "$LOG"
+python -m src.data.r2_sync down \
+  "s3://monica-training/poc-distill/teacher-outputs/topk-logits/shard-${SHARD_ID}" \
+  "/vol/teacher-outputs/topk-logits/shard-${SHARD_ID}" \
+  2>&1 | tee -a "$LOG" || echo "[shard-${SHARD_ID}] no prior checkpoint on R2 (fresh start)" | tee -a "$LOG"
+
 echo "[shard-${SHARD_ID}] split --shards" | tee -a "$LOG"
 python -m src.data.split \
   --shards /vol/corpus8k --out /vol/split8k --val-tokens 10000000 \
@@ -49,6 +57,19 @@ if [ "$SHARD_ID" -eq 0 ]; then
   SPLITS_ARG="train,val"
   echo "[shard-0] will also process val split" | tee -a "$LOG"
 fi
+
+# Background R2 checkpoint: sync output every 2 hours so a billing stop loses at most 2h.
+# Runs in a subshell so set -e in main script doesn't kill it on transient upload errors.
+(
+  while sleep 7200; do
+    echo "[r2-ckpt] shard-${SHARD_ID} syncing to R2 $(date)" >> "$LOG"
+    python -m src.data.r2_sync up \
+      "/vol/teacher-outputs/topk-logits/shard-${SHARD_ID}" \
+      "s3://monica-training/poc-distill/teacher-outputs/topk-logits/shard-${SHARD_ID}" \
+      >> "$LOG" 2>&1 || echo "[r2-ckpt] upload failed (non-fatal)" >> "$LOG"
+  done
+) &
+R2_CKPT_PID=$!
 
 echo "[shard-${SHARD_ID}] precompute_teacher start $(date)" | tee -a "$LOG"
 python scripts/precompute_teacher.py \
@@ -64,4 +85,5 @@ python scripts/precompute_teacher.py \
   --push s3://monica-training/poc-distill/teacher-outputs/topk-logits \
   2>&1 | tee -a "$LOG"
 
+kill "$R2_CKPT_PID" 2>/dev/null || true
 echo "PRECOMPUTE_SHARD_DONE shard=${SHARD_ID}/${NUM_SHARDS} $(date)" | tee -a "$LOG"
