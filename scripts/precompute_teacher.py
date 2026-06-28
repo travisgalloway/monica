@@ -194,8 +194,33 @@ def main() -> None:
             _vsz = _vf.stat().st_size if _vf.exists() else 0
             _chunks_resume = min(_isz // (seq_len * _IB), _vsz // (seq_len * _VB))
             if 0 < _chunks_resume < this_chunks:
-                _os.truncate(_idx_file, _chunks_resume * seq_len * _IB)
-                _os.truncate(_vf, _chunks_resume * seq_len * _VB)
+                # Trim both files to the last complete chunk boundary using delete+rewrite
+                # rather than os.truncate(): network volumes (RunPod /vol, MooseFS) may
+                # return 0 from truncate() but leave the file unchanged, causing the
+                # append mode below to write at the wrong offset.
+                _prefix_idx = _chunks_resume * seq_len * _IB
+                _prefix_vf  = _chunks_resume * seq_len * _VB
+                for _path, _keep in ((_idx_file, _prefix_idx), (_vf, _prefix_vf)):
+                    _tmp = _path.with_suffix(".topk_resume_tmp")
+                    try:
+                        with open(_path, "rb") as _src, open(_tmp, "wb") as _dst:
+                            _rem = _keep
+                            while _rem > 0:
+                                _buf = _src.read(min(8 * 1024 * 1024, _rem))
+                                if not _buf:
+                                    break
+                                _dst.write(_buf)
+                                _rem -= len(_buf)
+                        _os.replace(_tmp, _path)
+                    except Exception as _e:
+                        try:
+                            _tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            f"[resume] failed to trim {_path} to {_keep} bytes: {_e}. "
+                            "Delete the partial output and restart from scratch."
+                        ) from _e
                 start_chunk += _chunks_resume
                 this_chunks -= _chunks_resume
                 print(f"[resume] {_chunks_resume} chunks already done; "
