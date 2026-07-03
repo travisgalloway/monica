@@ -5,6 +5,10 @@ shard to `<push>/shard-N/`.  This script downloads all shards from R2, concatena
 files in shard order (preserving positional alignment with the corpus), and writes the merged
 teacher-outputs dir that `DistillLoader` / `distill.py` expect.
 
+`val` is handled as a shard-0-only passthrough (the cluster launcher only computes val on
+shard-0 — cheap, not worth sharding), so the default `--splits train,val` works without every
+shard needing a `teacher-val.meta.json`.
+
     # After all 4 pods finish (shards 0-3 on R2):
     python scripts/merge_teacher_shards.py \\
         --source s3://monica-training/poc-distill/teacher-outputs/topk-logits \\
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 
@@ -41,6 +46,11 @@ def _download_shard(source: str, shard_id: int, local_root: Path) -> Path:
     from src.data.r2_sync import download_dir
     shard_uri = f"{source.rstrip('/')}/shard-{shard_id}"
     shard_local = local_root / f"shard-{shard_id}"
+    # download_dir only fetches/overwrites — it never deletes local files that no longer
+    # exist remotely, so a reused cache dir could silently mix in stale artifacts from an
+    # earlier run. Start from a clean directory each time.
+    if shard_local.exists():
+        shutil.rmtree(shard_local)
     shard_local.mkdir(parents=True, exist_ok=True)
     download_dir(shard_uri, str(shard_local))
     return shard_local
@@ -81,6 +91,39 @@ def main() -> None:
 
     for split in splits:
         print(f"Merging split '{split}' ...")
+
+        if split == "val":
+            # The cluster launcher only computes val on shard-0 (cheap; not worth sharding
+            # across pods) — merge it as a single-shard passthrough rather than requiring
+            # every shard to have a teacher-val.meta.json (they don't).
+            meta_path = shard_dirs[0] / "teacher-val.meta.json"
+            if not meta_path.exists():
+                raise FileNotFoundError(f"shard 0 missing {meta_path} (expected val on shard-0)")
+            m = json.loads(meta_path.read_text())
+            if k is None:
+                k, seq_len, vocab_size = m["k"], m["seq_len"], m["vocab_size"]
+            elif m["k"] != k or m["seq_len"] != seq_len or m["vocab_size"] != vocab_size:
+                raise ValueError("shard 0 val meta mismatch: k/seq_len/vocab_size differ from train")
+
+            out_paths = topk_outputs_paths(args.out, split)
+            print(f"  copying {m['n_rows']:,} rows ({m['n_chunks']} chunks) from shard-0 ...")
+            _cat_binary([shard_dirs[0] / "teacher-val.topk_vals"], out_paths["vals"])
+            _cat_binary([shard_dirs[0] / "teacher-val.topk_idx"], out_paths["idx"])
+            meta = {"split": split, "k": k, "n_rows": m["n_rows"], "n_chunks": m["n_chunks"],
+                    "seq_len": seq_len, "vals_dtype": "float16", "idx_dtype": "uint32",
+                    "vocab_size": vocab_size, "src_packed": m.get("src_packed", ""),
+                    "src_n_tokens": m.get("src_n_tokens"), "merged_from_shards": 1}
+            out_paths["meta"].write_text(json.dumps(meta, indent=2))
+            print(f"  {split}: {m['n_rows']:,} rows written to {args.out} (shard-0 only)")
+
+            if teacher_info is None:
+                m0_manifest = shard_dirs[0] / "manifest.json"
+                if m0_manifest.exists():
+                    m0 = json.loads(m0_manifest.read_text())
+                    teacher_info = m0.get("teacher")
+                    corpus_manifest = m0.get("corpus_manifest")
+            continue
+
         # Collect per-shard meta and verify consistency
         shard_metas = []
         for i, sd in enumerate(shard_dirs):

@@ -53,18 +53,23 @@ def topk_outputs_paths(out_dir, split: str) -> dict:
 def write_teacher_topk(out_dir, split: str, *, blocks: Iterable[Tuple[np.ndarray, np.ndarray]],
                        n_chunks: int, seq_len: int, vocab_size: int,
                        src_packed: str, src_n_tokens: Optional[int] = None,
-                       extra: Optional[dict] = None) -> dict:
+                       extra: Optional[dict] = None,
+                       _append: bool = False, _rows_done: int = 0) -> dict:
     """Stream per-batch top-k blocks to disk and write the split's `.meta.json`.
 
     `blocks` yields `(vals_block, idx_block)` in on-disk chunk order; each block is shaped
     `(..., k)` (e.g. `(batch, seq_len, k)`) and is flattened to `(rows, k)`, cast to fp16 /
     uint32, and appended. `k` is taken from the first block (the teacher may have clamped it
     to the vocab). Returns the meta dict. Streaming keeps memory bounded over a large corpus.
+
+    `_append`/`_rows_done`: internal resume params set by precompute_teacher when restarting
+    after a crash. Callers should not set these directly.
     """
     paths = topk_outputs_paths(out_dir, split)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     n_rows, k = 0, None
-    with open(paths["vals"], "wb") as vf, open(paths["idx"], "wb") as xf:
+    _mode = "ab" if _append else "wb"
+    with open(paths["vals"], _mode) as vf, open(paths["idx"], _mode) as xf:
         for vb, ib in blocks:
             vb = np.ascontiguousarray(np.asarray(vb).reshape(-1, np.asarray(vb).shape[-1]),
                                       dtype=VALS_DTYPE)
@@ -82,7 +87,8 @@ def write_teacher_topk(out_dir, split: str, *, blocks: Iterable[Tuple[np.ndarray
     expected = n_chunks * seq_len
     if n_rows != expected:
         raise ValueError(f"wrote {n_rows} teacher rows, expected n_chunks*seq_len = {expected}")
-    meta = {"split": split, "k": int(k or 0), "n_rows": int(n_rows), "n_chunks": int(n_chunks),
+    meta = {"split": split, "k": int(k or 0), "n_rows": int(n_rows) + _rows_done,
+            "n_chunks": int(n_chunks) + _rows_done // seq_len,
             "seq_len": int(seq_len), "vals_dtype": VALS_DTYPE.name, "idx_dtype": IDX_DTYPE.name,
             "vocab_size": int(vocab_size), "src_packed": str(src_packed),
             "src_n_tokens": (int(src_n_tokens) if src_n_tokens is not None else None)}
