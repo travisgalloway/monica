@@ -1,5 +1,11 @@
 # M10 pod-chain — ready-to-fire staging (steps 3–4)
 
+> **Update (2026-07-03).** Step 3 (teacher precompute) below completed for the **base** corpus on
+> 2026-07-02. The corpus was then extended with new domains (#176); extending the teacher cache to
+> cover those new chunks is a separate **append** step (3′) that must run **before** Step 4, reusing
+> the base cache rather than re-running Step 3 from scratch — see
+> [`m10-phase-bprime-append.md`](m10-phase-bprime-append.md) (#177).
+
 The pod-gated stages of the M10 distillation chain — **teacher precompute** (#94) and the
 **two-layout student sweep** (#81) — are the only steps that need a rented CUDA pod. This doc is
 the *staging* companion: it records the plumbing validations that were run **without** a pod, and
@@ -52,6 +58,10 @@ Footprint ≈ 6·k bytes/token (k=50 → ~300 B/token). The manifest here only s
 `conversion_teacher` + `seq_len` (identical across hi/lo), which is why one precompute serves both.
 
 ### Step 4 — the two-layout sweep (reuses the single precompute)
+> Run **Step 3′ — the #177 append** first if the corpus extension (#176) hasn't been merged into
+> the teacher cache yet: [`m10-phase-bprime-append.md`](m10-phase-bprime-append.md). Otherwise this
+> sweep trains only against the base FineWeb-derived corpus.
+
 Two sibling manifests, **same** corpus + teacher outputs, only `layout` differs. The three distill
 stages run in order (mixing-match → hidden-align → logit-distill). This is the "sweep" — two
 manifests × three stages → a Phase-2 winner pick; it is one team-Workflow call away once the pod

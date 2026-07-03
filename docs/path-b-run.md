@@ -1,5 +1,15 @@
 # Path B run — session handoff (full-scale M10 distillation, ~1B student)
 
+> **Update (2026-07-03) — Steps 1 & 3 are DONE for the base corpus; don't re-run them as-is.**
+> The base 8k corpus build (Step 1) and the base teacher precompute (Step 3) both completed
+> 2026-07-02 (566 GB merged cache at `poc-distill/teacher-outputs/topk-logits-merged/`, 230,318
+> train chunks). The "Current state" section below predates that and is stale. Since then the
+> corpus was **extended** with new domains (#176) — extending the teacher cache for those new
+> chunks is an **append**, not a full re-precompute: see
+> [`runbooks/m10-phase-bprime-append.md`](runbooks/m10-phase-bprime-append.md) (#177) and run it
+> **before** Step 4 below. Only fall back to this doc's Step 3 if the append's alignment gate
+> fails (see that runbook's "Why append, not re-precompute").
+
 Self-contained runbook to execute the **real M10 deliverable** ([issue #141](https://github.com/travisgalloway/monica/issues/141),
 parent tracker [#65](https://github.com/travisgalloway/monica/issues/65)): distil a compact ~1B
 Mamba-2 hybrid student from the frozen `Qwen/Qwen3-4B-Thinking-2507` teacher, sweep the two attention
@@ -143,6 +153,11 @@ winner.
 
 ## Step 3 — teacher precompute at scale (GPU pod — the dominant cost)
 
+> **Already done for the base corpus (2026-07-02).** If you're extending an already-precomputed
+> corpus (the #176 domain extension), use the **append** flow instead —
+> [`runbooks/m10-phase-bprime-append.md`](runbooks/m10-phase-bprime-append.md) (#177) — which
+> reuses this cache rather than re-running the full 4B forward below.
+
 The 4B forward over the whole corpus. Done **once**; both students reuse it (the manifests share
 `teacher_outputs`). **Bench on a small slice first** to size the card and cost before the long run.
 
@@ -167,6 +182,11 @@ python scripts/precompute_teacher.py \
   to get the real s/batch**, then multiply by token count.
 
 ## Step 4 — student sweep (GPU pod — reuse the one precompute)
+
+> **Run the #177 append first** if the corpus extension (#176) hasn't been merged into the
+> teacher cache yet — see [`runbooks/m10-phase-bprime-append.md`](runbooks/m10-phase-bprime-append.md).
+> Otherwise the sweep below trains only against the base FineWeb-derived corpus, not the full
+> extended blend.
 
 Two sibling manifests, **same** corpus + teacher outputs, only `layout` differs:
 `attn-hi` (`attention_every 8` → 3/28 attn ≈10.7%, `state_size 128`) vs

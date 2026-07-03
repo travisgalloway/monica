@@ -1,0 +1,31 @@
+# ~1B Mamba-2 HYBRID student — higher-attention sibling of student-1b-attn-lo.yaml
+# (student-1b-attn-hi sweep variant). Same d_model/n_layers; higher attention fraction
+# (attn_every 8 -> 3 of 28 layers = ~10.7%) + narrower state (d_state 128), matching
+# student-1b.yaml's architecture exactly (that file is the sweep seed and numerically
+# already IS this layout). Added for hi/lo naming symmetry: -lo has a named config here;
+# -hi previously existed only as config/manifests/student-1b-attn-hi.yaml. Derived from the
+# manifest layout in config/manifests/student-1b-attn-hi.yaml (manifest_to_config maps
+# attention_every -> attn_every, state_size -> d_state). Needed by scripts/sft.py and
+# scripts/rlvr.py at post-training time — those drivers take a config yaml, not a manifest.
+d_model: 2048
+n_layers: 28
+d_state: 128           # narrower state — the higher attention fraction carries more recall
+expand: 2
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 4096/64 = 64 heads (scalar A per head)
+dt_rank: auto
+
+attn_every: 8           # 3 of 28 layers attention (~10.7%) — the higher-attention sibling
+n_attn_heads: 16         # must divide d_model 2048 -> attn_head_dim = 128
+
+vocab_size: 151669     # Qwen3 — FIXED by the conversion teacher; uint32 packing (#90)
+seq_len: 8192
+tie_embeddings: true
+precision: bf16
+chunk_size: null
+grad_checkpoint: true  # required at this depth
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
