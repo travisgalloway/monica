@@ -42,6 +42,14 @@ DEFAULT_CODE_LANGS: List[str] = [
     "shell", "hcl", "powershell", "ruby", "c++", "cmake", "r", "markdown", "lua", "matlab",
 ]
 
+#: Dataset-level (not per-row) licenses for curated single-license sources, confirmed against
+#: the live HF dataset cards (2026-07-03) — these datasets carry no per-row license field, so
+#: probing one always yielded "unknown" before this fix.
+DATASET_LEVEL_LICENSE = {
+    "openwebmath": "odc-by",
+    "library-docs": "cc-by-sa-4.0",
+}
+
 
 # --------------------------------------------------------------------------- #
 # License-field fallback helper
@@ -84,8 +92,8 @@ def iter_the_stack_dedup(langs: Iterable[str]) -> Iterator[Record]:
 
 def iter_the_stack_smol(langs: Iterable[str]) -> Iterator[Record]:
     """Fallback code source (single streaming config, filtered by `row["lang"]`) for when
-    `the-stack-dedup`'s gate/`HF_TOKEN` isn't available. Field names per the dataset card;
-    unverified against the live dataset in this dispatch (see plan)."""
+    `the-stack-dedup`'s gate/`HF_TOKEN` isn't available. Field names verified against the live
+    dataset card (2026-07-03): `content`/`lang`/`licenses` are correct as coded."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     wanted = {lang.strip().lower() for lang in langs}
@@ -97,7 +105,7 @@ def iter_the_stack_smol(langs: Iterable[str]) -> Iterator[Record]:
         text = row.get("content")
         if not text:
             continue
-        license = _first_license(row, ("licenses", "repository_name"))
+        license = _first_license(row, ("licenses",))
         yield Record(text=text, source="the-stack-smol", lang=lang, license=license,
                     meta={"is_code": True})
 
@@ -106,7 +114,10 @@ def iter_the_stack_smol(langs: Iterable[str]) -> Iterator[Record]:
 # Math — open-web-math
 # --------------------------------------------------------------------------- #
 def iter_open_web_math() -> Iterator[Record]:
-    """Stream `open-web-math/open-web-math` (lazy `datasets`, streaming)."""
+    """Stream `open-web-math/open-web-math` (lazy `datasets`, streaming). Verified against the
+    live dataset card (2026-07-03): the `text` field is correct, but the license is
+    dataset-level (`odc-by`), not a per-row column — rows without a `license` key fall back to
+    `DATASET_LEVEL_LICENSE["openwebmath"]` instead of `"unknown"`."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     ds = load_dataset("open-web-math/open-web-math", split="train",  # pragma: no cover
@@ -116,14 +127,18 @@ def iter_open_web_math() -> Iterator[Record]:
         if not text:
             continue
         yield Record(text=text, source="openwebmath", lang="en",
-                    license=_first_license(row, ("license",)))
+                    license=row.get("license") or DATASET_LEVEL_LICENSE["openwebmath"])
 
 
 # --------------------------------------------------------------------------- #
 # Docs — code-rag-bench/library-documentation
 # --------------------------------------------------------------------------- #
 def iter_library_documentation() -> Iterator[Record]:
-    """Stream `code-rag-bench/library-documentation` (~62 MB; lazy `datasets`, streaming)."""
+    """Stream `code-rag-bench/library-documentation` (~62 MB; lazy `datasets`, streaming).
+    Verified against the live dataset card (2026-07-03): the `doc_content` field is correct,
+    but there is no per-row `license` column — license is dataset-level (`cc-by-sa-4.0`); rows
+    without a `license` key fall back to `DATASET_LEVEL_LICENSE["library-docs"]` instead of
+    `"unknown"`."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     ds = load_dataset("code-rag-bench/library-documentation",  # pragma: no cover
@@ -133,7 +148,7 @@ def iter_library_documentation() -> Iterator[Record]:
         if not text:
             continue
         yield Record(text=text, source="library-docs", lang="en",
-                    license=_first_license(row, ("license",)))
+                    license=row.get("license") or DATASET_LEVEL_LICENSE["library-docs"])
 
 
 # --------------------------------------------------------------------------- #

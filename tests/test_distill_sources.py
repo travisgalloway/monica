@@ -6,7 +6,8 @@ this only exercises the pure mapper/render/cap/orchestration functions with fabr
 
 from src.data.corpus import Record
 from src.data.distill_sources import (build_extension_records, char_budget_cap,
-                                       messages_to_text)
+                                       iter_library_documentation, iter_open_web_math,
+                                       iter_the_stack_smol, messages_to_text)
 
 
 def test_messages_to_text_renders_role_prefixed_turns():
@@ -131,3 +132,42 @@ def test_build_extension_records_unknown_source_raises():
     stream, _counter = build_extension_records({"conversation": {"sources": ["nope"]}})
     with pytest.raises(ValueError):
         list(stream)
+
+
+# --------------------------------------------------------------------------- #
+# Dataset-level license fallback (#176) — open-web-math / library-documentation have no
+# per-row `license` field; the-stack-smol's `repository_name` fallback was bogus (not a
+# license field). These monkeypatch the lazy `datasets.load_dataset` import site.
+# --------------------------------------------------------------------------- #
+def test_iter_open_web_math_falls_back_to_dataset_level_license(monkeypatch):
+    def fake_load_dataset(*args, **kwargs):
+        return [{"text": "some math text"}]  # no "license" key, as on the real dataset
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    records = list(iter_open_web_math())
+    assert len(records) == 1
+    assert records[0].license == "odc-by"
+
+
+def test_iter_library_documentation_falls_back_to_dataset_level_license(monkeypatch):
+    def fake_load_dataset(*args, **kwargs):
+        return [{"doc_content": "some docs text"}]  # no "license" key, as on the real dataset
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    records = list(iter_library_documentation())
+    assert len(records) == 1
+    assert records[0].license == "cc-by-sa-4.0"
+
+
+def test_iter_the_stack_smol_uses_real_licenses_field_not_repository_name(monkeypatch):
+    def fake_load_dataset(*args, **kwargs):
+        return [{"content": "print('hi')", "lang": "python", "licenses": ["mit"],
+                 "repository_name": "foo/bar"}]
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    records = list(iter_the_stack_smol(["python"]))
+    assert len(records) == 1
+    assert records[0].license == "mit"
