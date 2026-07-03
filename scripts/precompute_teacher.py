@@ -174,7 +174,13 @@ def main() -> None:
         if total_chunks == 0:
             raise ValueError(f"{split}.bin too small for one chunk (seq_len={seq_len})")
 
-        if cluster:
+        # `val` is never shard-divided: shard 0 owns the whole val split (the launcher only
+        # gives val to shard 0). Other shards skip it entirely. `train` IS sharded across pods.
+        split_cluster = cluster and split != "val"
+        if cluster and split == "val" and shard_id != 0:
+            print(f"[shard {shard_id}] skipping val (owned by shard 0)", flush=True)
+            continue
+        if split_cluster:
             per_shard, remainder = divmod(total_chunks, num_shards)
             start_chunk = shard_id * per_shard + min(shard_id, remainder)
             this_chunks = per_shard + (1 if shard_id < remainder else 0)
