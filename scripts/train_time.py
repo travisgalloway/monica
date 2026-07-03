@@ -62,6 +62,8 @@ def main() -> None:
         sizes = [(args.config.stem, cfg.num_parameters())]
     elif args.params is not None:
         sizes = [(label.strip(), parse_count(label)) for label in args.params.split(",") if label.strip()]
+        if not sizes:
+            ap.error("--params resolved to no sizes (check for stray commas/whitespace)")
         # Re-label with the canonical compact form so 0.27B and 270M read the same.
         sizes = [(format_count(p), p) for _, p in sizes]
     else:
@@ -71,6 +73,8 @@ def main() -> None:
     registry = default_registry(mfu=args.mfu, scaling=args.scaling)
     if args.hardware is not None:
         names = [n.strip() for n in args.hardware.split(",") if n.strip()]
+        if not names:
+            ap.error("--hardware resolved to no entries (check for stray commas/whitespace)")
         unknown = [n for n in names if n not in registry]
         if unknown:
             ap.error(f"unknown hardware {unknown}; choose from {list(registry)}")
