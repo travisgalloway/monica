@@ -5,7 +5,8 @@ the contract; verified end to end through `build_sft_records`.
 """
 
 from src.data.sft_sources import (HANDAUTHORED, SOURCE_LICENSES, build_oasst1_threads,
-                                  flan_to_messages, handauthored_records, iter_clean_sft)
+                                  flan_to_messages, handauthored_records, iter_clean_sft,
+                                  ultrachat_row_to_messages)
 from src.data.sft_data import build_sft_records
 from src.data.tokenize import ByteTokenizer
 
@@ -75,4 +76,24 @@ def test_sources_feed_build_sft_records():
 
 
 def test_source_licenses_cover_loaders():
-    assert set(SOURCE_LICENSES) >= {"oasst1", "flan", "dolly", "handauthored"}
+    assert set(SOURCE_LICENSES) >= {"oasst1", "flan", "dolly", "handauthored", "ultrachat"}
+
+
+def test_ultrachat_row_to_messages():
+    row = {"messages": [{"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "Hello!"}]}
+    rec = ultrachat_row_to_messages(row)
+    assert rec is not None
+    assert rec["source"] == "ultrachat" and rec["license"] == "mit"
+    assert rec["messages"] == [{"role": "user", "content": "Hi"},
+                               {"role": "assistant", "content": "Hello!"}]
+
+
+def test_ultrachat_row_to_messages_skips_malformed():
+    assert ultrachat_row_to_messages({}) is None
+    assert ultrachat_row_to_messages({"messages": "not-a-list"}) is None
+    assert ultrachat_row_to_messages(
+        {"messages": [{"role": "user", "content": "only a question"}]}) is None
+    assert ultrachat_row_to_messages(
+        {"messages": [{"role": "user", "content": ""},
+                      {"role": "assistant", "content": "ok"}]}) is None
