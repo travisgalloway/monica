@@ -38,6 +38,7 @@ PORTABLE_MODULES = [
     "src.model.sizing",
     "src.data.loader",
     "src.data.corpus",
+    "src.data.distill_sources",
     "src.data.storage",
     "src.data.distill_corpus",
     "src.data.teacher_outputs",
