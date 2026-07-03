@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 
@@ -45,6 +46,11 @@ def _download_shard(source: str, shard_id: int, local_root: Path) -> Path:
     from src.data.r2_sync import download_dir
     shard_uri = f"{source.rstrip('/')}/shard-{shard_id}"
     shard_local = local_root / f"shard-{shard_id}"
+    # download_dir only fetches/overwrites — it never deletes local files that no longer
+    # exist remotely, so a reused cache dir could silently mix in stale artifacts from an
+    # earlier run. Start from a clean directory each time.
+    if shard_local.exists():
+        shutil.rmtree(shard_local)
     shard_local.mkdir(parents=True, exist_ok=True)
     download_dir(shard_uri, str(shard_local))
     return shard_local

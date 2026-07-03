@@ -192,8 +192,12 @@ def main() -> None:
         _idx_file = out_dir / f"teacher-{split}.topk_idx"
         if _idx_file.exists() and _idx_file.stat().st_size > 0:
             import os as _os
-            _IB = args.k * 4   # bytes per row in idx (uint32 × k)
-            _VB = args.k * 2   # bytes per row in vals (float16 × k)
+            # Use the teacher-clamped k (min(args.k, effective_vocab)), not args.k directly —
+            # the writer records rows at this width, so byte math must match what was actually
+            # written or chunk-boundary detection undercounts/overcounts on resume.
+            _on_disk_k = min(args.k, eff_vocab)
+            _IB = _on_disk_k * 4   # bytes per row in idx (uint32 × k)
+            _VB = _on_disk_k * 2   # bytes per row in vals (float16 × k)
             _vf = out_dir / f"teacher-{split}.topk_vals"
             _isz = _idx_file.stat().st_size
             _vsz = _vf.stat().st_size if _vf.exists() else 0

@@ -56,6 +56,11 @@ SPLITS_ARG="train"
 if [ "$SHARD_ID" -eq 0 ]; then
   SPLITS_ARG="train,val"
   echo "[shard-0] will also process val split" | tee -a "$LOG"
+else
+  # Guard against a reused /vol carrying stale val artifacts from an earlier shard-0 run —
+  # this shard won't rewrite them, but the R2 checkpoint loop uploads the whole shard dir,
+  # which would silently contaminate this shard's R2 prefix with val data.
+  rm -f "/vol/teacher-outputs/topk-logits/shard-${SHARD_ID}"/teacher-val.* 2>/dev/null || true
 fi
 
 # Background R2 checkpoint: sync output every 2 hours so a billing stop loses at most 2h.
