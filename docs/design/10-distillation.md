@@ -203,6 +203,14 @@ which are **tokenizer-independent and transfer**. Absolute capability numbers st
 from-scratch production run, so the POC is a **layout decision and a feasibility check**, sealed
 by the local-hardware headline metric (#104).
 
+The #104 harness itself (`scripts/bench_context.py`) is built and runnable now: it sweeps context
+length for an `ssm` arm (the config as given) vs a same-dims `attn` arm
+(`attn_every=1`), reporting prefill/decode tok/s, peak memory, and the analytic per-token state
+size — throughput and memory are architecture properties, not weight properties, so it needs no
+trained checkpoint. The final **headline number** — the post-trained ~1B student vs a same-size
+transformer — still needs that student (per the #65 tracker's dependency chain); #104 stays open
+until then.
+
 ## Related
 
 - [Corpus pipeline](08-corpus-pipeline.md) — the distillation corpus, teacher outputs, storage layout.
