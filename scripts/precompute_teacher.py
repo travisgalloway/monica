@@ -181,6 +181,11 @@ def main() -> None:
         else:
             start_chunk, this_chunks = 0, total_chunks
 
+        # The shard's TRUE starting position, for merge_teacher_shards.py's contiguity check
+        # (0, then previous_start+previous_n_chunks, ...). Resume below advances `start_chunk`
+        # to the actual resume point, which must not leak into this recorded value.
+        shard_start_chunk = start_chunk
+
         # Auto-resume: if output files already exist (e.g. after a pod billing stop),
         # skip already-written chunks and append from the last complete chunk boundary.
         _chunks_resume = 0
@@ -233,7 +238,7 @@ def main() -> None:
         blocks = _topk_blocks(teacher, backend, data, this_chunks, stride, seq_len,
                               args.batch_size, args.k, start_chunk=start_chunk)
         shard_info = {"shard_id": shard_id, "num_shards": num_shards,
-                      "start_chunk": start_chunk} if cluster else {}
+                      "start_chunk": shard_start_chunk} if cluster else {}
         meta = write_teacher_topk(out_dir, split, blocks=blocks, n_chunks=this_chunks,
                                   seq_len=seq_len, vocab_size=eff_vocab,
                                   src_packed=str(args.data / f"{split}.bin"),

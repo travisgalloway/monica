@@ -70,6 +70,7 @@ fi
   done
 ) &
 R2_CKPT_PID=$!
+trap 'kill "$R2_CKPT_PID" 2>/dev/null || true' EXIT INT TERM
 
 echo "[shard-${SHARD_ID}] precompute_teacher start $(date)" | tee -a "$LOG"
 python scripts/precompute_teacher.py \
@@ -85,5 +86,4 @@ python scripts/precompute_teacher.py \
   --push s3://monica-training/poc-distill/teacher-outputs/topk-logits \
   2>&1 | tee -a "$LOG"
 
-kill "$R2_CKPT_PID" 2>/dev/null || true
 echo "PRECOMPUTE_SHARD_DONE shard=${SHARD_ID}/${NUM_SHARDS} $(date)" | tee -a "$LOG"
