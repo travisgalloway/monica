@@ -23,7 +23,7 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 # Source -> license, for the clean-license accounting (CC-BY-SA flagged share-alike).
 SOURCE_LICENSES = {"oasst1": "apache-2.0", "flan": "apache-2.0",
-                   "dolly": "cc-by-sa-3.0", "handauthored": "cc0"}
+                   "dolly": "cc-by-sa-3.0", "handauthored": "cc0", "ultrachat": "mit"}
 
 
 def _tag(messages: List[dict], source: str) -> dict:
@@ -114,6 +114,42 @@ def load_flan_slice(split: str = "train", max_examples: Optional[int] = None,
 
 
 # --------------------------------------------------------------------------- #
+# UltraChat — multi-turn chat rows that already carry a `messages` list
+# --------------------------------------------------------------------------- #
+def ultrachat_row_to_messages(row: dict) -> Optional[dict]:
+    """A `HuggingFaceH4/ultrachat_200k` row (a `{messages: [{role, content}, ...]}` list) ->
+    a tagged `{messages}` example (or None if malformed/empty)."""
+    msgs = row.get("messages")
+    if not isinstance(msgs, (list, tuple)):
+        return None
+    out: List[dict] = []
+    for m in msgs:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role in ("system", "user", "assistant") and content:
+            out.append({"role": role, "content": content})
+    if out and out[0]["role"] in ("system", "user") and out[-1]["role"] == "assistant":
+        return _tag(out, "ultrachat")
+    return None
+
+
+def load_ultrachat(split: str = "train_sft", max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Stream HuggingFaceH4/ultrachat_200k and map rows to tagged chat rows (lazy `datasets`)."""
+    from datasets import load_dataset  # pragma: no cover - network/optional extra
+
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=split, streaming=True)
+    n = 0
+    for row in ds:
+        rec = ultrachat_row_to_messages(row)
+        if rec is None:
+            continue
+        yield rec
+        n += 1
+        if max_examples is not None and n >= max_examples:
+            break
+
+
+# --------------------------------------------------------------------------- #
 # Dolly — reuse the existing instruction/response shape (flagged CC-BY-SA)
 # --------------------------------------------------------------------------- #
 def load_dolly(max_examples: Optional[int] = None) -> Iterator[dict]:
@@ -163,6 +199,7 @@ _LOADERS = {
     "flan": lambda n: load_flan_slice(max_examples=n),
     "dolly": lambda n: load_dolly(max_examples=n),
     "handauthored": lambda n: handauthored_records(),
+    "ultrachat": lambda n: load_ultrachat(max_examples=n),
 }
 
 

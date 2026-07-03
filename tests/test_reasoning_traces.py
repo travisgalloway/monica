@@ -1,9 +1,9 @@
 """Reasoning-trace sources + <think>/<answer> formatting (#96). Pure stdlib (no backend/network)."""
 
-from src.data.reasoning_traces import (ANSWER_CLOSE, ANSWER_OPEN, THINK_CLOSE, THINK_OPEN,
-                                       format_trace, handauthored_trace_records,
+from src.data.reasoning_traces import (ANSWER_CLOSE, ANSWER_OPEN, SOURCE_LICENSES, THINK_CLOSE,
+                                       THINK_OPEN, format_trace, handauthored_trace_records,
                                        iter_reasoning_traces, mot_row_to_messages,
-                                       trace_to_messages)
+                                       openthoughts_row_to_messages, trace_to_messages)
 
 
 def test_format_trace_wraps_think_then_answer():
@@ -47,3 +47,30 @@ def test_iter_reasoning_traces_handauthored():
     rows = list(iter_reasoning_traces(["handauthored"]))
     assert rows == list(handauthored_trace_records())
     assert len(rows) >= 4 and all(r["messages"][-1]["role"] == "assistant" for r in rows)
+
+
+def test_openthoughts_row_conversations_sharegpt_style():
+    row = {"conversations": [{"from": "human", "value": "2+2?"},
+                             {"from": "gpt", "value": f"{THINK_OPEN}\nadd\n{THINK_CLOSE}\n4"}]}
+    rec = openthoughts_row_to_messages(row)
+    assert rec is not None and rec["source"] == "openthoughts"
+    assert rec["messages"] == [{"role": "user", "content": "2+2?"},
+                               {"role": "assistant",
+                                "content": f"{THINK_OPEN}\nadd\n{THINK_CLOSE}\n4"}]
+
+
+def test_openthoughts_row_falls_back_to_mot_shape():
+    # No `conversations` field -> falls back to mot_row_to_messages's problem/solution shape.
+    rec = openthoughts_row_to_messages({"problem": "2+2?", "reasoning": "add", "solution": "4"})
+    assert rec is not None and rec["source"] == "openthoughts"
+    content = rec["messages"][-1]["content"]
+    assert THINK_OPEN in content and "4" in content
+
+
+def test_openthoughts_row_skips_incomplete():
+    assert openthoughts_row_to_messages({"conversations": [{"from": "human", "value": "Q"}]}) is None
+    assert openthoughts_row_to_messages({}) is None
+
+
+def test_source_licenses_cover_openthoughts():
+    assert "openthoughts" in SOURCE_LICENSES
