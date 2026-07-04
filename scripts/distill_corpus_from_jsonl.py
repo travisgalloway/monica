@@ -1,13 +1,14 @@
 """Stream the cleaned jsonl.gz corpus (local or R2), and/or the Phase A' multi-domain
-distillation-extension sources (code/math/docs/conversation/reasoning, #65), into
-build_distill_corpus.
+distillation-extension sources (code/math/docs/wiki/conversation/reasoning/code_problems/
+code_instruct, #65), into build_distill_corpus.
 
 The cleaned jsonl(.gz) shards are already normalized/filtered/deduped text, so `--in` skips
 the datatrove re-clean and feeds `iter_jsonl_texts -> Record -> build_distill_corpus` unchanged
 (clean[no-op]->qwen3 tokenize->uint32 pack), writing the poc-distill/corpus layout.
 
-Setting any `--code-source`/`--math-source`/`--docs-source`/`--conversation-sources`/
-`--reasoning-sources` domain flag additionally (or instead) streams the new-source extension
+Setting any `--code-source`/`--math-source`/`--docs-source`/`--wiki-source`/
+`--conversation-sources`/`--reasoning-sources`/`--code-problem-sources`/
+`--code-instruct-sources` domain flag additionally (or instead) streams the new-source extension
 records via `distill_sources.build_extension_records` and, because those sources are curated
 (not raw web scrape), applies the documented A' cleaning policy: `quality=False,
 license_filter=True, drop_minified=True, drop_autogen=True, scrub=True` (see
@@ -44,12 +45,23 @@ def _extension_cfg(args: argparse.Namespace) -> dict:
     if args.math_source != "none":
         cfg["math"] = {"source": args.math_source, "tokens": args.math_tokens}
     if args.docs_source != "none":
-        cfg["docs"] = {"source": args.docs_source, "tokens": args.docs_tokens}
+        cfg["docs"] = {"source": args.docs_source,
+                      "langs": args.docs_langs or args.code_langs,
+                      "tokens": args.docs_tokens}
+    if args.wiki_source != "none":
+        cfg["wiki"] = {"source": args.wiki_source, "tokens": args.wiki_tokens}
     if args.conversation_sources:
         cfg["conversation"] = {"sources": args.conversation_sources,
                                "tokens": args.conversation_tokens}
     if args.reasoning_sources:
         cfg["reasoning"] = {"sources": args.reasoning_sources, "tokens": args.reasoning_tokens}
+    if args.code_problem_sources:
+        cfg["code_problems"] = {"sources": args.code_problem_sources,
+                                "langs": args.code_problem_langs or args.code_langs,
+                                "tokens": args.code_problem_tokens}
+    if args.code_instruct_sources:
+        cfg["code_instruct"] = {"sources": args.code_instruct_sources,
+                               "tokens": args.code_instruct_tokens}
     return cfg
 
 
@@ -84,14 +96,47 @@ def main() -> None:
                          "--code-tokens when both are set")
     ap.add_argument("--math-source", choices=("open-web-math", "none"), default="none")
     ap.add_argument("--math-tokens", type=int, default=None)
-    ap.add_argument("--docs-source", choices=("library-documentation", "none"), default="none")
+    ap.add_argument("--docs-source",
+                    choices=("starcoder2-documentation", "library-documentation", "none"),
+                    default="none",
+                    help="starcoder2-documentation is multilingual (48 langs, filtered by "
+                         "--docs-langs); library-documentation is Python-only and kept for "
+                         "back-compat (#65: starcoder2-documentation replaces it as the "
+                         "recommended choice, 2026-07-04)")
+    ap.add_argument("--docs-langs", nargs="+", default=None,
+                    help="language filter for --docs-source starcoder2-documentation "
+                         "(default: --code-langs); ignored by library-documentation")
     ap.add_argument("--docs-tokens", type=int, default=None)
+    ap.add_argument("--wiki-source", choices=("structured-wikipedia", "none"), default="none",
+                    help="wikimedia/structured-wikipedia, English config only (#65)")
+    ap.add_argument("--wiki-tokens", type=int, default=None)
     ap.add_argument("--conversation-sources", nargs="+", choices=("ultrachat", "oasst1"),
                     default=None)
     ap.add_argument("--conversation-tokens", type=int, default=None)
-    ap.add_argument("--reasoning-sources", nargs="+", choices=("mot", "openthoughts"),
-                    default=None)
+    ap.add_argument("--reasoning-sources", nargs="+",
+                    choices=("mot", "openthoughts", "openthoughts2"), default=None,
+                    help="use openthoughts2 (OpenThoughts2-1M), not openthoughts "
+                         "(OpenThoughts-114k), for a real build -- 2-1M supersets 114k, so "
+                         "blending both duplicates traces (#65, 2026-07-04)")
     ap.add_argument("--reasoning-tokens", type=int, default=None)
+    ap.add_argument("--code-problem-sources", nargs="+",
+                    choices=("opencodereasoning", "rosetta-code", "mceval", "kodcode"),
+                    default=None,
+                    help="competitive-programming / multilingual problem+solution sources "
+                         "(#65); kodcode (CC BY-NC 4.0) and rosetta-code (GFDL) carry "
+                         "non-permissive licenses, accepted per the project's 2026-07-04 "
+                         "decision (#182) that this open-source research project keeps such "
+                         "licenses rather than dropping them")
+    ap.add_argument("--code-problem-langs", nargs="+", default=None,
+                    help="language filter for the multilingual code-problem sources "
+                         "(rosetta-code/mceval; default: --code-langs); opencodereasoning/"
+                         "kodcode are Python-only and ignore this")
+    ap.add_argument("--code-problem-tokens", type=int, default=None)
+    ap.add_argument("--code-instruct-sources", nargs="+",
+                    choices=("opencodeinstruct", "codefeedback"), default=None,
+                    help="instruction -> code-solution sources (#65); opencodeinstruct is "
+                         "~5M rows -- set --code-instruct-tokens to cap it")
+    ap.add_argument("--code-instruct-tokens", type=int, default=None)
     ap.add_argument("--push", default=None,
                     help="after building, mirror <out-root> to this fsspec URI / R2 prefix "
                          "(e.g. s3://monica-training/poc-distill); R2 endpoint from "
