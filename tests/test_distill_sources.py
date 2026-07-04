@@ -255,6 +255,21 @@ def test_qa_records_falls_back_when_license_field_absent():
     assert out[0].license == "mit"
 
 
+def test_qa_records_sets_meta_is_code_when_requested():
+    # #182 review: without an explicit is_code flag, filters.is_code_record() falls back to a
+    # source-name substring match ("code" in source), which a source like "mceval" evades --
+    # is_code must be set explicitly, not inferred.
+    rows = [{"q": "q", "a": "a"}]
+    out = list(_qa_records(rows, "q", "a", "mceval", "mit", is_code=True))
+    assert out[0].meta.get("is_code") is True
+
+
+def test_qa_records_meta_is_code_false_by_default():
+    rows = [{"q": "q", "a": "a"}]
+    out = list(_qa_records(rows, "q", "a", "src", "mit"))
+    assert out[0].meta.get("is_code") is not True
+
+
 # --------------------------------------------------------------------------- #
 # Docs (CHANGED, #65) — starcoder2-documentation replaces library-documentation
 # (Python-only). Multilingual: filter by the row's `language` field.
@@ -356,6 +371,7 @@ def test_iter_opencodereasoning_maps_input_output(monkeypatch):
     assert records[0].text == "Sum two numbers.\n\ndef s(a,b): return a+b\n\n"
     assert records[0].license == "cc-by-4.0"
     assert records[0].source == "opencodereasoning"
+    assert records[0].meta.get("is_code") is True
 
 
 def test_iter_rosetta_code_filters_by_language_name(monkeypatch):
@@ -371,6 +387,7 @@ def test_iter_rosetta_code_filters_by_language_name(monkeypatch):
     assert len(records) == 1
     assert "print('hi')" in records[0].text
     assert records[0].license == "GFDL"
+    assert records[0].meta.get("is_code") is True
 
 
 def test_iter_mceval_instruct_filters_by_language(monkeypatch):
@@ -386,6 +403,9 @@ def test_iter_mceval_instruct_filters_by_language(monkeypatch):
     assert len(records) == 1
     assert "range(10)" in records[0].text
     assert records[0].license == "cc-by-sa-4.0"
+    assert records[0].meta.get("is_code") is True  # #182 review: "mceval" evades the
+    # is_code_record source-name-substring fallback ("code" not in "mceval"), so this must be
+    # explicit -- otherwise it's silently treated as text and skips code-only filters.
 
 
 def test_iter_code_problems_chains_multiple_sources(monkeypatch):
@@ -420,6 +440,23 @@ def test_iter_opencodeinstruct_maps_input_output(monkeypatch):
     assert len(records) == 1
     assert records[0].license == "cc-by-4.0"
     assert records[0].source == "opencodeinstruct"
+    assert records[0].meta.get("is_code") is True
+
+
+def test_iter_codefeedback_maps_query_answer(monkeypatch):
+    def fake_load_dataset(*args, **kwargs):
+        return [{"query": "Write a for loop.", "answer": "for i in range(10): pass"}]
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    from src.data.distill_sources import iter_codefeedback
+
+    records = list(iter_codefeedback())
+    assert len(records) == 1
+    assert records[0].text == "Write a for loop.\n\nfor i in range(10): pass\n\n"
+    assert records[0].license == "apache-2.0"
+    assert records[0].source == "codefeedback"
+    assert records[0].meta.get("is_code") is True
 
 
 def test_iter_code_instruct_chains_multiple_sources(monkeypatch):

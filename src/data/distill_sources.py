@@ -122,11 +122,13 @@ def _normalize_code_lang(raw: str) -> str:
     return CODE_LANG_ALIASES.get(key, key)
 
 
-def _code_lang_matches(raw: str, wanted: Iterable[str]) -> bool:
-    """`wanted` should already be `DEFAULT_CODE_LANGS`-style names (lowercase-hyphenated); `raw`
-    is the source row's own language label, normalized via `_normalize_code_lang` before the
-    membership check."""
-    return _normalize_code_lang(raw) in set(wanted)
+def _code_lang_matches(raw: str, wanted: set[str]) -> bool:
+    """`wanted` must already be a `set` of `DEFAULT_CODE_LANGS`-style names
+    (lowercase-hyphenated), built ONCE per stream by the caller — this runs on a per-row
+    streaming hot path (docs/wiki/code_problems filters over potentially millions of rows), so
+    it must not rebuild `wanted` on every call. `raw` is the source row's own language label,
+    normalized via `_normalize_code_lang` before the membership check."""
+    return _normalize_code_lang(raw) in wanted
 
 
 # --------------------------------------------------------------------------- #
@@ -385,13 +387,20 @@ def iter_reasoning(sources: Iterable[str],
 # --------------------------------------------------------------------------- #
 def _qa_records(rows: Iterable[dict], q_field: str, a_field: str, source: str, license: str, *,
                 lang_field: Optional[str] = None, keep_langs: Optional[Iterable[str]] = None,
-                license_field: Optional[str] = None) -> Iterator[Record]:
+                license_field: Optional[str] = None, is_code: bool = False) -> Iterator[Record]:
     """Render `{q_field: ..., a_field: ...}` rows into plain Q/A pretrain text
     (`"{question}\\n\\n{answer}\\n\\n"`), optionally filtering on `lang_field` (via
     `_code_lang_matches` against `keep_langs`) and/or resolving a per-row `license_field`
     (falling back to `license` when absent/empty). Pure, offline-testable — the analogue of
     `messages_to_text`/`_messages_records` for sources shaped as a flat prompt/response pair
-    rather than a chat thread."""
+    rather than a chat thread.
+
+    `is_code` sets `meta.is_code` explicitly for `filters.is_code_record()` — callers whose rows
+    are code (all current code_problems/code_instruct sources) MUST pass `is_code=True` rather
+    than relying on `is_code_record`'s source-name substring fallback (`"code" in source`),
+    which is easy to evade by accident (e.g. a source named "mceval" doesn't contain "code" and
+    would otherwise silently skip the permissive-license gate + minified/autogen filters, #182
+    review)."""
     wanted = set(keep_langs) if keep_langs is not None else None
     for row in rows:
         if lang_field is not None and wanted is not None:
@@ -403,7 +412,8 @@ def _qa_records(rows: Iterable[dict], q_field: str, a_field: str, source: str, l
             continue
         row_license = row.get(license_field) if license_field else None
         yield Record(text=f"{question}\n\n{answer}\n\n", source=source, lang="en",
-                    license=row_license or license)
+                    license=row_license or license,
+                    meta={"is_code": True} if is_code else {})
 
 
 # --------------------------------------------------------------------------- #
@@ -418,7 +428,7 @@ def iter_opencodereasoning() -> Iterator[Record]:
     ds = load_dataset("nvidia/OpenCodeReasoning", "split_0",  # pragma: no cover
                       split="train", streaming=True)
     yield from _qa_records(ds, "input", "output", "opencodereasoning",
-                           DATASET_LEVEL_LICENSE["opencodereasoning"])
+                           DATASET_LEVEL_LICENSE["opencodereasoning"], is_code=True)
 
 
 def iter_rosetta_code(langs: Iterable[str]) -> Iterator[Record]:
@@ -433,7 +443,7 @@ def iter_rosetta_code(langs: Iterable[str]) -> Iterator[Record]:
                       streaming=True)
     yield from _qa_records(ds, "task_description", "code", "rosetta-code",
                            DATASET_LEVEL_LICENSE["rosetta-code"],
-                           lang_field="language_name", keep_langs=wanted)
+                           lang_field="language_name", keep_langs=wanted, is_code=True)
 
 
 def iter_mceval_instruct(langs: Iterable[str]) -> Iterator[Record]:
@@ -447,7 +457,7 @@ def iter_mceval_instruct(langs: Iterable[str]) -> Iterator[Record]:
                       split="train", streaming=True)
     yield from _qa_records(ds, "instruction", "output", "mceval",
                            DATASET_LEVEL_LICENSE["mceval"],
-                           lang_field="language", keep_langs=wanted)
+                           lang_field="language", keep_langs=wanted, is_code=True)
 
 
 def iter_code_problems(sources: Iterable[str], langs: Optional[Iterable[str]] = None,
@@ -484,7 +494,7 @@ def iter_opencodeinstruct() -> Iterator[Record]:
     ds = load_dataset("nvidia/OpenCodeInstruct", split="train",  # pragma: no cover
                       streaming=True)
     yield from _qa_records(ds, "input", "output", "opencodeinstruct",
-                           DATASET_LEVEL_LICENSE["opencodeinstruct"])
+                           DATASET_LEVEL_LICENSE["opencodeinstruct"], is_code=True)
 
 
 def iter_codefeedback() -> Iterator[Record]:
@@ -497,7 +507,7 @@ def iter_codefeedback() -> Iterator[Record]:
     ds = load_dataset("m-a-p/CodeFeedback-Filtered-Instruction",  # pragma: no cover
                       split="train", streaming=True)
     yield from _qa_records(ds, "query", "answer", "codefeedback",
-                           DATASET_LEVEL_LICENSE["codefeedback"])
+                           DATASET_LEVEL_LICENSE["codefeedback"], is_code=True)
 
 
 def iter_code_instruct(sources: Iterable[str],
