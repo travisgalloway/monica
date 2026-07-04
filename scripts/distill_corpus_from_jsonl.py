@@ -120,14 +120,17 @@ def main() -> None:
                          "blending both duplicates traces (#65, 2026-07-04)")
     ap.add_argument("--reasoning-tokens", type=int, default=None)
     ap.add_argument("--code-problem-sources", nargs="+",
-                    choices=("opencodereasoning", "rosetta-code", "mceval"), default=None,
+                    choices=("opencodereasoning", "rosetta-code", "mceval", "kodcode"),
+                    default=None,
                     help="competitive-programming / multilingual problem+solution sources "
-                         "(#65); KodCode-V1 is deliberately not offered here (CC BY-NC 4.0 "
-                         "non-commercial, excluded by decision, 2026-07-04)")
+                         "(#65); kodcode (CC BY-NC 4.0) and rosetta-code (GFDL) carry "
+                         "non-permissive licenses, accepted per the project's 2026-07-04 "
+                         "decision (#182) that this open-source research project keeps such "
+                         "licenses rather than dropping them")
     ap.add_argument("--code-problem-langs", nargs="+", default=None,
                     help="language filter for the multilingual code-problem sources "
-                         "(rosetta-code/mceval; default: --code-langs); opencodereasoning is "
-                         "Python-only and ignores this")
+                         "(rosetta-code/mceval; default: --code-langs); opencodereasoning/"
+                         "kodcode are Python-only and ignore this")
     ap.add_argument("--code-problem-tokens", type=int, default=None)
     ap.add_argument("--code-instruct-sources", nargs="+",
                     choices=("opencodeinstruct", "codefeedback"), default=None,

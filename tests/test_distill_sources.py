@@ -10,12 +10,12 @@ from src.data.corpus import Record
 from src.data.distill_sources import (_code_lang_matches, _normalize_code_lang, _qa_records,
                                        build_extension_records, char_budget_cap,
                                        iter_code_instruct, iter_code_problems,
-                                       iter_library_documentation, iter_mceval_instruct,
-                                       iter_open_web_math, iter_opencodeinstruct,
-                                       iter_opencodereasoning, iter_rosetta_code,
-                                       iter_starcoder2_documentation, iter_structured_wikipedia,
-                                       iter_the_stack_smol, messages_to_text,
-                                       render_wikipedia_sections)
+                                       iter_kodcode, iter_library_documentation,
+                                       iter_mceval_instruct, iter_open_web_math,
+                                       iter_opencodeinstruct, iter_opencodereasoning,
+                                       iter_rosetta_code, iter_starcoder2_documentation,
+                                       iter_structured_wikipedia, iter_the_stack_smol,
+                                       messages_to_text, render_wikipedia_sections)
 
 
 def test_messages_to_text_renders_role_prefixed_turns():
@@ -357,8 +357,9 @@ def test_iter_structured_wikipedia_skips_rows_with_no_renderable_text(monkeypatc
 
 
 # --------------------------------------------------------------------------- #
-# Code problems — OpenCodeReasoning (Python-only) / rosetta-code / McEval-Instruct
-# (multilingual, #65). KodCode-V1 deliberately excluded (CC BY-NC 4.0).
+# Code problems — OpenCodeReasoning / rosetta-code / McEval-Instruct / KodCode-V1 (#65).
+# KodCode-V1 (CC BY-NC 4.0) and rosetta-code (GFDL) are accepted despite non-permissive
+# licenses per the project's 2026-07-04 decision (#182) -- see filters.NONCOMMERCIAL_LICENSES.
 # --------------------------------------------------------------------------- #
 def test_iter_opencodereasoning_maps_input_output(monkeypatch):
     def fake_load_dataset(*args, **kwargs):
@@ -408,6 +409,21 @@ def test_iter_mceval_instruct_filters_by_language(monkeypatch):
     # explicit -- otherwise it's silently treated as text and skips code-only filters.
 
 
+def test_iter_kodcode_maps_question_solution(monkeypatch):
+    def fake_load_dataset(*args, **kwargs):
+        return [{"question": "Reverse a list.", "solution": "def r(xs): return xs[::-1]",
+                "test": "assert r([1,2]) == [2,1]", "subset": "Leetcode"}]
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    records = list(iter_kodcode())
+    assert len(records) == 1
+    assert records[0].text == "Reverse a list.\n\ndef r(xs): return xs[::-1]\n\n"
+    assert records[0].license == "cc-by-nc-4.0"
+    assert records[0].source == "kodcode"
+    assert records[0].meta.get("is_code") is True
+
+
 def test_iter_code_problems_chains_multiple_sources(monkeypatch):
     import src.data.distill_sources as distill_sources
 
@@ -420,11 +436,21 @@ def test_iter_code_problems_chains_multiple_sources(monkeypatch):
     assert {r.text for r in records} == {"a", "b"}
 
 
+def test_iter_code_problems_includes_kodcode(monkeypatch):
+    import src.data.distill_sources as distill_sources
+
+    monkeypatch.setattr(distill_sources, "iter_kodcode",
+                        lambda: iter([Record(text="k", source="kodcode")]))
+
+    records = list(distill_sources.iter_code_problems(["kodcode"]))
+    assert {r.text for r in records} == {"k"}
+
+
 def test_iter_code_problems_unknown_source_raises():
     import pytest
 
     with pytest.raises(ValueError):
-        list(iter_code_problems(["kodcode"]))  # deliberately excluded, not a valid source
+        list(iter_code_problems(["nope"]))  # not a registered source
 
 
 # --------------------------------------------------------------------------- #

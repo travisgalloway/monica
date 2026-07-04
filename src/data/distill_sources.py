@@ -17,7 +17,10 @@ conversational/reasoning/knowledge behavior at pretrain, not only at SFT:
     (`iter_reasoning`) — OpenThoughts2-1M supersets the older OpenThoughts-114k.
   - **code_problems**: competitive-programming / multilingual problem+solution sources —
     `nvidia/OpenCodeReasoning`, `christopher/rosetta-code`, `Multilingual-Multimodal-NLP/
-    McEval-Instruct` (`iter_code_problems`).
+    McEval-Instruct`, `KodCode/KodCode-V1` (`iter_code_problems`). KodCode-V1 (CC BY-NC 4.0)
+    and rosetta-code (GFDL) are non-permissive/non-commercial — accepted per the project's
+    2026-07-04 decision (#182) that this open-source research project keeps such licenses
+    rather than dropping them (see `filters.NONCOMMERCIAL_LICENSES`).
   - **code_instruct**: instruction -> code-solution sources — `nvidia/OpenCodeInstruct`,
     `m-a-p/CodeFeedback-Filtered-Instruction` (`iter_code_instruct`).
 
@@ -94,6 +97,7 @@ DATASET_LEVEL_LICENSE = {
     "mceval": "cc-by-sa-4.0",
     "opencodeinstruct": "cc-by-4.0",
     "codefeedback": "apache-2.0",
+    "kodcode": "cc-by-nc-4.0",
 }
 
 
@@ -417,7 +421,7 @@ def _qa_records(rows: Iterable[dict], q_field: str, a_field: str, source: str, l
 
 
 # --------------------------------------------------------------------------- #
-# Code problems — OpenCodeReasoning (Python) + rosetta-code + McEval-Instruct (multilingual)
+# Code problems — OpenCodeReasoning + rosetta-code + McEval-Instruct + KodCode-V1
 # --------------------------------------------------------------------------- #
 def iter_opencodereasoning() -> Iterator[Record]:
     """Stream `nvidia/OpenCodeReasoning` (`split_0`, ~585k rows carrying `input`).
@@ -435,7 +439,8 @@ def iter_rosetta_code(langs: Iterable[str]) -> Iterator[Record]:
     """Stream `christopher/rosetta-code`, filtered to `langs` via the `language_name` field
     (883+ raw language names — see `CODE_LANG_ALIASES`; unmapped names are cleanly excluded).
     `task_description` = question, `code` = answer. License: `GFDL` (per the card, not an SPDX
-    id — Rosetta Code's own source-material license)."""
+    id — Rosetta Code's own source-material license; copyleft/attribution like CC-BY-SA, kept
+    via `filters.FLAGGED_LICENSES`, #182)."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     wanted = {lang.strip().lower() for lang in langs}
@@ -444,6 +449,22 @@ def iter_rosetta_code(langs: Iterable[str]) -> Iterator[Record]:
     yield from _qa_records(ds, "task_description", "code", "rosetta-code",
                            DATASET_LEVEL_LICENSE["rosetta-code"],
                            lang_field="language_name", keep_langs=wanted, is_code=True)
+
+
+def iter_kodcode() -> Iterator[Record]:
+    """Stream `KodCode/KodCode-V1` (fully-synthetic, verified Python problem+solution+test
+    triples; 12 subsets via a `subset` field — Prefill/Leetcode/Codeforces/Apps/Taco/
+    Code Contests/Algorithm/Data Structure/Docs/Filter/Package/Evol). `question` = question,
+    `solution` = answer; Python-only, no language filter. License: `cc-by-nc-4.0`
+    (non-commercial) — accepted per the project's 2026-07-04 decision (#182) that this
+    open-source research project keeps NC-licensed sources rather than dropping them (see
+    `filters.NONCOMMERCIAL_LICENSES`)."""
+    from datasets import load_dataset  # pragma: no cover - network/optional extra
+
+    ds = load_dataset("KodCode/KodCode-V1", split="train",  # pragma: no cover
+                      streaming=True)
+    yield from _qa_records(ds, "question", "solution", "kodcode",
+                           DATASET_LEVEL_LICENSE["kodcode"], is_code=True)
 
 
 def iter_mceval_instruct(langs: Iterable[str]) -> Iterator[Record]:
@@ -463,15 +484,17 @@ def iter_mceval_instruct(langs: Iterable[str]) -> Iterator[Record]:
 def iter_code_problems(sources: Iterable[str], langs: Optional[Iterable[str]] = None,
                        max_per_source: Optional[int] = None) -> Iterator[Record]:
     """Chain code-problem sources (competitive-programming / multilingual problem+solution).
-    `opencodereasoning` is Python-only (no language filter applies); `rosetta-code`/`mceval` are
-    multilingual, filtered to `langs` (default `DEFAULT_CODE_LANGS`). **`kodcode` (KodCode-V1)
-    is deliberately NOT registered here** — its CC BY-NC 4.0 license is non-commercial and was
-    excluded by user decision (#65, 2026-07-04)."""
+    `opencodereasoning`/`kodcode` are Python-only (no language filter applies); `rosetta-code`/
+    `mceval` are multilingual, filtered to `langs` (default `DEFAULT_CODE_LANGS`). `kodcode`
+    (CC BY-NC 4.0) and `rosetta-code` (GFDL) carry non-permissive licenses, accepted per the
+    project's 2026-07-04 decision (#182) — see `filters.NONCOMMERCIAL_LICENSES`/
+    `FLAGGED_LICENSES`."""
     langs = list(langs) if langs is not None else DEFAULT_CODE_LANGS
     loaders: Dict[str, callable] = {
         "opencodereasoning": lambda: iter_opencodereasoning(),
         "rosetta-code": lambda: iter_rosetta_code(langs),
         "mceval": lambda: iter_mceval_instruct(langs),
+        "kodcode": lambda: iter_kodcode(),
     }
     for name in sources:
         if name not in loaders:
