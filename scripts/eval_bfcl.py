@@ -60,6 +60,7 @@ def main() -> None:
     import numpy as np
 
     from src.data.chat_template import render
+    from src.data.instruct_sft import _effective_vocab_size
     from src.data.tokenize import (
         ByteTokenizer,
         load_olmo_tokenizer,
@@ -91,10 +92,13 @@ def main() -> None:
     else:
         tok = load_olmo_tokenizer()
     # A tokenizer that can emit ids >= the model vocab would crash deep in the
-    # embedding lookup; fail here with a clear message instead.
-    if tok.vocab_size > cfg.vocab_size:
+    # embedding lookup; fail here with a clear message instead. Use the effective
+    # vocab (len(tok)) rather than tok.vocab_size, since added special tokens
+    # (e.g. Qwen3's <|im_start|>/<|im_end|>) can have ids past vocab_size.
+    eff_vocab = _effective_vocab_size(tok)
+    if eff_vocab is not None and eff_vocab > cfg.vocab_size:
         raise SystemExit(
-            f"tokenizer vocab {tok.vocab_size} exceeds model vocab "
+            f"tokenizer vocab {eff_vocab} exceeds model vocab "
             f"{cfg.vocab_size} ({args.config}) — use a matching config, or "
             f"--byte-fallback only with toy-scale configs.")
 

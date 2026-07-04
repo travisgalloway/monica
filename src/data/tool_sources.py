@@ -102,7 +102,11 @@ def validate_call_against_tools(call: dict, tools: List[dict]) -> bool:
     if tool is None:
         return False
     required = (tool.get("parameters") or {}).get("required") or []
-    arguments = call.get("arguments") or {}
+    if not isinstance(required, list):
+        return False
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return False
     return all(r in arguments for r in required)
 
 

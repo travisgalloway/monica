@@ -221,6 +221,7 @@ BFCL_FIXTURE: List[dict] = [
         "category": "parallel",
         "tools": [_WEATHER_TOOL, _TIMER_TOOL],
         "messages": [
+            {"role": "system", "content": render_tool_system([_WEATHER_TOOL, _TIMER_TOOL])},
             {"role": "user", "content": "What's the weather in Tokyo, and set a 5 minute timer?"},
         ],
         "gold": [
@@ -232,6 +233,7 @@ BFCL_FIXTURE: List[dict] = [
         "category": "abstention",
         "tools": [_WEATHER_TOOL],
         "messages": [
+            {"role": "system", "content": render_tool_system([_WEATHER_TOOL])},
             {"role": "user", "content": "Translate 'hello' into French."},
         ],
         "gold": [],
