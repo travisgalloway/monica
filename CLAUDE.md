@@ -157,3 +157,23 @@ The smoke gate stresses exactly this round-trip.
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
   a milestone, tick its box in the relevant tracker (#2 / #65).
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.
+
+## Licensing / usage-policy compliance (M10 distillation)
+
+M10 distils from **`Qwen/Qwen3-4B-Thinking-2507`, licensed plain unmodified Apache-2.0** (no
+distillation or competing-model restriction — confirmed against the live LICENSE file
+2026-07-05) using third-party corpora (the-stack, open-web-math, Wikipedia, OpenCodeReasoning,
+etc.), not Claude-generated content. Anthropic's Usage Policy's "model scraping/distillation"
+clause restricts using **Claude's own** inputs/outputs to train another model without
+authorization — it does not restrict using Claude as a coding assistant to build an ML pipeline
+that distills a *different* (non-Anthropic) model, confirmed against the live Usage Policy the
+same date. On that basis M10 does not appear to cross either line.
+
+**Standing rule — flag before crossing the actual boundary:** if any future task would have
+Claude *generate* text (synthetic examples, code samples, explanations) that gets fed into the
+pretrain/SFT/RL corpus as a training signal for the student model, **stop and flag it for
+review** rather than proceeding — that is the specific thing Anthropic's policy restricts, and
+this project has otherwise been careful to keep the corpus entirely third-party/non-Claude.
+Re-check both the teacher model's license and Anthropic's Usage Policy if either changes, or if
+the teacher model itself ever changes — this assessment is not a legal ruling and is only as
+current as the sources checked on the date above.
