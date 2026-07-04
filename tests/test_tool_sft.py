@@ -22,6 +22,7 @@ from src.data.tool_sources import (
     iter_tool_sft,
     sample_distractors,
     toolace_row_to_messages,
+    validate_call_against_tools,
     when2call_row_to_messages,
     xlam_row_to_messages,
 )
@@ -176,6 +177,7 @@ def test_build_tool_sft_end_to_end(tmp_path):
     assert manifest["sources"].get("handauthored") == n
     assert manifest["n_abstention"] >= 1
     assert manifest["n_with_distractors"] >= 1
+    assert manifest["n_schema_invalid"] == 0  # handauthored set is clean
     loader = SFTLoader(tok_dir / "tool.jsonl", seq_len=8192, batch_size=2)
     inputs, targets, mask = next(loader.epoch())
     assert inputs.shape == targets.shape == mask.shape
@@ -192,6 +194,24 @@ def test_over_length_tool_examples_dropped(tmp_path):
     m = build_tool_sft([huge], tmp_path, tokenizer="qwen25", byte_fallback=True,
                        seq_len=8192, max_seq_len=50)
     assert m["n_records"] == 0 and m["n_skipped"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Schema-invalid rows: dropped and counted, not silently kept (#102 box #1)
+# --------------------------------------------------------------------------- #
+
+def test_schema_invalid_row_dropped_and_counted(tmp_path):
+    weather = {"name": "get_weather", "parameters": {"type": "object",
+                                                      "properties": {"city": {"type": "string"}},
+                                                      "required": ["city"]}}
+    # The call omits the required "city" argument -> schema-invalid.
+    bad = build_tool_messages([weather], "What's the weather?",
+                              [{"name": "get_weather", "arguments": {}}])
+    good = build_tool_messages([weather], "Weather in Paris?",
+                               [{"name": "get_weather", "arguments": {"city": "Paris"}}])
+    m = build_tool_sft([bad, good], tmp_path, tokenizer="qwen25", byte_fallback=True, seq_len=8192)
+    assert m["n_schema_invalid"] == 1
+    assert m["n_records"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +268,32 @@ def test_row_mappers_offline():
     assert trec is not None
     assert trec["source"] == "toolace"
     assert TOOL_CALL_OPEN in trec["messages"][-1]["content"]
+
+
+# --------------------------------------------------------------------------- #
+# validate_call_against_tools: name known + required args present (#102 box #1)
+# --------------------------------------------------------------------------- #
+
+def test_validate_call_against_tools_valid_call():
+    tools = [{"name": "get_weather", "parameters": {"type": "object",
+                                                     "properties": {"city": {"type": "string"}},
+                                                     "required": ["city"]}}]
+    call = {"name": "get_weather", "arguments": {"city": "Paris"}}
+    assert validate_call_against_tools(call, tools) is True
+
+
+def test_validate_call_against_tools_missing_required():
+    tools = [{"name": "get_weather", "parameters": {"type": "object",
+                                                     "properties": {"city": {"type": "string"}},
+                                                     "required": ["city"]}}]
+    call = {"name": "get_weather", "arguments": {}}
+    assert validate_call_against_tools(call, tools) is False
+
+
+def test_validate_call_against_tools_unknown_name():
+    tools = [{"name": "get_weather", "parameters": {"type": "object", "required": []}}]
+    call = {"name": "send_email", "arguments": {"to": "a@b.com"}}
+    assert validate_call_against_tools(call, tools) is False
 
 
 # --------------------------------------------------------------------------- #
