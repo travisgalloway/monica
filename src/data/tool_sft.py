@@ -37,11 +37,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, Iterator, List, Optional
 
 from . import chat_template, storage
 from .instruct_sft import _effective_vocab_size
-from .tool_sources import TOOL_CALL_OPEN, TOOLS_OPEN, TOOLS_CLOSE
+from .tool_sources import (TOOL_CALL_OPEN, TOOL_CALL_CLOSE, TOOLS_OPEN, TOOLS_CLOSE,
+                           validate_call_against_tools)
 
 
 def _valid_rows(rows: Iterable[dict]) -> List[dict]:
@@ -76,11 +77,9 @@ def _is_abstention(messages: List[dict]) -> bool:
     return TOOL_CALL_OPEN not in (messages[-1].get("content") or "")
 
 
-def _has_distractors(messages: List[dict]) -> bool:
-    """Heuristic audit flag: the system turn lists more tools than the row's calls reference.
-    Count <tool_call> blocks across assistant turns vs tool entries in the system <tools> list."""
-    # Extract tool names from the system turn's <tools>[...] block
-    system_tools: List[str] = []
+def _row_tools(messages: List[dict]) -> List[dict]:
+    """The row's declared tools: parsed out of the (first) system turn's
+    `<tools>[...]</tools>` block. Empty list if absent/malformed."""
     for m in messages:
         if m.get("role") == "system":
             content = m.get("content") or ""
@@ -89,37 +88,55 @@ def _has_distractors(messages: List[dict]) -> bool:
             if start != -1 and end != -1 and end > start:
                 body = content[start + len(TOOLS_OPEN):end].strip()
                 try:
-                    tool_list = json.loads(body)
-                    system_tools = [t.get("name", "") for t in tool_list if isinstance(t, dict)]
+                    tools = json.loads(body)
+                    return [t for t in tools if isinstance(t, dict)]
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    return []
             break
+    return []
 
-    # Collect tool names actually called across all assistant turns
-    called_names: set = set()
+
+def _iter_calls(messages: List[dict]) -> Iterator[dict]:
+    """Yield every parsed `<tool_call>{json}</tool_call>` block across assistant
+    turns (each a dict with at least a "name" key). Malformed JSON blocks are
+    skipped, never raised — shared by `_has_distractors` and the schema-validation
+    gate in `build_tool_sft`."""
     for m in messages:
-        if m.get("role") == "assistant":
-            content = m.get("content") or ""
-            pos = 0
-            while True:
-                s = content.find(TOOL_CALL_OPEN, pos)
-                if s == -1:
-                    break
-                e = content.find("</tool_call>", s)
-                if e == -1:
-                    break
-                block = content[s + len(TOOL_CALL_OPEN):e].strip()
-                try:
-                    call = json.loads(block)
-                    if isinstance(call, dict) and "name" in call:
-                        called_names.add(call["name"])
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                pos = e + len("</tool_call>")
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content") or ""
+        pos = 0
+        while True:
+            s = content.find(TOOL_CALL_OPEN, pos)
+            if s == -1:
+                break
+            e = content.find(TOOL_CALL_CLOSE, s)
+            if e == -1:
+                break
+            block = content[s + len(TOOL_CALL_OPEN):e].strip()
+            try:
+                call = json.loads(block)
+                if isinstance(call, dict) and "name" in call:
+                    yield call
+            except (json.JSONDecodeError, ValueError):
+                pass
+            pos = e + len(TOOL_CALL_CLOSE)
 
-    # Has distractors if there are more listed tools than called tools
-    listed_names = set(n for n in system_tools if n)
+
+def _has_distractors(messages: List[dict]) -> bool:
+    """Heuristic audit flag: the system turn lists more tools than the row's calls reference."""
+    listed_names = {t.get("name", "") for t in _row_tools(messages)}
+    listed_names.discard("")
+    called_names = {c["name"] for c in _iter_calls(messages)}
     return len(listed_names) > len(called_names)
+
+
+def _row_schema_valid(messages: List[dict]) -> bool:
+    """True iff every call in the row's assistant turns validates against the row's
+    declared `<tools>` list (see `tool_sources.validate_call_against_tools`).
+    Abstention rows (no calls at all) are vacuously valid."""
+    tools = _row_tools(messages)
+    return all(validate_call_against_tools(c, tools) for c in _iter_calls(messages))
 
 
 def build_tool_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
@@ -135,6 +152,15 @@ def build_tool_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
     tokenized_path = tok_dir / "tool.jsonl"
 
     valid = _valid_rows(rows)
+
+    n_schema_invalid = 0
+    schema_ok: List[dict] = []
+    for row in valid:
+        if _row_schema_valid(row["messages"]):
+            schema_ok.append(row)
+        else:
+            n_schema_invalid += 1
+    valid = schema_ok
 
     cleaned_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cleaned_path, "w", encoding="utf-8", newline="\n") as f:
@@ -187,6 +213,7 @@ def build_tool_sft(rows: Iterable[dict], out_root, *, tokenizer: str = "qwen3",
         "max_seq_len": max_seq_len,
         "n_records": n_records,
         "n_skipped": n_skipped,
+        "n_schema_invalid": n_schema_invalid,
         "n_tokens": n_tokens,
         "n_abstention": n_abstention,
         "n_with_distractors": n_with_distractors,
@@ -218,7 +245,8 @@ def main() -> None:
     m = build_tool_sft(rows, args.out_root, tokenizer=args.tokenizer, model_id=args.model_id,
                        seq_len=args.seq_len, byte_fallback=args.byte_fallback,
                        max_seq_len=args.max_seq_len)
-    print(f"tool sft: {m['n_records']} records ({m['n_skipped']} skipped, {m['n_tokens']} tokens, "
+    print(f"tool sft: {m['n_records']} records ({m['n_skipped']} skipped, "
+          f"{m['n_schema_invalid']} schema-invalid, {m['n_tokens']} tokens, "
           f"{m['n_abstention']} abstention, {m['n_with_distractors']} with distractors, "
           f"sources={m['sources']}) -> {m['tokenized_path']}")
 

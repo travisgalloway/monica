@@ -16,8 +16,10 @@ Primary sources:
 
 BFCL is eval-only (shared/eval/), intentionally absent from _LOADERS.
 
-Runtime schema-validation is out of scope; the corpus only guarantees
-`json.dumps`-round-trippable call JSON. Mappers return None to skip malformed rows.
+Calls are schema-validated against each row's declared tools via
+`validate_call_against_tools` (name known + required args present), wired into
+`tool_sft.build_tool_sft`; invalid rows are dropped and counted (`n_schema_invalid`).
+Mappers themselves still just return None to skip malformed/unparseable rows.
 
 ABOVE THE SEAM — stdlib only; `datasets` is imported lazily inside the HF loaders.
 Offline path: `handauthored_tool_records()` + `--byte-fallback`.
@@ -79,6 +81,33 @@ def format_tool_response(results: Sequence) -> str:
         payload = r if isinstance(r, str) else json.dumps(r)
         blocks.append(f"{TOOL_RESPONSE_OPEN}\n{payload}\n{TOOL_RESPONSE_CLOSE}")
     return "\n".join(blocks)
+
+
+# --------------------------------------------------------------------------- #
+# Schema validation (closes the "calls schema-validated" claim from #102 box #1)
+# --------------------------------------------------------------------------- #
+
+def validate_call_against_tools(call: dict, tools: List[dict]) -> bool:
+    """True iff `call` ({"name", "arguments"}) is a legal call against `tools`:
+    `call["name"]` must name a tool in `tools`, and every name in that tool's
+    `parameters["required"]` must be a key of `call["arguments"]`. Lenient by
+    design — JSON-level presence only, no type/value checking — so this catches
+    hallucinated tool names and missing required args (the two failure modes that
+    actually corrupt training signal) without rejecting a correct call over a
+    string-vs-int nit. Reused by both the SFT builder (`tool_sft.py`) and the
+    BFCL eval harness (`src/eval/bfcl_adapter.py`)."""
+    name = call.get("name")
+    by_name = {t.get("name"): t for t in tools if isinstance(t, dict)}
+    tool = by_name.get(name)
+    if tool is None:
+        return False
+    required = (tool.get("parameters") or {}).get("required") or []
+    if not isinstance(required, list):
+        return False
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return False
+    return all(r in arguments for r in required)
 
 
 # --------------------------------------------------------------------------- #
