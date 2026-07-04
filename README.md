@@ -14,6 +14,16 @@ train/distil → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](doc
 — running the data + training pipeline on object storage + rented GPUs (R2 + RunPod).
 **Design & rationale:** [`docs/design/`](docs/design/README.md).
 
+> **Licensing note.** The distillation program (M10) trains from
+> `Qwen/Qwen3-4B-Thinking-2507`, licensed plain **Apache-2.0** — no distillation or
+> competing-model restriction. The corpus and teacher signal are third-party data (the-stack,
+> Wikipedia, OpenCodeReasoning, etc.) and Qwen's own model outputs, not Claude/Anthropic content.
+> This repo's engineering work is assisted by Claude Code, but no Claude-generated text is part
+> of the training corpus or teacher signal — Anthropic's usage policy separately restricts using
+> *its own* model's outputs to train other models, which is a different thing than using it as a
+> coding assistant to build this pipeline. See `CLAUDE.md`'s "Licensing / usage-policy
+> compliance" section for the full note.
+
 ---
 
 ## TL;DR — what is this?
