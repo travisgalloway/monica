@@ -279,12 +279,30 @@ def render_wikipedia_sections(sections) -> str:
     return "\n\n".join(out)
 
 
+def wikipedia_license(row: dict) -> str:
+    """Extract the license identifier from a Structured Wikipedia row. **Confirmed against a
+    live row (2026-07-04):** `row["license"]` is a **list of dicts**, e.g.
+    `[{"identifier": "CC-BY-SA-4.0", "name": "...", "url": "..."}]` — not a flat string like
+    every other loader's `license` field. Falls back to `DATASET_LEVEL_LICENSE["wikipedia"]`
+    when the field is absent/empty or doesn't have the expected shape. Pure, offline-testable."""
+    licenses = row.get("license")
+    if isinstance(licenses, list) and licenses:
+        first = licenses[0]
+        if isinstance(first, dict):
+            ident = first.get("identifier")
+            if isinstance(ident, str) and ident.strip():
+                return ident.strip()
+    return DATASET_LEVEL_LICENSE["wikipedia"]
+
+
 def iter_structured_wikipedia() -> Iterator[Record]:
     """Stream `wikimedia/structured-wikipedia`, **English config only**
-    (`STRUCTURED_WIKIPEDIA_EN_CONFIG`). Rows have no flat `text` field: the rendered text is
-    `abstract` (the lead section) followed by `render_wikipedia_sections(json.loads(row
-    ["sections"]))` — infoboxes/tables/references are skipped. License is a per-row field on the
-    real dataset; falls back to `DATASET_LEVEL_LICENSE["wikipedia"]` when absent."""
+    (`STRUCTURED_WIKIPEDIA_EN_CONFIG` — confirmed correct against the live dataset card,
+    2026-07-04). Rows have no flat `text` field: the rendered text is `abstract` (the lead
+    section) followed by `render_wikipedia_sections(json.loads(row["sections"]))` — both
+    confirmed against a live row; infoboxes/tables/references are skipped. License comes from
+    `wikipedia_license(row)` (see its docstring — the real field is a list of dicts, not a
+    string)."""
     import json
 
     from datasets import load_dataset  # pragma: no cover - network/optional extra
@@ -310,8 +328,7 @@ def iter_structured_wikipedia() -> Iterator[Record]:
         text = "\n\n".join(parts)
         if not text:
             continue
-        license = row.get("license") or DATASET_LEVEL_LICENSE["wikipedia"]
-        yield Record(text=text, source="wikipedia", lang="en", license=license)
+        yield Record(text=text, source="wikipedia", lang="en", license=wikipedia_license(row))
 
 
 # --------------------------------------------------------------------------- #
@@ -424,13 +441,17 @@ def _qa_records(rows: Iterable[dict], q_field: str, a_field: str, source: str, l
 # Code problems — OpenCodeReasoning + rosetta-code + McEval-Instruct + KodCode-V1
 # --------------------------------------------------------------------------- #
 def iter_opencodereasoning() -> Iterator[Record]:
-    """Stream `nvidia/OpenCodeReasoning` (`split_0`, ~585k rows carrying `input`).
-    Competitive-programming problems (`input`) + full R1 reasoning responses (`output`);
-    Python-only, no language filter. License: `cc-by-4.0` (dataset-level, per the card)."""
+    """Stream `nvidia/OpenCodeReasoning` (config `split_0`, ~585k rows carrying `input`).
+    **Confirmed against the live dataset (2026-07-04): the config `split_0` has a split also
+    literally named `split_0`, not `train`** — `load_dataset(..., "split_0", split="train")`
+    404s with `Bad split: train. Available splits: ['split_0']`. Competitive-programming
+    problems (`input`) + full R1 reasoning responses (`output`); Python-only, no language
+    filter. License: `cc-by-4.0` (dataset-level; confirmed consistent per-row across a 500-row
+    sample, so the dataset-level constant is accurate)."""
     from datasets import load_dataset  # pragma: no cover - network/optional extra
 
     ds = load_dataset("nvidia/OpenCodeReasoning", "split_0",  # pragma: no cover
-                      split="train", streaming=True)
+                      split="split_0", streaming=True)
     yield from _qa_records(ds, "input", "output", "opencodereasoning",
                            DATASET_LEVEL_LICENSE["opencodereasoning"], is_code=True)
 
