@@ -15,7 +15,8 @@ from src.data.distill_sources import (_code_lang_matches, _normalize_code_lang, 
                                        iter_opencodeinstruct, iter_opencodereasoning,
                                        iter_rosetta_code, iter_starcoder2_documentation,
                                        iter_structured_wikipedia, iter_the_stack_smol,
-                                       messages_to_text, render_wikipedia_sections)
+                                       messages_to_text, render_wikipedia_sections,
+                                       wikipedia_license)
 
 
 def test_messages_to_text_renders_role_prefixed_turns():
@@ -324,7 +325,11 @@ def test_iter_structured_wikipedia_concatenates_abstract_and_sections(monkeypatc
     def fake_load_dataset(*args, **kwargs):
         return [{"abstract": "Lead paragraph.",
                 "sections": json.dumps([{"name": "Body", "has_parts": [{"value": "More."}]}]),
-                "license": "CC-BY-SA-4.0"}]
+                # Confirmed against a live row (2026-07-04): "license" is a LIST OF DICTS,
+                # not a flat string -- e.g. Wikipedia's real CC-BY-SA identifier shape.
+                "license": [{"identifier": "CC-BY-SA-4.0",
+                            "name": "Creative Commons Attribution-ShareAlike License 4.0",
+                            "url": "https://creativecommons.org/licenses/by-sa/4.0/"}]}]
 
     monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
 
@@ -354,6 +359,30 @@ def test_iter_structured_wikipedia_skips_rows_with_no_renderable_text(monkeypatc
     monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
 
     assert list(iter_structured_wikipedia()) == []
+
+
+# --------------------------------------------------------------------------- #
+# wikipedia_license — regression test for the real list-of-dicts license shape (found live
+# 2026-07-04: row["license"] is [{"identifier": ..., "name": ..., "url": ...}], not a flat
+# string like every other loader's license field -- the original code crashed
+# filters.normalize_license with AttributeError: 'list' object has no attribute 'strip').
+# --------------------------------------------------------------------------- #
+def test_wikipedia_license_extracts_identifier_from_list_of_dicts():
+    row = {"license": [{"identifier": "CC-BY-SA-4.0", "name": "..."}]}
+    assert wikipedia_license(row) == "CC-BY-SA-4.0"
+
+
+def test_wikipedia_license_falls_back_when_absent():
+    assert wikipedia_license({}) == "cc-by-sa-4.0"
+
+
+def test_wikipedia_license_falls_back_when_malformed():
+    # A flat string, an empty list, or a list of non-dicts should all fall back cleanly
+    # rather than crash -- these are defensive, not currently-observed shapes.
+    assert wikipedia_license({"license": "not-a-list"}) == "cc-by-sa-4.0"
+    assert wikipedia_license({"license": []}) == "cc-by-sa-4.0"
+    assert wikipedia_license({"license": ["just-a-string"]}) == "cc-by-sa-4.0"
+    assert wikipedia_license({"license": [{"name": "no identifier key"}]}) == "cc-by-sa-4.0"
 
 
 # --------------------------------------------------------------------------- #

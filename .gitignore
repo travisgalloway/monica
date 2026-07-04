@@ -231,3 +231,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.claude/automerge-active
