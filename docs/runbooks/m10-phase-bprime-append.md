@@ -181,13 +181,16 @@ pair.
 - Flip the local PHASE marker → `B′:append-done` (the ops-state convention recorded in
   `~/.claude/monica-runpod-ops/` from prior pod runs — reuse it, don't invent a new mechanism).
 - **Repoint the sweep at the extended cache.** The two sweep manifests
-  (`config/manifests/student-1b-attn-{hi,lo}.yaml`) currently pin
-  `teacher_outputs: poc-distill/teacher-outputs/topk-logits` (the base-only cache). Two ways to
-  point the Step 4 sweep (in `m10-pod-chain.md`) at the extended one instead:
-  - **Recommended — CLI override, keeps manifests stable:** pass
-    `--teacher-outputs s3://monica-training/poc-distill/teacher-outputs/topk-logits-ext-merged`
-    (or the local synced copy) to `scripts/distill.py` instead of relying on the manifest field.
-  - **Alternative:** edit both manifests' `teacher_outputs:` field to the new `-ext-merged` prefix.
+  (`config/manifests/student-1b-attn-{hi,lo}.yaml`) list
+  `teacher_outputs: poc-distill/teacher-outputs/topk-logits` (the base-only cache), but
+  `scripts/distill.py` never actually reads that field — `--teacher-outputs` on the CLI is the
+  **sole** source of truth (mandatory whenever the `logit-distill` stage runs), not an override of
+  a manifest default. So the only real way to point the Step 4 sweep (in `m10-pod-chain.md`) at
+  the extended cache is:
+  - Pass `--teacher-outputs s3://monica-training/poc-distill/teacher-outputs/topk-logits-ext-merged`
+    (or the local synced copy) to `scripts/distill.py`.
+  - Editing the manifests' `teacher_outputs:` field is **decorative only** — `distill.py` won't
+    pick it up; do it for documentation/record-keeping if you like, but it has no effect on the run.
 
 ## Sizing
 
