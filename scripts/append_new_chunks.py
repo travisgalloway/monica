@@ -19,8 +19,10 @@ Recipe:
      write the combined `.meta.json` (summed `n_tokens`).
   5. Merge teacher top-k shards via the stream-to-R2 pattern (download frozen shard-0 from R2,
      keep the freshly-precomputed shard-1 local, concatenate streaming straight to a new R2
-     prefix — avoiding materializing the ~1.1 TB combined set locally); verify shard-0's
-     `n_chunks == 230318` with no stray `start_chunk` offset.
+     prefix — avoiding materializing the ~1.57 TB combined set locally); verify shard-0's
+     `n_chunks == 230318` with no stray `start_chunk` offset. Splits with no shard-1 counterpart
+     (Step 3 only ever precomputes `train` for the new chunks) are passed through unchanged from
+     shard-0 rather than merged.
   6. Verify `DistillLoader` opens the combined `(train.bin, merged teacher-outputs)` pair.
 
 Pod-only (network + big local volumes); authored here (Mac, Phase A') for Phase B' to run.
@@ -31,7 +33,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 #: The frozen FineWeb cache's chunk count / geometry (positionally binds the existing
 #: 566 GB teacher-outputs cache — see teacher_outputs.py's DistillLoader n_chunks assert).
@@ -64,13 +66,15 @@ def trim_file_prefix_copy(path: Path, keep_bytes: int) -> None:
 
 
 def regenerate_fineweb_train(shard_dir: Path, out_dir: Path,
-                             val_tokens: int = 10_000_000) -> Path:
+                             val_tokens: int = 10_000_000) -> Tuple[Path, Path]:
     """Step 1: rebuild FineWeb's flat `train.bin`/`val.bin` via `split.split_shards` and assert
-    the frozen chunk count. Raises `SystemExit` (abort -> full re-precompute) on drift."""
+    the frozen chunk count. Raises `SystemExit` (abort -> full re-precompute) on drift. Returns
+    `(train_path, val_path)` — `val_path` is the base cache's positional partner for the `val`
+    split (never trimmed/combined; the extension contributes train data only)."""
     from src.data.pack import open_packed
     from src.data.split import split_shards
 
-    train_path, _val_path = split_shards(shard_dir, out_dir, val_tokens)
+    train_path, val_path = split_shards(shard_dir, out_dir, val_tokens)
     n_tokens = int(open_packed(train_path).shape[0])
     n_chunks = n_tokens // STRIDE
     if n_chunks != FINEWEB_N_CHUNKS:
@@ -78,7 +82,7 @@ def regenerate_fineweb_train(shard_dir: Path, out_dir: Path,
             f"regenerated FineWeb train.bin has n_chunks={n_chunks}, expected "
             f"{FINEWEB_N_CHUNKS} — the corpus has drifted from the frozen 566 GB cache's "
             "positional binding; abort and run a full re-precompute instead of an append")
-    return train_path
+    return train_path, val_path
 
 
 def trim_to_frozen_chunks(train_path: Path) -> None:
@@ -143,16 +147,40 @@ def _remote_topk_paths(prefix: str, split: str) -> dict:
     return {"vals": f"{base}.topk_vals", "idx": f"{base}.topk_idx", "meta": f"{base}.meta.json"}
 
 
+def _stream_copy(src: Path, fs, dst_path: str) -> None:
+    """Stream-copy one local file to an fsspec destination in bounded-memory chunks."""
+    with fs.open(dst_path, "wb") as dst, open(src, "rb") as src_f:
+        while True:
+            buf = src_f.read(256 * 1024 * 1024)
+            if not buf:
+                break
+            dst.write(buf)
+
+
 def merge_teacher_shards_stream_to_r2(shard0_r2: str, shard1_local: Path, splits: List[str],
                                       push: str) -> None:
     """Step 5: merge the frozen shard-0 (566 GB, downloaded from R2) with the freshly
     precomputed shard-1 (new chunks, local) by concatenating streaming straight to `push` — no
-    ~1.1 TB local materialization. Verifies shard-0 is the whole unshifted frozen cache (no
-    stray `start_chunk`, `n_chunks == FINEWEB_N_CHUNKS`) before merging."""
+    ~1.57 TB local materialization. Verifies shard-0 is the whole unshifted frozen cache (no
+    stray `start_chunk`, `n_chunks == FINEWEB_N_CHUNKS`) before merging.
+
+    Splits with no shard-1 counterpart are **passed through unchanged** rather than merged: Step
+    3 only ever precomputes `train` for the new chunks (the frozen base `val` chunks have no
+    extension counterpart), so a shard-1-less split streams shard-0's `topk_vals`/`topk_idx`
+    straight to `push` and copies its `.meta.json` verbatim — counts stay shard-0's, not summed.
+    This makes the default `--splits train,val` complete out of the box: `train` merges,
+    `val` passes through from the base cache.
+    """
     from src.data.r2_sync import _fs_for, download_dir
 
-    local_root = shard1_local.parent / "_shard0_cache"
-    download_dir(shard0_r2, str(local_root))
+    if str(shard0_r2).startswith("s3://"):
+        local_root = shard1_local.parent / "_shard0_cache"
+        download_dir(shard0_r2, str(local_root))
+    else:
+        # `--topk-dir` is already a local filesystem path (e.g. Step 1 already downloaded it for
+        # the alignment gate) — `_fs_for` resolves any non-`s3://` URI to the local FS, so reuse
+        # the path directly instead of an ~566 GB local->local re-copy into `local_root`.
+        local_root = Path(shard0_r2)
 
     fs, root = _fs_for(push)
     root = root.rstrip("/")
@@ -169,12 +197,24 @@ def merge_teacher_shards_stream_to_r2(shard0_r2: str, shard1_local: Path, splits
             raise SystemExit(
                 f"shard-0 {split} n_chunks={shard0_meta['n_chunks']} != {FINEWEB_N_CHUNKS}")
 
-        shard1_meta = json.loads((shard1_local / f"teacher-{split}.meta.json").read_text())
+        out_paths = _remote_topk_paths(push, split)
+        shard1_meta_path = shard1_local / f"teacher-{split}.meta.json"
+
+        if not shard1_meta_path.exists():
+            # Passthrough: no shard-1 counterpart for this split. Stream shard-0's files
+            # unchanged and copy its .meta.json verbatim (counts = shard-0's own, not summed).
+            for kind, out_path in (("vals", out_paths["vals"]), ("idx", out_paths["idx"])):
+                _stream_copy(local_root / f"teacher-{split}.topk_{kind}", fs, out_path)
+            with fs.open(out_paths["meta"], "w") as f:
+                f.write((local_root / f"teacher-{split}.meta.json").read_text())
+            n_rows_total += shard0_meta["n_rows"]
+            continue
+
+        shard1_meta = json.loads(shard1_meta_path.read_text())
         total_rows = shard0_meta["n_rows"] + shard1_meta["n_rows"]
         total_chunks = shard0_meta["n_chunks"] + shard1_meta["n_chunks"]
         n_rows_total += total_rows
 
-        out_paths = _remote_topk_paths(push, split)
         for kind, out_path in (("vals", out_paths["vals"]), ("idx", out_paths["idx"])):
             src_paths = [local_root / f"teacher-{split}.topk_{kind}",
                         shard1_local / f"teacher-{split}.topk_{kind}"]
@@ -238,7 +278,8 @@ def main() -> None:
 
     splits = [s for s in args.splits.split(",") if s]
 
-    train_path = regenerate_fineweb_train(args.fineweb_shards, args.work_dir, args.val_tokens)
+    train_path, val_path = regenerate_fineweb_train(args.fineweb_shards, args.work_dir,
+                                                     args.val_tokens)
     trim_to_frozen_chunks(train_path)
 
     new_train = args.work_dir / "new" / "train.bin"
@@ -252,7 +293,13 @@ def main() -> None:
     local_merged = args.work_dir / "_merged_meta_check"
     from src.data.r2_sync import download_dir
     download_dir(args.push, str(local_merged))
-    verify_combined(combined_path, local_merged, "train", args.seq_len)
+    if "train" in splits:
+        verify_combined(combined_path, local_merged, "train", args.seq_len)
+    if "val" in splits:
+        # `val` is passed through unchanged from the base cache (no extension counterpart), so
+        # its positional partner is the base val.bin regenerate_fineweb_train wrote — NOT the
+        # combined train.bin.
+        verify_combined(val_path, local_merged, "val", args.seq_len)
 
     print(f"append complete: combined train.bin -> {combined_path}, merged teacher -> {args.push}")
 
