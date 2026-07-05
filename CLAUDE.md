@@ -157,6 +157,27 @@ The smoke gate stresses exactly this round-trip.
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
   a milestone, tick its box in the relevant tracker (#2 / #65).
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.
+- **The corpus-extension domains that chain multiple named sources under one pooled
+  `char_budget_cap`** (`conversation`, `reasoning`, `code_problems`, `code_instruct` in
+  `src/data/distill_sources.py`) **only exercise later sources in the list once the earlier
+  ones exhaust their real data** — a large source (e.g. `ultrachat`, `mot`, `opencodereasoning`,
+  `opencodeinstruct`) can single-handedly consume the whole pooled budget and starve its
+  siblings entirely (confirmed live, 2026-07-05: the first real corpus-extension build silently
+  produced zero docs from `oasst1`/`openthoughts2`/`rosetta-code`/`mceval`/`kodcode`/
+  `codefeedback`). To guarantee a specific source contributes, run it **alone** in its own
+  `distill_corpus_from_jsonl.py` invocation with its own token budget, then merge (renumber
+  shards to continue the existing manifest's sequence, merge `manifest.json`'s `shards` list +
+  aggregate counts, merge `provenance.json` — see the merge done for `poc-distill-ext`,
+  2026-07-05).
+- **Before trusting a new corpus-extension domain, decontamination-check it against the real
+  eval sets** (MATH-500, AIME25, LiveCodeBench, IFEval, or whichever this project's actual eval
+  axes are), not just against the license/field-shape dry run — a source named after or derived
+  from a benchmark (e.g. McEval-Instruct/McEval) is a contamination risk even when its license is
+  fine. Checked 2026-07-05 for the `poc-distill-ext` corpus: zero overlap for LiveCodeBench/
+  AIME25/IFEval; **5/500 MATH-500 problems (1%) matched `openwebmath`** (verbatim AoPS-forum
+  content that any large web crawl picks up — a known, low-severity, expected issue for this
+  class of source, not specific to a bad choice here). Accepted as-is; re-check if `openwebmath`
+  or the eval suite changes.
 
 ## Licensing / usage-policy compliance (M10 distillation)
 
