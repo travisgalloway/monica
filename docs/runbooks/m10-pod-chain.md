@@ -45,6 +45,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # required for the MOH
 
 ### Step 3 — teacher precompute (the dominant $, run ONCE; both layouts reuse it)
 Needs an **Ampere+ 80 GB** card (A100/H100) for the bf16 / seq-8192 path. Bench a small slice first.
+**Prefer H100** — a single card run in sequence for cost simplicity, or an **8× H100 cluster for
+this phase only** (embarrassingly parallel over chunks) when wall-clock matters. See
+[`../path-b-run.md`](../path-b-run.md) §"Time & \$ estimate" for the full time/$ table
+(~\$150–1,100 depending on measured MFU — bench first).
 ```bash
 python -m src.data.r2_sync down s3://monica-training/poc-distill/corpus/tokenized/qwen3-8k /vol/corpus8k
 python -m src.data.split --shards /vol/corpus8k --out /vol/split8k --val-tokens 10000000   # seq_len stays 8192
