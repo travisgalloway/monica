@@ -184,6 +184,13 @@ opens the combined `(train.bin, merged teacher-outputs)` pair.
 | Step 3 (new-chunk precompute) | 4B forward over 3,356,712,960 new tokens (≈1.00 TB-equivalent teacher cache) — the real $ of this runbook, ~1.77× the original estimate | `/vol/teacher-outputs/shard1-new` |
 | Step 4 (append-merge) | I/O-bound (streaming merge), not compute-bound | `topk-logits-ext-merged` on R2, ≈1.57 TB |
 
+Step 3's 3,356,712,960-token extension precompute is the real \$ of this runbook: **~\$100 (8×
+H100 cluster) to ~\$700 (single A100), depending on measured MFU — bench a small slice first.**
+**Prefer H100** — single card in sequence, or an 8× H100 cluster for this phase specifically,
+since it's the one embarrassingly-parallel-over-chunks step where cluster wall-clock pays off. See
+[`../path-b-run.md`](../path-b-run.md) §"Time & \$ estimate" for the full derivation and the
+from-scratch-pretrain comparison.
+
 ## Gotchas
 
 - **Positional alignment is everything** — if the regenerated FineWeb `train.bin` doesn't yield

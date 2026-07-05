@@ -272,6 +272,48 @@ length + tok/s vs a same-size transformer, #104) — *not* benchmark scores.
 
 Whole run is **order \$100s** on A100/H100 (issue #141). Bench Step 3 before committing.
 
+### Time & $ estimate — prefer H100 (single, in sequence; cluster only if needed)
+
+Model: `6·N·D` training FLOPs (student ~1.03B) + `2·N·D` inference FLOPs (4B teacher forward),
+divided by each card's achieved throughput at the repo's **40% MFU** convention (H100 bf16 dense
+peak ~990 TFLOPS → ~396 eff TFLOP/s single-card; an 8-GPU cluster scales at ×8×0.85). This
+reproduces the repo's own calibrated anchor in `docs/design/09-hybrid-architectures.md` (1B
+Chinchilla pretrain: 1×H100 = 3.7 d, 8×H100 = 13.2 h), so the extension below rests on the same
+basis. **$/hr are external ~2026 RunPod market rates, not stored in-repo** — H100 ≈ \$2.79/GPU-hr,
+A100 ≈ \$1.60/GPU-hr (fallback, ~2× slower than H100 at similar $/FLOP) — re-price before
+committing spend.
+
+| Phase | 1× H100 | 8× H100 | ~$ |
+|---|---|---|---|
+| Teacher precompute (4B fwd, dominant $ — extension only, base already cached) | ~1–7 d | ~3–27 h | \$150–1,100 |
+| Student sweep (2 layouts × 3 stages) | 3–7 h | — | \$30–60 |
+| Post-train SFT (2 epochs) | 3–6 h | — | \$20–50 |
+| Eval (long-context + OLMES) | 2–6 h | — | ~\$10 |
+| **Total** | **~2–8 d** | **~1–2 d** | **~\$400–900 (realistic)** |
+
+**Recommendation:** run phases on a **single H100 in sequence** — cheapest and simplest, and
+correctness gates (alignment check, val-ppl curve) are easiest to babysit one pod at a time.
+Escalate to an **8× H100 cluster only for the teacher-precompute phase**, since it's
+embarrassingly parallel over corpus chunks and is the one phase where wall-clock (days → hours)
+actually matters. A100 is a viable fallback at similar total $ but ~2× the wall-clock.
+
+**The precompute phase is the swing factor** (~6× cost range) because its real MFU is unmeasured:
+at the repo's 40% MFU convention it lands near \$150–250 (the "order \$100s" line above); at the
+naive throughput implied by Path A's measured 7B-teacher forward (~7 s/batch, seq 1024, batch
+8 — roughly ~5% MFU at that shape) it lands near \$700–1,100. **Bench a small slice of Step 3
+first** (as already instructed above) before committing to a multi-day/multi-hundred-dollar pod
+reservation. Only the 3.357B-token corpus extension remains — the 1.897B base corpus is already
+precomputed and cached.
+
+**Reserve alternative — from-scratch 1B pretrain** (20.67B Chinchilla tokens, no teacher/distill):
+~\$250–300 either way — 3.7 d on 1× H100, or 13 h on an 8× H100 cluster. Compute-bound, so cost is
+roughly flat across cards; only wall-clock changes.
+
+**Local Apple-Silicon training is not viable at this scale** — a full run is months of wall-clock
+even on the newest Mac hardware, and the seq-8192 logit tensor (~40 GB fp32 at batch 8) OOMs
+Metal. Mac's role here stays what it already is per `docs/local-development.md`: toy/small POC
+iteration, small-split local dry-runs, and running eval (Step 6 above).
+
 ## Gotchas (carried from Path A)
 
 - **MOHAWK stage-1 O(L²) OOM** — small micro-batch + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
