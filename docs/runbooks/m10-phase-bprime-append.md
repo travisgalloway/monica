@@ -1,7 +1,7 @@
 # M10 Phase B′ — append-only teacher precompute for the corpus extension (#177)
 
 Ready-to-fire runbook for **#177**: extend the frozen 566 GB Qwen3-4B-Thinking teacher top-k cache
-to cover the multi-domain corpus extension (#176, built 2026-07-03) **without re-precomputing the
+to cover the multi-domain corpus extension (#176/#182, built 2026-07-05) **without re-precomputing the
 ~230,318 unchanged FineWeb chunks**. All machinery is merged
 (`scripts/verify_teacher_alignment.py`, `scripts/append_new_chunks.py`, `scripts/precompute_teacher.py`)
 — this is a **run**, not a build. Written so a fresh session (or a clean pod clone) can fire it with
@@ -12,20 +12,31 @@ banner; this doc replaces its Step 3 for the *extension* leg), [`m10-pod-chain.m
 (precompute + sweep staging, steps 3–4 — this runbook's output feeds its Step 3),
 [`../infrastructure.md`](../infrastructure.md) (generic R2 + RunPod flow).
 
-## State (as of 2026-07-03)
+## State (as of 2026-07-05)
 
 - **Base corpus + base teacher precompute: DONE (2026-07-02).** 4× A100-SXM4-80GB pods ran the
   4B-teacher top-k forward (k=50, seq_len=8192) over the base 1.897B-token FineWeb-derived corpus
   and merged: **230,318 train chunks (~1.887B rows), 305 val chunks**, at
   `s3://monica-training/poc-distill/teacher-outputs/topk-logits-merged/` (IDX 377 GB + VALS 189 GB
   ≈ 566 GB total). Pod terminated.
-- **Corpus extension: DONE (2026-07-03, #176).** ~1.9B new pretrain tokens blended across five
-  domains (code, math, docs, conversation, reasoning) pushed to R2 alongside the base corpus
-  (`s3://monica-training/poc-distill/corpus/tokenized/qwen3-8k`) — confirm the exact extension
-  shard prefix from `provenance.json` written by #176's run (not hard-coded here since it wasn't
-  captured in this session).
+- **Corpus extension: DONE (2026-07-05), real numbers confirmed — bigger than the original
+  estimate.** **3,356,712,960 new tokens (~3.36B)** — not the ~1.9B originally estimated (#176) —
+  across **14 sources** spanning 8 domains (code: `the-stack-dedup`; math: `openwebmath`; docs:
+  `starcoder2-docs`; wiki: `wikipedia`; conversation: `ultrachat` + `oasst1`; reasoning: `mot` +
+  `openthoughts2`; code_problems: `opencodereasoning` + `rosetta-code` + `mceval` + `kodcode`;
+  code_instruct: `opencodeinstruct` + `codefeedback`). 3,262,881 documents, 409,755 sequences.
+  Pushed to a **separate top-level R2 prefix**, not nested under `poc-distill`:
+  **`s3://monica-training/poc-distill-ext/corpus/tokenized/qwen3-8k`** (61 files, 16.784 GB) +
+  `.../poc-distill-ext/corpus/cleaned/` (28 parquet shards, 3.830 GB pre-tokenization text).
+  Decontamination-checked against MATH-500/AIME25/LiveCodeBench/IFEval: zero overlap on three of
+  four; 5/500 MATH-500 problems (1%) matched `openwebmath` (expected/low-severity web-crawl
+  leakage, accepted as-is — see CLAUDE.md). One build gotcha worth knowing: the domains that
+  chain multiple sources under one pooled token budget (`conversation`/`reasoning`/
+  `code_problems`/`code_instruct`) only exercise later-listed sources once earlier ones exhaust —
+  six sources initially got silently starved and had to be rebuilt separately then merged in
+  (also recorded in CLAUDE.md).
 - **This runbook (#177): not yet run.** It is the remaining step before the two-layout sweep (#81)
-  can train against the *full* extended ~3.8B blend.
+  can train against the *full* extended **~5.25B-token** blend (1.897B base + 3.357B extension).
 
 ## Why append, not re-precompute (enforced by code, not a guess)
 
@@ -51,10 +62,11 @@ a full re-precompute if violated:
 
 - **GPU: Ampere+ 80 GB (A100/H100)** — the alignment gate and the new-chunk precompute both need a
   live CUDA teacher forward; bf16 needs Ampere+.
-- **Volume: ≥1.2 TB.** Combined footprint estimate ≈ 566 GB (existing) + ~475 GB (new chunks) ≈
-  **~1.05 TB** — recompute exactly once the real new-chunk count is known from #176's
-  `provenance.json`, and size the volume with headroom (the merge also needs scratch space for the
-  regenerated/trimmed/combined `train.bin`).
+- **Volume: ≥2 TB** (revised 2026-07-05 — up from the original ≥1.2 TB estimate, since the real
+  extension is 1.77× bigger than planned). Base cache is 566 GB for 1.897B tokens (≈298 B/token);
+  applying that same ratio to the real 3,356,712,960-token extension gives a new-chunk cache of
+  **≈1.00 TB**, for a combined footprint of **≈1.57 TB** — the ≥2 TB floor leaves headroom for the
+  merge's scratch space (regenerated/trimmed/combined `train.bin`).
 
 ```bash
 git clone https://github.com/travisgalloway/monica && cd monica
@@ -71,8 +83,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # regenerated FineWeb corpus (the ORIGINAL base corpus — must still tokenize to 230318 chunks):
 python -m src.data.r2_sync down s3://monica-training/poc-distill/corpus/tokenized/qwen3-8k /vol/fineweb-shards
 
-# the new-source corpus extension (#176) — confirm the exact prefix from #176's provenance.json:
-python -m src.data.r2_sync down s3://monica-training/poc-distill/corpus/tokenized/<extension-prefix> /vol/extension-shards
+# the new-source corpus extension (#176/#182, real numbers confirmed 2026-07-05) -- note this is
+# a SEPARATE top-level prefix, not nested under poc-distill:
+python -m src.data.r2_sync down s3://monica-training/poc-distill-ext/corpus/tokenized/qwen3-8k /vol/extension-shards
 
 # the frozen base teacher cache (shard-0 for the merge):
 python -m src.data.r2_sync down s3://monica-training/poc-distill/teacher-outputs/topk-logits-merged /vol/topk-logits-merged
@@ -146,7 +159,7 @@ frozen 230,318-chunk prefix (via **copy-prefix-then-rename**, not `os.truncate` 
 MooseFS mount silently no-ops truncate, corrupting resumed writes), builds a flat `train.bin` from
 the extension shards, concatenates the two into the combined corpus, and **stream-merges** the
 frozen shard-0 (from R2) with the new shard-1 straight to the new R2 prefix — avoiding
-materializing the ~1.1 TB combined set locally. It self-verifies at the end that `DistillLoader`
+materializing the ≈1.57 TB combined set locally. It self-verifies at the end that `DistillLoader`
 opens the combined `(train.bin, merged teacher-outputs)` pair.
 
 ## Step 5 — finalize
@@ -167,8 +180,8 @@ opens the combined `(train.bin, merged teacher-outputs)` pair.
 | Stage | Cost driver | Output |
 |---|---|---|
 | Step 2 (alignment gate) | 1 live teacher forward × 3 probe chunks — cheap, the point of the gate | pass/fail |
-| Step 3 (new-chunk precompute) | 4B forward over ~475 GB-equivalent new tokens — the real $ of this runbook | `/vol/teacher-outputs/shard1-new` |
-| Step 4 (append-merge) | I/O-bound (streaming merge), not compute-bound | `topk-logits-ext-merged` on R2, ~1.05 TB |
+| Step 3 (new-chunk precompute) | 4B forward over 3,356,712,960 new tokens (≈1.00 TB-equivalent teacher cache) — the real $ of this runbook, ~1.77× the original estimate | `/vol/teacher-outputs/shard1-new` |
+| Step 4 (append-merge) | I/O-bound (streaming merge), not compute-bound | `topk-logits-ext-merged` on R2, ≈1.57 TB |
 
 ## Gotchas
 
@@ -186,8 +199,9 @@ opens the combined `(train.bin, merged teacher-outputs)` pair.
 
 - [ ] Merged extended teacher-outputs cache on R2 at the new `-ext-merged` prefix.
 - [ ] PHASE marker flipped → `B′:append-done`.
-- [ ] Unblocks the two-layout student sweep (#81), now trainable against the full extended ~3.8B
-      blend — proceed to [`m10-pod-chain.md`](m10-pod-chain.md) Step 4.
+- [ ] Unblocks the two-layout student sweep (#81), now trainable against the full extended
+      **~5.25B-token** blend (1.897B base + 3.357B extension) — proceed to
+      [`m10-pod-chain.md`](m10-pod-chain.md) Step 4.
 
 ## After this: the rest of the chain
 
