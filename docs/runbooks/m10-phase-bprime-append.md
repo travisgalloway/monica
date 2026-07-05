@@ -27,7 +27,8 @@ banner; this doc replaces its Step 3 for the *extension* leg), [`m10-pod-chain.m
   code_instruct: `opencodeinstruct` + `codefeedback`). 3,262,881 documents, 409,755 sequences.
   Pushed to a **separate top-level R2 prefix**, not nested under `poc-distill`:
   **`s3://monica-training/poc-distill-ext/corpus/tokenized/qwen3-8k`** (61 files, 16.784 GB) +
-  `.../poc-distill-ext/corpus/cleaned/` (28 parquet shards, 3.830 GB pre-tokenization text).
+  `s3://monica-training/poc-distill-ext/corpus/cleaned/` (28 parquet shards, 3.830 GB
+  pre-tokenization text).
   Decontamination-checked against MATH-500/AIME25/LiveCodeBench/IFEval: zero overlap on three of
   four; 5/500 MATH-500 problems (1%) matched `openwebmath` (expected/low-severity web-crawl
   leakage, accepted as-is — see CLAUDE.md). One build gotcha worth knowing: the domains that
