@@ -24,7 +24,10 @@ banner; this doc replaces its Step 3 for the *extension* leg), [`m10-pod-chain.m
   across **14 sources** spanning 8 domains (code: `the-stack-dedup`; math: `openwebmath`; docs:
   `starcoder2-docs`; wiki: `wikipedia`; conversation: `ultrachat` + `oasst1`; reasoning: `mot` +
   `openthoughts2`; code_problems: `opencodereasoning` + `rosetta-code` + `mceval` + `kodcode`;
-  code_instruct: `opencodeinstruct` + `codefeedback`). 3,262,881 documents, 409,755 sequences.
+  code_instruct: `opencodeinstruct` + `codefeedback`). 3,262,881 documents, 409,755 sequences
+  (this is the `tokens / 8192` **window** count — the packed-teacher-cache reader strides
+  `SEQ_LEN+1 = 8193` per chunk, so the actual precomputed-chunk count is **409,704**, an
+  8,088-token tail dropped; informational, not a bug — don't change any commands over this).
   Pushed to a **separate top-level R2 prefix**, not nested under `poc-distill`:
   **`s3://monica-training/poc-distill-ext/corpus/tokenized/qwen3-8k`** (61 files, 16.784 GB) +
   `s3://monica-training/poc-distill-ext/corpus/cleaned/` (28 parquet shards, 3.830 GB
@@ -160,21 +163,34 @@ frozen 230,318-chunk prefix (via **copy-prefix-then-rename**, not `os.truncate` 
 MooseFS mount silently no-ops truncate, corrupting resumed writes), builds a flat `train.bin` from
 the extension shards, concatenates the two into the combined corpus, and **stream-merges** the
 frozen shard-0 (from R2) with the new shard-1 straight to the new R2 prefix — avoiding
-materializing the ≈1.57 TB combined set locally. It self-verifies at the end that `DistillLoader`
-opens the combined `(train.bin, merged teacher-outputs)` pair.
+materializing the ≈1.57 TB combined set locally. The default `--splits train,val` is correct and
+complete as shown above: **`train` merges** shard-0 (frozen base) + shard-1 (freshly precomputed
+extension chunks), while **`val` is passed through unchanged** from the base cache — Step 3 never
+precomputes a val shard for the extension (there's no new val data to add), so `val`'s teacher
+outputs stream straight from shard-0 to the new `-ext-merged` prefix with its `.meta.json` copied
+verbatim. It self-verifies at the end that `DistillLoader` opens **both** the combined
+`(train.bin, merged teacher-outputs)` pair and the `(base val.bin, passed-through teacher-outputs)`
+pair.
 
 ## Step 5 — finalize
 
+- **The merged `-ext-merged` cache now carries both splits**: `train` merged, `val` passed through
+  from the base cache. The base `val.bin` regenerated in Step 2 (`/vol/fineweb-split/val.bin`) is
+  `val`'s positional partner for the sweep — the extension contributes no val chunks, so the
+  sweep's val-loss is computed against the same 305 frozen FineWeb val chunks as the base run.
 - Flip the local PHASE marker → `B′:append-done` (the ops-state convention recorded in
   `~/.claude/monica-runpod-ops/` from prior pod runs — reuse it, don't invent a new mechanism).
 - **Repoint the sweep at the extended cache.** The two sweep manifests
-  (`config/manifests/student-1b-attn-{hi,lo}.yaml`) currently pin
-  `teacher_outputs: poc-distill/teacher-outputs/topk-logits` (the base-only cache). Two ways to
-  point the Step 4 sweep (in `m10-pod-chain.md`) at the extended one instead:
-  - **Recommended — CLI override, keeps manifests stable:** pass
-    `--teacher-outputs s3://monica-training/poc-distill/teacher-outputs/topk-logits-ext-merged`
-    (or the local synced copy) to `scripts/distill.py` instead of relying on the manifest field.
-  - **Alternative:** edit both manifests' `teacher_outputs:` field to the new `-ext-merged` prefix.
+  (`config/manifests/student-1b-attn-{hi,lo}.yaml`) list
+  `teacher_outputs: poc-distill/teacher-outputs/topk-logits` (the base-only cache), but
+  `scripts/distill.py` never actually reads that field — `--teacher-outputs` on the CLI is the
+  **sole** source of truth (mandatory whenever the `logit-distill` stage runs), not an override of
+  a manifest default. So the only real way to point the Step 4 sweep (in `m10-pod-chain.md`) at
+  the extended cache is:
+  - Pass `--teacher-outputs s3://monica-training/poc-distill/teacher-outputs/topk-logits-ext-merged`
+    (or the local synced copy) to `scripts/distill.py`.
+  - Editing the manifests' `teacher_outputs:` field is **decorative only** — `distill.py` won't
+    pick it up; do it for documentation/record-keeping if you like, but it has no effect on the run.
 
 ## Sizing
 

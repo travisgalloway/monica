@@ -43,6 +43,14 @@ set -a; . ./.env; set +a                     # R2 creds + HF_TOKEN (HF_TOKEN opt
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # required for the MOHAWK O(L^2) stage-1 (see below)
 ```
 
+> **`cuda` vs `cuda-fast`, not a contradiction.** `scripts/runpod/m10/bootstrap.sh` actually runs
+> `pip install -e ".[dev,data,cuda]"` followed by a separate `pip install "mamba-ssm>=2.0"
+> "causal-conv1d>=1.0" --no-build-isolation` — `mamba-ssm`'s `setup.py` imports `torch` at build
+> time, which pip's isolated build env for a plain `.[cuda-fast]` extra doesn't have, so the
+> one-line extras form fails there. `bootstrap.sh`'s two-step sequence is the documented
+> workaround for that pip build-isolation issue, not a different/lesser install — it lands the
+> same fused Triton scan + `causal-conv1d` as `.[dev,data,cuda-fast]` above.
+
 ### Step 3 — teacher precompute (the dominant $, run ONCE; both layouts reuse it)
 Needs an **Ampere+ 80 GB** card (A100/H100) for the bf16 / seq-8192 path. Bench a small slice first.
 **Prefer H100** — a single card run in sequence for cost simplicity, or an **8× H100 cluster for
@@ -70,6 +78,17 @@ Two sibling manifests, **same** corpus + teacher outputs, only `layout` differs.
 stages run in order (mixing-match → hidden-align → logit-distill). This is the "sweep" — two
 manifests × three stages → a Phase-2 winner pick; it is one team-Workflow call away once the pod
 exists (no repo runner needed — it's the loop below).
+
+> **`--teacher-outputs` is the sole source, not an override.** `scripts/distill.py` never reads a
+> `teacher_outputs` field out of the manifest at all — the CLI flag below is mandatory whenever
+> the `logit-distill` stage runs and is the *only* place the path comes from. More generally, the
+> manifest fields `corpus`, `teacher_outputs`, `sft`, `rl`, `schedule` are parsed by the manifest
+> loader (`src/train/distill_manifest.py`) but currently **ignored** by `distill.py` (decorative —
+> everything it actually needs is passed on the CLI: `--corpus`, `--teacher-outputs`, etc.). Also
+> note there are **two separate per-layout file families** that must be kept manually in sync when
+> tuning a layout: `config/manifests/student-1b-attn-{hi,lo}.yaml` (read by this Step-4 sweep) vs.
+> the flat `config/student-1b-attn-{hi,lo}.yaml` at the config root (resolved `MambaConfig` YAMLs
+> read by Step-5's `scripts/sft.py`/`scripts/rlvr.py`, **not** by `distill.py`).
 ```bash
 for M in student-1b-attn-hi student-1b-attn-lo; do
   python scripts/distill.py --manifest config/manifests/$M.yaml \
