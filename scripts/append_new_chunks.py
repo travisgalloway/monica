@@ -194,7 +194,10 @@ def merge_teacher_shards_stream_to_r2(shard0_r2: str, shard1_local: Path, splits
             raise SystemExit(
                 f"shard-0 {split} has a stray start_chunk={shard0_meta['start_chunk']}")
 
-        out_paths = _remote_topk_paths(push, split)
+        # Use the protocol-stripped `root` (from `_fs_for(push)` above), not the raw `push`
+        # URI -- matches the established pattern elsewhere in this codebase (e.g.
+        # src/data/corpus.py's shard writer) for building fs.open() destinations.
+        out_paths = _remote_topk_paths(root, split)
         shard1_meta_path = shard1_local / f"teacher-{split}.meta.json"
 
         if not shard1_meta_path.exists():
