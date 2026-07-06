@@ -188,3 +188,31 @@ def test_local_shard0_path_is_reused_without_recopy(tmp_path, monkeypatch):
 
     assert not called["download_dir"]
     assert (push_dir / "teacher-train.meta.json").exists()
+
+
+def test_file_uri_shard0_path_is_reused_without_recopy(tmp_path, monkeypatch):
+    """A `file://` URI (not just a bare path) must also be treated as local and reused directly
+    -- `Path("file://...")` collapses to a bogus, nonexistent path (e.g. `'file:/vol/...'`), so
+    the local-vs-remote check must resolve via `_fs_for`'s protocol, not a raw string prefix."""
+    import scripts.append_new_chunks as anc
+
+    shard0_dir = tmp_path / "shard0"
+    shard1_dir = tmp_path / "shard1_local"
+    push_dir = tmp_path / "push"
+
+    _write_topk(shard0_dir, "train", n_rows=8, n_chunks=FINEWEB_N_CHUNKS)
+    _write_topk(shard1_dir, "train", n_rows=3, n_chunks=17, seed=2)
+
+    called = {"download_dir": False}
+
+    def _fail_if_called(*args, **kwargs):
+        called["download_dir"] = True
+        raise AssertionError("download_dir should not be called for a file:// shard0 path")
+
+    monkeypatch.setattr("src.data.r2_sync.download_dir", _fail_if_called)
+
+    anc.merge_teacher_shards_stream_to_r2(f"file://{shard0_dir}", shard1_dir, ["train"],
+                                         str(push_dir))
+
+    assert not called["download_dir"]
+    assert (push_dir / "teacher-train.meta.json").exists()

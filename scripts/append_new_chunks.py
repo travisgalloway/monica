@@ -173,14 +173,19 @@ def merge_teacher_shards_stream_to_r2(shard0_r2: str, shard1_local: Path, splits
     """
     from src.data.r2_sync import _fs_for, download_dir
 
-    if str(shard0_r2).startswith("s3://"):
+    shard0_fs, shard0_root = _fs_for(shard0_r2)
+    shard0_protocol = shard0_fs.protocol
+    shard0_protocols = (shard0_protocol,) if isinstance(shard0_protocol, str) else shard0_protocol
+    if "file" in shard0_protocols or "local" in shard0_protocols:
+        # `--topk-dir` is already a local filesystem path (bare path or `file://`, e.g. Step 1
+        # already downloaded it for the alignment gate) -- resolve via `_fs_for` (not a raw
+        # `str.startswith("s3://")` check, which mishandles `file://` since `Path("file://...")`
+        # collapses to a bogus non-existent path) and reuse the resolved root directly instead of
+        # an ~566 GB local->local re-copy.
+        local_root = Path(shard0_root)
+    else:
         local_root = shard1_local.parent / "_shard0_cache"
         download_dir(shard0_r2, str(local_root))
-    else:
-        # `--topk-dir` is already a local filesystem path (e.g. Step 1 already downloaded it for
-        # the alignment gate) — `_fs_for` resolves any non-`s3://` URI to the local FS, so reuse
-        # the path directly instead of an ~566 GB local->local re-copy into `local_root`.
-        local_root = Path(shard0_r2)
 
     fs, root = _fs_for(push)
     root = root.rstrip("/")
