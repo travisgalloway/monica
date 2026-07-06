@@ -127,12 +127,15 @@ def check(prefix, label):
     uri = f's3://monica-training/{prefix}'
     fs, root = _fs_for(uri)
     root = root.rstrip('/')
-    files = fs.find(root)
-    assert files, f'{label}: no files found under {uri} — #177 append cannot proceed'
+    # non-recursive top-level listing -- fs.find() would recursively walk every object under
+    # the prefix (slow + many LIST calls on the 566 GB base teacher cache); existence only needs
+    # one level.
+    entries = fs.ls(root, detail=False)
+    assert entries, f'{label}: no entries found under {uri} — #177 append cannot proceed'
     manifest = f'{root}/manifest.json'
     assert fs.exists(manifest), f'{label}: manifest.json missing at {manifest}'
     size = fs.info(manifest)['size']
-    print(f'  {label}: {len(files)} files under {uri}, manifest.json {size} bytes OK')
+    print(f'  {label}: {len(entries)} top-level entries under {uri}, manifest.json {size} bytes OK')
 
 # the corpus extension (#176/#182) — append_new_chunks.py's --extension-shards source
 check('poc-distill-ext/corpus/tokenized/qwen3-8k', 'extension corpus')

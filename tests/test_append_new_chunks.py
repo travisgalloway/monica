@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -149,11 +150,8 @@ def test_shard0_n_chunks_mismatch_aborts(tmp_path):
     _write_topk(shard0_dir, "train", n_rows=8, n_chunks=FINEWEB_N_CHUNKS - 1)
     _write_topk(shard1_dir, "train", n_rows=3, n_chunks=17, seed=2)
 
-    try:
+    with pytest.raises(SystemExit, match="n_chunks"):
         merge_teacher_shards_stream_to_r2(str(shard0_dir), shard1_dir, ["train"], str(push_dir))
-        assert False, "expected SystemExit on n_chunks mismatch"
-    except SystemExit as e:
-        assert "n_chunks" in str(e)
 
 
 def test_local_shard0_path_is_reused_without_recopy(tmp_path, monkeypatch):

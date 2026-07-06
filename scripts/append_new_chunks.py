@@ -267,8 +267,11 @@ def main() -> None:
     ap.add_argument("--work-dir", type=Path, required=True,
                     help="scratch dir for the regenerated/trimmed/combined train.bin")
     ap.add_argument("--val-tokens", type=int, default=10_000_000)
-    ap.add_argument("--topk-dir", type=Path, required=True,
-                    help="the frozen topk-logits-merged dir (R2 prefix; shard-0 for the merge)")
+    ap.add_argument("--topk-dir", required=True,
+                    help="the frozen topk-logits-merged dir (R2 prefix; shard-0 for the merge). "
+                         "Kept as a plain str, not Path — Path() collapses 's3://' to 's3:/', "
+                         "breaking the s3:// vs. local-path detection in "
+                         "merge_teacher_shards_stream_to_r2.")
     ap.add_argument("--shard1-local", type=Path, required=True,
                     help="the freshly precomputed teacher-outputs shard for the new chunks")
     ap.add_argument("--push", required=True, help="R2 prefix for the merged teacher-outputs")
