@@ -193,22 +193,29 @@ def merge_teacher_shards_stream_to_r2(shard0_r2: str, shard1_local: Path, splits
         if shard0_meta.get("start_chunk") not in (None, 0):
             raise SystemExit(
                 f"shard-0 {split} has a stray start_chunk={shard0_meta['start_chunk']}")
-        if shard0_meta["n_chunks"] != FINEWEB_N_CHUNKS:
-            raise SystemExit(
-                f"shard-0 {split} n_chunks={shard0_meta['n_chunks']} != {FINEWEB_N_CHUNKS}")
 
         out_paths = _remote_topk_paths(push, split)
         shard1_meta_path = shard1_local / f"teacher-{split}.meta.json"
 
         if not shard1_meta_path.exists():
-            # Passthrough: no shard-1 counterpart for this split. Stream shard-0's files
-            # unchanged and copy its .meta.json verbatim (counts = shard-0's own, not summed).
+            # Passthrough: no shard-1 counterpart for this split. No FINEWEB_N_CHUNKS check
+            # here -- that invariant binds only the frozen FineWeb TRAIN prefix (the thing a new
+            # shard-1 gets appended after); `val` is a separate, much smaller held-out cache
+            # (e.g. 305 chunks, not 230,318) with no shard-1 counterpart to align against, so
+            # there is nothing to verify beyond the start_chunk check above. Stream shard-0's
+            # files unchanged and copy its .meta.json verbatim (counts = shard-0's own).
             for kind, out_path in (("vals", out_paths["vals"]), ("idx", out_paths["idx"])):
                 _stream_copy(local_root / f"teacher-{split}.topk_{kind}", fs, out_path)
             with fs.open(out_paths["meta"], "w") as f:
                 f.write((local_root / f"teacher-{split}.meta.json").read_text())
             n_rows_total += shard0_meta["n_rows"]
             continue
+
+        # Merging: this split's shard-0 IS the frozen FineWeb prefix a new shard-1 is being
+        # appended after, so it must still be exactly the frozen chunk count before concatenating.
+        if shard0_meta["n_chunks"] != FINEWEB_N_CHUNKS:
+            raise SystemExit(
+                f"shard-0 {split} n_chunks={shard0_meta['n_chunks']} != {FINEWEB_N_CHUNKS}")
 
         shard1_meta = json.loads(shard1_meta_path.read_text())
         total_rows = shard0_meta["n_rows"] + shard1_meta["n_rows"]

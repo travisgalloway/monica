@@ -26,6 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.append_new_chunks import FINEWEB_N_CHUNKS, merge_teacher_shards_stream_to_r2
 
+#: The frozen base cache's real val chunk count (docs/runbooks/m10-phase-bprime-append.md: "305
+#: val chunks") — deliberately NOT FINEWEB_N_CHUNKS. val is a separate, much smaller held-out
+#: cache with its own geometry; using a distinct value here exercises that the passthrough path
+#: does not (and must not) assert val's n_chunks against the train-specific FINEWEB_N_CHUNKS.
+VAL_N_CHUNKS = 305
+
 
 def _write_topk(out_dir: Path, split: str, *, n_rows: int, n_chunks: int, k: int = 4,
                 seq_len: int = 4, vocab_size: int = 32, seed: int = 0) -> dict:
@@ -34,7 +40,8 @@ def _write_topk(out_dir: Path, split: str, *, n_rows: int, n_chunks: int, k: int
     fields `split/k/n_rows/n_chunks/seq_len/vals_dtype/idx_dtype/vocab_size/src_packed/
     src_n_tokens`). `n_rows` intentionally need not equal `n_chunks*seq_len` here — the merge
     function only reads/propagates the meta fields, it does not cross-check them against actual
-    array shape (that positional cross-check is `DistillLoader`'s job, exercised elsewhere)."""
+    array shape (that positional cross-check is `DistillLoader`'s job, exercised elsewhere).
+    `src_packed` is per-split (`fineweb/{split}.bin`), matching real precompute metas."""
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     vals = rng.random((n_rows, k), dtype=np.float32).astype(np.float16)
@@ -43,7 +50,7 @@ def _write_topk(out_dir: Path, split: str, *, n_rows: int, n_chunks: int, k: int
     idx.tofile(out_dir / f"teacher-{split}.topk_idx")
     meta = {"split": split, "k": k, "n_rows": n_rows, "n_chunks": n_chunks, "seq_len": seq_len,
             "vals_dtype": "float16", "idx_dtype": "uint32", "vocab_size": vocab_size,
-            "src_packed": "fineweb/train.bin", "src_n_tokens": n_rows}
+            "src_packed": f"fineweb/{split}.bin", "src_n_tokens": n_rows}
     (out_dir / f"teacher-{split}.meta.json").write_text(json.dumps(meta, indent=2))
     return meta
 
@@ -57,7 +64,7 @@ def test_default_splits_train_val_with_train_only_shard1_does_not_crash(tmp_path
     push_dir = tmp_path / "push"
 
     _write_topk(shard0_dir, "train", n_rows=8, n_chunks=FINEWEB_N_CHUNKS)
-    _write_topk(shard0_dir, "val", n_rows=6, n_chunks=FINEWEB_N_CHUNKS, seed=1)
+    _write_topk(shard0_dir, "val", n_rows=6, n_chunks=VAL_N_CHUNKS, seed=1)
     _write_topk(shard1_dir, "train", n_rows=3, n_chunks=17, seed=2)
     # Deliberately no teacher-val.* under shard1_dir.
 
@@ -78,7 +85,7 @@ def test_val_passthrough_is_byte_identical_to_shard0(tmp_path):
     push_dir = tmp_path / "push"
 
     _write_topk(shard0_dir, "train", n_rows=8, n_chunks=FINEWEB_N_CHUNKS)
-    shard0_val_meta = _write_topk(shard0_dir, "val", n_rows=6, n_chunks=FINEWEB_N_CHUNKS, seed=1)
+    shard0_val_meta = _write_topk(shard0_dir, "val", n_rows=6, n_chunks=VAL_N_CHUNKS, seed=1)
     _write_topk(shard1_dir, "train", n_rows=3, n_chunks=17, seed=2)
 
     merge_teacher_shards_stream_to_r2(str(shard0_dir), shard1_dir, ["train", "val"], str(push_dir))
@@ -90,9 +97,11 @@ def test_val_passthrough_is_byte_identical_to_shard0(tmp_path):
 
     dst_meta = json.loads((push_dir / "teacher-val.meta.json").read_text())
     assert dst_meta == shard0_val_meta
-    # Explicitly not summed with any shard-1 val (there is none): counts are shard0's own.
+    # Explicitly not summed with any shard-1 val (there is none): counts are shard0's own. Also
+    # confirms the passthrough path does NOT assert val's (deliberately non-FINEWEB_N_CHUNKS)
+    # n_chunks against the train-specific frozen count.
     assert dst_meta["n_rows"] == 6
-    assert dst_meta["n_chunks"] == FINEWEB_N_CHUNKS
+    assert dst_meta["n_chunks"] == VAL_N_CHUNKS
 
 
 def test_train_still_merges_shard0_plus_shard1(tmp_path):
@@ -103,7 +112,7 @@ def test_train_still_merges_shard0_plus_shard1(tmp_path):
     push_dir = tmp_path / "push"
 
     _write_topk(shard0_dir, "train", n_rows=8, n_chunks=FINEWEB_N_CHUNKS)
-    _write_topk(shard0_dir, "val", n_rows=6, n_chunks=FINEWEB_N_CHUNKS, seed=1)
+    _write_topk(shard0_dir, "val", n_rows=6, n_chunks=VAL_N_CHUNKS, seed=1)
     _write_topk(shard1_dir, "train", n_rows=3, n_chunks=17, seed=2)
 
     merge_teacher_shards_stream_to_r2(str(shard0_dir), shard1_dir, ["train", "val"], str(push_dir))
