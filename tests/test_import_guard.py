@@ -85,6 +85,7 @@ PORTABLE_MODULES = [
     "src.lsp.tsc",
     "src.lsp.diagnostics",
     "src.lsp.lm",
+    "src.lsp.harness",
     "src.conformance.forward_step_parity",
     "src.conformance.backend_parity",
     "src.conformance.doc_boundary_parity",
