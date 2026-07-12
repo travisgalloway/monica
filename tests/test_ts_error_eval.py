@@ -40,7 +40,7 @@ def _write_jsonl(tmp_path: Path, records: list[dict]) -> Path:
 
 def test_default_set_loads_clean():
     records = load_ts_error_set(DEFAULT_SET_PATH)
-    assert len(records) >= 90
+    assert len(records) == 96
 
 
 def test_default_set_is_balanced():
@@ -48,9 +48,12 @@ def test_default_set_is_balanced():
     counts: dict[str, int] = {}
     for rec in records:
         counts[rec["error_class"]] = counts.get(rec["error_class"], 0) + 1
-    for cls in ("unfamiliar_member_access", "undefined_name", "arity_mismatch"):
-        assert 20 <= counts.get(cls, 0) <= 35, f"{cls}: {counts}"
-    assert counts.get("clean_control", 0) >= 10, counts
+    assert counts == {
+        "unfamiliar_member_access": 28,
+        "undefined_name": 28,
+        "arity_mismatch": 28,
+        "clean_control": 12,
+    }
 
 
 def test_default_set_has_unique_ids():

@@ -106,6 +106,12 @@ def main() -> int:
         error_class = rec.get("error_class")
         expected = rec.get("expected_diagnostic", "")
 
+        missing = [k for k in ("prompt", "gold_completion", "error_completion") if k not in rec]
+        if missing:
+            print(f"FAIL {rid}: record missing keys {missing}")
+            n_fail += 1
+            continue
+
         gold_source = rec["prompt"] + rec["gold_completion"]
         gold_codes = tsc_diagnostics(gold_source, args.tsconfig, tsc_argv)
         if gold_codes:
