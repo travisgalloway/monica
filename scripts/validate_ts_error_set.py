@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,11 +38,17 @@ _DIAGNOSTIC_RE = re.compile(r"error (TS\d+):")
 
 
 def resolve_tsc() -> List[str] | None:
-    """Return the argv prefix to invoke `tsc`, or None if no toolchain is found."""
+    """Return the argv prefix to invoke `tsc`, or None if the pinned local install is missing.
+
+    Deliberately does not fall back to `npx -p typescript tsc`: npx would fetch a bare
+    `typescript` package with no access to this directory's pinned `SET_DIR/node_modules/
+    @types/node`, so ambient globals like `console` (used by several records) would
+    spuriously fail to resolve under this project's `lib: ["ES2020"]` (no-DOM) tsconfig
+    -- producing diagnostics unrelated to the labeled error and making validation flaky
+    on hosts with `node`/`npx` but no `npm install` run in this directory.
+    """
     if LOCAL_TSC.exists():
         return [str(LOCAL_TSC)]
-    if shutil.which("npx"):
-        return ["npx", "-p", "typescript", "tsc"]
     return None
 
 
