@@ -36,14 +36,15 @@ module (guarded by `tests/test_import_guard.py`); `lm: LMAdapter` and
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..serve.sampling import sample
 from .diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
-                           filter_diagnostics, statement_boundary, strip_suggestion)
+                           filter_diagnostics, is_incomplete, statement_boundary,
+                           strip_suggestion)
 from .lm import LMAdapter, token_index_at
 
 DiagnoseFn = Callable[[str], List[Diagnostic]]
@@ -249,10 +250,35 @@ def generate_slow_loop(
             gen_text = lm.decode(gen_ids)
             check_text = close_open_delimiters(gen_text) if segment_is_final_partial else gen_text
             source = context + check_text
-            frontier = segment_start + (len(lm.decode(gen_ids[:-1])) if gen_ids else 0)
+            if hit_boundary:
+                # The model itself emitted an explicit terminator and generation
+                # for this attempt has genuinely stopped -- there is no "one more
+                # token might still be coming" to wait out, so the whole segment
+                # (including its last token) counts as committed. Withholding the
+                # last token here (as the mid-generation case below does) would
+                # create a permanent blind spot for single-token segments, where
+                # the last token IS the only token.
+                frontier = segment_start + len(gen_text)
+            else:
+                # Budget ran out mid-statement (segment_is_final_partial): the last
+                # real token may genuinely still be "forming" -- keep withholding
+                # it. Virtually-appended closer characters sit past this frontier
+                # by construction, so their own syntax noise is dropped for free.
+                frontier = segment_start + (len(lm.decode(gen_ids[:-1])) if gen_ids else 0)
 
             raw = _diag(source)
             filtered = filter_diagnostics(raw, frontier=frontier, generation_start=segment_start)
+            if hit_boundary and not filtered:
+                # filter_diagnostics unconditionally drops TS1xxx as mid-generation
+                # "still typing" noise -- correct while more tokens might still be
+                # coming, but this segment just reached a genuine statement
+                # boundary: there ISN'T any more text coming for this attempt, so a
+                # committed TS1xxx (e.g. `u.)` -- "Identifier expected") is a real
+                # defect, not noise, and must not be waved through as clean.
+                committed_incomplete = [d for d in raw if is_incomplete(d.code) and d.offset < frontier]
+                if committed_incomplete:
+                    filtered = [replace(d, offset=max(d.offset, segment_start))
+                                for d in committed_incomplete]
             if SUPPRESSION_RE.search(gen_text):
                 result.reward_hack_detected = True
             clean = _is_clean(filtered, gen_text)

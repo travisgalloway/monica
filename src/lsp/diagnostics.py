@@ -73,17 +73,30 @@ def _line_start_offsets(source: str) -> List[int]:
     return starts
 
 
-def line_col_to_offset(source: str, line: int, col: int) -> int:
-    """1-indexed (line, col) -> 0-indexed character offset into `source`.
-
-    Asserts `source.isascii()`: tsc's `col` is a UTF-16 code-unit offset, which only
-    coincides with a Python `str` character index for ASCII source. The #194 eval set
-    is 100% ASCII by construction (see its README); this assertion is the boundary
-    that keeps that assumption from silently rotting.
+def _utf16_col_to_char_index(line: str, col: int) -> int:
+    """1-indexed UTF-16-code-unit column -> 0-indexed Python `str` character index
+    within `line`. Most characters are 1 UTF-16 unit; astral-plane characters
+    (outside the Basic Multilingual Plane, e.g. many emoji) encode as a 2-unit
+    surrogate pair in UTF-16 but are a single Python `str` character, so a flat
+    `col - 1` offset silently mis-maps once one appears anywhere on the line
+    (`tsc`'s columns are always UTF-16 units, regardless of what generated the
+    source). The #194 eval set is 100% ASCII by construction, but a model's
+    free-running block-budget completion is not guaranteed to stay ASCII, so this
+    module must handle the general case rather than assert it away.
     """
-    assert source.isascii(), "line_col_to_offset assumes ASCII source (tsc col is UTF-16 code units)"
+    units = 0
+    for i, ch in enumerate(line):
+        if units >= col - 1:
+            return i
+        units += 2 if ord(ch) > 0xFFFF else 1
+    return len(line)
+
+
+def line_col_to_offset(source: str, line: int, col: int) -> int:
+    """1-indexed (line, col) -> 0-indexed character offset into `source`."""
     starts = _line_start_offsets(source)
-    return starts[line - 1] + (col - 1)
+    line_text = source.split("\n")[line - 1]
+    return starts[line - 1] + _utf16_col_to_char_index(line_text, col)
 
 
 def parse_tsc_output(output: str, source: str) -> List[Diagnostic]:

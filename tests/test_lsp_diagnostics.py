@@ -58,6 +58,23 @@ def test_line_col_to_offset_multiline():
     assert line_col_to_offset(source, 3, 3) == 10
 
 
+def test_line_col_to_offset_bmp_non_ascii():
+    # 'é' is a single UTF-16 code unit (BMP), so this behaves like plain ASCII.
+    source = "const é = 1;\nconst y = 2;"
+    # 'y' is at index 6 within line 2 ("const y..."), so 1-indexed col 7.
+    assert line_col_to_offset(source, 2, 7) == source.index("y = 2")
+
+
+def test_line_col_to_offset_astral_surrogate_pair():
+    # An emoji outside the BMP is 1 Python str character but 2 UTF-16 code units --
+    # a flat col-1 mapping would land one character too far right after it.
+    source = "const s = \"\U0001F600\"; const after = 1;"
+    after_char_idx = source.index("after")
+    # tsc's column count: everything before "after" in UTF-16 units, +1 (1-indexed).
+    utf16_units_before = len(source[:after_char_idx].encode("utf-16-le")) // 2
+    assert line_col_to_offset(source, 1, utf16_units_before + 1) == after_char_idx
+
+
 # --------------------------------------------------------------------------- #
 # is_incomplete (TS1xxx)
 # --------------------------------------------------------------------------- #
