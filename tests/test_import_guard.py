@@ -82,6 +82,7 @@ PORTABLE_MODULES = [
     "src.eval.retrieval_probe",
     "src.eval.probes",
     "src.eval.ts_error_eval",
+    "src.eval.lsp_eval",
     "src.lsp.tsc",
     "src.lsp.diagnostics",
     "src.lsp.lm",
