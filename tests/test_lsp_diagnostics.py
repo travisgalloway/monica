@@ -1,0 +1,228 @@
+"""Tests for `src/lsp/diagnostics.py` — pure string/parsing logic, no `tsc` needed.
+
+Real-compiler format pinning lives in `test_lsp_tsc.py`; this file only exercises
+`diagnostics.py`'s own primitives against hand-built inputs.
+"""
+
+from __future__ import annotations
+
+from src.lsp.diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
+                                  filter_diagnostics, is_incomplete, line_col_to_offset,
+                                  parse_tsc_output, statement_boundary, strip_suggestion)
+
+
+# --------------------------------------------------------------------------- #
+# parse_tsc_output
+# --------------------------------------------------------------------------- #
+
+def test_parse_parenthesized_format():
+    source = "const x: number = 'hi';\n"
+    output = "snippet.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\n"
+    diags = parse_tsc_output(output, source)
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.code == "TS2322"
+    assert d.line == 1 and d.col == 7
+    assert d.offset == line_col_to_offset(source, 1, 7)
+    assert "not assignable" in d.message
+
+
+def test_parse_pretty_fallback_format():
+    source = "const x: number = 'hi';\n"
+    output = "snippet.ts:1:7 - error TS2322: Type 'string' is not assignable to type 'number'.\n"
+    diags = parse_tsc_output(output, source)
+    assert len(diags) == 1
+    assert diags[0].code == "TS2322"
+
+
+def test_parse_ignores_non_diagnostic_lines():
+    source = "const x = 1;\n"
+    output = "\nsnippet.ts(1,1): error TS9999: bogus\nFound 1 error.\n"
+    diags = parse_tsc_output(output, source)
+    assert len(diags) == 1
+    assert diags[0].code == "TS9999"
+
+
+def test_parse_multiple_diagnostics_in_order():
+    source = "a\nb\n"
+    output = ("snippet.ts(1,1): error TS1001: first\n"
+              "snippet.ts(2,1): error TS1002: second\n")
+    diags = parse_tsc_output(output, source)
+    assert [d.code for d in diags] == ["TS1001", "TS1002"]
+
+
+def test_line_col_to_offset_multiline():
+    source = "abc\ndef\nghi"
+    assert line_col_to_offset(source, 1, 1) == 0
+    assert line_col_to_offset(source, 2, 1) == 4
+    assert line_col_to_offset(source, 3, 3) == 10
+
+
+# --------------------------------------------------------------------------- #
+# is_incomplete (TS1xxx)
+# --------------------------------------------------------------------------- #
+
+def test_is_incomplete_ts1xxx():
+    assert is_incomplete("TS1003")
+    assert is_incomplete("TS1005")
+    assert is_incomplete("TS1109")
+
+
+def test_is_incomplete_false_for_others():
+    assert not is_incomplete("TS2339")
+    assert not is_incomplete("TS2304")
+    assert not is_incomplete("TS2554")
+
+
+# --------------------------------------------------------------------------- #
+# filter_diagnostics: TS1xxx drop, frontier drop, generation_start clamp
+# --------------------------------------------------------------------------- #
+
+def _diag(code, offset, message="msg"):
+    return Diagnostic(code=code, line=1, col=offset + 1, message=message, offset=offset)
+
+
+def test_filter_drops_ts1xxx():
+    diags = [_diag("TS1003", 5), _diag("TS2339", 5)]
+    out = filter_diagnostics(diags, frontier=100, generation_start=0)
+    assert [d.code for d in out] == ["TS2339"]
+
+
+def test_filter_drops_at_or_past_frontier():
+    diags = [_diag("TS2339", 10)]
+    assert filter_diagnostics(diags, frontier=10, generation_start=0) == []  # >= frontier dropped
+    kept = filter_diagnostics(diags, frontier=11, generation_start=0)
+    assert len(kept) == 1 and kept[0].offset == 10  # < frontier kept
+
+
+def test_filter_clamps_offset_up_to_generation_start():
+    # The arity-005 regression: a real diagnostic anchored inside the PROMPT region
+    # (offset < generation_start) must clamp up to generation_start, not be dropped
+    # and not go negative.
+    diags = [_diag("TS2554", 5)]
+    out = filter_diagnostics(diags, frontier=100, generation_start=20)
+    assert len(out) == 1
+    assert out[0].offset == 20
+    assert out[0].code == "TS2554"
+
+
+def test_filter_clamp_is_noop_when_offset_already_past_generation_start():
+    diags = [_diag("TS2339", 30)]
+    out = filter_diagnostics(diags, frontier=100, generation_start=20)
+    assert out[0].offset == 30
+
+
+def test_filter_never_produces_negative_offset():
+    diags = [_diag("TS2554", 0)]
+    out = filter_diagnostics(diags, frontier=100, generation_start=0)
+    assert out[0].offset == 0
+    assert out[0].offset >= 0
+
+
+# --------------------------------------------------------------------------- #
+# strip_suggestion
+# --------------------------------------------------------------------------- #
+
+def test_strip_suggestion_removes_did_you_mean():
+    d = _diag("TS2304", 0, message="Cannot find name 'visitorName'. Did you mean 'userName'?")
+    stripped = strip_suggestion(d)
+    assert "Did you mean" not in stripped.message
+    assert stripped.message.startswith("Cannot find name 'visitorName'")
+
+
+def test_strip_suggestion_noop_without_suggestion():
+    d = _diag("TS2339", 0, message="Property 'gorblak' does not exist on type 'User'.")
+    assert strip_suggestion(d).message == d.message
+
+
+def test_suppression_re_matches_ts_ignore_and_as_any():
+    assert SUPPRESSION_RE.search("// @ts-ignore\nconsole.log(u.gorblak);")
+    assert SUPPRESSION_RE.search("const v = u as any;")
+    assert not SUPPRESSION_RE.search("console.log(u.name);")
+
+
+# --------------------------------------------------------------------------- #
+# close_open_delimiters — string/template/comment aware
+# --------------------------------------------------------------------------- #
+
+def test_close_open_delimiters_noop_on_balanced():
+    src = "console.log(u.name);\n"
+    assert close_open_delimiters(src) == src
+
+
+def test_close_open_delimiters_brace_in_string_is_not_a_real_delimiter():
+    src = 'const t = ("{ not real'
+    closed = close_open_delimiters(src)
+    # The `{` inside the (unterminated) string must NOT be tracked as a real open
+    # bracket — only the string itself (innermost) and the paren need closing.
+    assert closed == src + '")'
+
+
+def test_close_open_delimiters_brace_in_line_comment_ignored():
+    src = "foo({ // comment with a } brace"
+    closed = close_open_delimiters(src)
+    assert closed == src + "\n})"
+
+
+def test_close_open_delimiters_brace_in_block_comment_ignored():
+    src = "foo({ /* a } b */ bar("
+    closed = close_open_delimiters(src)
+    # Nesting outer->inner is paren1 > brace1 > paren2 (the comment's `}` doesn't
+    # count); closers come out innermost-first: paren2, brace1, paren1.
+    assert closed == src + ")})"
+
+
+def test_close_open_delimiters_unterminated_block_comment():
+    src = "foo(/* never closed"
+    closed = close_open_delimiters(src)
+    assert closed == src + "*/)"
+
+
+def test_close_open_delimiters_template_literal_expr():
+    src = "const s = `hello ${user."
+    closed = close_open_delimiters(src)
+    assert closed == src + "}`"
+
+
+def test_close_open_delimiters_string_inside_template_expr():
+    src = "const s = `${'a"
+    closed = close_open_delimiters(src)
+    assert closed == src + "'}`"
+
+
+def test_close_open_delimiters_nested_brackets():
+    src = "const arr = [1, {a: (2"
+    closed = close_open_delimiters(src)
+    assert closed == src + ")}]"
+
+
+# --------------------------------------------------------------------------- #
+# statement_boundary
+# --------------------------------------------------------------------------- #
+
+def test_statement_boundary_semicolon_at_depth_zero():
+    text = "name;\n"
+    assert statement_boundary(text) == text.index(";") + 1
+
+
+def test_statement_boundary_none_when_absent():
+    assert statement_boundary("console.log(u.name") is None
+
+
+def test_statement_boundary_ignores_semicolon_inside_call():
+    # A `;` cannot appear inside a call in TS, but do check bracket depth isn't
+    # fooled by a newline inside an open paren.
+    text = "foo(\n  1,\n  2\n);\n"
+    boundary = statement_boundary(text)
+    assert boundary == text.index(");") + 2
+
+
+def test_statement_boundary_ignores_semicolon_in_string():
+    text = 'const s = "a;b";\n'
+    boundary = statement_boundary(text)
+    assert boundary == text.index('";') + 2  # the real terminator, not the one in the string
+
+
+def test_statement_boundary_newline_counts_at_depth_zero():
+    text = "const x = 1\nconst y = 2;\n"
+    assert statement_boundary(text) == text.index("\n") + 1
