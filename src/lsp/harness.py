@@ -375,6 +375,9 @@ def generate_toolcall(
     prompt: str,
     *,
     k: int = 1,
+    budget: str = "stmt",
+    block_size: int = _DEFAULT_BLOCK_SIZE,
+    max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
     strip_suggestions: bool = False,
@@ -383,10 +386,17 @@ def generate_toolcall(
     trip: diagnostic injected as a comment, the whole completion regenerated from
     scratch, `k` rounds. See the module docstring for why this shares
     `generate_slow_loop`'s soft-repair machinery under a distinct label.
+
+    `budget`/`block_size`/`max_gen_tokens` MUST be threaded through to
+    `generate_slow_loop` rather than hardcoded to `"stmt"` — a caller comparing
+    strategies under `budget="block"` needs every strategy free-running to the
+    same token budget, or a "toolcall" that quietly stops at the first statement
+    boundary looks artificially cheap and artificially clean for reasons that have
+    nothing to do with tool-call repair actually working.
     """
     result = generate_slow_loop(
-        lm, diagnose, prompt, repair="soft", budget="stmt",
-        max_retries=k, temperature=temperature, rng=rng,
+        lm, diagnose, prompt, repair="soft", budget=budget, block_size=block_size,
+        max_gen_tokens=max_gen_tokens, max_retries=k, temperature=temperature, rng=rng,
         strip_suggestions=strip_suggestions,
     )
     result.strategy = f"toolcall-k{k}"

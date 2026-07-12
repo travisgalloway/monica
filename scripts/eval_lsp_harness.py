@@ -143,8 +143,8 @@ def main() -> None:
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
             else:  # toolcall
                 result = generate_toolcall(
-                    lm, runner.diagnostics, rec["prompt"], temperature=args.temperature,
-                    rng=rng, strip_suggestions=args.strip_suggestions, **kwargs)
+                    lm, runner.diagnostics, rec["prompt"],
+                    strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
 
             s = score_record(rec, result, runner.diagnostics)
             scored.append(s)

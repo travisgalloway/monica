@@ -264,6 +264,23 @@ def test_toolcall_shares_soft_repair_machinery_under_its_own_label():
     assert "// tsc:" not in result.artifact
 
 
+def test_toolcall_respects_block_budget_not_hardcoded_to_stmt():
+    # Regression test for a real bug: generate_toolcall hardcoded budget="stmt",
+    # so under budget="block" it silently stopped at the first statement boundary
+    # while every other strategy free-ran to block_size tokens -- an unfair
+    # comparison where toolcall looked artificially cheap/clean purely because it
+    # generated far less text, not because tool-call repair was actually working.
+    script = _linear_script("a;" * 20)  # many trivial one-char statements
+    lm = ScriptedFakeLM(script)
+    always_clean = lambda source: []
+
+    baseline = generate_baseline(lm, "", budget="block", block_size=20)
+    toolcall = generate_toolcall(lm, always_clean, "", k=1, budget="block", block_size=20)
+
+    assert toolcall.n_generated_tokens == 20
+    assert toolcall.n_generated_tokens == baseline.n_generated_tokens
+
+
 # --------------------------------------------------------------------------- #
 # block budget: checkpoint stack across multiple statements
 # --------------------------------------------------------------------------- #
