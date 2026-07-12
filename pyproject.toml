@@ -28,6 +28,10 @@ data = ["datasets>=2.0", "transformers>=4.40", "pyarrow>=14", "fsspec>=2024.0"]
 datatrove = ["datatrove[processing,io,s3]>=0.9.0"]
 # Apple Silicon backend (NOT installable on Linux/CUDA hosts).
 mlx = ["mlx>=0.18"]
+# #199 LSP-in-the-loop harness's model adapter (src/model/mlx_lm_adapter.py):
+# mlx_lm wraps `mlx` with prompt-cache trimming (make_prompt_cache/trim_prompt_cache)
+# the harness's rollback needs. Apple Silicon only, same as `mlx` above.
+lsp = ["mlx-lm>=0.28"]
 # CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
 cuda = ["torch>=2.0"]
 # Optional fused CUDA kernels (#40): mamba-ssm provides the Triton SSD chunked scan
