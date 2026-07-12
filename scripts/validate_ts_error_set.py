@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,7 @@ _DIAGNOSTIC_RE = re.compile(r"error (TS\d+):")
 
 
 def resolve_tsc() -> List[str] | None:
-    """Return the argv prefix to invoke `tsc`, or None if the pinned local install is missing.
+    """Return the argv prefix to invoke `tsc`, or None if no usable toolchain exists.
 
     Deliberately does not fall back to `npx -p typescript tsc`: npx would fetch a bare
     `typescript` package with no access to this directory's pinned `SET_DIR/node_modules/
@@ -46,8 +47,13 @@ def resolve_tsc() -> List[str] | None:
     spuriously fail to resolve under this project's `lib: ["ES2020"]` (no-DOM) tsconfig
     -- producing diagnostics unrelated to the labeled error and making validation flaky
     on hosts with `node`/`npx` but no `npm install` run in this directory.
+
+    Also requires `node` itself on PATH: the local `tsc` shim's `#!/usr/bin/env node`
+    shebang needs it, and without this check a node-less host would hit a raw
+    `FileNotFoundError` from `subprocess.run` instead of the clean skip this script
+    promises (see the module docstring).
     """
-    if LOCAL_TSC.exists():
+    if LOCAL_TSC.exists() and shutil.which("node") is not None:
         return [str(LOCAL_TSC)]
     return None
 

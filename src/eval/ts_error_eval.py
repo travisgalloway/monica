@@ -49,8 +49,10 @@ def validate_record(rec: dict) -> None:
     """Raise `ValueError` if `rec` doesn't satisfy the eval-set schema.
 
     Checks: all required keys present; `error_class` is a known class; `prompt` and
-    `gold_completion` are non-empty; for non-`clean_control` rows, `error_completion`
-    is non-empty and `expected_diagnostic` equals the class's mapped `tsc` code.
+    `gold_completion` are non-empty; `expected_diagnostic` equals the class's mapped
+    `tsc` code; `error_completion` is non-empty for non-`clean_control` rows and
+    empty for `clean_control` rows (the schema treats it as required-but-empty
+    there, so downstream consumers can rely on it never being set).
     """
     missing = [k for k in _REQUIRED_KEYS if k not in rec]
     if missing:
@@ -73,6 +75,8 @@ def validate_record(rec: dict) -> None:
 
     if error_class != "clean_control" and not rec["error_completion"]:
         raise ValueError(f"record {rec['id']!r} ({error_class}) has empty error_completion")
+    if error_class == "clean_control" and rec["error_completion"]:
+        raise ValueError(f"record {rec['id']!r} (clean_control) must have empty error_completion")
 
 
 def load_ts_error_set(path: Path = DEFAULT_SET_PATH) -> List[dict]:
