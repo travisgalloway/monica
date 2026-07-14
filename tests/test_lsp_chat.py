@@ -111,6 +111,33 @@ def test_short_member_expressions_are_code_not_prose():
         assert r.completion == completion
 
 
+def test_duplicate_join_delimiter_is_dropped():
+    """Regression, caught live: the model repeats the prompt's trailing delimiter.
+
+    Asked to continue `const firstTitle = books[0].`, an instruct model answers `.title`
+    — the way a human would say it. Naive concatenation gives `books[0]..title` and a
+    spurious TS1003. This was a large share of the chat arm's apparent failures, i.e. our
+    bug being scored as the model's, biasing the comparison toward hard-ban.
+    """
+    r = extract_completion(".title", "const firstTitle = books[0].")
+    assert r.ok and r.completion == "title"
+
+    r = extract_completion("```ts\n.gpa;\n```", "const g = s.")
+    assert r.ok and r.completion == "gpa;"
+
+
+def test_join_normalization_does_not_rewrite_a_genuinely_bad_completion():
+    """It drops one duplicated delimiter — it does not rescue a wrong answer."""
+    bad = "area(): number { return this.width * this.height; }"
+    r = extract_completion(bad, "const a = r.")
+    assert r.ok and r.completion == bad     # still wrong, still scored as wrong
+
+
+def test_join_normalization_leaves_a_correct_completion_alone():
+    r = extract_completion("title;", "const firstTitle = books[0].")
+    assert r.ok and r.completion == "title;"
+
+
 def test_apology_is_still_prose():
     """The other side of that boundary must not move: an apology is not a completion."""
     for prose in ("I'm sorry, I cannot complete that snippet",

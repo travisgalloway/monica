@@ -82,6 +82,37 @@ def _is_prose(body: str) -> bool:
     return len(_WORD_RE.findall(body)) >= 4
 
 
+_JOIN_DELIMS = ".(,["
+
+
+def _normalize_join(body: str, prompt: str) -> str:
+    """Drop a delimiter the model repeated from the end of the prompt.
+
+    The prompts end mid-expression (`const firstTitle = books[0].`), and an instruct
+    model asked to "continue this" very often answers with the member access *including*
+    the dot — `.title` — because that is how a human would say it. Concatenated naively
+    that yields `books[0]..title` and a spurious `TS1003`.
+
+    Observed live: this alone accounted for a large share of the chat tool-call's
+    apparent failures. Left unfixed it would have understated the tool-call arm and
+    handed hard-ban a win it did not earn — the precise bias this experiment exists to
+    remove. Any real agent harness normalizes the join, so we do too.
+
+    Deliberately narrow: only a *single* leading delimiter that exactly duplicates the
+    prompt's trailing one is dropped. It never rewrites the model's actual tokens, so a
+    genuinely bad completion (a method body where a member name belonged) still fails, as
+    it should.
+    """
+    tail = prompt.rstrip()
+    if not tail or not body:
+        return body
+    last = tail[-1]
+    if last in _JOIN_DELIMS and body.lstrip()[:1] == last:
+        stripped = body.lstrip()
+        return stripped[1:]
+    return body
+
+
 @dataclass
 class ExtractionResult:
     """`ok=False` means the response could not be read as a continuation.
@@ -169,6 +200,8 @@ def extract_completion(response: str, prompt: str) -> ExtractionResult:
     body = body.lstrip("\n")
     if not body.strip():
         return ExtractionResult("", False, "no completion after removing prompt/fences")
+
+    body = _normalize_join(body, prompt)
 
     if _is_prose(body):
         return ExtractionResult("", False, "response looks like prose, not code")

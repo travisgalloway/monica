@@ -215,6 +215,12 @@ class MLXLMAdapter:
             [None if a is None else self._mx.array(a) for a in layer.state]
             for layer in self._cache
         ]
+        # MLX is lazy: `mx.array(a)` builds a graph node, it does not copy. Without this
+        # eval the snapshot's real cost is silently deferred to whenever the arrays are
+        # first used, which makes a naive timing of checkpoint() report a ~1900x speedup
+        # over re-prefill that is pure measurement artifact. Force it here so the cost is
+        # paid — and measured — where it is actually incurred.
+        self._mx.eval([a for layer in state for a in layer if a is not None])
         return {
             "cache_state": state,
             "context_ids": list(self._context_ids),
@@ -241,6 +247,7 @@ class MLXLMAdapter:
         fresh = self._make_prompt_cache(self.model)
         for layer, saved in zip(fresh, handle["cache_state"]):
             layer.state = [None if a is None else self._mx.array(a) for a in saved]
+        self._mx.eval([a for layer in fresh for a in layer.state if a is not None])
         self._cache = fresh
         self._last_logits = handle["logits"]
         self.n_snapshot_rollbacks += 1
