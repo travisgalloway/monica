@@ -232,3 +232,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude/automerge-active
+.claude/work-active
+
+# LSP harness: keep JSON summaries (doc provenance), drop bulky per-record transcripts
+results/*.jsonl
