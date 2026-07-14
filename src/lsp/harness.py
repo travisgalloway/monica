@@ -69,6 +69,11 @@ class GenResult:
     unrepaired: bool = False
     no_progress: bool = False
     reward_hack_detected: bool = False
+    # Chat-mode only: the model answered with something that isn't a usable completion
+    # (prose, an empty string, a bare restatement). A first-class outcome of the
+    # tool-call path, reported rather than silently scored as an empty completion.
+    extraction_failed: bool = False
+    extraction_failure_reason: str = ""
     n_tsc_calls: int = 0
     tsc_wall_s: float = 0.0
     n_forward_tokens: int = 0
@@ -133,6 +138,117 @@ def generate_baseline(
         n_forward_tokens_nocache=lm.n_forward_tokens_nocache - n_fwd_nc0,
         wall_s=time.monotonic() - t0,
     )
+
+
+# --------------------------------------------------------------------------- #
+# chat-mode tool-call — the FAIR opponent (#199 follow-up)
+# --------------------------------------------------------------------------- #
+
+def generate_toolcall_chat(
+    lm: LMAdapter,
+    diagnose: DiagnoseFn,
+    prompt: str,
+    *,
+    k: int = 1,
+    max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
+    temperature: float = 0.0,
+    rng: Optional[np.random.Generator] = None,
+    strip_suggestions: bool = False,
+) -> GenResult:
+    """A real tool-call round-trip against an **instruction-tuned** model.
+
+    This is the comparison hard-ban actually has to beat. Phase 0's tool-call baseline
+    ran on a *base* model, which cannot follow instructions by construction — so
+    "diagnostics-as-text doesn't work" was close to unfalsifiable. Here the model gets
+    the `tsc` error in a genuine chat turn, the way every production coding agent does
+    it, and may rewrite its answer `k` times.
+
+    Scoring stays identical to the completion-mode strategies (`artifact = prompt +
+    completion`, same `tsc`), so the numbers are comparable. Extraction failures are
+    recorded on the result rather than swallowed: a model that answers with prose has
+    failed the task, and hiding that would flatter the tool-call path.
+    """
+    from .chat import build_toolcall_messages, extract_completion
+
+    t0 = time.monotonic()
+    n_fwd0, n_fwd_nc0 = lm.n_forward_tokens, lm.n_forward_tokens_nocache
+    result = GenResult(strategy=f"toolcall-chat-k{k}", prompt=prompt,
+                       completion="", context=prompt)
+
+    completion, diag, previous = "", None, None
+    for round_idx in range(k + 1):
+        messages = build_toolcall_messages(prompt, diag, previous,
+                                            strip_suggestions=strip_suggestions)
+        rendered = lm.render_chat(messages)
+
+        logits = lm.reset(rendered)
+        gen_ids: List[int] = []
+        eos = _eos_ids(lm)
+        for _ in range(max_gen_tokens):
+            tok = sample(logits, temperature=temperature, rng=rng, previous_tokens=gen_ids)
+            if tok in eos:
+                break
+            logits = lm.step(tok)
+            gen_ids.append(tok)
+        result.n_generated_tokens += len(gen_ids)
+
+        extracted = extract_completion(lm.decode(gen_ids), prompt)
+        if not extracted.ok:
+            # A real outcome, not a glitch: the model didn't return usable code.
+            result.extraction_failed = True
+            result.extraction_failure_reason = extracted.reason
+            result.events.append({"kind": "extraction_failure", "round": round_idx,
+                                   "reason": extracted.reason})
+            break
+
+        completion = extracted.completion
+        previous = completion
+
+        t_tsc = time.monotonic()
+        diags = diagnose(prompt + completion)
+        result.tsc_wall_s += time.monotonic() - t_tsc
+        result.n_tsc_calls += 1
+
+        real = [d for d in diags if not is_incomplete(d.code)]
+        if not real:
+            break                       # clean — nothing to feed back
+        if round_idx == k:
+            result.unrepaired = True
+            break
+        diag = real[0]
+        result.n_soft_repairs += 1
+        result.events.append({"kind": "toolcall_round", "round": round_idx,
+                               "code": diag.code, "message": diag.message})
+
+    result.completion = completion
+    result.context = prompt + completion
+    result.n_forward_tokens = lm.n_forward_tokens - n_fwd0
+    result.n_forward_tokens_nocache = lm.n_forward_tokens_nocache - n_fwd_nc0
+    result.wall_s = time.monotonic() - t0
+    return result
+
+
+def _eos_ids(lm: LMAdapter) -> set:
+    """EOS/end-of-turn ids. An instruct model ends its turn with `<|im_end|>` rather
+    than a plain EOS, and missing it means the model rambles into a new turn and the
+    completion is scored as garbage."""
+    ids = set()
+    tok = getattr(lm, "tokenizer", None)
+    for attr in ("eos_token_id",):
+        v = getattr(tok, attr, None)
+        if isinstance(v, int):
+            ids.add(v)
+        elif isinstance(v, (list, tuple)):
+            ids.update(int(x) for x in v)
+    inner = getattr(tok, "_tokenizer", tok)
+    for name in ("<|im_end|>", "<|endoftext|>"):
+        try:
+            tid = inner.convert_tokens_to_ids(name)
+            if isinstance(tid, int) and tid >= 0:
+                ids.add(tid)
+        except Exception:
+            pass
+    return ids
 
 
 # --------------------------------------------------------------------------- #

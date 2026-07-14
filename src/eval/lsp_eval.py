@@ -89,6 +89,11 @@ def score_record(rec: dict, gen_result: Any, diagnose: DiagnoseFn) -> dict:
         "exact_gold": exact_gold,
         "rolled_back": rolled_back,
         "no_progress": bool(getattr(gen_result, "no_progress", False)),
+        # Chat tool-call only: the model answered with prose/nothing usable. Kept as a
+        # scored row (not dropped) so `diagnostic_clean_rate` is over ALL records — a
+        # clean-rate computed only over the parseable answers would flatter the
+        # tool-call path exactly where it is failing.
+        "extraction_failed": bool(getattr(gen_result, "extraction_failed", False)),
         "suggestion_leak": suggestion_leak,
         "truncated": truncated,
         "suppression_hack": suppression_hack,

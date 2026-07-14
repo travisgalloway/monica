@@ -73,6 +73,73 @@ class LMAdapter(Protocol):
 
 
 # --------------------------------------------------------------------------- #
+# Optional capabilities
+#
+# Deliberately NOT part of `LMAdapter` above: `FakeLM` and the original MLX adapter
+# predate them and must stay valid implementations. Probe with `supports_chat(...)` /
+# `supports_snapshot(...)` rather than `isinstance`, so an adapter opts in simply by
+# having the methods.
+# --------------------------------------------------------------------------- #
+
+@runtime_checkable
+class ChatCapable(Protocol):
+    """An adapter whose tokenizer carries a chat template (i.e. an instruct model).
+
+    The template belongs to the tokenizer, so rendering happens below the seam; the
+    portable side (`src/lsp/chat.py`) only decides what the messages *say*.
+    """
+
+    def render_chat(self, messages: Sequence[dict]) -> str:
+        """Render chat `messages` into the model's prompt string, with the generation
+        prompt appended (so the model's next token starts the assistant turn)."""
+        ...
+
+
+@runtime_checkable
+class SnapshotCapable(Protocol):
+    """An adapter that can checkpoint and restore generation state directly (#202).
+
+    This exists because of a hard asymmetry between architectures, and it is the whole
+    reason the SSM arm of this experiment is interesting:
+
+    - A **transformer** KV cache stores per-token history, so rollback is a *trim*:
+      move the write offset back. O(1) time, zero extra memory — but the cache itself
+      grows linearly with context.
+    - An **SSM** (Mamba) keeps a fixed-size running summary with no per-token history,
+      so there is nothing to trim (`ArraysCache.is_trimmable()` is False). Rollback
+      therefore degrades to a full re-prefill... *unless* you snapshot the state and
+      restore it, which is possible precisely because the state is fixed-size.
+
+    So the SSM cannot trim but *can* checkpoint, at a cost that is **constant in
+    context length** (it is O(layers x d_inner x d_state)) where the transformer's is
+    linear. That inverts the usual intuition: SSM rollback is more expensive than a
+    trim at short context and *cheaper* at long context — which is exactly the regime
+    this project's headline claim (long-context local inference) lives in.
+    """
+
+    def checkpoint(self) -> object:
+        """Capture current generation state; returns an opaque handle."""
+        ...
+
+    def restore(self, handle: object) -> np.ndarray:
+        """Restore state captured by `checkpoint`; return next-token logits."""
+        ...
+
+    def snapshot_bytes(self) -> int:
+        """Size of one checkpoint handle, for the cost table."""
+        ...
+
+
+def supports_chat(adapter: object) -> bool:
+    return callable(getattr(adapter, "render_chat", None))
+
+
+def supports_snapshot(adapter: object) -> bool:
+    return callable(getattr(adapter, "checkpoint", None)) and \
+        callable(getattr(adapter, "restore", None))
+
+
+# --------------------------------------------------------------------------- #
 # Backend-agnostic helpers (work against any LMAdapter, incl. FakeLM)
 # --------------------------------------------------------------------------- #
 

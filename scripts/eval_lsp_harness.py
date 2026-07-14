@@ -43,6 +43,14 @@ def _parse_strategy(name: str):
         return "slow", {"repair": "soft"}
     if name in ("slow-both", "slow-soft+hard"):
         return "slow", {"repair": "both"}
+    if name.startswith("toolcall-chat-k"):
+        # The FAIR opponent (#199 follow-up): a real chat turn against an instruct
+        # model, not a comment injected into a base model's context.
+        try:
+            k = int(name[len("toolcall-chat-k"):])
+        except ValueError:
+            raise SystemExit(f"bad strategy {name!r} (want toolcall-chat-k<N>)")
+        return "toolcall-chat", {"k": k}
     if name.startswith("toolcall-k"):
         try:
             k = int(name[len("toolcall-k"):])
@@ -69,6 +77,12 @@ def main() -> None:
     ap.add_argument("--max-retries", type=int, default=8)
     ap.add_argument("--strategies", default="baseline,slow-hard,slow-soft,slow-both,toolcall-k1,toolcall-k2",
                     help="comma-separated: baseline, slow-hard, slow-soft, slow-both, toolcall-k<N>")
+    ap.add_argument("--rollback-strategy", choices=("auto", "trim", "reprefill", "snapshot"),
+                     default="auto",
+                     help="how rollback physically unwinds state (#202). 'auto' trims when the "
+                          "cache allows (transformer) and re-prefills when it can't (SSM); "
+                          "'reprefill' forces the re-prefill path even on a trimmable cache, so a "
+                          "transformer can be compared like-for-like against an SSM.")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--strip-suggestions", action="store_true",
@@ -94,7 +108,8 @@ def main() -> None:
 
     from src.eval.lsp_eval import compare, score_record, summarize
     from src.eval.ts_error_eval import load_ts_error_set, DEFAULT_SET_PATH
-    from src.lsp.harness import generate_baseline, generate_slow_loop, generate_toolcall
+    from src.lsp.harness import (generate_baseline, generate_slow_loop, generate_toolcall,
+                                  generate_toolcall_chat)
     from src.lsp.tsc import TscRunner, resolve_tsc
     from src.model.mlx_lm_adapter import MLXLMAdapter
 
@@ -115,7 +130,7 @@ def main() -> None:
           f"temperature={args.temperature} records={len(records)} strategies={strategies}")
 
     t_load = time.monotonic()
-    lm = MLXLMAdapter(args.model, dtype=args.dtype)
+    lm = MLXLMAdapter(args.model, dtype=args.dtype, rollback_strategy=args.rollback_strategy)
     runner = TscRunner()
     print(f"model + tsc scratch dir ready in {time.monotonic() - t_load:.1f}s")
 
@@ -141,6 +156,13 @@ def main() -> None:
                 result = generate_slow_loop(
                     lm, runner.diagnostics, rec["prompt"], max_retries=args.max_retries,
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
+            elif kind == "toolcall-chat":
+                # Chat-mode has no `budget`/`block_size`: an instruct model answers a
+                # turn and stops on <|im_end|>, it does not free-run to a token budget.
+                result = generate_toolcall_chat(
+                    lm, runner.diagnostics, rec["prompt"],
+                    max_gen_tokens=args.max_gen_tokens, temperature=args.temperature,
+                    rng=rng, strip_suggestions=args.strip_suggestions, **kwargs)
             else:  # toolcall
                 result = generate_toolcall(
                     lm, runner.diagnostics, rec["prompt"],
@@ -164,11 +186,25 @@ def main() -> None:
 
         scored_by_strategy[strategy_name] = scored
         summary = summarize(scored)
+        # Extraction failure is a first-class outcome of the chat tool-call path, not a
+        # glitch to hide: a model that answers with prose has failed the task, and a
+        # clean-rate computed over only the parseable answers would flatter it.
+        n_extract_fail = sum(1 for s in scored if s.get("extraction_failed"))
+        summary["extraction_failure_rate"] = n_extract_fail / len(scored) if scored else 0.0
+        # Which physical rollback path ran (#202) — the SSM cost story.
+        summary["rollback_paths"] = {
+            "trim": lm.n_trim_rollbacks,
+            "reprefill": lm.n_reprefill_rollbacks,
+            "snapshot": lm.n_snapshot_rollbacks,
+            "reprefill_tokens": lm.n_reprefill_tokens,
+        }
+        summary["snapshot_bytes"] = lm.snapshot_bytes()
         print(f"[{strategy_name}] clean={summary['diagnostic_clean_rate']:.3f} "
               f"avoid={summary['error_avoidance_rate']:.3f} "
               f"exact_gold={summary['exact_gold_rate']:.3f} "
               f"over_repair={summary['over_repair_rate']:.3f} "
               f"no_progress={summary['no_progress_rate']:.3f} "
+              f"extract_fail={summary['extraction_failure_rate']:.3f} "
               f"mean_fwd_tok={summary['mean_n_forward_tokens']:.1f}")
 
     if transcript_f is not None:

@@ -170,3 +170,125 @@ def test_rollback_zero_is_a_noop():
     n_before = a.n_forward_tokens
     a.rollback(0)
     assert a.n_forward_tokens == n_before
+
+
+# --------------------------------------------------------------------------- #
+# #202 — checkpoint/restore, and the SSM arm
+#
+# The gate that matters for the SSM experiment. A transformer rolls back by *trimming*
+# its KV cache; an SSM has no per-token history to trim (`is_trimmable()` is False), so
+# rollback degrades to a full re-prefill unless the fixed-size state is snapshotted and
+# restored. If restore is even slightly inexact, every SSM rollback silently corrupts
+# generation and the measured table is garbage that still *looks* fine — so this is
+# pinned against a real model, not a mock.
+# --------------------------------------------------------------------------- #
+
+SSM_MODEL = os.environ.get("LSP_TEST_SSM_MODEL", "mlx-community/mamba2-130m")
+
+
+def _ssm_available() -> bool:
+    try:
+        from mlx_lm.utils import hf_repo_to_path
+        hf_repo_to_path(SSM_MODEL)
+        return True
+    except Exception:
+        return False
+
+
+requires_ssm = pytest.mark.skipif(
+    not _ssm_available(), reason=f"SSM model {SSM_MODEL!r} not locally cached")
+
+
+def _walk(adapter: MLXLMAdapter, first: np.ndarray, n: int):
+    """Greedily take `n` steps; return (tokens, final logits)."""
+    toks, logits = [], first
+    for _ in range(n):
+        t = int(np.argmax(logits))
+        toks.append(t)
+        logits = adapter.step(t)
+    return toks, logits
+
+
+def test_checkpoint_restore_reproduces_logits_transformer(adapter: MLXLMAdapter):
+    """checkpoint -> walk -> restore -> replay lands on identical logits."""
+    first = adapter.reset("const total = items.")
+    handle = adapter.checkpoint()
+    toks, walked = _walk(adapter, first, 3)
+
+    restored = adapter.restore(handle)
+    assert np.allclose(restored, first, atol=1e-5)
+    for t in toks:
+        replayed = adapter.step(t)
+    assert np.allclose(walked, replayed, atol=1e-4)
+
+
+@requires_ssm
+def test_ssm_cache_is_not_trimmable():
+    """The premise of #202: an SSM cannot trim, so it must checkpoint instead."""
+    from mlx_lm.models.cache import can_trim_prompt_cache
+
+    ssm = MLXLMAdapter(SSM_MODEL, dtype="float32")
+    ssm.reset("const x = ")
+    assert not can_trim_prompt_cache(ssm._cache), \
+        "expected an SSM's ArraysCache to be non-trimmable (no per-token history)"
+
+
+@requires_ssm
+def test_ssm_checkpoint_restore_matches_fresh_reprefill():
+    """The #202 parity gate, on a real Mamba-2.
+
+    Snapshot-restore must be indistinguishable from re-prefilling the same token
+    sequence into a fresh cache. Measured bit-exact (max|Δ| = 0.0) in fp32.
+    """
+    ctx = "function add(a: number, b: number): number { return a + b; }\nconst r = add("
+    ssm = MLXLMAdapter(SSM_MODEL, dtype="float32")
+    first = ssm.reset(ctx)
+
+    handle = ssm.checkpoint()
+    toks, walked = _walk(ssm, first, 3)
+
+    ssm.restore(handle)
+    for t in toks:
+        replayed = ssm.step(t)
+    assert np.allclose(walked, replayed, atol=1e-4)
+
+    fresh = MLXLMAdapter(SSM_MODEL, dtype="float32")
+    logits = fresh.reset(ctx)
+    for t in toks:
+        logits = fresh.step(t)
+    assert np.allclose(logits, replayed, atol=1e-4), \
+        "restored SSM state diverges from a fresh re-prefill — rollback is corrupting state"
+
+
+@requires_ssm
+def test_ssm_rollback_without_snapshot_pays_a_full_reprefill():
+    """Quantifies what #202 buys: without it, one rollback re-forwards the whole context."""
+    ssm = MLXLMAdapter(SSM_MODEL, dtype="float32")
+    ctx = "const greeting = "
+    first = ssm.reset(ctx)
+    _walk(ssm, first, 2)
+
+    before = ssm.n_forward_tokens
+    ssm.rollback(2)
+    burned = ssm.n_forward_tokens - before
+
+    assert ssm.n_reprefill_rollbacks == 1 and ssm.n_trim_rollbacks == 0
+    assert burned == len(ssm.encode(ctx)), \
+        "an SSM rollback should re-prefill exactly the retained context"
+
+
+@requires_ssm
+def test_ssm_snapshot_is_constant_size_regardless_of_context():
+    """The property that makes #202 work: SSM state does not grow with context length.
+
+    This is the whole architectural argument. A transformer's KV cache grows linearly, so
+    at long context its rollback state dwarfs an SSM's — which is the regime this project
+    targets.
+    """
+    ssm = MLXLMAdapter(SSM_MODEL, dtype="float32")
+    ssm.reset("const x = 1;")
+    small = ssm.snapshot_bytes()
+    ssm.reset("const x = 1;\n" + "// filler comment line\n" * 200)
+    large = ssm.snapshot_bytes()
+    assert small == large > 0, \
+        f"SSM snapshot must be context-independent, got {small} vs {large}"
