@@ -286,6 +286,153 @@ gate anything**, per the compound verdict:
 > #194 needs harder records or #199's `block`-budget framing needs to become the eval set's
 > native shape.
 
+---
+
+# Follow-up validation (E1–E4): attacking the Phase-0 conclusion
+
+Phase 0 concluded *"the mechanism works, but only at the logit level, not as text."* That claim
+had three load-bearing weaknesses, and this section attacks each one rather than defending it.
+
+> **Framing correction.** Hard-ban is not "feedback" at all. It masks a token id and forces
+> resampling; the model never learns that `gorblak` isn't a property of `User`, it just finds
+> `age` because the door closed on `gorblak`. What works is **constrained search with a
+> verifier**, not communication. The comment-insertion pathology (§ Qualitative findings) is the
+> tell: banned, the model escapes into `/*…*/` and routes *around* the constraint.
+
+## E1 — a fair tool-call opponent
+
+Phase 0's tool-call baseline ran on a **base** model, which cannot follow instructions by
+construction. That made "diagnostics-as-text doesn't work" close to unfalsifiable — every
+production coding agent feeds compiler errors back as text and it demonstrably works. E1 replaces
+it with `Qwen2.5-Coder-1.5B-**Instruct**` (deliberately the *same size*, so the comparison isolates
+instruction-tuning rather than scale) receiving the `tsc` error in a genuine chat turn.
+
+**The design had to be fixed before it could answer anything.** Comparing chat-tool-call against
+completion-baseline confounds *two* variables — the feedback mechanism **and** the task format. An
+instruct model in chat mode writes different code than the same model continuing a prefix,
+feedback or no feedback. So each mechanism is measured against **its own format's control**:
+
+| | control (no feedback) | with feedback | Δ |
+|---|---|---|---|
+| **completion mode** — logit-mask feedback | baseline **0.948** | slow-hard **1.000** | **+0.052** |
+| **chat mode** — text feedback, 1 round | chat-k0 **0.802** | chat-k1 **0.802** | **+0.000** |
+| **chat mode** — text feedback, 2 rounds | chat-k0 **0.802** | chat-k2 **0.802** | **+0.000** |
+
+*(stmt budget, 96 records, greedy, length-matched: every arm generates 11–12 chars.)*
+
+**Feeding a real compiler error to a competent instruct model, in a real chat turn, changed the
+clean-rate by exactly zero — at one round and at two.** The mechanism underneath that zero:
+
+> Of the **19** records where the instruct model wrote broken code, it was shown the actual `tsc`
+> diagnostic and **re-emitted byte-identical wrong code 18 times (95%)**. The single time it did
+> change its answer, it made things *worse* — a type error (`TS7022`/`TS2448`) became two syntax
+> errors (`TS1005`).
+
+The Phase-0 thesis therefore **survives its strongest available challenge**. The pre-registered
+decision rule said a fair tool-caller matching hard-ban would scope the thesis to weak models; it
+did not match. It did not move at all.
+
+**Two measurement bugs were found and fixed en route, and both biased toward the conclusion we
+already believed** — the direction a bug is most dangerous:
+1. The chat extractor rejected valid short completions (`.title`, `zx.x`) as "prose" (33% bogus
+   extraction-failure rate), and
+2. the join concatenated `books[0].` + `.title` → `books[0]..title`, manufacturing `TS1003`s.
+
+Both were our bugs being scored as the model's. Fixed and pinned by tests before any number here
+was recorded.
+
+**A third bug was in the metric itself:** `no_progress` was only wired into the completion-mode
+path, so chat mode reported `0.000` while the model was in fact stuck 95% of the time. A metric
+that cannot see the phenomenon it exists to measure is worse than no metric.
+
+### The `block` budget is not a fair arena (and that is a finding)
+
+The first E1 run said chat-tool-call *beat* hard-ban on the block budget (0.781 vs 0.500), which
+would have overturned everything. It is an artifact: the chat model generates **10 characters**
+while every other strategy free-runs **~340**, and scores well for writing almost nothing. This is
+the *same* length-mismatch that faked the tool-call win in Phase-0's Table C — mirrored, now
+flattering the opposite conclusion.
+
+Asking the instruct model for a multi-statement continuation (`BLOCK_SYSTEM_PROMPT`) moved it from
+10 to only ~26 characters. An instruct model writes correct, concise code and stops; the
+completion-mode strategies are *forced* to keep emitting for 96 tokens. **So the block budget
+measures how well a model survives being made to keep typing — not how much feedback helps.** Only
+the length-matched `stmt` comparison above is fair, and it is the one reported.
+
+## E2 — the capability ladder: is hard-ban a crutch that better training subsumes?
+
+If hard-ban only patches errors a better-trained model wouldn't make, then **#193** (LSP-clean
+corpus) and **#103** (verifier GRPO) would *subsume* it, and the inference harness would be the
+wrong place to spend. Committed decision rule: **Δclean ≤ 3 points at 7B ⇒ crutch.**
+
+| model | baseline | slow-hard | Δclean | **headroom captured** |
+|---|---|---|---|---|
+| `mamba2-130m` (SSM) | 0.625 | 0.781 | +15.6 | 42% |
+| Qwen2.5-Coder-0.5B base | 0.875 | 0.969 | +9.4 | 75% |
+| Qwen2.5-Coder-1.5B base | 0.854 | 1.000 | +14.6 | 100% |
+| Qwen2.5-Coder-1.5B instruct | 0.948 | 1.000 | +5.2 | 100% |
+| Qwen2.5-Coder-7B instruct (4-bit) | 0.833 | 0.979 | +14.6 | 87% |
+| Mamba-Codestral-7B (SSM, 8-bit, n=32) | 0.938 | 0.969 | +3.1 | 50% |
+
+**Read the last column, not the Δ.** Raw Δ tracks *available headroom* (a model at 0.948 cannot
+gain 15 points), so it is the wrong statistic. Normalized, **hard-ban closes 42–100% of whatever
+gap remains — at every scale from 130M to 7B, and across both architectures.** It does not decay.
+
+**Verdict: NOT a crutch** (Δ at 7B = +14.6, far above the 3-point threshold). Hard-ban is an
+orthogonal lever, so it *composes* with #193/#103 rather than being replaced by them.
+
+**Caveats, stated rather than buried.** (a) The 7B is 4-bit quantized and its baseline (0.833) is
+*below* the 1.5B bf16's (0.948) — quantization degraded it, so the ladder is **not monotone in
+capability** and the 7B rung is a weaker test than it looks. (b) This whole experiment is a
+**proxy**: a stronger model is not the same thing as a model trained on LSP-clean data. Only #193
+can answer that; this is the best stand-in until it exists.
+
+## E3 — the SSM arm and #202: is the mechanism affordable on *our* architecture?
+
+The one mechanism that works needs **rollback**, and monica is an SSM. Verified against the real
+library:
+
+| cache | `is_trimmable()` | rollback |
+|---|---|---|
+| `KVCache` (transformer) | **True** | O(1) trim — but the cache grows linearly with context |
+| `ArraysCache` (Mamba SSM) | **False** | no per-token history to trim → **full re-prefill** |
+
+This looked like bad news for the architecture the whole project rests on. **It is the opposite.**
+An SSM's state is **fixed-size**, so while it cannot be *trimmed*, it can be *checkpointed* — at a
+cost that is **constant in context length**, where a transformer's is linear. That is #202, and it
+is now implemented (`MLXLMAdapter.checkpoint()/restore()`) and measured on **Mamba-Codestral-7B**
+(Mamba-2 *and* code-specialized — the closest public analogue of monica's own architecture):
+
+| context | #202 snapshot+restore | naive re-prefill | ratio |
+|---|---|---|---|
+| 39 tok | 0.4 ms | 307 ms | 840× |
+| 159 tok | 0.4 ms | 759 ms | 2,081× |
+| 639 tok | 1.1 ms | 5,499 ms | 4,981× |
+| 1,839 tok | 4.4 ms | 116,482 ms | 26,692× |
+
+Snapshot/restore is **bit-exact** (max\|Δ\| = 0.0 vs a fresh re-prefill, fp32 — pinned by a parity
+gate, because an inexact restore would silently corrupt every rollback while still *looking* fine).
+Cost: **272 MB per snapshot**, constant.
+
+**Do not read those ratios as an architectural property.** A 116-*second* re-prefill means MLX's
+Mamba-2 prefills sequentially (~9–21 ms/token, no chunked-scan kernel), so the absolute re-prefill
+figures — and hence the ratios — are **implementation-dependent**. What is intrinsic is the
+*shape*: **snapshot is O(1) in context, re-prefill is O(context).** A production Mamba kernel would
+shrink the constant, not the asymptote.
+
+**Verdict: #202 is affordable, and the SSM's rollback story is a long-context *advantage*, not a
+liability.** The transformer wins at short context (a trim is free; a 272 MB snapshot is not), but
+its KV cache grows without bound while the SSM's state does not — and long-context local inference
+is exactly this project's headline claim. **#202 should be promoted out of the "optional P2
+extension" tier: it is a precondition for the one mechanism that works.**
+
+## E4 — over-repair, measured on real code
+
+*(in progress — 200 statement-boundary prefixes from real third-party TypeScript
+(`bigcode/the-stack-smol`), filtered to files that already compile clean, so every rollback the
+loop fires is by construction an interruption of correct code. Phase 0's alarming "0.50
+over-repair" rests on 4 of 8 hand-authored rows and needs a real denominator.)*
+
 ## Risks realized (see the original plan for the full list)
 
 - **Tool-call-as-base-model risk, confirmed as predicted**: toolcall-k1 and slow-soft land on

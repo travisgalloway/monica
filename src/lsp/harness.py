@@ -150,6 +150,7 @@ def generate_toolcall_chat(
     prompt: str,
     *,
     k: int = 1,
+    budget: str = "stmt",
     max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
@@ -178,7 +179,8 @@ def generate_toolcall_chat(
     completion, diag, previous = "", None, None
     for round_idx in range(k + 1):
         messages = build_toolcall_messages(prompt, diag, previous,
-                                            strip_suggestions=strip_suggestions)
+                                            strip_suggestions=strip_suggestions,
+                                            budget=budget)
         rendered = lm.render_chat(messages)
 
         logits = lm.reset(rendered)
@@ -200,6 +202,17 @@ def generate_toolcall_chat(
             result.events.append({"kind": "extraction_failure", "round": round_idx,
                                    "reason": extracted.reason})
             break
+
+        # No-progress: the model was shown a real compiler error and answered with the
+        # byte-identical code anyway. This is THE decision-relevant number for the M12
+        # thesis, and it was previously only tracked on the completion-mode soft path —
+        # so chat mode reported no_progress=0.000 while in reality the instruct model was
+        # re-emitting the same wrong code 18 times out of 19. A metric that cannot see the
+        # phenomenon it exists to measure is worse than no metric.
+        if diag is not None and extracted.completion == previous:
+            result.no_progress = True
+            result.events.append({"kind": "no_progress", "round": round_idx,
+                                   "code": diag.code})
 
         completion = extracted.completion
         previous = completion

@@ -145,6 +145,7 @@ def main() -> None:
                        max_gen_tokens=args.max_gen_tokens, temperature=args.temperature, rng=rng)
 
     scored_by_strategy = {}
+    summaries = {}
     t_run = time.monotonic()
     for strategy_name in strategies:
         kind, kwargs = _parse_strategy(strategy_name)
@@ -157,10 +158,13 @@ def main() -> None:
                     lm, runner.diagnostics, rec["prompt"], max_retries=args.max_retries,
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
             elif kind == "toolcall-chat":
-                # Chat-mode has no `budget`/`block_size`: an instruct model answers a
-                # turn and stops on <|im_end|>, it does not free-run to a token budget.
+                # `budget` selects the system prompt, NOT a token cap: an instruct model
+                # stops at <|im_end|>, so under budget="block" it must be *asked* for a
+                # multi-statement continuation or it answers in ~10 characters while every
+                # other strategy free-runs ~340 — and then wins on clean-rate for writing
+                # almost nothing. Length parity is what makes this about feedback.
                 result = generate_toolcall_chat(
-                    lm, runner.diagnostics, rec["prompt"],
+                    lm, runner.diagnostics, rec["prompt"], budget=args.budget,
                     max_gen_tokens=args.max_gen_tokens, temperature=args.temperature,
                     rng=rng, strip_suggestions=args.strip_suggestions, **kwargs)
             else:  # toolcall
@@ -186,6 +190,7 @@ def main() -> None:
 
         scored_by_strategy[strategy_name] = scored
         summary = summarize(scored)
+        summaries[strategy_name] = summary
         # Extraction failure is a first-class outcome of the chat tool-call path, not a
         # glitch to hide: a model that answers with prose has failed the task, and a
         # clean-rate computed over only the parseable answers would flatter it.
@@ -227,7 +232,11 @@ def main() -> None:
         "model": args.model, "dtype": args.dtype, "set": str(set_path), "n_records": len(records),
         "budget": args.budget, "block_size": args.block_size, "temperature": args.temperature,
         "seed": args.seed, "strip_suggestions": args.strip_suggestions,
-        "summaries": {name: summarize(scored) for name, scored in scored_by_strategy.items()},
+        # Reuse the summaries built in the loop above — recomputing summarize() here would
+        # silently discard the fields attached to them there (extraction_failure_rate,
+        # rollback_paths, snapshot_bytes), which is how the SSM cost data went missing
+        # from the first E3 run's JSON while still printing correctly to stdout.
+        "summaries": summaries,
         "comparisons": comparisons,
         "tsc_n_calls_total": runner.n_calls, "tsc_wall_s_total": runner.wall_s,
         "wall_s_total": time.monotonic() - t_run,

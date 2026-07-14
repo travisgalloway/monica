@@ -54,6 +54,24 @@ SYSTEM_PROMPT = (
     "must start exactly where the snippet stops."
 )
 
+# Block-budget variant. Without this, the chat arm cannot be compared against the
+# completion-mode strategies at all: an instruct model finishes the one expression it was
+# asked for and stops at <|im_end|>, while `budget="block"` forces every other strategy to
+# free-run to a fixed token budget. Measured live: 10 generated characters against
+# baseline's 346 — and a *higher* clean-rate purely for writing almost nothing. That is
+# the same length-mismatch artifact that faked the tool-call "win" in Phase 0's Table C,
+# and it flatters whichever side happens to write less. Matching the requested output
+# length is what makes the comparison about feedback rather than about verbosity.
+BLOCK_SYSTEM_PROMPT = (
+    "You are a TypeScript code completion engine. You will be given an incomplete "
+    "TypeScript snippet that ends mid-expression. First finish that expression, then "
+    "continue writing the next several statements of plausible TypeScript code that "
+    "follow from it (aim for roughly 8-12 lines in total). Reply with ONLY code — no "
+    "explanation, no markdown fences, and do not repeat any of the code you were given. "
+    "Your reply is concatenated directly onto the snippet, so it must start exactly "
+    "where the snippet stops."
+)
+
 
 _STRUCTURAL = "(){}[];=<>"
 _WORD_RE = re.compile(r"[A-Za-z']+")
@@ -132,6 +150,7 @@ def build_toolcall_messages(
     previous_completion: Optional[str] = None,
     *,
     strip_suggestions: bool = False,
+    budget: str = "stmt",
 ) -> List[dict]:
     """Chat messages for one tool-call round.
 
@@ -145,7 +164,7 @@ def build_toolcall_messages(
     copy the compiler's own suggestion rather than reason from the error.
     """
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": BLOCK_SYSTEM_PROMPT if budget == "block" else SYSTEM_PROMPT},
         {"role": "user", "content": f"Complete this TypeScript snippet:\n\n{prompt}"},
     ]
     if diagnostic is None:
