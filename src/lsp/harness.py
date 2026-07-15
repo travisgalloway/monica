@@ -133,8 +133,11 @@ def generate_baseline(
     gen_ids: List[int] = []
     checkpoints: List[int] = []
     stop_at: Optional[int] = None
+    eos = _eos_ids(lm) if not stop_at_boundary else set()   # EOS ends a real-code body
     for _ in range(target):
         tok = sample(logits, temperature=temperature, rng=rng, previous_tokens=gen_ids)
+        if tok in eos:
+            break
         logits = lm.step(tok)
         gen_ids.append(tok)
         text = lm.decode(gen_ids)
@@ -362,6 +365,7 @@ def generate_slow_loop(
     committed_completion = "" # ARTIFACT text already locked in from prior committed segments
     total_budget = block_size if budget == "block" else max_gen_tokens
     committed_tokens = 0
+    eos_ids = _eos_ids(lm) if budget == "block" else set()   # EOS ends a real-code body
 
     while committed_tokens < total_budget:
         segment_start = len(context)  # context coords: this segment's checkpoint
@@ -375,7 +379,10 @@ def generate_slow_loop(
 
         # --- generate this segment, up to `remaining` tokens or a statement boundary ---
         def _extend_to_boundary_or_budget(n_max: int) -> Tuple[bool, bool]:
-            """Returns (hit_boundary, hit_budget)."""
+            """Returns (hit_boundary, hit_budget). An EOS token also ends the segment as a
+            boundary — in real-code (block) generation the model closes the function with
+            EOS, and without stopping there the body runs on into literal `<|endoftext|>`
+            text that breaks both tsc and the functional run."""
             nonlocal logits
             for _ in range(n_max):
                 key = tuple(gen_ids)
@@ -386,6 +393,8 @@ def generate_slow_loop(
                     step_logits[list(banned)] = -np.inf
                 tok = sample(step_logits, temperature=temperature, rng=rng,
                              previous_tokens=gen_ids)
+                if tok in eos_ids:
+                    return True, False
                 logits = lm.step(tok)
                 gen_ids.append(tok)
                 logits_history.append(logits)
