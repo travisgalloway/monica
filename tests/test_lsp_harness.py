@@ -295,3 +295,32 @@ def test_block_budget_commits_multiple_checkpoints():
     assert result.n_generated_tokens == 4
     assert len(result.checkpoints) == 2
     assert result.checkpoints == [0, 2]
+
+
+# --------------------------------------------------------------------------- #
+# stop_strings — real-code function-body generation (#199 F1)
+# --------------------------------------------------------------------------- #
+
+def test_baseline_block_stops_at_stop_string_and_truncates():
+    """The body is `x;\\n` then the next construct `function `; stop_strings cuts it."""
+    lm = ScriptedFakeLM(_linear_script("x;\nfunction y"))
+    result = generate_baseline(lm, "", budget="block", block_size=40,
+                                stop_strings=["\nfunction "])
+    assert result.completion == "x;"          # truncated exactly at the stop, newline dropped with it
+
+
+def test_baseline_block_without_stop_strings_is_unchanged():
+    """Regression guard on the existing #194 block path: no stop_strings => old behaviour."""
+    lm = ScriptedFakeLM(_linear_script("abcdefghij"))
+    result = generate_baseline(lm, "", budget="block", block_size=5)
+    assert result.completion == "abcde"        # exactly block_size tokens, no early stop
+
+
+def test_slow_loop_block_stops_at_stop_string():
+    """slow_loop checks the stop at segment-commit. Use a stop marker that sits WITHIN a
+    segment (no statement boundary before it) so a single committed segment contains it."""
+    lm = ScriptedFakeLM(_linear_script("aaaXbbbbbb"))   # no ; or \n before default ';' kicks in
+    always_clean = lambda source: []
+    result = generate_slow_loop(lm, always_clean, "", repair="hard",
+                                 budget="block", block_size=40, stop_strings=["X"])
+    assert result.completion == "aaa"                   # truncated at the stop marker

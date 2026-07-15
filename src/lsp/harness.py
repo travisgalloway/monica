@@ -54,6 +54,21 @@ _DEFAULT_MAX_GEN_TOKENS = 200
 _DEFAULT_BLOCK_SIZE = 96
 
 
+def _first_stop(text: str, stop_strings: Optional[Sequence[str]]) -> Optional[int]:
+    """Index of the earliest stop-string occurrence in `text`, or None.
+
+    Used by the block budget to end a real-code generation where the model starts the
+    *next* top-level construct (MultiPL-E ships these as `stop_tokens`, e.g. `\\nfunction `,
+    `\\nclass`). Without it a function body runs straight into the following function and
+    the artifact is un-scorable. Mirrors `olmes_adapter._truncate_at_stops`: truncate at
+    the earliest stop so the completion is exactly one construct.
+    """
+    if not stop_strings:
+        return None
+    hits = [i for s in stop_strings if s and (i := text.find(s)) != -1]
+    return min(hits) if hits else None
+
+
 @dataclass
 class GenResult:
     strategy: str
@@ -98,11 +113,13 @@ def generate_baseline(
     max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
+    stop_strings: Optional[Sequence[str]] = None,
 ) -> GenResult:
     """Generate a completion with no diagnostic feedback at all — the thing every
     repair strategy has to beat. `budget="stmt"` stops at the first statement
-    boundary (or `max_gen_tokens` as a safety cap); `budget="block"` always
-    generates exactly `block_size` tokens with no early stop.
+    boundary (or `max_gen_tokens` as a safety cap); `budget="block"` generates up to
+    `block_size` tokens, stopping early if any `stop_strings` entry appears (used for
+    real-code function-body generation, where the stop marks the next construct).
     """
     if budget not in ("stmt", "block"):
         raise ValueError(f"unknown budget {budget!r}")
@@ -115,21 +132,26 @@ def generate_baseline(
     logits = lm.reset(prompt)
     gen_ids: List[int] = []
     checkpoints: List[int] = []
+    stop_at: Optional[int] = None
     for _ in range(target):
         tok = sample(logits, temperature=temperature, rng=rng, previous_tokens=gen_ids)
         logits = lm.step(tok)
         gen_ids.append(tok)
+        text = lm.decode(gen_ids)
         if stop_at_boundary:
-            text = lm.decode(gen_ids)
             if statement_boundary(text) is not None:
                 break
         else:
-            text = lm.decode(gen_ids)
+            stop_at = _first_stop(text, stop_strings)
+            if stop_at is not None:
+                break
             b = statement_boundary(text)
             if b is not None and (not checkpoints or checkpoints[-1] != len(prompt) + b):
                 checkpoints.append(len(prompt) + b)
 
     completion = lm.decode(gen_ids)
+    if stop_at is not None:
+        completion = completion[:stop_at]
     return GenResult(
         strategy="baseline", prompt=prompt, completion=completion,
         context=prompt + completion, checkpoints=checkpoints,
@@ -305,6 +327,7 @@ def generate_slow_loop(
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
     strip_suggestions: bool = False,
+    stop_strings: Optional[Sequence[str]] = None,
 ) -> GenResult:
     """Checkpoint-and-repair generation. See the module docstring for the three
     `repair` modes and the two-string (context/artifact) invariant.
@@ -482,8 +505,21 @@ def generate_slow_loop(
         committed_tokens += len(gen_ids)
         context = context + gen_text
 
-        if result.no_progress or result.unrepaired or segment_is_final_partial or budget == "stmt":
+        # Stop at the next top-level construct (real-code generation). Checked at
+        # commit granularity rather than inside the rollback/ban hot loop — MultiPL-E
+        # stop tokens begin with a newline, which is itself a statement boundary, so
+        # the segment ends right at the stop anyway; the final completion is truncated
+        # below. Kept out of `_extend_to_boundary_or_budget` on purpose: that path is
+        # the delicate part of this function and a fairness-critical one.
+        hit_stop = _first_stop(committed_completion, stop_strings) is not None
+
+        if (result.no_progress or result.unrepaired or segment_is_final_partial
+                or hit_stop or budget == "stmt"):
             break
+
+    stop_at = _first_stop(committed_completion, stop_strings)
+    if stop_at is not None:
+        committed_completion = committed_completion[:stop_at]
 
     result.completion = committed_completion
     result.context = context
