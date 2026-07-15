@@ -236,3 +236,7 @@ __marimo__/
 
 # LSP harness: keep JSON summaries (doc provenance), drop bulky per-record transcripts
 results/*.jsonl
+
+# LSP harness tsc scratch dirs (leaked if a run is interrupted mid-compile)
+eval_sets/ts_error_injection/lsp_scratch_*
+eval_sets/ts_error_injection/tmp*
