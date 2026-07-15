@@ -327,6 +327,7 @@ def generate_slow_loop(
     block_size: int = _DEFAULT_BLOCK_SIZE,
     max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
     max_retries: int = _DEFAULT_MAX_RETRIES,
+    max_tsc_calls: int = 400,
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
     strip_suggestions: bool = False,
@@ -334,6 +335,11 @@ def generate_slow_loop(
 ) -> GenResult:
     """Checkpoint-and-repair generation. See the module docstring for the three
     `repair` modes and the two-string (context/artifact) invariant.
+
+    `max_tsc_calls` is a per-record safety valve: on long real-code bodies the
+    checkpoint stack can, in a pathological case, churn many repair rounds across many
+    statement boundaries, and a single record must never be able to stall a whole run.
+    Once exceeded the loop stops repairing and commits what it has (`unrepaired=True`).
 
     `budget="stmt"` checks and repairs exactly one statement. `budget="block"`
     generates `block_size` tokens total across possibly several statements,
@@ -521,9 +527,16 @@ def generate_slow_loop(
         # below. Kept out of `_extend_to_boundary_or_budget` on purpose: that path is
         # the delicate part of this function and a fairness-critical one.
         hit_stop = _first_stop(committed_completion, stop_strings) is not None
+        # Zero-progress guard: if a segment committed no tokens, `committed_tokens` does
+        # not advance and the outer `while committed_tokens < total_budget` would spin
+        # forever — the exact way a single real-code record hung a 9-hour run. Stop.
+        made_progress = len(gen_ids) > 0
+        over_tsc_budget = result.n_tsc_calls >= max_tsc_calls
+        if over_tsc_budget:
+            result.unrepaired = True
 
         if (result.no_progress or result.unrepaired or segment_is_final_partial
-                or hit_stop or budget == "stmt"):
+                or hit_stop or not made_progress or over_tsc_budget or budget == "stmt"):
             break
 
     stop_at = _first_stop(committed_completion, stop_strings)
