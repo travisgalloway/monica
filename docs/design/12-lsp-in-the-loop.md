@@ -374,12 +374,21 @@ wrong place to spend. Committed decision rule: **Δclean ≤ 3 points at 7B ⇒ 
 | Qwen2.5-Coder-7B instruct (4-bit) | 0.833 | 0.979 | +14.6 | 87% |
 | Mamba-Codestral-7B (SSM, 8-bit, n=32) | 0.938 | 0.969 | +3.1 | 50% |
 
-**Read the last column, not the Δ.** Raw Δ tracks *available headroom* (a model at 0.948 cannot
-gain 15 points), so it is the wrong statistic. Normalized, **hard-ban closes 42–100% of whatever
-gap remains — at every scale from 130M to 7B, and across both architectures.** It does not decay.
+**Verdict against the pre-registered rule first: NOT a crutch.** The rule was stated on **raw
+Δclean ≤ 3 at 7B**; the 7B instruct rung is **+14.6**, nearly 5× the threshold, so the conclusion
+holds on the metric committed to *before* seeing the data. Hard-ban is an orthogonal lever and
+*composes* with #193/#103 rather than being replaced by them.
 
-**Verdict: NOT a crutch** (Δ at 7B = +14.6, far above the 3-point threshold). Hard-ban is an
-orthogonal lever, so it *composes* with #193/#103 rather than being replaced by them.
+The "headroom captured" column is a **post-hoc** normalization (chosen after seeing that raw Δ is
+noisy because it tracks available headroom — a model at 0.948 cannot gain 15 points). It is a
+better statistic and tells the same story — hard-ban closes 42–100% of whatever gap remains, at
+every scale and both architectures — but it is presentation, not the verdict, and is labeled
+post-hoc for the same reason Phase 0's `diagnostic_clean_rate` was.
+
+**Two caveats that genuinely weaken this experiment:** the ladder is **not monotone in capability**
+— the 4-bit 7B's baseline (0.833) is *below* the bf16 1.5B's (0.948), so quantization is a
+confound and the top rung is a weaker test than it looks; and the whole thing is a **proxy** — a
+stronger model is not a model trained on LSP-clean data, which only #193 can supply.
 
 **Caveats, stated rather than buried.** (a) The 7B is 4-bit quantized and its baseline (0.833) is
 *below* the 1.5B bf16's (0.948) — quantization degraded it, so the ladder is **not monotone in
@@ -420,18 +429,51 @@ figures — and hence the ratios — are **implementation-dependent**. What is i
 *shape*: **snapshot is O(1) in context, re-prefill is O(context).** A production Mamba kernel would
 shrink the constant, not the asymptote.
 
-**Verdict: #202 is affordable, and the SSM's rollback story is a long-context *advantage*, not a
-liability.** The transformer wins at short context (a trim is free; a 272 MB snapshot is not), but
-its KV cache grows without bound while the SSM's state does not — and long-context local inference
-is exactly this project's headline claim. **#202 should be promoted out of the "optional P2
-extension" tier: it is a precondition for the one mechanism that works.**
+**Verdict, stated as measured-then-extrapolated so the two are not conflated:**
 
-## E4 — over-repair, measured on real code
+- **Measured (trust high):** #202 is correct (bit-exact, test-pinned) and cheap in absolute terms
+  (sub-millisecond at our eval's ~40-token contexts). At *short* context the SSM is nonetheless
+  **worse off than a transformer** — a KV trim is free, a 272 MB snapshot is not. That is the honest
+  short-context picture and it is not flattering.
+- **Extrapolated (trust lower — not measured end-to-end):** because snapshot is O(1) in context and
+  the KV cache is O(context), the ordering *must* invert at long context, which is the regime this
+  project targets. This is an inference from the complexity shape, not a measured long-context
+  rollback benchmark, and the 840×–26,692× ratios above are additionally inflated by MLX's sequential
+  Mamba-2 prefill — so they are illustrative of the *shape*, not a claimed speedup.
 
-*(in progress — 200 statement-boundary prefixes from real third-party TypeScript
-(`bigcode/the-stack-smol`), filtered to files that already compile clean, so every rollback the
-loop fires is by construction an interruption of correct code. Phase 0's alarming "0.50
-over-repair" rests on 4 of 8 hand-authored rows and needs a real denominator.)*
+On that basis **#202 should still be promoted out of the "optional P2 extension" tier** — it is a
+precondition for the one mechanism that works, and correct + cheap is already enough to justify it —
+but the "long-context advantage" is a hypothesis to confirm with a real long-context benchmark, not
+a result this experiment delivered.
+
+## E4 — over-repair on real code: **inconclusive by construction**
+
+The intent was to replace Phase-0's 4-of-8-row over-repair anecdote with a real denominator: 200
+statement-boundary prefixes from real TypeScript (`bigcode/the-stack-smol`), filtered to files that
+already compile clean, so any rollback is by construction an interruption of correct code. It ran,
+and it does not measure what it claims to — reported here as a negative result rather than tuned
+into a number, because tuning an unfavorable experiment until it yields a figure is exactly the
+motivated-reasoning failure the rest of this section is about.
+
+Three stacked confounds, found by reading the transcripts:
+1. **Module resolution.** The dominant baseline diagnostic is `TS2307 "cannot find module"` (335
+   occurrences): the model continues a real file by writing plausible `import`s that don't resolve
+   under the isolated tsconfig. This was filtered out of *file selection* but not out of *scoring*
+   or the *in-loop diagnose* — a real bug. Filtering it recovers the baseline clean-rate from 0.10
+   to 0.68, but does not fix (2) or (3).
+2. **Cuts land inside multi-line constructs.** A brace-depth-0 newline *within a cut fragment* is
+   not a true top-level statement boundary in the original file, so `prompt + completion` is often
+   a fragment of an unclosed `interface`/object/function and cannot compile in isolation
+   (`TS1005`/`TS1109`). Finding genuine top-level boundaries needs a real parser — tree-sitter work
+   already chartered under **#201**.
+3. **Special-token leakage.** `<|endoftext|>`/`<|fim_prefix|>` are decoded into some completions and
+   then scored as TypeScript.
+
+**What survives:** over-repair remains measured only on the synthetic `clean_control` rows (Phase-0:
+0.083 greedy / 0.25 at temp 0.8 on `stmt`, 0.50 on the `block` subset — small-n, the "0.50" is 4/8),
+and E1/E2's `over_repair_rate` on the same synthetic controls (0.08–0.17). A trustworthy real-code
+number is deferred to a parser-based prefix set under #201. The honest status is: **over-repair is a
+real and unresolved risk, and this experiment did not resolve it.**
 
 ## Risks realized (see the original plan for the full list)
 
