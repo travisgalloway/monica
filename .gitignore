@@ -12,6 +12,9 @@
 # Wrangler (Cloudflare CLI) local state.
 .wrangler/
 
+# macOS Finder metadata.
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -232,3 +235,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude/automerge-active
+.claude/work-active
+
+# LSP harness: keep JSON summaries (doc provenance), drop bulky per-record transcripts
+results/*.jsonl
+
+# LSP harness tsc scratch dirs (leaked if a run is interrupted mid-compile)
+eval_sets/ts_error_injection/lsp_scratch_*
+eval_sets/ts_error_injection/tmp*

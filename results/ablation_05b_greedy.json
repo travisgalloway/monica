@@ -1,0 +1,108 @@
+{
+  "model": "mlx-community/Qwen2.5-Coder-0.5B-bf16",
+  "dtype": null,
+  "set": "/Users/travisgalloway/github/monica/eval_sets/ts_error_injection/eval.jsonl",
+  "n_records": 96,
+  "budget": "stmt",
+  "block_size": 96,
+  "temperature": 0.0,
+  "seed": 0,
+  "strip_suggestions": false,
+  "summaries": {
+    "baseline": {
+      "n": 96,
+      "diagnostic_clean_rate": 0.875,
+      "error_avoidance_rate": 1.0,
+      "exact_gold_rate": 0.09375,
+      "over_repair_rate": 0.0,
+      "no_progress_rate": NaN,
+      "suggestion_leak_rate": NaN,
+      "n_error_rows": 84,
+      "n_clean_control_rows": 12,
+      "total_n_forward_tokens": 4465,
+      "mean_n_forward_tokens": 46.510416666666664,
+      "total_n_forward_tokens_nocache": 4465,
+      "mean_n_forward_tokens_nocache": 46.510416666666664,
+      "total_n_generated_tokens": 363,
+      "mean_n_generated_tokens": 3.78125,
+      "total_n_tsc_calls": 0,
+      "mean_n_tsc_calls": 0.0,
+      "total_n_rollbacks": 0,
+      "mean_n_rollbacks": 0.0,
+      "total_n_soft_repairs": 0,
+      "mean_n_soft_repairs": 0.0,
+      "total_n_retries": 0,
+      "mean_n_retries": 0.0,
+      "total_wall_s": 6.428992503322661,
+      "mean_wall_s": 0.06696867190961105,
+      "total_tsc_wall_s": 0.0,
+      "mean_tsc_wall_s": 0.0
+    },
+    "slow-hard": {
+      "n": 96,
+      "diagnostic_clean_rate": 0.96875,
+      "error_avoidance_rate": 1.0,
+      "exact_gold_rate": 0.09375,
+      "over_repair_rate": 0.08333333333333333,
+      "no_progress_rate": NaN,
+      "suggestion_leak_rate": NaN,
+      "n_error_rows": 84,
+      "n_clean_control_rows": 12,
+      "total_n_forward_tokens": 4747,
+      "mean_n_forward_tokens": 49.447916666666664,
+      "total_n_forward_tokens_nocache": 5429,
+      "mean_n_forward_tokens_nocache": 56.552083333333336,
+      "total_n_generated_tokens": 552,
+      "mean_n_generated_tokens": 5.75,
+      "total_n_tsc_calls": 114,
+      "mean_n_tsc_calls": 1.1875,
+      "total_n_rollbacks": 18,
+      "mean_n_rollbacks": 0.1875,
+      "total_n_soft_repairs": 0,
+      "mean_n_soft_repairs": 0.0,
+      "total_n_retries": 18,
+      "mean_n_retries": 0.1875,
+      "total_wall_s": 43.11494575114921,
+      "mean_wall_s": 0.44911401824113756,
+      "total_tsc_wall_s": 34.07925329124555,
+      "mean_tsc_wall_s": 0.3549922217838078
+    }
+  },
+  "comparisons": {
+    "slow-hard": {
+      "avoided_vs_baseline": {
+        "n": 84,
+        "key": "avoided",
+        "table": {
+          "both_true": 84,
+          "baseline_true_other_false": 0,
+          "baseline_false_other_true": 0,
+          "both_false": 0
+        },
+        "baseline_rate": 1.0,
+        "other_rate": 1.0,
+        "mcnemar_p": 1.0,
+        "flip_to_true_rate": NaN,
+        "flip_to_false_rate": 0.0
+      },
+      "clean_vs_baseline": {
+        "n": 96,
+        "key": "clean",
+        "table": {
+          "both_true": 84,
+          "baseline_true_other_false": 0,
+          "baseline_false_other_true": 9,
+          "both_false": 3
+        },
+        "baseline_rate": 0.875,
+        "other_rate": 0.96875,
+        "mcnemar_p": 0.00390625,
+        "flip_to_true_rate": 0.75,
+        "flip_to_false_rate": 0.0
+      }
+    }
+  },
+  "tsc_n_calls_total": 306,
+  "tsc_wall_s_total": 92.21095563005656,
+  "wall_s_total": 107.8239335839171
+}

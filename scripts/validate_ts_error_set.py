@@ -14,66 +14,25 @@ no node toolchain), this script prints a message and exits 0 rather than failing
 host that was never meant to run it — the hard gate belongs on machines that do have
 node, not on every host that happens to run the portable test suite.
 
-`tsc_diagnostics` is written to be reusable by #199's LSP-harness (same
-prompt+completion → diagnostic-codes shape it needs for its repair loop).
+`resolve_tsc` / `tsc_diagnostics` now live in `src/lsp/tsc.py` (#199's LSP-harness
+reuses them — same prompt+completion -> diagnostic-codes shape its repair loop
+needs, plus the persistent-scratch-dir `TscRunner` for its much hotter call rate).
+This module re-exports them so existing callers (`tests/test_ts_error_eval.py`)
+keep working unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import List
 
-SET_DIR = Path(__file__).resolve().parent.parent / "eval_sets" / "ts_error_injection"
+from src.lsp.tsc import (DEFAULT_TSCONFIG_PATH, SET_DIR, resolve_tsc,  # noqa: F401 (re-export)
+                          tsc_diagnostics)
+
 DEFAULT_SET_PATH = SET_DIR / "eval.jsonl"
-DEFAULT_TSCONFIG_PATH = SET_DIR / "tsconfig.json"
-LOCAL_TSC = SET_DIR / "node_modules" / ".bin" / "tsc"
-
-_DIAGNOSTIC_RE = re.compile(r"error (TS\d+):")
-
-
-def resolve_tsc() -> List[str] | None:
-    """Return the argv prefix to invoke `tsc`, or None if no usable toolchain exists.
-
-    Deliberately does not fall back to `npx -p typescript tsc`: npx would fetch a bare
-    `typescript` package with no access to this directory's pinned `SET_DIR/node_modules/
-    @types/node`, so ambient globals like `console` (used by several records) would
-    spuriously fail to resolve under this project's `lib: ["ES2020"]` (no-DOM) tsconfig
-    -- producing diagnostics unrelated to the labeled error and making validation flaky
-    on hosts with `node`/`npx` but no `npm install` run in this directory.
-
-    Also requires `node` itself on PATH: the local `tsc` shim's `#!/usr/bin/env node`
-    shebang needs it, and without this check a node-less host would hit a raw
-    `FileNotFoundError` from `subprocess.run` instead of the clean skip this script
-    promises (see the module docstring).
-    """
-    if LOCAL_TSC.exists() and shutil.which("node") is not None:
-        return [str(LOCAL_TSC)]
-    return None
-
-
-def tsc_diagnostics(source: str, tsconfig: Path, tsc_argv: List[str]) -> List[str]:
-    """Compile `source` under `tsconfig` and return the `TSxxxx` codes reported.
-
-    Writes `source` to a scratch directory alongside a copy of `tsconfig`, then runs
-    `tsc -p <scratch dir>` (not `tsc <file>`, which conflicts with `-p` and skips the
-    project's compiler options entirely — see the plan's local-toolchain notes).
-    """
-    # Nested under SET_DIR (not system temp) so TS's default typeRoots walk finds
-    # SET_DIR/node_modules/@types (e.g. @types/node's ambient `console`/`process`).
-    with tempfile.TemporaryDirectory(dir=SET_DIR) as td:
-        tmpdir = Path(td)
-        (tmpdir / "tsconfig.json").write_text(tsconfig.read_text(encoding="utf-8"), encoding="utf-8")
-        (tmpdir / "snippet.ts").write_text(source, encoding="utf-8")
-        proc = subprocess.run(tsc_argv + ["-p", str(tmpdir)],
-                               capture_output=True, text=True)
-        return _DIAGNOSTIC_RE.findall(proc.stdout + proc.stderr)
 
 
 def _load_records(path: Path) -> List[dict]:

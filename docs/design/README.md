@@ -45,6 +45,11 @@ Every claim here is sourced from a docstring or config comment in the code, with
     sweep student layouts cheaply (#98).
 11. [Post-training](11-post-training.md) — instruct SFT → reasoning-trace SFT → optional
     tool-use → GRPO, the Qwen `<|im_end|>` chat-template invariant, shared with production.
+12. [LSP-in-the-loop (no-training validation)](12-lsp-in-the-loop.md) — M12's Phase-0 gate
+    (#199): a `tsc`-in-the-loop repair harness on an off-the-shelf model, and the measurement
+    that decides the P1 tier. Hard-ban (logit mask) roughly doubles diagnostic-clean rate on a
+    free-running budget and beats the tool-call baseline; the pre-registered `error_avoidance`
+    axis turned out saturated, which is itself a finding about the #194 eval set.
 
 > Topics 8–11 are the **scale-up / distillation** design record (epic
 > [#65](https://github.com/travisgalloway/monica/issues/65)). Much of the machinery now exists —
