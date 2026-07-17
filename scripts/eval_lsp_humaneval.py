@@ -50,6 +50,9 @@ def main() -> None:
     ap.add_argument("--max-retries", type=int, default=8)
     ap.add_argument("--strategies", default="baseline,slow-hard",
                     help="baseline, slow-hard, slow-both, toolcall-chat-k<N>")
+    ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
+                    help="diagnostic oracle: persistent TS-LSP (default), opengrep "
+                         "(experimental -- see src/lsp/opengrep.py), or both merged")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-functional", action="store_true",
@@ -71,10 +74,14 @@ def main() -> None:
     from src.lsp.execute import Executor
     from src.lsp.harness import (generate_baseline, generate_slow_loop,
                                   generate_toolcall_chat)
-    from src.lsp.tsc import TscRunner, resolve_tsc
+    from src.lsp.oracle import CompositeOracle, resolve_oracle
 
-    if resolve_tsc() is None:
-        raise SystemExit("no node/tsc toolchain — run `npm install` in eval_sets/ts_error_injection.")
+    if not resolve_oracle(args.oracle):
+        raise SystemExit(
+            f"no toolchain for --oracle {args.oracle} — for 'ts'/'both', run `npm install` "
+            "in eval_sets/ts_error_injection and `npm i -D typescript-language-server`; "
+            "for 'opengrep', install opengrep and put it on PATH "
+            "(see eval_sets/opengrep_rules/README.md).")
 
     records = _load_humaneval(args.set)
     if args.limit is not None:
@@ -90,9 +97,10 @@ def main() -> None:
     from src.model.mlx_lm_adapter import MLXLMAdapter
     t_load = time.monotonic()
     lm = MLXLMAdapter(args.model, dtype=args.dtype)
-    runner = TscRunner()
+    oracle = CompositeOracle(args.oracle)
     executor = None if args.no_functional else Executor(timeout_s=args.exec_timeout)
-    print(f"model + tsc + node ready in {time.monotonic() - t_load:.1f}s")
+    print(f"model + oracle({args.oracle}, sources_active={oracle.sources_active}) "
+          f"ready in {time.monotonic() - t_load:.1f}s")
 
     rng = np.random.default_rng(args.seed) if args.temperature > 0 else None
     transcript_f = open(args.transcript, "w", encoding="utf-8") if args.transcript else None
@@ -111,18 +119,18 @@ def main() -> None:
                                            block_size=args.block_size, temperature=args.temperature,
                                            rng=rng, stop_strings=stops)
             elif name.startswith("slow-"):
-                result = generate_slow_loop(lm, runner.diagnostics, rec["prompt"],
+                result = generate_slow_loop(lm, oracle.diagnostics, rec["prompt"],
                                             repair=name[len("slow-"):], budget="block",
                                             block_size=args.block_size, max_retries=args.max_retries,
                                             temperature=args.temperature, rng=rng, stop_strings=stops)
             elif name.startswith("toolcall-chat-k"):
                 k = int(name[len("toolcall-chat-k"):])
-                result = generate_toolcall_chat(lm, runner.diagnostics, rec["prompt"], k=k,
+                result = generate_toolcall_chat(lm, oracle.diagnostics, rec["prompt"], k=k,
                                                 budget="block", temperature=args.temperature, rng=rng)
             else:
                 raise SystemExit(f"unknown strategy {name!r}")
 
-            s = score_record(rec, result, runner.diagnostics)
+            s = score_record(rec, result, oracle.diagnostics)
             # Functional pass@1 — the independent correctness guard.
             if executor is not None:
                 ex = executor.run_tests(rec["prompt"], result.completion, rec["tests"])
@@ -172,8 +180,11 @@ def main() -> None:
         "model": args.model, "set": str(args.set), "n_records": len(records),
         "block_size": args.block_size, "temperature": args.temperature, "seed": args.seed,
         "functional": not args.no_functional,
+        "oracle": args.oracle, "sources_active": oracle.sources_active,
         "summaries": summaries, "comparisons": comparisons,
-        "tsc_wall_s_total": runner.wall_s, "wall_s_total": time.monotonic() - t_run,
+        # Keep the pre-Stage-A key names (mapped from oracle.wall_s/.n_calls) so
+        # anything reading past results JSONs doesn't need to change.
+        "tsc_wall_s_total": oracle.wall_s, "wall_s_total": time.monotonic() - t_run,
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +192,7 @@ def main() -> None:
             json.dump(results, f, indent=2, default=str)
         print(f"results -> {args.output}")
 
-    runner.close()
+    oracle.close()
     if executor is not None:
         executor.close()
 

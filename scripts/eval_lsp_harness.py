@@ -1,12 +1,13 @@
 """#199 LSP-in-the-loop no-training validation: baseline vs. hard/soft repair vs.
 tool-call, on the #194 TS error-injection eval set.
 
-Wires config -> MLXLMAdapter -> TscRunner -> src/lsp/harness's generation
+Wires config -> MLXLMAdapter -> CompositeOracle (`--oracle`: persistent TS-LSP by
+default, optionally opengrep or both -- #199 Stage A) -> src/lsp/harness's generation
 strategies -> src/eval/lsp_eval's scoring, mirroring scripts/eval_bfcl.py's split
 (mlx-only imports kept local to main() so the seam stays clean). One `MLXLMAdapter`
-and one `TscRunner` are created per script run and reused across every record and
-strategy — reloading the model or re-`npm install`-ing a scratch dir per record
-would dominate the wall clock for no benefit.
+and one `CompositeOracle` are created per script run and reused across every record
+and strategy — reloading the model or restarting the oracle's language server(s)
+per record would dominate the wall clock for no benefit.
 
 Runs every requested `--strategies` entry over the same record set, scores each
 against `--set` via `lsp_eval.score_record`/`summarize`, and reports each non
@@ -77,6 +78,9 @@ def main() -> None:
     ap.add_argument("--max-retries", type=int, default=8)
     ap.add_argument("--strategies", default="baseline,slow-hard,slow-soft,slow-both,toolcall-k1,toolcall-k2",
                     help="comma-separated: baseline, slow-hard, slow-soft, slow-both, toolcall-k<N>")
+    ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
+                    help="diagnostic oracle: persistent TS-LSP (default), opengrep "
+                         "(experimental -- see src/lsp/opengrep.py), or both merged")
     ap.add_argument("--rollback-strategy", choices=("auto", "trim", "reprefill", "snapshot"),
                      default="auto",
                      help="how rollback physically unwinds state (#202). 'auto' trims when the "
@@ -110,12 +114,15 @@ def main() -> None:
     from src.eval.ts_error_eval import load_ts_error_set, DEFAULT_SET_PATH
     from src.lsp.harness import (generate_baseline, generate_slow_loop, generate_toolcall,
                                   generate_toolcall_chat)
-    from src.lsp.tsc import TscRunner, resolve_tsc
+    from src.lsp.oracle import CompositeOracle, resolve_oracle
     from src.model.mlx_lm_adapter import MLXLMAdapter
 
-    if resolve_tsc() is None:
-        raise SystemExit("no node/tsc toolchain found — run `npm install` in "
-                          "eval_sets/ts_error_injection first.")
+    if not resolve_oracle(args.oracle):
+        raise SystemExit(
+            f"no toolchain for --oracle {args.oracle} — for 'ts'/'both', run `npm install` "
+            "in eval_sets/ts_error_injection and `npm i -D typescript-language-server`; "
+            "for 'opengrep', install opengrep and put it on PATH "
+            "(see eval_sets/opengrep_rules/README.md).")
 
     set_path = args.set or DEFAULT_SET_PATH
     records = load_ts_error_set(set_path)
@@ -131,8 +138,9 @@ def main() -> None:
 
     t_load = time.monotonic()
     lm = MLXLMAdapter(args.model, dtype=args.dtype, rollback_strategy=args.rollback_strategy)
-    runner = TscRunner()
-    print(f"model + tsc scratch dir ready in {time.monotonic() - t_load:.1f}s")
+    oracle = CompositeOracle(args.oracle)
+    print(f"model + oracle({args.oracle}, sources_active={oracle.sources_active}) "
+          f"ready in {time.monotonic() - t_load:.1f}s")
 
     rng = np.random.default_rng(args.seed) if args.temperature > 0 else None
 
@@ -155,7 +163,7 @@ def main() -> None:
                 result = generate_baseline(lm, rec["prompt"], **gen_kwargs)
             elif kind == "slow":
                 result = generate_slow_loop(
-                    lm, runner.diagnostics, rec["prompt"], max_retries=args.max_retries,
+                    lm, oracle.diagnostics, rec["prompt"], max_retries=args.max_retries,
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
             elif kind == "toolcall-chat":
                 # `budget` selects the system prompt, NOT a token cap: an instruct model
@@ -164,15 +172,15 @@ def main() -> None:
                 # other strategy free-runs ~340 — and then wins on clean-rate for writing
                 # almost nothing. Length parity is what makes this about feedback.
                 result = generate_toolcall_chat(
-                    lm, runner.diagnostics, rec["prompt"], budget=args.budget,
+                    lm, oracle.diagnostics, rec["prompt"], budget=args.budget,
                     max_gen_tokens=args.max_gen_tokens, temperature=args.temperature,
                     rng=rng, strip_suggestions=args.strip_suggestions, **kwargs)
             else:  # toolcall
                 result = generate_toolcall(
-                    lm, runner.diagnostics, rec["prompt"],
+                    lm, oracle.diagnostics, rec["prompt"],
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
 
-            s = score_record(rec, result, runner.diagnostics)
+            s = score_record(rec, result, oracle.diagnostics)
             scored.append(s)
 
             if transcript_f is not None:
@@ -232,13 +240,16 @@ def main() -> None:
         "model": args.model, "dtype": args.dtype, "set": str(set_path), "n_records": len(records),
         "budget": args.budget, "block_size": args.block_size, "temperature": args.temperature,
         "seed": args.seed, "strip_suggestions": args.strip_suggestions,
+        "oracle": args.oracle, "sources_active": oracle.sources_active,
         # Reuse the summaries built in the loop above — recomputing summarize() here would
         # silently discard the fields attached to them there (extraction_failure_rate,
         # rollback_paths, snapshot_bytes), which is how the SSM cost data went missing
         # from the first E3 run's JSON while still printing correctly to stdout.
         "summaries": summaries,
         "comparisons": comparisons,
-        "tsc_n_calls_total": runner.n_calls, "tsc_wall_s_total": runner.wall_s,
+        # Keep the pre-Stage-A key names (mapped from oracle.n_calls/.wall_s) so
+        # anything reading past results JSONs doesn't need to change.
+        "tsc_n_calls_total": oracle.n_calls, "tsc_wall_s_total": oracle.wall_s,
         "wall_s_total": time.monotonic() - t_run,
     }
 
@@ -254,7 +265,7 @@ def main() -> None:
               f"{summary['mean_n_forward_tokens']:.1f} | "
               f"{summary['mean_n_forward_tokens_nocache']:.1f} | {p:.4f} |")
 
-    runner.close()
+    oracle.close()
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
