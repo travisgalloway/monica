@@ -244,10 +244,14 @@ class JsonRpcEndpoint:
 
 
 def spawn(argv: List[str], cwd: Optional[str] = None,
-          env: Optional[Dict[str, str]] = None) -> Tuple[subprocess.Popen, JsonRpcEndpoint]:
+          env: Optional[Dict[str, str]] = None,
+          on_notification: Optional[OnNotification] = None,
+          ) -> Tuple[subprocess.Popen, JsonRpcEndpoint]:
     """Start `argv` as a child process and wrap its stdio in a started
     `JsonRpcEndpoint`. Drains stderr in the background (see module docstring) so
-    verbose server logging can never deadlock the child."""
+    verbose server logging can never deadlock the child. `on_notification` is
+    passed straight through to the `JsonRpcEndpoint` -- both `ts_lsp.py` and
+    `opengrep.py` register a per-uri `publishDiagnostics` router this way."""
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
@@ -260,7 +264,7 @@ def spawn(argv: List[str], cwd: Optional[str] = None,
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
-    endpoint = JsonRpcEndpoint(proc.stdout, proc.stdin)
+    endpoint = JsonRpcEndpoint(proc.stdout, proc.stdin, on_notification=on_notification)
     endpoint.stderr_tail = stderr_tail  # type: ignore[attr-defined]
     endpoint.start()
     return proc, endpoint

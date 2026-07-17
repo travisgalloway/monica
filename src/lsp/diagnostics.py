@@ -9,10 +9,13 @@ Not `file:line:col: message` — that format (what issue #199's text originally
 specified) never matches this compiler's real output; a parser built to it silently
 reports zero diagnostics for everything. See `docs/design/12-lsp-in-the-loop.md`.
 
-`offset` is a **character** offset into the Python `str` source. `tsc` reports
-columns as UTF-16 code units; the #194 eval set is 100% ASCII, where a UTF-16 code
-unit and a Python `str` character coincide, so `line_col_to_offset` asserts
-`source.isascii()` at the boundary rather than silently mis-mapping non-ASCII input.
+`offset` is a **character** offset into the Python `str` source. `tsc` (and LSP
+servers generally) report columns as UTF-16 code units; `line_col_to_offset` handles
+the general case (`_utf16_col_to_char_index` accounts for astral-plane characters
+that are one Python `str` character but a 2-unit UTF-16 surrogate pair) rather than
+asserting the source is ASCII-only — the #194 eval set happens to be 100% ASCII, but
+a model's free-running completion, or the #199 Stage A HumanEval-TS bodies, are not
+guaranteed to stay that way.
 
 ABOVE THE SEAM — stdlib only. No `mlx`/`torch` import anywhere in this module
 (guarded by `tests/test_import_guard.py`).
@@ -62,6 +65,12 @@ class Diagnostic:
     col: int
     message: str
     offset: int
+    # #199 Stage A: which oracle arm produced this diagnostic ("ts" | "opengrep"),
+    # and its LSP severity (1=Error, 2=Warning, 3=Information, 4=Hint). Defaulted so
+    # every existing 5-positional-arg call site (tsc.py, the #194 test suite) keeps
+    # working unchanged -- both new fields describe LSP-sourced diagnostics only.
+    source: str = "ts"
+    severity: int = 1
 
 
 def _line_start_offsets(source: str) -> List[int]:
