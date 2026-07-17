@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from src.lsp.diagnostics import is_incomplete
+from src.lsp.diagnostics import filter_diagnostics, is_incomplete, is_source_balanced
 from src.lsp.tsc import SET_DIR, TscRunner, resolve_tsc
 from src.lsp.ts_lsp import TsLspOracle, resolve_ts_lsp
 
@@ -121,6 +121,66 @@ def test_no_orphan_process_after_close():
     assert proc.poll() is not None, "child process was not reaped by close()"
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Real-code (block-budget) divergence from tsc: a not-yet-finished function
+# body, and an "unexpected EOF"-style error anchored one character differently
+# than tsc anchors it -- both confirmed live, both real #199 Stage A findings
+# (measured directly: an unguarded ts_lsp-backed slow-hard run hit 100%
+# over-repair on otherwise-correct HumanEval-TS generation before these gates
+# existed in diagnostics.py/harness.py). Regression coverage for both.
+# --------------------------------------------------------------------------- #
+
+def test_unclosed_function_reports_control_flow_completeness_raw(oracle: TsLspOracle):
+    # tsserver's error-recovery parsing can still do semantic analysis on a
+    # function whose closing brace hasn't been typed yet -- tsc's batch compile
+    # never gets far enough to. Confirming the RAW (unfiltered) oracle output
+    # here pins the fact `filter_diagnostics`'s source-balance gate depends on.
+    source = "function f(): boolean {\n  for (let i = 0; i < 1; i++) {\n  }\n"
+    assert not is_source_balanced(source)
+    diags = oracle.diagnostics(source)
+    codes = {d.code for d in diags}
+    assert "TS2366" in codes or "TS2355" in codes, \
+        f"expected a control-flow-completeness code among {codes}"
+
+
+def test_unexpected_eof_anchors_one_character_before_tsc(oracle: TsLspOracle):
+    # The exact scenario debugged live on HumanEval_0_has_close_elements: tsc
+    # anchors "'}' expected" at len(source) (the true EOF); tsserver anchors the
+    # SAME defect one character earlier (the last real character). A frontier
+    # check of `offset < len(source)` therefore disagrees between the two
+    # oracles for the identical missing-brace defect.
+    source = "function f(): boolean {\n  for (let i = 0; i < 1; i++) {\n  }\n"
+    ts2366 = [d for d in oracle.diagnostics(source) if d.code in ("TS1005", "TS2366", "TS2355")]
+    assert ts2366
+    assert all(d.offset < len(source) for d in ts2366 if d.code == "TS1005"), \
+        "expected tsserver's EOF-style TS1005 to anchor before len(source), not at/past it"
+
+
+def test_committed_incomplete_carveout_needs_balance_not_just_ts1xxx(oracle: TsLspOracle):
+    """The exact fix: `filter_diagnostics` alone already drops TS2366 on
+    unbalanced source (tested in test_lsp_diagnostics.py); this pins the OTHER
+    half -- harness.py's `hit_boundary` "committed TS1xxx" carve-out must also
+    be gated on `is_source_balanced`, or tsserver's off-by-one EOF anchor
+    reinstates a "'}' expected" as a real defect for a function that's simply
+    not finished yet (more segments legitimately still coming under
+    budget="block") -- the exact mechanism the F1 --limit 5 smoke run exposed.
+    """
+    source = "function f(): boolean {\n  for (let i = 0; i < 1; i++) {\n  }\n"
+    frontier = len(source)  # hit_boundary=True: this segment's generation is done
+    raw = oracle.diagnostics(source)
+    filtered = filter_diagnostics(raw, frontier=frontier, generation_start=0, source=source)
+    assert filtered == [], "filter_diagnostics itself must already be clean here"
+
+    committed_incomplete = [d for d in raw if is_incomplete(d.code) and d.offset < frontier]
+    # tsserver's off-by-one EOF anchor means this list is often non-empty --
+    # the bug is trusting it unconditionally, not that it's ever empty.
+    if committed_incomplete:
+        assert not is_source_balanced(source), (
+            "a committed-incomplete TS1xxx only clears the offset<frontier bar "
+            "when the source is still open -- reinstating it as real here would "
+            "be exactly the false positive this test exists to catch")
 
 
 # --------------------------------------------------------------------------- #

@@ -53,6 +53,27 @@ SUPPRESSION_RE = re.compile(r"@ts-ignore|@ts-expect-error|\bas\s+any\b")
 # not because of a real bug — they must never count as a "real" diagnostic.
 _TS1XXX_RE = re.compile(r"^TS1\d{3}$")
 
+# Control-flow-completeness codes ("function lacks a return on all paths").
+# #199 Stage A finding (confirmed empirically, real toolchains, not assumed):
+# a not-yet-finished function body triggers these from a LANGUAGE SERVER's
+# error-recovery parsing (`typescript-language-server`/tsserver can still do
+# semantic analysis on a function whose closing brace hasn't been typed yet) —
+# `tsc`'s batch compile never gets far enough to emit them on the same
+# unclosed text, instead flooding TS1xxx syntax noise that `is_incomplete`
+# already suppresses. Swapping the oracle to a persistent language server
+# therefore surfaces a genuinely new class of "not real yet" diagnostic that
+# `is_incomplete` alone doesn't catch — a naive hard-repair loop bans tokens
+# chasing a "bug" that was only ever "the function isn't finished," producing
+# 100% over-repair on otherwise-correct real-code generation (measured
+# directly on the #199 F1 HumanEval-TS set before this fix).
+#
+# BUT these codes are NOT always noise: on syntactically-COMPLETE code, both
+# `tsc` and tsserver report them identically for a function that genuinely
+# never returns on some path (also confirmed empirically). `filter_diagnostics`
+# below tells the two cases apart with `source`'s brace-balance, the same way
+# `is_incomplete` tells apart "still typing" TS1xxx from a genuine defect.
+_CONTROL_FLOW_COMPLETENESS_CODES = frozenset({"TS2355", "TS2366"})
+
 # "Did you mean 'x'?" — tsc's spelling-correction suggestion, stripped by the
 # --strip-suggestions ablation so the harness can't just copy the compiler's answer.
 _SUGGESTION_RE = re.compile(r"\s*Did you mean\b[^.]*\.?\s*$")
@@ -134,16 +155,29 @@ def is_incomplete(code: str) -> bool:
     return bool(_TS1XXX_RE.match(code))
 
 
+def is_source_balanced(source: str) -> bool:
+    """True if `source` has no bracket/string/template/comment left open at its
+    end (`close_open_delimiters` is then a no-op on it) — i.e. every function
+    or block the source opens has actually been closed."""
+    return close_open_delimiters(source) == source
+
+
 # --------------------------------------------------------------------------- #
 # Frontier filtering + prompt-region clamping
 # --------------------------------------------------------------------------- #
 
 def filter_diagnostics(diags: Sequence[Diagnostic], *, frontier: int,
-                        generation_start: int) -> List[Diagnostic]:
+                        generation_start: int, source: Optional[str] = None) -> List[Diagnostic]:
     """The repair loop's diagnostic gate.
 
     Drops:
       * every TS1xxx diagnostic (in-progress-generation syntax noise, never real).
+      * every control-flow-completeness diagnostic (`TS2355`/`TS2366`, see their
+        definition above) WHEN `source` is given and not yet brace-balanced --
+        the language-server-only false positive that surfaces on a not-yet-finished
+        function. Kept once `source` is balanced (a real defect there). If `source`
+        is omitted, this extra gate is skipped entirely (every pre-#199-Stage-A
+        caller/test that only exercised TS1xxx keeps working unchanged).
       * every diagnostic at or past `frontier` (the char offset of the START of the
         last emitted token) — "an error is only real once the model has committed to
         it by emitting at least one more token" (see the design doc's frontier
@@ -155,9 +189,12 @@ def filter_diagnostics(diags: Sequence[Diagnostic], *, frontier: int,
     TS2554 at the call expression, inside the prompt) — real, but not attributable
     to any generated token, so rollback must not walk past the start of generation.
     """
+    is_balanced = source is None or is_source_balanced(source)
     out: List[Diagnostic] = []
     for d in diags:
         if is_incomplete(d.code):
+            continue
+        if d.code in _CONTROL_FLOW_COMPLETENESS_CODES and not is_balanced:
             continue
         if d.offset >= frontier:
             continue

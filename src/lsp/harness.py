@@ -43,8 +43,8 @@ import numpy as np
 
 from ..serve.sampling import sample
 from .diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
-                           filter_diagnostics, is_incomplete, statement_boundary,
-                           strip_suggestion)
+                           filter_diagnostics, is_incomplete, is_source_balanced,
+                           statement_boundary, strip_suggestion)
 from .lm import LMAdapter, token_index_at
 
 DiagnoseFn = Callable[[str], List[Diagnostic]]
@@ -243,11 +243,17 @@ def generate_toolcall_chat(
         previous = completion
 
         t_tsc = time.monotonic()
-        diags = diagnose(prompt + completion)
+        round_source = prompt + completion
+        diags = diagnose(round_source)
         result.tsc_wall_s += time.monotonic() - t_tsc
         result.n_tsc_calls += 1
 
-        real = [d for d in diags if not is_incomplete(d.code)]
+        # filter_diagnostics (not just is_incomplete) so an LSP-sourced oracle's
+        # control-flow-completeness false positive on a completion that was cut
+        # off mid-function (e.g. by max_gen_tokens) doesn't get fed back as a
+        # "real" diagnostic -- see diagnostics.py's _CONTROL_FLOW_COMPLETENESS_CODES.
+        real = filter_diagnostics(diags, frontier=len(round_source),
+                                  generation_start=len(prompt), source=round_source)
         if not real:
             break                       # clean — nothing to feed back
         if round_idx == k:
@@ -434,14 +440,29 @@ def generate_slow_loop(
                 frontier = segment_start + (len(lm.decode(gen_ids[:-1])) if gen_ids else 0)
 
             raw = _diag(source)
-            filtered = filter_diagnostics(raw, frontier=frontier, generation_start=segment_start)
-            if hit_boundary and not filtered:
+            filtered = filter_diagnostics(raw, frontier=frontier, generation_start=segment_start,
+                                          source=source)
+            if hit_boundary and not filtered and is_source_balanced(source):
                 # filter_diagnostics unconditionally drops TS1xxx as mid-generation
                 # "still typing" noise -- correct while more tokens might still be
                 # coming, but this segment just reached a genuine statement
                 # boundary: there ISN'T any more text coming for this attempt, so a
                 # committed TS1xxx (e.g. `u.)` -- "Identifier expected") is a real
                 # defect, not noise, and must not be waved through as clean.
+                #
+                # BUT gated on `is_source_balanced`: #199 Stage A finding (confirmed
+                # empirically on real HumanEval-TS block-budget generation) -- a
+                # LANGUAGE SERVER's "'}' expected" (still TS1xxx) for an outer
+                # function/block that's genuinely still open (more segments legitimately
+                # still coming under budget="block") anchors ONE CHARACTER earlier than
+                # `tsc`'s batch compile anchors the exact same defect (`tsc` always
+                # points exactly at len(source); tsserver points at the last real
+                # character) -- close enough to slip under `d.offset < frontier` for
+                # tsserver but not for tsc, so tsc's EOF convention accidentally never
+                # reinstates "the file isn't finished yet" while tsserver's does. Both
+                # report the SAME code for TWO different things (a genuine local defect
+                # like `u.)`, vs. "there's more legitimate text still to come"), and only
+                # `source`'s own brace-balance state actually tells them apart.
                 committed_incomplete = [d for d in raw if is_incomplete(d.code) and d.offset < frontier]
                 if committed_incomplete:
                     filtered = [replace(d, offset=max(d.offset, segment_start))

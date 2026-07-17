@@ -7,8 +7,9 @@ Real-compiler format pinning lives in `test_lsp_tsc.py`; this file only exercise
 from __future__ import annotations
 
 from src.lsp.diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
-                                  filter_diagnostics, is_incomplete, line_col_to_offset,
-                                  parse_tsc_output, statement_boundary, strip_suggestion)
+                                  filter_diagnostics, is_incomplete, is_source_balanced,
+                                  line_col_to_offset, parse_tsc_output, statement_boundary,
+                                  strip_suggestion)
 
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +135,61 @@ def test_filter_never_produces_negative_offset():
     out = filter_diagnostics(diags, frontier=100, generation_start=0)
     assert out[0].offset == 0
     assert out[0].offset >= 0
+
+
+# --------------------------------------------------------------------------- #
+# is_source_balanced + the control-flow-completeness gate (#199 Stage A)
+#
+# Real finding, confirmed against the live typescript-language-server binary on
+# HumanEval-TS block-budget generation: a not-yet-finished function body (more
+# segments still legitimately coming) triggers TS2355/TS2366 ("function lacks a
+# return on all paths") from a language server's error-recovery parsing, which
+# `tsc`'s batch compile never gets far enough to emit on the same unclosed text.
+# Before this gate, an ts_lsp-backed slow-hard run measured 100% over-repair on
+# otherwise-correct real code (`--limit 5` smoke, eval_lsp_humaneval.py).
+# --------------------------------------------------------------------------- #
+
+def test_is_source_balanced_true_for_complete_code():
+    assert is_source_balanced("function f(): boolean {\n  return true;\n}\n")
+
+
+def test_is_source_balanced_false_for_open_function_body():
+    # The for-loop is closed but the enclosing function is not -- exactly the
+    # HumanEval-TS block-budget mid-generation state that triggered the bug.
+    src = "function f(arr: number[]): boolean {\n  for (let i = 0; i < arr.length; i++) {\n  }\n"
+    assert not is_source_balanced(src)
+
+
+def test_filter_drops_control_flow_completeness_when_source_unbalanced():
+    # TS2366 anchored well before the frontier -- would pass every OTHER gate --
+    # but the source is still missing its closing brace, so it must be dropped.
+    src = "function f(): boolean {\n  for (let i = 0; i < 1; i++) {\n  }\n"
+    diags = [_diag("TS2366", 10, message="Function lacks ending return statement")]
+    out = filter_diagnostics(diags, frontier=len(src), generation_start=0, source=src)
+    assert out == []
+
+
+def test_filter_keeps_control_flow_completeness_when_source_balanced():
+    # Same code, but the function IS fully closed -- now it's a real defect.
+    src = "function f(): boolean {\n  for (let i = 0; i < 1; i++) {\n  }\n}\n"
+    diags = [_diag("TS2366", 10, message="Function lacks ending return statement")]
+    out = filter_diagnostics(diags, frontier=len(src), generation_start=0, source=src)
+    assert [d.code for d in out] == ["TS2366"]
+
+
+def test_filter_control_flow_gate_is_noop_without_source():
+    # Every pre-#199-Stage-A caller (e.g. test_lsp_tsc.py) never passes `source` --
+    # the new gate must not activate and change their behavior.
+    diags = [_diag("TS2366", 10)]
+    out = filter_diagnostics(diags, frontier=100, generation_start=0)
+    assert [d.code for d in out] == ["TS2366"]
+
+
+def test_filter_unaffected_codes_pass_through_regardless_of_balance():
+    src = "function f(arr: number[]): boolean {\n  for (let i = 0; i < arr.length; i++) {\n  }\n"
+    diags = [_diag("TS2339", 5)]
+    out = filter_diagnostics(diags, frontier=len(src), generation_start=0, source=src)
+    assert [d.code for d in out] == ["TS2339"]
 
 
 # --------------------------------------------------------------------------- #
