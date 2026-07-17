@@ -1,0 +1,173 @@
+rules:
+  - id: loop-bound-off-by-one
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      Loop bound uses `<=` against `.length`, so the last iteration indexes one
+      past the end of the array (a classic off-by-one). Use `<` instead.
+    patterns:
+      - pattern-either:
+          - pattern: for (let $I = 0; $I <= $ARR.length; $I++) $BODY
+          - pattern: for (var $I = 0; $I <= $ARR.length; $I++) $BODY
+
+  - id: index-at-length
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `$ARR[$ARR.length]` is always out of bounds -- valid indices run
+      0..length-1, so this always reads `undefined`.
+    pattern: $ARR[$ARR.length]
+
+  - id: sort-without-comparator
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: MEDIUM
+      note: >-
+        High match rate, medium VALUE: `.sort()` with no comparator is
+        correct for string arrays and only wrong for numeric ones -- watch
+        this rule's contribution to over-repair.
+    message: >-
+      `.sort()` with no comparator sorts elements as strings (Unicode code
+      point order), not numerically -- e.g. `[10, 2, 1].sort()` yields
+      `[1, 10, 2]`. Pass a numeric comparator if this array holds numbers.
+    pattern: $ARR.sort()
+
+  - id: indexof-truthy-check
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `.indexOf($X) > 0` is false when `$X` is the FIRST element (index 0),
+      which is almost never the intent. Use `!== -1` (or `>= 0`) to test
+      membership.
+    pattern: $ARR.indexOf($X) > 0
+
+  - id: parseint-no-radix
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `parseInt` without an explicit radix can misparse numeric strings
+      (leading zeros, non-decimal prefixes) depending on the input. Always
+      pass a radix, e.g. `parseInt($X, 10)`.
+    patterns:
+      - pattern: parseInt($X)
+      - pattern-not: parseInt($X, $R)
+
+  - id: self-comparison
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      Comparing a value to itself (`$X == $X` / `$X != $X`) is always
+      true/false (except for `NaN`) -- almost certainly a typo for a
+      different variable or property.
+    patterns:
+      - pattern-either:
+          - pattern: $X == $X
+          - pattern: $X != $X
+
+  - id: useless-ternary
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      Both branches of this ternary evaluate to the same expression, so the
+      condition can never change the result -- one branch almost certainly
+      has the wrong value.
+    pattern: |
+      $C ? $A : $A
+
+  - id: fill-shared-reference
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `Array($N).fill([])` (or `.fill({})`) fills every slot with the SAME
+      array/object reference, not a fresh one per slot -- mutating one
+      element mutates all of them. Use `Array.from({length: $N}, () => [])`.
+    patterns:
+      - pattern-either:
+          - pattern: Array($N).fill([])
+          - pattern: Array($N).fill({})
+
+  - id: strict-equality-nan
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `NaN` is never equal to anything, including itself, under `===`/`==` --
+      this comparison is always false. Use `Number.isNaN($X)`.
+    patterns:
+      - pattern-either:
+          - pattern: $X === NaN
+          - pattern: NaN === $X
+          - pattern: $X == NaN
+          - pattern: NaN == $X
+
+  - id: typeof-array
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: HIGH
+    message: >-
+      `typeof` an array is always `"object"`, never `"array"` -- this check
+      is always false. Use `Array.isArray($X)`.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              typeof $X === "array"
+          - pattern: |
+              "array" === typeof $X
+
+  - id: assignment-in-condition
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: MEDIUM
+    message: >-
+      `if ($X = $Y)` is an ASSIGNMENT, not a comparison -- the condition's
+      truthiness is `$Y`'s value, and `$X` is silently overwritten. Almost
+      certainly meant `===`.
+    pattern: if ($X = $Y) $BODY
+
+  - id: for-in-over-array
+    languages: [typescript]
+    severity: ERROR
+    metadata:
+      confidence: MEDIUM
+      note: >-
+        Syntactic only (no type info): matched only when the loop body
+        indexes back into the iterated value (`$ARR[$I]`), the same heuristic
+        ESLint's `no-for-in-array` uses, to avoid firing on every `for...in`
+        over a plain object.
+    message: >-
+      `for...in` over an array-like value enumerates string keys (and any
+      inherited enumerable properties), not numeric indices in order. Use
+      `for...of`, `.forEach`, or a numeric `for` loop instead.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              for (const $I in $ARR) { ... }
+          - pattern-inside: |
+              for (let $I in $ARR) { ... }
+      - pattern: $ARR[$I]
+
+  # Excluded: `map-without-return` (a `.map()` callback that never executes a
+  # `return` on some path). Semgrep/opengrep has no data-flow reasoning about
+  # which paths through a callback body reach a `return`, so any syntactic
+  # pattern attempt either matches nearly every `.map()` call (useless noise)
+  # or nearly none (useless narrowness). Not reliably expressible -- excluded
+  # rather than shipped as a rule that can't actually discriminate. See
+  # README.md.
