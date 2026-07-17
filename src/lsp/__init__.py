@@ -14,5 +14,20 @@ labeled TypeScript error-injection eval set.
   (`src/model/mlx_lm_adapter.py`) implement it below the seam.
 - `harness.py` — the baseline / slow-loop / tool-call generation strategies.
 
+**Stage A (#199)** replaces the batch-`tsc` oracle with real analysis tooling behind
+the same `DiagnoseFn` seam, split into a fake-transport-tested framing layer plus one
+module per arm:
+
+- `jsonrpc.py` — pure LSP framing + the async request/notification demux, tested
+  with a fake `os.pipe()` transport (no subprocess) since the demux is the hard part.
+- `ts_lsp.py` — a persistent `typescript-language-server` oracle (incremental,
+  open-document checking, replacing per-call batch `tsc` compiles).
+- `opengrep.py` — a persistent `opengrep lsp` oracle carrying a custom, frozen
+  correctness ruleset (`eval_sets/opengrep_rules/`) targeting syntactic bug idioms a
+  type checker can't see; experimental (see its module docstring's residual-risk
+  note) and not Stage A's default.
+- `oracle.py` — `CompositeOracle`, the `TscRunner`-contract-compatible drop-in that
+  wires one or both arms behind `--oracle {ts,opengrep,both}`; `"ts"` is the default.
+
 See `docs/design/12-lsp-in-the-loop.md` for the design writeup and measurement.
 """
