@@ -3,7 +3,8 @@
   "private": true,
   "description": "Pinned TypeScript compiler for validating eval_sets/ts_error_injection/eval.jsonl",
   "devDependencies": {
+    "@types/node": "22.15.0",
     "typescript": "5.9.3",
-    "@types/node": "22.15.0"
+    "typescript-language-server": "5.3.0"
   }
 }
