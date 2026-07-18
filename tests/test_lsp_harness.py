@@ -193,6 +193,21 @@ def test_hard_repair_retry_cap_terminates_and_marks_unrepaired():
     assert result.n_retries == 3
 
 
+def test_suppression_hack_with_no_diagnostic_does_not_crash():
+    # A suppression hack (`as any`) makes `_is_clean` return False, but the diagnose
+    # fn reports NO diagnostics -> `filtered` is empty. Hard repair is diagnostic-guided
+    # and has nothing to roll back to; the loop must mark unrepaired and stop, not crash
+    # on `filtered[0]` (regression: #201, exposed by --ignore-module-resolution making an
+    # empty `filtered` common on real TS full of `as any`).
+    lm = ScriptedFakeLM(_linear_script("v as any;\n"))
+    no_diags = lambda source: []
+    result = generate_slow_loop(lm, no_diags, "const x = ", repair="hard",
+                                 budget="stmt", max_retries=3)
+    assert result.unrepaired is True
+    assert result.n_rollbacks == 0          # never rolled back correct code
+    assert result.reward_hack_detected is True
+
+
 # --------------------------------------------------------------------------- #
 # soft repair
 # --------------------------------------------------------------------------- #
