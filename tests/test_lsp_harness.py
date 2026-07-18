@@ -193,6 +193,63 @@ def test_hard_repair_retry_cap_terminates_and_marks_unrepaired():
     assert result.n_retries == 3
 
 
+# --------------------------------------------------------------------------- #
+# committed-TS1xxx reinstatement: only on the genuinely final block segment (#201)
+# --------------------------------------------------------------------------- #
+
+def _dangling_const_diag(source: str) -> List[Diagnostic]:
+    """A TS1xxx that fires only while a `const` declaration is dangling (no `=`
+    yet) -- a *transient* incompleteness that the next segment resolves, mirroring
+    the real `export const\\n` -> TS1146 case."""
+    i = source.find("const")
+    if i == -1 or "=" in source:
+        return []
+    return [Diagnostic(code="TS1146", line=1, col=i + 1,
+                        message="Declaration expected", offset=i)]
+
+
+def test_transient_ts1xxx_at_intermediate_boundary_is_not_reinstated():
+    # Segment 1 ("export const\n") ends at a balanced-but-incomplete boundary with
+    # budget headroom left; the next segment ("x = 1;") completes the declaration and
+    # the TS1146 vanishes. The loop must NOT reinstate the transient code and roll back.
+    # (Fails on pre-#201 code, which reinstates at every balanced boundary.)
+    # alt_script kicks in once "export const" is in the context (segment 2+), so the
+    # second segment actually completes the declaration instead of repeating segment 1.
+    lm = ScriptedFakeLM(_linear_script("export const\n"),
+                        alt_script=_linear_script("x = 1;\n"), alt_trigger="export const")
+    result = generate_slow_loop(lm, _dangling_const_diag, "", repair="hard",
+                                 budget="block", block_size=19, max_retries=5)
+    assert result.n_rollbacks == 0                 # transient code was not chased
+    assert "export const" in result.completion     # generation continued past segment 1
+    assert "x = 1" in result.completion            # the declaration was completed
+
+
+def test_genuine_ts1xxx_at_final_segment_is_still_reinstated():
+    # A genuine, persistent TS1xxx at the block's FINAL segment (budget exhausts on a
+    # one-token boundary segment) must still be caught -- the #199 F1 defect-catch the
+    # reinstatement exists for. `u.` never resolves, so diagnose keeps flagging it.
+    persistent = lambda source: (
+        [Diagnostic(code="TS1003", line=1, col=1, message="Identifier expected",
+                    offset=source.find("u.") + 1)] if "u." in source else [])
+    lm = ScriptedFakeLM(_linear_script(";\n"))     # first token ';' is a boundary
+    result = generate_slow_loop(lm, persistent, "const x = u.", repair="hard",
+                                 budget="block", block_size=1, max_retries=3)
+    # is_final_segment is True (this one boundary segment exhausts block_size=1), so the
+    # committed TS1003 is reinstated -> the loop acts on it (rolls back or gives up).
+    assert result.n_rollbacks > 0 or result.unrepaired is True
+
+
+def test_stmt_budget_still_reinstates_genuine_ts1xxx():
+    # budget="stmt" is a single (final) segment, so reinstatement is unchanged by #201.
+    persistent = lambda source: (
+        [Diagnostic(code="TS1003", line=1, col=1, message="Identifier expected",
+                    offset=source.find("u.") + 1)] if "u." in source else [])
+    lm = ScriptedFakeLM(_linear_script(";\n"))
+    result = generate_slow_loop(lm, persistent, "const x = u.", repair="hard",
+                                 budget="stmt", max_retries=3)
+    assert result.n_rollbacks > 0 or result.unrepaired is True
+
+
 def test_suppression_hack_with_no_diagnostic_does_not_crash():
     # A suppression hack (`as any`) makes `_is_clean` return False, but the diagnose
     # fn reports NO diagnostics -> `filtered` is empty. Hard repair is diagnostic-guided
