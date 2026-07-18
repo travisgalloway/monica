@@ -46,20 +46,27 @@ pattern):
     `_WARMUP_TIMEOUT_S` -- a startup cost paid once per process (construction
     + each restart), never a hang.
 
-**Known residual limitation (measured, not theoretical):** even with both
-fixes above, a stress test of ~80 sequential rescans against one long-lived
-`opengrep lsp` process saw a **~10% rate of a genuine, full-timeout stall**
-(no response at all, confirmed not just "slow" -- raising the per-call timeout
-to 25s did not recover it) that appears to build up under sustained repeated
-single-file rescanning of the same process. `diagnostics()` still never hangs
-past its own `timeout_s` (a stalled call is counted in `n_timeouts` and returns
-`[]`, exactly like any other timeout), but this means the opengrep arm is
-**not yet reliable enough to trust unconditionally at full-run scale** --
-Stage A's shipped default (`--oracle ts` in both drivers, and
-`CompositeOracle(kind="ts")` by default) does not depend on it. `--oracle
-opengrep`/`--oracle both` are implemented and functionally correct when they
-respond, but should be treated as experimental until this is root-caused
-further or fixed upstream.
+**The full-timeout stall (measured) and its mitigation.** A stress test of ~80
+sequential rescans against one long-lived `opengrep lsp` process saw a **~10%
+rate of a genuine, full-timeout stall** (no response at all, confirmed not just
+"slow" -- raising the per-call timeout to 25s did not recover it) that builds up
+under sustained repeated single-file rescanning of the same process. The stalled
+process stays *alive* (`poll()` returns None), so a dead-process liveness check
+never catches it -- a stalled call was simply counted in `n_timeouts` and
+returned `[]`, **silently dropping findings**, which at ~10% would corrupt a
+full-run `both` measurement.
+
+Because each `_rescan` overwrites the whole candidate file and is independent of
+prior calls, respawning the process changes *reliability, never the finding set
+for a given source*. So `diagnostics()` now (a) **proactively recycles** the
+process every `recycle_every` calls (default 32) before the stall builds up, and
+(b) **reactively restarts and retries once** when a scan returns no response at
+all (`restart_on_stall`, default on). A stall that survives both is still counted
+in `n_timeouts` and returns `[]` (never a hang). `n_recycles` / `n_restarts` /
+`n_stall_recoveries` record the reliability activity so a run's results JSON is
+self-describing; validate the residual stall rate with `scripts/opengrep_soak.py`
+before trusting a full run. Set `recycle_every=0, restart_on_stall=False` to
+reproduce the pre-mitigation behavior.
 
 ABOVE THE SEAM -- stdlib only. No `mlx`/`torch` import anywhere in this module
 (guarded by `tests/test_import_guard.py`).
@@ -88,6 +95,7 @@ _WARMUP_TIMEOUT_S = 15.0
 _WARMUP_POLL_S = 1.5
 _POLL_INTERVAL_S = 0.5   # how often _rescan re-checks its own deadline
 _SETTLE_S = 0.3          # grace window to absorb a still-arriving, newer generation
+_DEFAULT_RECYCLE_EVERY = 32   # proactively respawn every N calls (0 disables) -- see stall note
 
 # Self-verifying warmup canary: this ruleset's own `loop-bound-off-by-one` positive
 # fixture (`tests/test_opengrep.py`) -- a known-positive input from the same
@@ -141,7 +149,9 @@ class OpengrepOracle:
     """One persistent `opengrep lsp` process carrying the frozen custom
     ruleset. Same contract/attrs as `TsLspOracle`: `diagnostics`, `codes`,
     `close`, `__enter__`/`__exit__`, `n_calls`, `wall_s`, `n_timeouts`,
-    `n_restarts`. Not safe for concurrent use.
+    `n_restarts`, plus `n_recycles` (proactive respawns) and
+    `n_stall_recoveries` (reactive restart-and-retry respawns). Not safe for
+    concurrent use.
 
     Unlike `TsLspOracle`, this oracle reuses **one** candidate file for its
     whole lifetime (overwritten per call, `TscRunner`-style) rather than a
@@ -152,6 +162,8 @@ class OpengrepOracle:
     def __init__(self, *, timeout_s: float = _DEFAULT_TIMEOUT_S,
                  rules_dir: Path = RULES_DIR,
                  scratch_parent: Path = SET_DIR,
+                 recycle_every: int = _DEFAULT_RECYCLE_EVERY,
+                 restart_on_stall: bool = True,
                  argv: Optional[List[str]] = None) -> None:
         self.argv = argv if argv is not None else resolve_opengrep()
         if self.argv is None:
@@ -159,11 +171,19 @@ class OpengrepOracle:
                                 "and put it on PATH -- see eval_sets/opengrep_rules/README.md)")
         self.timeout_s = timeout_s
         self.rules_dir = rules_dir
+        # Reliability knobs against the measured full-timeout stall (see module
+        # docstring). `recycle_every` proactively respawns the process every N
+        # calls before the stall builds up; `restart_on_stall` reactively respawns
+        # and retries once when a scan comes back empty-with-no-response.
+        self.recycle_every = recycle_every
+        self.restart_on_stall = restart_on_stall
 
         self.n_calls = 0
         self.wall_s = 0.0
         self.n_timeouts = 0
         self.n_restarts = 0
+        self.n_recycles = 0          # proactive recycle_every respawns
+        self.n_stall_recoveries = 0  # reactive restart-and-retry-once respawns
 
         self._tmpdir_obj = tempfile.TemporaryDirectory(dir=str(scratch_parent), prefix="lsp_scratch_")
         self.scratch_dir = Path(self._tmpdir_obj.name)
@@ -230,8 +250,18 @@ class OpengrepOracle:
             "(warmup canary never fired) -- see eval_sets/opengrep_rules/README.md")
 
     def _ensure_alive(self) -> None:
+        """Respawn only if the process has actually *died* (`poll()` non-None).
+        The measured full-timeout stall is a *live-but-unresponsive* process --
+        `poll()` stays None, so this guard never catches it; that case is handled
+        reactively in `diagnostics()` via `restart_on_stall`."""
         if self._proc is not None and self._proc.poll() is None:
             return
+        self._restart()
+
+    def _restart(self) -> None:
+        """Unconditionally tear down and respawn the process (re-paying warmup).
+        Every restart path -- dead-process, proactive recycle, stall recovery --
+        funnels through here so `n_restarts` counts them all."""
         self.n_restarts += 1
         self._teardown_process()
         self._start_server()
@@ -294,10 +324,32 @@ class OpengrepOracle:
     def diagnostics(self, source: str) -> List[Diagnostic]:
         """Rescan the persistent candidate document with `source` and return
         every finding as a `Diagnostic` (`source="opengrep"`). Never raises on
-        timeout or a dead server -- returns `[]` and counts it."""
+        timeout or a dead server -- returns `[]` and counts it.
+
+        Reliability handling for the measured full-timeout stall (module
+        docstring): proactively recycle the process every `recycle_every` calls
+        before the stall builds up, and -- since a stalled scan and a fresh
+        process are deterministic w.r.t. `source` -- reactively respawn and retry
+        **once** when a scan comes back with no response at all. A restart cannot
+        change the finding set for a given source (each `_rescan` overwrites the
+        whole candidate file and is independent of prior calls); it only converts
+        a silently-dropped-to-`[]` stall back into real findings.
+        """
+        # Proactive recycle: respawn on the call-count boundary, before scanning.
+        if self.recycle_every and self.n_calls and self.n_calls % self.recycle_every == 0:
+            self._restart()
+            self.n_recycles += 1
+
         self._ensure_alive()
         t0 = time.monotonic()
         got, payload = self._rescan(source, self.timeout_s)
+
+        # Reactive restart-on-stall: one respawn + one retry against the fresh process.
+        if not got and self.restart_on_stall:
+            self._restart()
+            self.n_stall_recoveries += 1
+            got, payload = self._rescan(source, self.timeout_s)
+
         self.wall_s += time.monotonic() - t0
         self.n_calls += 1
 
