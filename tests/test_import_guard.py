@@ -93,6 +93,7 @@ PORTABLE_MODULES = [
     "src.lsp.ts_lsp",
     "src.lsp.opengrep",
     "src.lsp.oracle",
+    "src.lsp.ts_boundaries",
     "src.conformance.forward_step_parity",
     "src.conformance.backend_parity",
     "src.conformance.doc_boundary_parity",

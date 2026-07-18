@@ -32,6 +32,11 @@ mlx = ["mlx>=0.18"]
 # mlx_lm wraps `mlx` with prompt-cache trimming (make_prompt_cache/trim_prompt_cache)
 # the harness's rollback needs. Apple Silicon only, same as `mlx` above.
 lsp = ["mlx-lm>=0.28"]
+# tree-sitter TypeScript parser for the #201 real-code over-repair probe builder
+# (true top-level statement boundaries; src/lsp/ts_boundaries.py, imported lazily so
+# the seam/import-guard are unaffected). Lightweight cross-platform wheels — kept out
+# of the heavy `eval` (lm-eval/torch) extra on purpose.
+tree-sitter = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23"]
 # CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
 cuda = ["torch>=2.0"]
 # Optional fused CUDA kernels (#40): mamba-ssm provides the Triton SSD chunked scan
