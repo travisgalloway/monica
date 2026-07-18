@@ -390,11 +390,14 @@ def generate_slow_loop(
         ban_table: Dict[Tuple[int, ...], set] = {}
 
         # --- generate this segment, up to `remaining` tokens or a statement boundary ---
-        def _extend_to_boundary_or_budget(n_max: int) -> Tuple[bool, bool]:
-            """Returns (hit_boundary, hit_budget). An EOS token also ends the segment as a
-            boundary — in real-code (block) generation the model closes the function with
-            EOS, and without stopping there the body runs on into literal `<|endoftext|>`
-            text that breaks both tsc and the functional run."""
+        def _extend_to_boundary_or_budget(n_max: int) -> Tuple[bool, bool, bool]:
+            """Returns (hit_boundary, eos_hit, hit_budget). An EOS token also ends the
+            segment as a boundary — in real-code (block) generation the model closes the
+            function with EOS, and without stopping there the body runs on into literal
+            `<|endoftext|>` text that breaks both tsc and the functional run. `eos_hit`
+            distinguishes that EOS boundary from a plain statement boundary, so the
+            committed-TS1xxx reinstatement can tell a genuinely-final segment from an
+            intermediate one (see the `is_final_segment` gate below)."""
             nonlocal logits
             for _ in range(n_max):
                 key = tuple(gen_ids)
@@ -406,16 +409,16 @@ def generate_slow_loop(
                 tok = sample(step_logits, temperature=temperature, rng=rng,
                              previous_tokens=gen_ids)
                 if tok in eos_ids:
-                    return True, False
+                    return True, True, False
                 logits = lm.step(tok)
                 gen_ids.append(tok)
                 logits_history.append(logits)
                 text = lm.decode(gen_ids)
                 if statement_boundary(text) is not None:
-                    return True, False
-            return False, True
+                    return True, False, False
+            return False, False, True
 
-        hit_boundary, hit_budget = _extend_to_boundary_or_budget(remaining)
+        hit_boundary, eos_hit, hit_budget = _extend_to_boundary_or_budget(remaining)
         segment_is_final_partial = hit_budget and not hit_boundary  # budget ran out mid-statement
 
         n_retry_rounds = 0
@@ -439,16 +442,33 @@ def generate_slow_loop(
                 # by construction, so their own syntax noise is dropped for free.
                 frontier = segment_start + (len(lm.decode(gen_ids[:-1])) if gen_ids else 0)
 
+            # Is this the genuinely LAST segment of the block? The reinstatement below
+            # only holds when no more text is legitimately coming for the whole BLOCK
+            # (not merely the current attempt). Under budget="block" the outer loop runs
+            # once per statement boundary, so a committed TS1xxx at an INTERMEDIATE
+            # balanced boundary (e.g. `export const\n` -> TS1146) is usually transient --
+            # the next segment completes it -- and reinstating it there rolls back correct
+            # code (measured: #201 over_repair_rate 0.26). A transient TS1xxx and a genuine
+            # one (`u.)`) are indistinguishable AT the prefix; the only discriminator is
+            # whether generation continues, i.e. whether this is the final segment.
+            is_final_segment = (
+                budget == "stmt"                                       # single-segment block
+                or eos_hit                                             # model closed the body
+                or committed_tokens + len(gen_ids) >= total_budget     # this segment exhausts budget
+                or (bool(stop_strings)
+                    and _first_stop(committed_completion + gen_text, stop_strings) is not None)
+            )
+
             raw = _diag(source)
             filtered = filter_diagnostics(raw, frontier=frontier, generation_start=segment_start,
                                           source=source)
-            if hit_boundary and not filtered and is_source_balanced(source):
+            if hit_boundary and not filtered and is_source_balanced(source) and is_final_segment:
                 # filter_diagnostics unconditionally drops TS1xxx as mid-generation
                 # "still typing" noise -- correct while more tokens might still be
-                # coming, but this segment just reached a genuine statement
-                # boundary: there ISN'T any more text coming for this attempt, so a
-                # committed TS1xxx (e.g. `u.)` -- "Identifier expected") is a real
-                # defect, not noise, and must not be waved through as clean.
+                # coming, but this is the genuinely final segment: there ISN'T any more
+                # text coming for the block, so a committed TS1xxx (e.g. `u.)` --
+                # "Identifier expected") is a real defect, not noise, and must not be
+                # waved through as clean.
                 #
                 # BUT gated on `is_source_balanced`: #199 Stage A finding (confirmed
                 # empirically on real HumanEval-TS block-budget generation) -- a
@@ -517,7 +537,7 @@ def generate_slow_loop(
                     ban_table.setdefault(tuple(gen_ids), set()).add(banned_tok)
                 result.events.append({"kind": "hard_repair", "code": diag.code,
                                        "offset": diag.offset, "rolled_back_to": tok_idx})
-                hit_boundary, hit_budget = _extend_to_boundary_or_budget(
+                hit_boundary, eos_hit, hit_budget = _extend_to_boundary_or_budget(
                     total_budget - committed_tokens - len(gen_ids))
                 segment_is_final_partial = hit_budget and not hit_boundary
             else:
@@ -532,7 +552,7 @@ def generate_slow_loop(
                 gen_ids = []
                 logits_history = [logits]
                 ban_table = {}
-                hit_boundary, hit_budget = _extend_to_boundary_or_budget(
+                hit_boundary, eos_hit, hit_budget = _extend_to_boundary_or_budget(
                     total_budget - committed_tokens)
                 segment_is_final_partial = hit_budget and not hit_boundary
 
