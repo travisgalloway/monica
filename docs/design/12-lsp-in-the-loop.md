@@ -446,34 +446,66 @@ precondition for the one mechanism that works, and correct + cheap is already en
 but the "long-context advantage" is a hypothesis to confirm with a real long-context benchmark, not
 a result this experiment delivered.
 
-## E4 — over-repair on real code: **inconclusive by construction**
+## E4 — over-repair on real code: **resolved (#201)**
 
-The intent was to replace Phase-0's 4-of-8-row over-repair anecdote with a real denominator: 200
+The intent was to replace Phase-0's 4-of-8-row over-repair anecdote with a real denominator: ~200
 statement-boundary prefixes from real TypeScript (`bigcode/the-stack-smol`), filtered to files that
-already compile clean, so any rollback is by construction an interruption of correct code. It ran,
-and it does not measure what it claims to — reported here as a negative result rather than tuned
-into a number, because tuning an unfavorable experiment until it yields a figure is exactly the
-motivated-reasoning failure the rest of this section is about.
+already compile clean, so a rollback on one is an interruption of code that was heading toward clean.
+The first attempt was **inconclusive by construction** — three stacked confounds. #201 fixed all
+three and re-ran; the number below is trustworthy.
 
-Three stacked confounds, found by reading the transcripts:
-1. **Module resolution.** The dominant baseline diagnostic is `TS2307 "cannot find module"` (335
-   occurrences): the model continues a real file by writing plausible `import`s that don't resolve
-   under the isolated tsconfig. This was filtered out of *file selection* but not out of *scoring*
-   or the *in-loop diagnose* — a real bug. Filtering it recovers the baseline clean-rate from 0.10
-   to 0.68, but does not fix (2) or (3).
-2. **Cuts land inside multi-line constructs.** A brace-depth-0 newline *within a cut fragment* is
-   not a true top-level statement boundary in the original file, so `prompt + completion` is often
-   a fragment of an unclosed `interface`/object/function and cannot compile in isolation
-   (`TS1005`/`TS1109`). Finding genuine top-level boundaries needs a real parser — tree-sitter work
-   already chartered under **#201**.
-3. **Special-token leakage.** `<|endoftext|>`/`<|fim_prefix|>` are decoded into some completions and
-   then scored as TypeScript.
+The three confounds and their fixes:
+1. **Module resolution.** The model continues a real file with plausible `import`s that don't resolve
+   under the isolated tsconfig (`TS2307` etc.). These were filtered out of *file selection* but not
+   the *in-loop diagnose* or *scoring* — a real bug. **Fixed:** `MODULE_RESOLUTION_CODES` is a shared
+   set (`src/lsp/diagnostics.py`) applied consistently everywhere via `--ignore-module-resolution`
+   (`drop_codes` wraps the diagnose fn for both the loop and scoring).
+2. **Cuts inside multi-line constructs.** A brace-depth-0 newline *within a cut fragment* is not a
+   true top-level boundary, so `prompt+completion` was often an unclosed `interface`/object fragment
+   (`TS1005`/`TS1109`). **Fixed:** the probe set is now cut with a real parser
+   (`src/lsp/ts_boundaries.py`, tree-sitter-typescript) that returns only true top-level statement
+   ends — no boundary can land inside an unclosed construct (proved in `tests/test_ts_boundaries.py`).
+3. **Special-token leakage.** `<|endoftext|>`/`<|fim_prefix|>` decoded into completions and scored as
+   TS. **Already fixed** by the F1 EOS-stop (`_eos_ids`, `harness.py`) under `budget=block`; **verified
+   0 leaks across all 600 transcript rows** of the re-run.
 
-**What survives:** over-repair remains measured only on the synthetic `clean_control` rows (Phase-0:
-0.083 greedy / 0.25 at temp 0.8 on `stmt`, 0.50 on the `block` subset — small-n, the "0.50" is 4/8),
-and E1/E2's `over_repair_rate` on the same synthetic controls (0.08–0.17). A trustworthy real-code
-number is deferred to a parser-based prefix set under #201. The honest status is: **over-repair is a
-real and unresolved risk, and this experiment did not resolve it.**
+**The measured real-code over-repair** (`results/e4_overrepair_realcode.json`; 200 tree-sitter-cut
+prefixes, `mlx-community/Qwen2.5-Coder-1.5B-bf16`, greedy, `budget=block --block-size 256`,
+`--ignore-module-resolution --oracle ts`):
+
+| metric | slow-hard | slow-both |
+|---|---|---|
+| `over_repair_rate` (any rollback on a clean_control row) | **0.260** | 0.260 |
+| true over-repair (rollback \| the model's continuation was *actually* clean) | **13/36 = 0.36** | 0.36 |
+| final clean-rate (vs baseline 0.180) | 0.235 | 0.240 |
+| mean rollbacks / row | 1.09 | 1.07 |
+
+Read carefully, because the raw rate and the honest rate differ:
+
+- **The raw `over_repair_rate` (0.26) is 2–3× the synthetic-control estimate** (Phase-0 0.083 greedy /
+  0.25 temp 0.8; E1/E2 0.08–0.17; #199 Stage A ts/both 0.101/0.120). The synthetic controls
+  **understated real-code over-repair.**
+- But a 256-token block continuation of real code is *usually itself broken* — the model's raw
+  continuation is diagnostic-clean only **18%** of the time — so most of the 52 rollbacks are
+  *legitimate* repairs (the loop nets clean-rate **0.180 → 0.235**), not over-repair. The metric as
+  defined conflates the two.
+- **The honest over-repair signal** is the rollback rate *conditioned on the continuation being
+  clean*: of the 36 rows where the model's greedy continuation was already clean, the loop still
+  rolled back **13 (36%)**. On code that was genuinely fine, the loop interrupts it about a third of
+  the time.
+
+**Mechanism** (from the transcripts): the spurious rollbacks are the frontier logic reinstating a
+*committed* `TS1xxx` syntax-incompleteness code (e.g. `TS1146` "Declaration expected") as "real" at a
+segment boundary when `is_source_balanced` — but on multi-segment block generation that code is
+transient and resolves as generation continues (the same run's baseline reaches a clean final
+artifact). The `is_source_balanced` gate (a Phase-0 Stage-A heuristic) is not tight enough for real
+multi-segment real-code bodies; tightening it is the concrete follow-up.
+
+**Verdict:** over-repair on real code is **real and non-trivial** — ~26% of rows, ~36% of the rows
+where the model was already right — materially higher than the synthetic controls implied, though
+partly offset because the loop also fixes genuinely-broken continuations. This is a cost the
+trained-model ablation (#201's blocked half) and any reward design (#103) must weigh, and it points
+at the frontier/`is_source_balanced` transient-diagnostic handling as the first thing to harden.
 
 ## Risks realized (see the original plan for the full list)
 

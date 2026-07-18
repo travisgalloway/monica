@@ -6,10 +6,10 @@ Real-compiler format pinning lives in `test_lsp_tsc.py`; this file only exercise
 
 from __future__ import annotations
 
-from src.lsp.diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
-                                  filter_diagnostics, is_incomplete, is_source_balanced,
-                                  line_col_to_offset, parse_tsc_output, statement_boundary,
-                                  strip_suggestion)
+from src.lsp.diagnostics import (Diagnostic, MODULE_RESOLUTION_CODES, SUPPRESSION_RE,
+                                  close_open_delimiters, drop_codes, filter_diagnostics,
+                                  is_incomplete, is_source_balanced, line_col_to_offset,
+                                  parse_tsc_output, statement_boundary, strip_suggestion)
 
 
 # --------------------------------------------------------------------------- #
@@ -299,3 +299,30 @@ def test_statement_boundary_ignores_semicolon_in_string():
 def test_statement_boundary_newline_counts_at_depth_zero():
     text = "const x = 1\nconst y = 2;\n"
     assert statement_boundary(text) == text.index("\n") + 1
+
+
+# --- module-resolution filter (#201 confound (a)) --------------------------- #
+
+def test_module_resolution_codes_membership():
+    # The unresolved-import family the over-repair probe must ignore everywhere.
+    assert "TS2307" in MODULE_RESOLUTION_CODES        # cannot find module
+    assert "TS2305" in MODULE_RESOLUTION_CODES        # no exported member
+    # A genuine type error is NOT in the ignore set.
+    assert "TS2339" not in MODULE_RESOLUTION_CODES     # property does not exist
+
+
+def test_drop_codes_filters_only_the_named_codes():
+    diags = [
+        Diagnostic(code="TS2307", line=1, col=1, message="cannot find module", offset=0),
+        Diagnostic(code="TS2339", line=2, col=5, message="no such property", offset=20),
+        Diagnostic(code="TS2305", line=3, col=1, message="no exported member", offset=40),
+    ]
+    wrapped = drop_codes(lambda src: list(diags), MODULE_RESOLUTION_CODES)
+    kept = wrapped("irrelevant source")
+    assert [d.code for d in kept] == ["TS2339"]   # only the real error survives
+
+
+def test_drop_codes_passes_everything_through_when_no_match():
+    diags = [Diagnostic(code="TS2339", line=1, col=1, message="x", offset=0)]
+    wrapped = drop_codes(lambda src: list(diags), MODULE_RESOLUTION_CODES)
+    assert [d.code for d in wrapped("s")] == ["TS2339"]

@@ -476,6 +476,17 @@ def generate_slow_loop(
                     result.unrepaired = True
                 break
 
+            if not filtered:
+                # Not clean, but no located diagnostic to roll back to: the only
+                # not-clean reason left is a suppression hack (`as any`/`@ts-ignore`,
+                # very common in real TS) in the generated text, which diagnostic-guided
+                # hard/soft repair cannot target. Nothing to repair -- mark unrepaired and
+                # stop rather than crash on `filtered[0]`. (Exposed by
+                # `--ignore-module-resolution` making an empty `filtered` common; a latent
+                # bug regardless.)
+                result.unrepaired = True
+                break
+
             diag = filtered[0]
             n_retry_rounds += 1
             result.n_retries += 1

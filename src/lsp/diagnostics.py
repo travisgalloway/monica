@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------- #
 # Parsing
@@ -73,6 +73,31 @@ _TS1XXX_RE = re.compile(r"^TS1\d{3}$")
 # below tells the two cases apart with `source`'s brace-balance, the same way
 # `is_incomplete` tells apart "still typing" TS1xxx from a genuine defect.
 _CONTROL_FLOW_COMPLETENESS_CODES = frozenset({"TS2355", "TS2366"})
+
+# Module-resolution diagnostics. Real TypeScript `import`s things, and under the
+# pinned isolated tsconfig those raise TS2307 ("cannot find module") etc. For the
+# real-code over-repair probe (#201) the files are selected to compile clean *ignoring*
+# these codes (an unresolved import only weakens checking — `any` — it doesn't invent
+# errors), so they must be ignored consistently in the in-loop diagnose and scoring
+# too, or the model's continuation touching an imported symbol fires a spurious
+# diagnostic → rollback → a false "over-repair". Single source of truth for that set.
+MODULE_RESOLUTION_CODES = frozenset({
+    "TS2307",   # cannot find module
+    "TS2305",   # module has no exported member
+    "TS2614",   # no exported member (default vs named import)
+    "TS6133",   # declared but never read (noUnusedLocals-ish noise)
+    "TS2792",   # cannot find module — did you mean to set moduleResolution?
+})
+
+
+def drop_codes(diagnose: Callable[[str], List["Diagnostic"]],
+               codes) -> Callable[[str], List["Diagnostic"]]:
+    """Wrap a diagnose fn so diagnostics whose `.code` is in `codes` are dropped.
+    Seam-clean and testable — used to make MODULE_RESOLUTION_CODES invisible to both
+    the in-loop diagnose and scoring for the #201 over-repair probe."""
+    def _wrapped(source: str) -> List["Diagnostic"]:
+        return [d for d in diagnose(source) if d.code not in codes]
+    return _wrapped
 
 # "Did you mean 'x'?" — tsc's spelling-correction suggestion, stripped by the
 # --strip-suggestions ablation so the harness can't just copy the compiler's answer.
