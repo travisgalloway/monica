@@ -87,6 +87,8 @@ def main() -> int:
                       split="train", streaming=True)
 
     records, n_seen, n_skipped_shape, n_skipped_dirty, n_skipped_no_cut = [], 0, 0, 0, 0
+    n_skipped_dup = 0
+    seen_prompts = set()
     with TscRunner(tsc_argv) as tsc:
         for row in ds:
             if len(records) >= args.n or n_seen >= args.max_files:
@@ -114,14 +116,19 @@ def main() -> int:
             if b is None:
                 n_skipped_no_cut += 1
                 continue
+            prompt = src[:b]
+            if prompt in seen_prompts:   # e.g. identical license header + first import
+                n_skipped_dup += 1
+                continue
+            seen_prompts.add(prompt)
             records.append({
                 "id": f"clean-prefix-{len(records):04d}",
                 "error_class": "clean_control",   # reuse the #194 schema
                 "expected_diagnostic": "",
-                "prompt": src[:b],
+                "prompt": prompt,
                 "gold_completion": "\n",          # any tsc-clean continuation is correct
                 "error_completion": "",
-                "notes": f"real TS, {row.get('max_stars_repo_name', '?')}; "
+                "notes": f"real TS, {row.get('repository_name', '?')}; "
                          f"file compiles clean under the pinned tsconfig; "
                          f"cut at a tree-sitter top-level boundary",
             })
@@ -135,7 +142,8 @@ def main() -> int:
 
     print(f"\nscanned {n_seen} files: {n_skipped_shape} not self-contained, "
           f"{n_skipped_dirty} already had diagnostics, "
-          f"{n_skipped_no_cut} had no top-level boundary in range")
+          f"{n_skipped_no_cut} had no top-level boundary in range, "
+          f"{n_skipped_dup} duplicate prefixes")
     print(f"wrote {len(records)} clean prefixes -> {args.out}")
     if len(records) < args.n:
         print(f"NOTE: fell short of --n {args.n}; raise --max-files to scan more.")
