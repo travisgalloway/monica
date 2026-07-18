@@ -507,6 +507,37 @@ partly offset because the loop also fixes genuinely-broken continuations. This i
 trained-model ablation (#201's blocked half) and any reward design (#103) must weigh, and it points
 at the frontier/`is_source_balanced` transient-diagnostic handling as the first thing to harden.
 
+### The final-segment gate — first hardening pass (#201)
+
+The mechanism above says the reinstatement fires at *every* balanced boundary with no notion of
+whether more segments are still coming. The fix: reinstate a committed `TS1xxx` **only on the
+genuinely final segment of the block** (`is_final_segment` = `budget=="stmt"`, or EOS, or this
+segment exhausts the block budget, or a stop string fired), threading a new `eos_hit` out of
+`_extend_to_boundary_or_budget`. A transient `TS1xxx` and a genuine one are indistinguishable *at*
+the prefix — the only discriminator is whether generation continues — so the final-segment condition
+is not a heuristic but the actual invariant.
+
+Re-measured (same protocol; `results/e4_overrepair_realcode_fix.json`, `results/f1_ts_fix.json`):
+
+| | before | after gate |
+|---|---|---|
+| #201 slow-hard `over_repair_rate` (raw) | 0.260 | **0.215** |
+| #201 conditioned true over-repair (rollback \| continuation clean) | 13/36 = 0.36 | **7/36 = 0.194** |
+| #199 F1 slow-hard clean-rate / pass@1 | 0.962 / 0.503 | **0.962 / 0.503 (byte-identical)** |
+
+The conditioned over-repair — the honest signal — **nearly halves**, at **zero F1 cost**: the gate
+never fires on HumanEval-TS (single open-function bodies are unbalanced at intermediate boundaries,
+so the reinstatement never fired there to begin with), so the whole F1 run is byte-identical. The
+change is confined to multi-top-level-statement real code, exactly the over-repair case.
+
+**Residual (honest):** the gate cuts the `TS1xxx`-transient rollbacks, but a *second* source
+surfaces — transient committed **`TS2xxx`** semantic codes (e.g. `TS2395` "merged declaration must be
+all exported or all local") on incomplete multi-segment code, which flow through the normal filter
+(not the `TS1xxx`-only reinstatement) and still trigger rollbacks. On the exemplar `clean-prefix-0020`
+the `TS1146` chasing is gone (5→0) but the trajectory now chases `TS2395`. Extending the same
+"final-segment / transient" reasoning to committed `TS2xxx` is the next hardening step; raw
+over-repair (0.215) won't fall to zero until it's addressed.
+
 ## Risks realized (see the original plan for the full list)
 
 - **Tool-call-as-base-model risk, confirmed as predicted**: toolcall-k1 and slow-soft land on
