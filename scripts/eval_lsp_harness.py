@@ -92,6 +92,11 @@ def main() -> None:
     ap.add_argument("--strip-suggestions", action="store_true",
                     help="strip tsc's 'Did you mean X?' before it reaches the model "
                          "(the suggestion-leak ablation)")
+    ap.add_argument("--ignore-module-resolution", action="store_true",
+                    help="drop the module-resolution diagnostic family (TS2307 etc.) from "
+                         "the in-loop diagnose AND scoring — for the #201 real-code "
+                         "over-repair probe, whose clean_control files are selected to "
+                         "compile clean ignoring unresolved imports")
     ap.add_argument("--output", type=Path, default=None, help="write the results JSON here")
     ap.add_argument("--transcript", type=Path, default=None,
                     help="write the per-record JSONL transcript here")
@@ -114,6 +119,7 @@ def main() -> None:
     from src.eval.ts_error_eval import load_ts_error_set, DEFAULT_SET_PATH
     from src.lsp.harness import (generate_baseline, generate_slow_loop, generate_toolcall,
                                   generate_toolcall_chat)
+    from src.lsp.diagnostics import MODULE_RESOLUTION_CODES, drop_codes
     from src.lsp.oracle import CompositeOracle, resolve_oracle
     from src.model.mlx_lm_adapter import MLXLMAdapter
 
@@ -139,8 +145,15 @@ def main() -> None:
     t_load = time.monotonic()
     lm = MLXLMAdapter(args.model, dtype=args.dtype, rollback_strategy=args.rollback_strategy)
     oracle = CompositeOracle(args.oracle)
+    # For the #201 over-repair probe, make the module-resolution family invisible to BOTH
+    # the in-loop diagnose and scoring (not just file selection) so an unresolved import
+    # can't masquerade as a real diagnostic → rollback → false over-repair.
+    diagnose = oracle.diagnostics
+    if args.ignore_module_resolution:
+        diagnose = drop_codes(oracle.diagnostics, MODULE_RESOLUTION_CODES)
     print(f"model + oracle({args.oracle}, sources_active={oracle.sources_active}) "
-          f"ready in {time.monotonic() - t_load:.1f}s")
+          f"ready in {time.monotonic() - t_load:.1f}s"
+          + (" [ignoring module-resolution codes]" if args.ignore_module_resolution else ""))
 
     rng = np.random.default_rng(args.seed) if args.temperature > 0 else None
 
@@ -163,7 +176,7 @@ def main() -> None:
                 result = generate_baseline(lm, rec["prompt"], **gen_kwargs)
             elif kind == "slow":
                 result = generate_slow_loop(
-                    lm, oracle.diagnostics, rec["prompt"], max_retries=args.max_retries,
+                    lm, diagnose, rec["prompt"], max_retries=args.max_retries,
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
             elif kind == "toolcall-chat":
                 # `budget` selects the system prompt, NOT a token cap: an instruct model
@@ -172,15 +185,15 @@ def main() -> None:
                 # other strategy free-runs ~340 — and then wins on clean-rate for writing
                 # almost nothing. Length parity is what makes this about feedback.
                 result = generate_toolcall_chat(
-                    lm, oracle.diagnostics, rec["prompt"], budget=args.budget,
+                    lm, diagnose, rec["prompt"], budget=args.budget,
                     max_gen_tokens=args.max_gen_tokens, temperature=args.temperature,
                     rng=rng, strip_suggestions=args.strip_suggestions, **kwargs)
             else:  # toolcall
                 result = generate_toolcall(
-                    lm, oracle.diagnostics, rec["prompt"],
+                    lm, diagnose, rec["prompt"],
                     strip_suggestions=args.strip_suggestions, **kwargs, **gen_kwargs)
 
-            s = score_record(rec, result, oracle.diagnostics)
+            s = score_record(rec, result, diagnose)
             scored.append(s)
 
             if transcript_f is not None:
