@@ -487,3 +487,90 @@ real and unresolved risk, and this experiment did not resolve it.**
   saturation is a property of the task, not of model capacity.
 - **Reward hacking**: `SUPPRESSION_RE` (`@ts-ignore`/`as any`) forces not-clean regardless of
   `tsc`'s verdict; zero suppression hacks were observed in any table's transcript.
+
+# Stage A — the real-analysis oracle: persistent TS-LSP + opengrep (#199 follow-up)
+
+Everything above draws its diagnostic signal from `TscRunner` — a fresh `tsc -p` **batch compile per
+check**. Two things motivated replacing it. First, the F1 measurement on real HumanEval-TS (159
+records, functional pass@1 via the reference test suites) sharpened the gap the whole project is
+about: model bodies are **88.7% type-clean but only 50.3% correct** (`results/f1_base.json`,
+baseline) — the failures are logic errors a type checker structurally cannot see. Second, a batch
+compile per check is the wrong model of "LSP-in-the-loop". Stage A (PR #208) replaced the oracle with
+a **persistent TypeScript language server** and an **opengrep** arm carrying a frozen, pre-registered
+12-rule correctness ruleset, behind the same `DiagnoseFn` seam, then re-measured. All three runs
+below are the same protocol: 159 records, `block` budget 256, greedy (temp 0, seed 0),
+`baseline` + `slow-hard`.
+
+## The oracle swap moves the win from the functional axis to the clean axis
+
+| slow-hard vs baseline | `f1_base` (batch `tsc`) | `f1_ts` (persistent LSP) | `f1_both` (LSP + opengrep) |
+|---|---|---|---|
+| clean-rate | 0.887 → 0.906, p=**0.375** (ns) | 0.887 → **0.962**, p=**0.0005** | 0.862 → 0.937, p=**0.0005** |
+| pass@1 | 0.491 → **0.560**, p=**0.001** | 0.491 → 0.503, p=**0.69** (ns) | 0.491 → 0.528, p=**0.109** (ns) |
+| over-repair (synthetic controls) | 0.094 | 0.101 | 0.120 |
+| mean diagnose calls / record | 8.18 | 6.75 | 7.25 |
+
+The batch-`tsc` slow loop delivered a **real functional lift** (pass@1 +6.9 pts, p=0.001, 11 records
+flipped to passing and 0 to failing) but no significant clean-rate lift. Swapping in the persistent
+LSP **inverts this**: a strong clean-rate lift (+7.5 pts, p=0.0005) but the functional lift **vanishes**
+(p=0.69) and the loop now flips 2 correct records to failing. This is the plan's "retune, don't port
+blind" risk, now measured: a language server's diagnostics on an *open/incomplete* document are not
+the batch whole-program diagnostics the `tsc`-tuned loop was calibrated against. The loop cleans more
+aggressively under the LSP and that extra cleaning is not correctness-bearing. (Baseline pass@1 is
+identical — 0.491 — across all three runs, as it must be: baseline generation is greedy and
+oracle-independent; the oracle only affects clean-rate scoring and the slow loop.)
+
+## Does opengrep find a syntactic correctness signal for the clean-but-wrong class?
+
+**Yes — narrow, but with perfect precision on this eval.** On the raw (`baseline`) outputs, the
+12-rule set fired on exactly **4 of 159 records, and all 4 are functionally wrong** (0 false
+positives). That is the direct answer to the question the arm exists for — it is measured as the
+baseline clean-rate dropping from 0.887 (`ts`) to 0.862 (`both`): those 4 records are type-clean but
+rule-flagged, and every one fails its tests.
+
+| Record | Rule | Functionally correct? |
+|---|---|---|
+| `HumanEval_14_all_prefixes` | `loop-bound-off-by-one` | ✗ wrong |
+| `HumanEval_67_fruit_distribution` | `parseint-no-radix` | ✗ wrong |
+| `HumanEval_95_check_dict_case` | `for-in-over-array` | ✗ wrong |
+| `HumanEval_111_histogram` | `for-in-over-array` | ✗ wrong |
+
+Across the whole `both` run only three rules ever fired (`for-in-over-array` ×4, `parseint-no-radix`
+×2, `loop-bound-off-by-one` ×1). The rules the plan flagged as noisy (`sort-without-comparator`,
+etc.) **never fired**, so the feared false-positive tax did not materialize on this set. This exceeds
+the pre-registered calibrated expectation (a near-zero hit-rate was the honest prior); the hit-rate
+*is* low (4/159 ≈ 2.5%), but it is a genuine, precise signal, not noise.
+
+Folding opengrep into the slow loop **partially recovers the pass@1 the LSP swap lost** (0.503 →
+0.528; 8 records flipped to passing vs baseline) but does **not** reach significance (p=0.109) and
+costs more over-repair (0.101 → 0.120; 2 correct records broken). Net: acting on opengrep's findings
+fixes a few real bugs, but the idiom-rule signal is too sparse — HumanEval failures are mostly
+*algorithmic* misunderstanding, which a syntactic AST matcher structurally cannot see — to move the
+functional metric on its own.
+
+## The measurement is trustworthy: the opengrep stall did not corrupt it
+
+A prior stress test had seen a ~10% full-timeout stall under sustained single-file rescanning of one
+long-lived `opengrep lsp` process — a *live-but-unresponsive* process that the dead-process liveness
+check never caught, so a stalled scan was silently counted as a timeout and returned `[]`, **dropping
+findings**. At ~10% that would corrupt any `both` measurement. Since each scan overwrites the whole
+candidate file and is independent of prior calls, respawning changes reliability but never the finding
+set, so `OpengrepOracle` now proactively recycles the process every 32 calls and reactively restarts +
+retries once on a no-response scan (`src/lsp/opengrep.py`; `scripts/opengrep_soak.py` is the soak
+harness). The `both` run's self-reported counters: **`n_timeouts = 0` over 1471 opengrep calls**, 0
+stall recoveries, 45 proactive recycles (~68 s overhead). No findings were silently dropped — and
+notably the stall did not reproduce on this host at all (0 timeouts across 160 rotating + 200
+single-file soak calls with the mitigation off), so the recycler is a cheap, unit-tested safety net
+rather than a demonstrated before/after fix.
+
+## Verdict
+
+The persistent-LSP swap is **not a free upgrade over batch `tsc`**: it trades the slow loop's
+functional benefit for a clean-rate benefit, because open-document diagnostics differ from
+whole-program ones and the `tsc`-tuned gating does not transfer. The opengrep arm delivers a **real
+but narrow** correctness signal (4/4 precision on raw outputs, sparse), which nudges pass@1 up inside
+the slow loop without reaching significance and at a small over-repair cost. The honest read for the
+program gate (#198): the clean-but-wrong gap is real and a syntactic idiom-matcher can *see a corner
+of it precisely* but not enough of it to carry the functional metric — the correctness-bearing signal
+for this class lives in semantics (tests, execution, type-aware analysis), which is where the AR
+harness ablation (#201) and the LSP-verifier reward work (#103) should aim.
