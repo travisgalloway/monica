@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from src.lsp.opengrep import OpengrepOracle
+from src.lsp.oracle import CompositeOracle
 
 # A minimal well-formed raw LSP finding, enough for `_map_finding` to build a
 # Diagnostic (line/character 0-indexed; maps to offset 0 for any source).
@@ -113,3 +114,30 @@ def test_mitigation_off_reproduces_pre_fix_behavior():
     assert o.n_recycles == 0
     assert o.n_stall_recoveries == 0
     assert o.n_timeouts == 1
+
+
+# --- CompositeOracle.opengrep_stats plumbing (Part 2) ------------------- #
+
+class _FakeArm:
+    n_calls = 5
+    wall_s = 1.25
+    n_timeouts = 1
+    n_restarts = 2
+    n_recycles = 1
+    n_stall_recoveries = 1
+
+
+def test_opengrep_stats_is_none_when_arm_inactive():
+    # kind="ts" (or a degraded "both") -> no opengrep arm -> None.
+    c = object.__new__(CompositeOracle)   # bypass __init__ (would spawn real servers)
+    c._opengrep = None
+    assert c.opengrep_stats is None
+
+
+def test_opengrep_stats_reports_the_arm_counters():
+    c = object.__new__(CompositeOracle)
+    c._opengrep = _FakeArm()
+    assert c.opengrep_stats == {
+        "n_calls": 5, "wall_s": 1.25, "n_timeouts": 1,
+        "n_restarts": 2, "n_recycles": 1, "n_stall_recoveries": 1,
+    }

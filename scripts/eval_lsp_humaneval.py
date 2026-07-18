@@ -186,6 +186,10 @@ def main() -> None:
         # anything reading past results JSONs doesn't need to change.
         "tsc_wall_s_total": oracle.wall_s, "wall_s_total": time.monotonic() - t_run,
     }
+    # When the opengrep arm ran, record its reliability counters so the run is
+    # self-describing about completeness (n_timeouts = silently-dropped scans).
+    if oracle.opengrep_stats is not None:
+        results["opengrep"] = oracle.opengrep_stats
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:

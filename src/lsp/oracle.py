@@ -100,6 +100,25 @@ class CompositeOracle:
     def wall_s(self) -> float:
         return sum(o.wall_s for o in self._active_oracles())
 
+    @property
+    def opengrep_stats(self) -> Optional[dict]:
+        """The opengrep arm's reliability/cost counters, or `None` when that arm
+        isn't active (`kind="ts"`, or `"both"` that degraded past opengrep). A
+        `both` run's results JSON reads this to record how many opengrep scans
+        stalled (`n_timeouts` -- silently-dropped findings) versus recovered, so
+        the measurement is self-describing about its own completeness."""
+        if self._opengrep is None:
+            return None
+        og = self._opengrep
+        return {
+            "n_calls": og.n_calls,
+            "wall_s": og.wall_s,
+            "n_timeouts": og.n_timeouts,
+            "n_restarts": og.n_restarts,
+            "n_recycles": og.n_recycles,
+            "n_stall_recoveries": og.n_stall_recoveries,
+        }
+
     def diagnostics(self, source: str) -> List[Diagnostic]:
         """Every arm's findings, UNFILTERED (the caller applies
         `diagnostics.filter_diagnostics`, same as `TscRunner`/`TsLspOracle`),
