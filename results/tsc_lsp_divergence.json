@@ -1,0 +1,305 @@
+{
+  "n_records": 159,
+  "baseline_pass_at_1": 0.49056603773584906,
+  "baseline_mismatch": 0,
+  "tsc_slow_hard_pass_at_1": 0.559748427672956,
+  "lsp_slow_hard_pass_at_1": 0.5031446540880503,
+  "tsc_advantage_records": 10,
+  "lsp_advantage_records": 1,
+  "tsc_advantage_won_via_rollback": 10,
+  "lsp_premature_clean_on_crux": 9,
+  "clean_but_wrong_tsc": 67,
+  "clean_but_wrong_lsp": 76,
+  "total_rollbacks_tsc": 113,
+  "total_rollbacks_lsp": 33,
+  "crux": [
+    {
+      "id": "HumanEval_105_by_length",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 8,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 3,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS2345"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_10_make_palindrome",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 7,
+        "codes": [
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2304"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_113_odd_count",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 6,
+        "codes": [
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2362"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_131_digits",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 11,
+        "codes": [
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362",
+          "TS2362"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2362"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_143_words_in_sentence",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": true,
+        "n_rollbacks": 3,
+        "codes": [
+          "TS2304",
+          "TS2304",
+          "TS2304"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2304"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_150_x_or_y",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": true,
+        "n_rollbacks": 5,
+        "codes": [
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2304"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_156_int_to_mini_roman",
+      "baseline_pass": true,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 11,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 3,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS2304"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_19_sort_numbers",
+      "baseline_pass": true,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 7,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": false,
+        "n_rollbacks": 6,
+        "codes": [
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053",
+          "TS7053"
+        ]
+      },
+      "lsp_premature_clean": false
+    },
+    {
+      "id": "HumanEval_39_prime_fib",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 13,
+        "codes": [
+          "TS2366",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304",
+          "TS2304"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 2,
+        "codes": [
+          "TS2304",
+          "TS2304"
+        ]
+      },
+      "lsp_premature_clean": true
+    },
+    {
+      "id": "HumanEval_54_same_chars",
+      "baseline_pass": false,
+      "tsc": {
+        "pass": true,
+        "clean": false,
+        "n_rollbacks": 7,
+        "codes": [
+          "TS2532",
+          "TS2532",
+          "TS2532",
+          "TS2532",
+          "TS2532",
+          "TS2532",
+          "TS2532"
+        ]
+      },
+      "lsp": {
+        "pass": false,
+        "clean": true,
+        "n_rollbacks": 1,
+        "codes": [
+          "TS2532"
+        ]
+      },
+      "lsp_premature_clean": true
+    }
+  ]
+}
