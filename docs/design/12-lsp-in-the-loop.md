@@ -626,6 +626,44 @@ notably the stall did not reproduce on this host at all (0 timeouts across 160 r
 single-file soak calls with the mitigation off), so the recycler is a cheap, unit-tested safety net
 rather than a demonstrated before/after fix.
 
+## The TS-LSP oracle's first-push-wins is complete — no multi-push race in practice (#211)
+
+`TsLspOracle.diagnostics()` arms a single `threading.Event` and returns on the **first**
+`textDocument/publishDiagnostics` push for the candidate URI, with **no settle/quiescence window** —
+unlike `OpengrepOracle._rescan`'s `_SETTLE_S`. The open concern (#211): a push-model server that
+publishes a fast **syntactic** pass then a slower **semantic** pass would have the oracle capture the
+early syntactic-only push and **miss the semantic `TS2xxx` errors**, biasing measured LSP lift toward
+"finds nothing" and making the set timing-dependent. That would silently corrupt the phases that trust
+the oracle's diagnostic set (the #201 ablation, and especially #203, LSP-as-diffusion-discriminator).
+
+**Probed, not assumed** (`scripts/probe_ts_lsp_multipush.py`, `results/ts_lsp_multipush_probe.json`).
+The probe re-opens each candidate the oracle sees but registers a *list-append* callback that records
+**every** push for the URI — timestamp + codes — and captures the server's advertised
+`capabilities.diagnosticProvider`. Run over the whole #194 set (96 records, all 4 error classes) plus a
+**crafted candidate carrying both a syntactic (`TS1109`) and a distinct semantic (`TS2322`) defect**,
+with a settle window (3.5 s) wide enough to catch late pushes:
+
+| Signal | Result |
+|---|---|
+| Candidates where the **first** push ≠ the final union of all pushes | **0 / 97** |
+| Candidates where a **semantic** code appeared only in a later push (the race) | **0 / 97** |
+| Candidates where a later push added *any* code | **0 / 97** |
+| Crafted syntax+semantic candidate | **1 push**, carrying `TS1109` **and** `TS2322` together |
+| `capabilities.diagnosticProvider` (pull diagnostics / LSP 3.17) | **absent** on `typescript-language-server` 5.3.0 |
+
+The pinned server *does* emit up to **3** pushes per document (median inter-push gap ~1.2 s), but the
+**first push is always semantically complete** — pushes 2–3 are **idempotent re-publishes** carrying
+the identical code set (tsserver re-emitting after the project settles). The crafted candidate — which
+deliberately mixes a syntactic and a semantic defect, the exact split the race hypothesis needs —
+**coalesces both into one push**, directly refuting a syntactic-then-semantic split for this server.
+
+**Resolution: no production change.** First-push-wins captures the complete set on every candidate and
+every error class, so the current `diagnostics()` is correct as written. The pull-diagnostics fix path
+is moot anyway (5.3.0 advertises no `diagnosticProvider`). The multi-push race remains a **latent**
+risk for a *different* server or config that front-loads a syntactic-only push — the probe script is
+retained so it can be re-run if the pinned toolchain changes — but it is not a live bug, and **#211 is
+closed** on this evidence.
+
 ## Verdict
 
 The persistent-LSP swap is **not a free upgrade over batch `tsc`**: it trades the slow loop's
