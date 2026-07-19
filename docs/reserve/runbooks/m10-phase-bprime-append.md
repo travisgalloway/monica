@@ -1,5 +1,11 @@
 # M10 Phase B′ — append-only teacher precompute for the corpus extension (#177)
 
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
+> active — the runbook below is **parked**, not live. See
+> [`../../design/13-code-model-moe.md`](../../design/13-code-model-moe.md) and
+> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. Retained as the inventory of the frozen ~566 GB teacher top-k cache on R2 (paid storage).
+
 Ready-to-fire runbook for **#177**: extend the frozen 566 GB Qwen3-4B-Thinking teacher top-k cache
 to cover the multi-domain corpus extension (#176/#182, built 2026-07-05) **without re-precomputing the
 ~230,318 unchanged FineWeb chunks**. All machinery is merged
@@ -10,7 +16,7 @@ no prior context.
 Related: [`../path-b-run.md`](../path-b-run.md) (the authoritative Path B runbook — see its update
 banner; this doc replaces its Step 3 for the *extension* leg), [`m10-pod-chain.md`](m10-pod-chain.md)
 (precompute + sweep staging, steps 3–4 — this runbook's output feeds its Step 3),
-[`../infrastructure.md`](../infrastructure.md) (generic R2 + RunPod flow).
+[`../infrastructure.md`](../../infrastructure.md) (generic R2 + RunPod flow).
 
 ## State (as of 2026-07-05)
 

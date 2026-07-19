@@ -2,27 +2,33 @@
 
 A proof-of-concept **Mamba-2 hybrid** language model, developed and validated on
 **Apple Silicon with MLX**, architected behind **one hardware seam** so a successful POC
-migrates to **CUDA** for a larger run with minimal rewrite. The current program is to
-**distil** a compact **~1B** hybrid student from a larger frozen teacher, sweep a few
-architecture layouts cheaply, then post-train the winner for reasoning. (1B is the single
-target model — the `poc` is the cheap architecture-validation rung, run at ~205M with the
-Qwen2.5 tokenizer (`config/poc-qwen.yaml`) to mirror the student's data path; a ~127M OLMo
-variant, `config/poc.yaml`, stays in reserve.)
+migrates to **CUDA** for a larger run with minimal rewrite. The current program (**M12**) is a
+from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code model**: a mostly
+Mamba-2/SSD backbone with ~12.5% attention layers for cross-file recall and Jamba-style MoE on the
+MLPs, trained on a general multilingual Essential-Web + Stack-v2 corpus with its own byte-level
+BPE and fill-in-the-middle, at two sizes (small ~120M-active/700M-total; large "Large A"
+~700M-active/3.5B-total, sparse-upcycled from the small dense checkpoint). A **secondary axis**
+studies feeding language-server / static-analysis signal into the model. See
+[`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md) and
+[issue #198](https://github.com/travisgalloway/monica/issues/198).
+
+> The earlier **M10 distillation program** (distil a ~1B student from a frozen
+> `Qwen/Qwen3-4B-Thinking-2507` teacher) was dropped 2026-07-19; its machinery is built and its
+> design record is kept under [`docs/reserve/`](docs/reserve/10-distillation.md). The from-scratch
+> OLMo pretrain path is complete and stays in reserve.
 
 **Usage:** [`docs/usage.md`](docs/usage.md) — end-to-end commands (install → data →
-train/distil → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](docs/infrastructure.md)
+train → serve/chat → eval). **Cloud:** [`docs/infrastructure.md`](docs/infrastructure.md)
 — running the data + training pipeline on object storage + rented GPUs (R2 + RunPod).
 **Design & rationale:** [`docs/design/`](docs/design/README.md).
 
-> **Licensing note.** The distillation program (M10) trains from
-> `Qwen/Qwen3-4B-Thinking-2507`, licensed plain **Apache-2.0** — no distillation or
-> competing-model restriction. The corpus and teacher signal are third-party data (the-stack,
-> Wikipedia, OpenCodeReasoning, etc.) and Qwen's own model outputs, not Claude/Anthropic content.
-> This repo's engineering work is assisted by Claude Code, but no Claude-generated text is part
-> of the training corpus or teacher signal — Anthropic's usage policy separately restricts using
-> *its own* model's outputs to train other models, which is a different thing than using it as a
-> coding assistant to build this pipeline. See `CLAUDE.md`'s "Licensing / usage-policy
-> compliance" section for the full note.
+> **Licensing note.** This project keeps its training corpus entirely **third-party/non-Claude**
+> (Essential-Web, Stack-v2, Wikipedia, etc.). Anthropic's Usage Policy restricts training a model
+> on *Claude's own* inputs/outputs — a different thing than using Claude Code as a coding
+> assistant to build this pipeline, which is what happens here. No Claude-generated text enters the
+> training corpus (this must hold for any M12 SSI reward / SFT data too). See `CLAUDE.md`'s
+> "Licensing / usage-policy compliance" section for the full note, including the reserve M10
+> teacher-license assessment.
 
 ---
 
@@ -38,29 +44,31 @@ weak at _exact_ recall (copying a variable name, quoting a number), so Monica is
 **hybrid**: it mixes in a _few_ ordinary attention layers (roughly one in eight) to recover
 precise lookup where it matters — math and code.
 
-**How it learns.** Training a model from scratch is enormously expensive. Instead, Monica
-**learns from a bigger, already-trained "teacher" model** — a technique called
-**distillation**. The student watches what the teacher would predict and learns to match it,
-reaching useful capability for a _tiny fraction_ of the data a from-scratch run needs. Because
-each student is cheap to train, we can **try several small designs** (how much attention, where
-to place it, how big the state is) and keep the best one.
+**How it's built.** Monica is a **code model trained from scratch**. To get strong capability
+per parameter it uses a **Mixture-of-Experts (MoE)**: many small "expert" sub-networks of which
+only a few fire per token, so the model holds a lot of knowledge while staying cheap to run. It's
+**TypeScript-first**, trained with **fill-in-the-middle** (so it learns to complete code from both
+sides, not just left-to-right), and comes in two sizes — a small rung and a larger one
+**sparse-upcycled** from it (the small dense model is grown into the big sparse one instead of
+training the big one from zero).
 
 **The intended process, in order:**
 
-1. **Precompute the teacher's signal once** — tokenize a corpus and record the teacher's
-   predictions. This is the expensive part, and it's done a single time.
-2. **Sweep student layouts** — train several cheap candidate students against that frozen
-   signal and pick the layout that wins on math/code _and_ on the local speed/long-context
-   advantage.
-3. **Post-train the winner** — teach it to follow instructions and to reason
-   (`<think>…</think>` style), with optional tool-use and a final reinforcement-learning polish.
+1. **Build the corpus + tokenizer** — a general multilingual code+text mixture (Essential-Web +
+   Stack-v2) and Monica's own byte-level BPE trained on it.
+2. **Build the MoE architecture & harness** — load-balancing router, the CUDA MoE backend,
+   fill-in-the-middle, a length curriculum, and the evals (bits-per-byte is the primary metric).
+3. **Sweep small designs, then run** — cheaply ablate attention ratio / state size / routing,
+   train the small model, then sparse-upcycle to the large one.
 4. **Run it locally** — serve it on Apple Silicon, where the constant-memory design pays off.
+
+Alongside this, a **secondary axis** asks whether feeding a language server's diagnostics into
+generation helps — a validated way to raise type-cleanliness, though (so far) not functional
+correctness; see [`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md).
 
 This is a **proof of concept**: success is a smoothly improving learning curve plus a clear
 local-hardware win (context length and tokens/sec that a same-size Transformer can't match), not a
-leaderboard score. The from-scratch training path is fully built and validated; the
-**distillation stage is in progress** (the building blocks exist; the end-to-end cloud run is
-being wired up — see [issue #65](https://github.com/travisgalloway/monica/issues/65)).
+leaderboard score. The tracker is [issue #198](https://github.com/travisgalloway/monica/issues/198).
 
 ---
 
@@ -104,9 +112,12 @@ docs/usage.md              usage guide   docs/infrastructure.md  cloud runbook  
 ## Status
 
 The POC core is **implemented and verified on Apple Silicon**, and the **CUDA backend is now
-done and verified on a rented A40** (full suite green on both). The active program is **M10 —
-distillation** ([issue #65](https://github.com/travisgalloway/monica/issues/65)); the M1–M8
-core was tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2).
+done and verified on a rented A40** (full suite green on both). The active program is **M12 — the
+from-scratch Mamba-2 hybrid MoE code model**
+([issue #198](https://github.com/travisgalloway/monica/issues/198)); the M1–M8 core was tracked in
+[issue #2](https://github.com/travisgalloway/monica/issues/2). The earlier M10 distillation program
+(#65) was **dropped 2026-07-19** — machinery built, kept as reserve under
+[`docs/reserve/`](docs/reserve/10-distillation.md).
 
 | Milestone                 | State                                                                             |
 | ------------------------- | --------------------------------------------------------------------------------- |
@@ -119,25 +130,29 @@ core was tracked in [issue #2](https://github.com/travisgalloway/monica/issues/2
 | 7 Serving + chat + rewind | done — CLI generate/chat over `SessionStore` + `RewindTree`                       |
 | 8 CUDA backend            | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified |
 | 9 Post-training           | **done** — SFT / DPO / GRPO machinery on MLX (+ CUDA step-factory parity)         |
-| 10 Distillation           | **in progress** — teacher loader, student init, staged loss, sweep harness built  |
+| 10 Distillation           | machinery **built, then dropped** 2026-07-19 (reserve; see `docs/reserve/`)        |
+| 12 MoE code model         | **active** — MoE build (#213/#214) is the net-new work; SSI signal secondary       |
 
-**M10 distillation — where it stands.** The frozen-artifact strategy and its building blocks
-are in place: the frozen conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`, loaded by
-`src/model/mlx_teacher.py` / `cuda_teacher.py`), student initialization
-(`src/model/mlx_student_init.py` — Mamba-in-the-Llama / MOHAWK), the staged distillation loss
-(`src/model/mlx_distill.py` — mixing-match → hidden-align → logit-distill), the manifest parser
-(`src/train/distill_manifest.py`), the sweep table (`scripts/sweep.py`), and the run driver
-(`scripts/distill.py`). **Pending:** the corpus re-tokenize to the Qwen3 vocab + corpus-scale
-teacher-logit precompute ([#94](https://github.com/travisgalloway/monica/issues/94)), the R2 +
-RunPod plumbing ([#80](https://github.com/travisgalloway/monica/issues/80)), and the end-to-end
-cloud distill run at full scale ([#81](https://github.com/travisgalloway/monica/issues/81); the
-runbook is [`docs/path-b-run.md`](docs/path-b-run.md)).
+**M12 — the active program.** A from-scratch **TypeScript-first Mamba-2 hybrid MoE code model**
+(tracker [#198](https://github.com/travisgalloway/monica/issues/198); design record
+[`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md)). The spine: own byte-level
+BPE (#191) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
+backend (#214) → FIM / length curriculum / evals → ablation sweep (#219) → small full run (#222) →
+sparse-upcycled large run (#223). The bulk of the net-new work is the MoE build — MoE is
+MLX-toy-only today. A **secondary axis (SSI)** studies language-server / static-analysis signal:
+a validated clean-rate tool with a found functional ceiling (#225/#226/#227/#230).
 
-**Two training paths.** The original **from-scratch pretrain** path (`scripts/train.py`,
-OLMo tokenizer, uint16) is complete and validated — it's the POC's foundation and the
+**Reserve — M10 distillation (dropped 2026-07-19).** The frozen-teacher machinery is built (teacher
+loader `src/model/mlx_teacher.py`, student init `src/model/mlx_student_init.py`, staged loss
+`src/model/mlx_distill.py`, manifest parser, sweep table, `scripts/distill.py`) but the program is
+no longer active; the design record and run playbook are kept under
+[`docs/reserve/`](docs/reserve/path-b-run.md).
+
+**Two training paths (both reserve now).** The original **from-scratch pretrain** path
+(`scripts/train.py`, OLMo tokenizer, uint16) is complete and validated — the POC's foundation and
 production-reserve route ([#75](https://github.com/travisgalloway/monica/issues/75)). The
-**distillation** path (Qwen3 tokenizer, uint32, `config/student-1b.yaml`) is the current
-focus and the cheaper route to a capable model.
+**distillation** path (Qwen3 tokenizer, uint32, `config/student-1b.yaml`) is reserve. M12 trains a
+new code model from scratch on its own BPE.
 
 ## Hybrid architecture
 
@@ -148,7 +163,9 @@ fraction of layers are **causal attention** instead of Mamba, config-gated by `a
 Optional **sparse MoE** FFN layers are likewise gated by `moe_every` / `n_experts` / `top_k`.
 Both are off by default (pure Mamba) and live behind the seam. Sizing and the attention-fraction
 sweep are in [`docs/design/09-hybrid-architectures.md`](docs/design/09-hybrid-architectures.md);
-the distillation rationale is in [`docs/design/10-distillation.md`](docs/design/10-distillation.md).
+the M12 MoE code-model plan is in
+[`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md), and the reserve
+distillation rationale in [`docs/reserve/10-distillation.md`](docs/reserve/10-distillation.md).
 
 Reference configs: `config/poc.yaml` = d_model 768 / 24 layers / d_state 16 / head_dim 64 (24
 heads) / seq 1024 / ~3B tokens / OLMo vocab (pure Mamba). `config/student-1b.yaml` = d_model
@@ -201,7 +218,7 @@ For a **real corpus** and the full train → serve → eval flow, see
 [`docs/usage.md`](docs/usage.md); for the **cloud** (R2 + RunPod) pipeline, see
 [`docs/infrastructure.md`](docs/infrastructure.md). To **validate every stage locally** in one
 offline command — and for the small local-training configs (`config/small.yaml`,
-`config/poc-small.yaml`) and the local Qwen3 teacher — see
+`config/poc-small.yaml`) — see
 [`docs/local-development.md`](docs/local-development.md):
 
 ```bash
@@ -234,19 +251,19 @@ python scripts/train.py --config config/poc.yaml --data data/split --out runs/po
 **POC success = a smoothly decreasing `val_perplexity` in `runs/poc/metrics.jsonl`** with a
 stable `grad_norm` — not a benchmark score.
 
-### Distillation (in progress)
+### Distillation (reserve — dropped 2026-07-19)
 
-The distillation corpus, teacher loader, student init, and staged loss exist; the cloud run
-harness is being wired up. Inspect a candidate sweep over attention fraction / placement / state
-size:
+The distillation corpus, teacher loader, student init, and staged loss exist but the program is
+**no longer active**. The machinery still runs — a candidate sweep over attention fraction /
+placement / state size:
 
 ```bash
 python scripts/sweep.py                    # all of config/manifests/
 python scripts/sweep.py config/manifests/student-1b-attn-lo.yaml config/manifests/student-1b-attn-hi.yaml
 ```
 
-See [`docs/usage.md`](docs/usage.md#3-train) and
-[`docs/design/10-distillation.md`](docs/design/10-distillation.md) for the full picture.
+See [`docs/reserve/10-distillation.md`](docs/reserve/10-distillation.md) for the full (reserve)
+picture.
 
 ### Post-training (M9)
 

@@ -2,14 +2,26 @@
 
 [← Index](README.md)
 
+> **Status note (2026-07-19).** This doc records the `datatrove` + R2 + RunPod corpus
+> foundation built for the M10 distillation program (issue #65, **dropped 2026-07-19** —
+> design record moved to [`../reserve/10-distillation.md`](../reserve/10-distillation.md)).
+> The stages, common schema, and R2 layout below are reusable infrastructure and still apply;
+> the **live program is M12** ([issue #198](https://github.com/travisgalloway/monica/issues/198)),
+> which re-anchors the corpus to a general multilingual **Essential-Web + Stack-v2** mixture
+> ([#193](https://github.com/travisgalloway/monica/issues/193)) with its **own byte-level BPE**
+> ([#191](https://github.com/travisgalloway/monica/issues/191)) instead of the Qwen3-aligned
+> tokenizer described below — see [`13-code-model-moe.md`](13-code-model-moe.md) for the
+> current plan.
+
 How the scale-up corpus is built, stored, and post-trained. The offline
 [`src/data/`](../../src/data/) stages ([data pipeline](04-data-pipeline.md)) are the
 laptop-scale version of this; at scale the same shape runs on **Hugging Face
 [`datatrove`](https://github.com/huggingface/datatrove)**, stores intermediates on
-**Cloudflare R2**, and processes on **RunPod**. This doc is the decision record for that
-flow; the GitHub tracker is [issue #65](https://github.com/travisgalloway/monica/issues/65)
-and its phase children (#69–#81). Model choice is in
-[hybrid architectures](09-hybrid-architectures.md).
+**Cloudflare R2**, and processes on **RunPod**. This doc is the decision record for the
+M10-era flow (now reserve); the GitHub tracker was [issue #65](https://github.com/travisgalloway/monica/issues/65)
+and its phase children (#69–#81). Model choice for that reserve plan is in
+[hybrid architectures](09-hybrid-architectures.md); the live M12 model plan is
+[`13-code-model-moe.md`](13-code-model-moe.md).
 
 Like everything above the [seam](01-architecture-seam.md), the pipeline is **portable** —
 no `mlx`/`torch` import. It produces shards; the trainer consumes them.
@@ -72,14 +84,16 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 
 ## Tokenize + shard (Phase 3, #74)
 
-> **Superseded by the distillation pivot ([10](10-distillation.md)).** The tokenizer is now
-> **fixed to Qwen3 (vocab ~151,669)** by the conversion teacher (token-aligned with Qwen2.5 plus
-> the `<think>`/`</think>` ids) — it intentionally *exceeds* the uint16 bound, so packing is
-> **uint32** (#90, now implemented: dtype-aware `pack.py` + relaxed `MambaConfig.validate()`). The
-> StarCoder2/uint16 reasoning below is the historical record of the from-scratch plan; the #75
-> production-reserve corpus reuses these clean-corpus *stages* under **uint32 packing** (the
-> already-built reserve corpus uses Qwen2.5; re-tokenize to Qwen3 to match the student) — so
-> StarCoder2/uint16 is fully superseded.
+> **Reserve note.** Under the M10 distillation reserve plan
+> ([`../reserve/10-distillation.md`](../reserve/10-distillation.md)), the tokenizer was **fixed
+> to Qwen3 (vocab ~151,669)** by the conversion teacher (token-aligned with Qwen2.5 plus the
+> `<think>`/`</think>` ids) — it intentionally *exceeds* the uint16 bound, so packing is
+> **uint32** (#90, implemented: dtype-aware `pack.py` + relaxed `MambaConfig.validate()`). The
+> StarCoder2/uint16 reasoning below is the historical record of the original from-scratch plan;
+> the #75 production-reserve corpus reuses these clean-corpus *stages* under **uint32 packing**
+> (the already-built reserve corpus uses Qwen2.5). **M12** (the live program) sidesteps this
+> tokenizer question with its **own byte-level BPE** trained on the M12 mixture (#191) — see
+> [`13-code-model-moe.md`](13-code-model-moe.md).
 
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
   (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`
@@ -93,12 +107,14 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 - **Shard:** high-hundreds-of-MB to low-GB shards (few large files → fewer R2 Class A ops),
   written to R2 alongside the cleaned text.
 
-## R2 storage layout
+## R2 storage layout (reserve — M10 distillation)
 
-The distillation pivot adopts a **three-class** layout (#97), so the student layout stays
-downstream of every frozen artifact. `src/data/storage.py` is the single source of truth for these
-prefixes; the data drivers (`distill_corpus.py`, `instruct_sft.py`, `reasoning_sft.py`) build their
-paths through it, and #80 points the R2 `s3fs` readers/writers at the same prefixes.
+The M10 distillation reserve plan adopted a **three-class** layout (#97), so the student layout
+stayed downstream of every frozen artifact. `src/data/storage.py` is the single source of truth
+for these prefixes; the data drivers (`distill_corpus.py`, `instruct_sft.py`, `reasoning_sft.py`)
+build their paths through it, and #80 pointed the R2 `s3fs` readers/writers at the same prefixes.
+This layout is kept as reserve/example; the live M12 corpus build (#193) has no frozen-teacher
+class to isolate, so it may adopt a simpler layout.
 
 ```
 r2://<bucket>/
@@ -117,7 +133,7 @@ Two rules the layout enforces: **cleaned text and RL problems stay tokenizer-agn
 name-pins tokenizer + seq_len** (`<tok>-<k>`, e.g. `qwen3-8k`) so multiple tokenized views coexist.
 Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regenerate.
 
-## Training flow (Phases 4–5, #81 / #75)
+## Training flow (Phases 4–5, #81 / #75) — reserve (M10)
 
 - **Phase 4 (#81):** the 100M smoke run on a cheap GPU pod (T4/L4). Bring the pod up in
   this order so a config or throughput problem surfaces *before* the long run:
@@ -163,10 +179,12 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
   [checkpointing](05-training.md); success is a smoothly decreasing held-out val-perplexity curve
   at scale.
 
-## Post-training (Phase 6, #76–#78)
+## Post-training (Phase 6, #76–#78) — reserve (M10)
 
 Clean-license, extending the M9 SFT+DPO machinery (#57). See those issues for dataset detail;
-the licensing reframe is the load-bearing part:
+the licensing reframe is the load-bearing part. (The live M12 post-training arms are #101/#103,
+currently parked — see [`11-post-training.md`](11-post-training.md) and
+[`13-code-model-moe.md`](13-code-model-moe.md).)
 
 - **SFT (#76):** OASST1 (multi-turn, Apache-2.0), Dolly (CC-BY-SA, flagged), FLAN, plus a
   small hand-authored in-format set; synthetic top-up only from *permissive* open models.
@@ -181,6 +199,7 @@ the licensing reframe is the load-bearing part:
 ## Related
 
 - [Data pipeline](04-data-pipeline.md) — the offline `src/data/` stages this scales up.
-- [Hybrid architectures](09-hybrid-architectures.md) — the ~1B model the corpus trains (100M poc is the validation rung).
+- [Hybrid architectures](09-hybrid-architectures.md) — the reserve ~1B model this corpus was built to train (100M poc is the validation rung).
 - [Training](05-training.md) — the portable loop + checkpoint/resume the cloud runs reuse.
 - [Architecture: the hardware seam](01-architecture-seam.md) — why the pipeline stays portable.
+- [`13-code-model-moe.md`](13-code-model-moe.md) — the live M12 program this corpus foundation now feeds (#193, #191).

@@ -8,7 +8,9 @@ regenerate) beats re-reading diagnostics as tool-call tokens. **#199 is the gate
 program**: build a `tsc`-in-the-loop autoregressive harness on an off-the-shelf model (no
 training) and measure it against the [#194 eval set](../../eval_sets/ts_error_injection/README.md)
 before funding the P1 tier (#191/#192/#193/#200/#201/#101/#103/#104). This doc is the design
-record and the measurement.
+record, the measurement, and — at the end — the **arc-level assessment/conclusion**. For where
+this sits in the live program, see [`13-code-model-moe.md`](13-code-model-moe.md) (M12, #198),
+which demotes this LSP signal to a secondary axis on the strength of the conclusion below.
 
 **Model**: `mlx-community/Qwen2.5-Coder-1.5B-bf16` (base, not instruct — see risks below).
 **Locked decisions** (user): build and run locally on MLX-LM; implement both hard and soft
@@ -708,3 +710,49 @@ program gate (#198): the clean-but-wrong gap is real and a syntactic idiom-match
 of it precisely* but not enough of it to carry the functional metric — the correctness-bearing signal
 for this class lives in semantics (tests, execution, type-aware analysis), which is where the AR
 harness ablation (#201) and the LSP-verifier reward work (#103) should aim.
+
+## Assessment / conclusion (arc-level)
+
+Rolling the whole arc up, the answer is partly negative and useful:
+
+- **Proven — a clean-rate tool.** Diagnostic-guided rollback/regeneration reliably raises
+  *type-cleanliness*: the persistent-LSP swap moved it **0.887 → 0.962 (p=0.0005)**, robust and
+  well-instrumented, with over-repair understood and mostly neutralized (#212 final-segment gate,
+  the forward-resolvable TS2xxx deferral, and #211 confirming the oracle isn't dropping
+  diagnostics).
+- **Bounded — it can't touch the functional gap.** The gap this program exists to close is
+  clean-but-wrong: bodies are **88.7% type-clean but only 50.3% functionally correct**. Persistent
+  LSP leaves **pass@1 flat (0.503, p=0.69, ns)** because the failures are *algorithmic*, which a
+  type/lint checker structurally cannot see. opengrep sees a genuine but far-too-sparse corner
+  (4/159, 4/4 precise). And over-repair on multi-statement code is **trajectory-bound, not
+  trigger-bound** (this session's A1): specific triggers trim at zero F1 cost, but the aggregate
+  and per-row outcomes don't budge — the over-firing is structural to incremental repair.
+- **The unexplained bright spot.** Batch `tsc` *did* move **pass@1 (0.491 → 0.560, p=0.001)** where
+  open-document LSP did not — attributed to whole-program vs open-document diagnostics. This
+  **tsc-vs-LSP divergence is the single most information-rich loose end** in the arc: either a real
+  signal (whole-program view catching cross-statement errors) or a gating artifact.
+
+**Bottom line:** inference-time type/lint-guided rollback on a *frozen* model is a validated
+clean-rate tool, **not** the lever for the functional gap. The correctness-bearing signal lives in
+semantics/execution, and the untested high-value question is whether it helps as a **training
+signal** rather than an inference-time patch.
+
+**Next-steps ledger (evidence-to-cost order):**
+
+1. **Resolve the tsc-vs-LSP pass@1 divergence** — one targeted study of why whole-program `tsc`
+   moved functional correctness when open-document LSP didn't. Cheap, could flip the conclusion and
+   redirect the program. Do first.
+2. **Put the signal in training** — the oracle as a reward (#230 / the parked #103) and/or the
+   fast/slow/both ablation (#201) on a *trained* model, not the frozen base coder. This is where
+   the value proposition actually lives; it costs a training run and a Track-B decision.
+3. **Swap in a semantic/execution oracle** — execution against tests/spec as the `DiagnoseFn`;
+   pairs naturally with (2) as a train-time reward.
+4. **Exploratory** — the #203 diffusion discriminator (diagnostic-guided denoising); #211 cleared
+   its prerequisite.
+5. **The honest #198 gate call** — write up "validated clean-rate tool, functional ceiling found,
+   functional signal needs semantics-as-training" and shelve. A legitimate, well-earned outcome.
+
+Recommendation: do (1) as a small immediate experiment, then use its result to choose between
+committing to (2)+(3) as the serious next thrust or making the (5) gate call. With M10 off the
+plan, this is also the moment to decide whether LSP-in-the-loop becomes a headline **training**
+program (i.e. (2)) or stays exploratory.

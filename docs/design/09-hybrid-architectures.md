@@ -3,12 +3,14 @@
 [← Index](README.md)
 
 Why the scale-up model is a **Mamba-2 *hybrid*** — mostly SSD blocks with a small fraction
-of attention layers — and how it is sized. The target is a **single ~1B model** (the cheap
-100M `poc` is the architecture-validation rung; the earlier 2B/4B tiers were dropped). This is
-the model companion to the [corpus pipeline](08-corpus-pipeline.md); the GitHub tracker is
-[issue #65](https://github.com/travisgalloway/monica/issues/65) (arch children #66–#68). The
-SSD block itself is documented in [model: the Mamba block](02-model-ssm.md); this doc is
-about what to add to it at scale.
+of attention layers — and how it is sized. This hybrid rationale is **foundation** that the live
+M12 code model builds on (its MoE spine + sizing are in
+[13-code-model-moe.md](13-code-model-moe.md), tracker
+[issue #198](https://github.com/travisgalloway/monica/issues/198)); the SSD block itself is in
+[model: the Mamba block](02-model-ssm.md). The single-~1B-model sizing discussed below was the
+**reserve M10** target (arch children #66–#68, epic
+[#65](https://github.com/travisgalloway/monica/issues/65), dropped 2026-07-19) — read it for the
+attention-fraction reasoning, which carries over to the M12 MoE model.
 
 ## Why a hybrid, not pure SSD
 
@@ -53,23 +55,23 @@ earlier 2B/4B scale tiers — and a 16B candidate before them — were dropped f
 | tier | d_model | n_layers | head_dim | ≈ params | bf16 weights | train GPU |
 |---|---|---|---|---|---|---|
 | **100M** (poc — OLMo, reserve) | 768 | 24 | 64 | ~127M | ~0.25 GB | T4 16 GB / L4 24 GB |
-| **205M** (poc-qwen — Qwen2.5, active POC run) | 768 | 24 | 64 | ~205M | ~0.4 GB | T4 16 GB / L4 24 GB |
+| **205M** (poc-qwen — Qwen2.5, completed POC run, reserve) | 768 | 24 | 64 | ~205M | ~0.4 GB | T4 16 GB / L4 24 GB |
 | **1B** (target — from scratch) | 2048 | 36 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
-| **1B** (target — distillation student, hybrid) | 2048 | 28 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
+| **1B** (reserve distillation student, hybrid) | 2048 | 28 | 64 | ~1.03B | ~2 GB | L4 / A10 24 GB |
 
-Both ~1B configs land within ±5% of the 1B target (verify with the sizing tool). The
-**distillation student** ([`config/student-1b.yaml`](../../config/student-1b.yaml)) uses **28
+Both ~1B configs land within ±5% of the 1B target (verify with the sizing tool). The **reserve
+distillation student** ([`config/student-1b.yaml`](../../config/student-1b.yaml)) uses **28
 layers** — matching the teacher's 28 transformer layers so the Mamba-in-the-Llama init maps
-layer-to-layer (see [distillation](10-distillation.md)) — while the **from-scratch** 1B
-([`config/1b.yaml`](../../config/1b.yaml), OLMo vocab) uses 36 layers for the same param budget
-(its smaller vocab leaves more room in the layer stack). The 100M tier is the validated
-[`poc.yaml`](07-configs-and-decisions.md) (OLMo). The **active POC run** uses
-[`poc-qwen.yaml`](../../config/poc-qwen.yaml) — the same layers retargeted to the Qwen2.5 vocab
-(151,646) so the POC exercises a tokenizer/data path token-aligned with the distillation student's
-(the student is on the Qwen3 vocab 151,669, which is token-aligned with Qwen2.5); the larger
-tied embedding (~116M) then dominates, making it ~205M, embedding-heavy. (At the student's
-d_model 2048 that same embedding is a negligible ~11%, so the vocab is "free" there — it only
-dominates a narrow 768-wide model.) The sizing tool is a portable closed-form
+layer-to-layer (see [distillation, reserve](../reserve/10-distillation.md)) — while the
+**from-scratch** 1B ([`config/1b.yaml`](../../config/1b.yaml), OLMo vocab) uses 36 layers for the
+same param budget (its smaller vocab leaves more room in the layer stack). The 100M tier is the
+validated [`poc.yaml`](07-configs-and-decisions.md) (OLMo). The now-**completed POC run** (reserve)
+used [`poc-qwen.yaml`](../../config/poc-qwen.yaml) — the same layers retargeted to the Qwen2.5
+vocab (151,646) so the POC exercised a tokenizer/data path token-aligned with the (reserve)
+distillation student's (the student is on the Qwen3 vocab 151,669, which is token-aligned with
+Qwen2.5); the larger tied embedding (~116M) then dominates, making it ~205M, embedding-heavy. (At
+the student's d_model 2048 that same embedding is a negligible ~11%, so the vocab is "free" there
+— it only dominates a narrow 768-wide model.) The sizing tool is a portable closed-form
 param/memory calculator (`src/model/sizing.py` + `scripts/model_size.py`, #66), cross-checked
 against the built model's portable state-dict param sum. Training memory ≈ 8 B/param
 (weights+grad+AdamW), or **~10 B/param with 8-bit Adam** — the VRAM-tight lever used in
@@ -116,8 +118,8 @@ honest laptop question is the inverse — "how many tokens fit in a day?" — wh
 
 These are first-principles estimates (generic `6·N·D`, not the SSM/attention split);
 the real per-step cost is what `scripts/bench_train_step.py` (MLX) and
-`scripts/bench_cuda_train_step.py` (CUDA) measure. The short distillation runs in
-particular need ≪ Chinchilla tokens — see [distillation](10-distillation.md).
+`scripts/bench_cuda_train_step.py` (CUDA) measure. The short (reserve) distillation runs in
+particular needed ≪ Chinchilla tokens — see [distillation, reserve](../reserve/10-distillation.md).
 
 ### Precision differs from the POC
 
@@ -127,8 +129,8 @@ where **bf16 is native** and needs no loss scaling — so `config/1b.yaml` and
 `config/student-1b.yaml` set `precision: bf16` (`scaler_for_precision` already returns `None`
 for bf16). `tie_embeddings`
 and `grad_checkpoint` stay on; vocab follows the chosen tokenizer and sets the packed dtype —
-uint16 below 65536 (POC), uint32 for Qwen3 (the distillation student, #90; see
-[distillation](10-distillation.md)).
+uint16 below 65536 (POC), uint32 for Qwen3 (the reserve distillation student, #90; see
+[distillation, reserve](../reserve/10-distillation.md)).
 
 ## Verifying the attention fraction
 
