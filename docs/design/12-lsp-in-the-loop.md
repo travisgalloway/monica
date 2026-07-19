@@ -727,10 +727,19 @@ Rolling the whole arc up, the answer is partly negative and useful:
   (4/159, 4/4 precise). And over-repair on multi-statement code is **trajectory-bound, not
   trigger-bound** (this session's A1): specific triggers trim at zero F1 cost, but the aggregate
   and per-row outcomes don't budge — the over-firing is structural to incremental repair.
-- **The unexplained bright spot.** Batch `tsc` *did* move **pass@1 (0.491 → 0.560, p=0.001)** where
-  open-document LSP did not — attributed to whole-program vs open-document diagnostics. This
-  **tsc-vs-LSP divergence is the single most information-rich loose end** in the arc: either a real
-  signal (whole-program view catching cross-statement errors) or a gating artifact.
+- **The bright spot, resolved — it is exploration variance, not detection.** Batch `tsc` moved
+  **pass@1 (0.491 → 0.560, p=0.001)** where open-document LSP did not (0.503). Investigated directly
+  (`scripts/analyze_tsc_lsp_divergence.py`, `scripts/probe_tsc_lsp_divergence_subcause.py`,
+  `results/tsc_lsp_divergence*.json`): the gap is **9 records LSP finishes `clean` but functionally
+  wrong** (76 vs tsc's 67 of 159), and tsc does **3.4× more rollbacks** (0.711 vs 0.208). But driving
+  tsc's winning trajectory and querying both oracles on identical text yields **0/10 forks** (tsc
+  never flags where LSP is clean — LSP in fact emits *more* codes on incomplete candidates, doing
+  error-recovery semantic analysis tsc can't), and running batch tsc on LSP's 9 clean-but-wrong final
+  artifacts **clears all 9**: the wrong code type-checks *even to the whole-program compiler*. So both
+  loops bottom out at **type-clean endpoints the type oracle cannot rank**; tsc's edge is
+  **trajectory/exploration variance** (≈ best-of-N via more regeneration), **not** a correctness
+  signal — which only sharpens the "bounded" bullet above. The "gating artifact" branch wins; the
+  "whole-program catches real cross-statement errors" branch is refuted.
 
 **Bottom line:** inference-time type/lint-guided rollback on a *frozen* model is a validated
 clean-rate tool, **not** the lever for the functional gap. The correctness-bearing signal lives in
@@ -739,9 +748,9 @@ signal** rather than an inference-time patch.
 
 **Next-steps ledger (evidence-to-cost order):**
 
-1. **Resolve the tsc-vs-LSP pass@1 divergence** — one targeted study of why whole-program `tsc`
-   moved functional correctness when open-document LSP didn't. Cheap, could flip the conclusion and
-   redirect the program. Do first.
+1. ~~**Resolve the tsc-vs-LSP pass@1 divergence**~~ — **DONE** (see the "bright spot, resolved"
+   bullet above): it was exploration variance among type-clean endpoints, not a real signal. It did
+   not flip the conclusion — it reinforced it, and killed the "stricter LSP stopping gate" lever.
 2. **Put the signal in training** — the oracle as a reward (#230 / the parked #103) and/or the
    fast/slow/both ablation (#201) on a *trained* model, not the frozen base coder. This is where
    the value proposition actually lives; it costs a training run and a Track-B decision.
@@ -752,7 +761,9 @@ signal** rather than an inference-time patch.
 5. **The honest #198 gate call** — write up "validated clean-rate tool, functional ceiling found,
    functional signal needs semantics-as-training" and shelve. A legitimate, well-earned outcome.
 
-Recommendation: do (1) as a small immediate experiment, then use its result to choose between
-committing to (2)+(3) as the serious next thrust or making the (5) gate call. With M10 off the
-plan, this is also the moment to decide whether LSP-in-the-loop becomes a headline **training**
-program (i.e. (2)) or stays exploratory.
+Recommendation: with (1) now resolved — and resolved *against* a cheap inference-time fix — the
+fork is between (2)+(3) as the serious next thrust and the (5) gate call. The divergence result
+removes the last hope that oracle tuning alone moves the functional metric, so the honest read is
+that LSP-in-the-loop only becomes worth more investment as a **training** signal ((2)/(3),
+semantics/execution as a reward); absent appetite for that training run, (5) is the well-earned
+shelve. With M10 off the plan, this is the moment to make that call.
