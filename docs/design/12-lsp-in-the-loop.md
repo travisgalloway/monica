@@ -535,8 +535,41 @@ surfaces — transient committed **`TS2xxx`** semantic codes (e.g. `TS2395` "mer
 all exported or all local") on incomplete multi-segment code, which flow through the normal filter
 (not the `TS1xxx`-only reinstatement) and still trigger rollbacks. On the exemplar `clean-prefix-0020`
 the `TS1146` chasing is gone (5→0) but the trajectory now chases `TS2395`. Extending the same
-"final-segment / transient" reasoning to committed `TS2xxx` is the next hardening step; raw
-over-repair (0.215) won't fall to zero until it's addressed.
+"final-segment / transient" reasoning to committed `TS2xxx` is the next hardening step — done below.
+
+### Forward-resolvable `TS2xxx` deferral — second hardening pass (#201)
+
+Symmetric with the `TS1xxx` final-segment gate, `FORWARD_RESOLVABLE_CODES = {TS2395, TS2449}` are
+**deferred on non-final block segments only** (`diagnostics.py` constant, `harness.py` gate): both are
+artifacts of a not-yet-generated later top-level construct — `TS2395` fires until all merge partners
+are generated, `TS2449` ("used before its declaration") is a forward reference resolved by hoisting —
+so they self-resolve as generation continues. The `cannot-find-name` family (`TS2304`/`TS2552`) is
+**deliberately excluded**: it is the loop's core error-catching competency (and the #194 injected-error
+set's staple), so deferring it would blunt the mechanism to chase a metric. On the final segment these
+codes pass through `filter_diagnostics` unchanged and are still caught.
+
+Re-measured, same protocol (`results/e4_overrepair_realcode_fix2.json`, `results/f1_ts_fix2.json`):
+
+| | before (gate only) | after `TS2xxx` deferral |
+|---|---|---|
+| #201 slow-hard `over_repair_rate` (raw) | 0.215 | **0.215 (flat)** |
+| #201 slow-hard total rollbacks | 161 | **149** |
+| #201 broken-row set (of 200) | 157 rows | **the same 157 rows** (0 flipped either way) |
+| #199 F1 slow-hard clean-rate / pass@1 | 0.962 / 0.503 | **0.962 / 0.503 (byte-identical)** |
+
+**The finding — over-repair on multi-statement real code is *trajectory-bound*, not *trigger-bound*.**
+The deferral does exactly what it says at the event level — `TS2395` repair triggers halve (20→10 on
+slow-hard) — but the aggregate does not move: deferring the early `TS2395` rollback lets generation
+continue down a different path that surfaces an equivalent diagnostic downstream (`TS2449` triggers
+rise 2→16), and **every one of the 200 rows lands in the identical clean/broken state**. So trimming
+the clearly-forward-resolvable subset of triggers is **correct, principled, zero-F1-cost hardening**
+(shipped — it removes provably-spurious rollbacks and is symmetric with #212), but it is **not a lever
+that moves the over-repair metric**. Incremental per-segment repair over-fires on multi-top-level-
+statement code as a structural property of the trajectory, not of any particular code family; the
+signal that would actually close this gap lives in the semantic/training axis (the #201 AR-harness
+ablation on a *trained* model, and the #103 LSP-verifier reward), not in further diagnostic-code
+allowlisting. Chasing zero by deferring `cannot-find-name` would only trade the loop's error-catching
+for a metric that, on this evidence, would not even move.
 
 ## Risks realized (see the original plan for the full list)
 
