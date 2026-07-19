@@ -250,6 +250,68 @@ def test_stmt_budget_still_reinstates_genuine_ts1xxx():
     assert result.n_rollbacks > 0 or result.unrepaired is True
 
 
+# --------------------------------------------------------------------------- #
+# forward-resolvable committed-TS2xxx deferral: non-final block segments (#201)
+# --------------------------------------------------------------------------- #
+
+def _merged_decl_diag(source: str) -> List[Diagnostic]:
+    """A forward-resolvable TS2395 that fires while a merged declaration's later
+    partner hasn't been generated yet -- a *transient* semantic code the next
+    segment resolves (mirrors `export const Foo` before its `namespace Foo` merge
+    partner). Unlike a TS1xxx, `filter_diagnostics` does NOT drop it, so pre-fix it
+    reaches the rollback path at an intermediate boundary (over-repair)."""
+    i = source.find("Foo")
+    if i == -1 or "namespace" in source:
+        return []
+    return [Diagnostic(code="TS2395", line=1, col=i + 1,
+                        message="merged declaration must be all exported or all local",
+                        offset=i)]
+
+
+def test_forward_resolvable_ts2xxx_deferred_on_non_final_segment():
+    # Segment 1 ("export const Foo\n") commits a TS2395 at a balanced boundary with block
+    # budget headroom; segment 2 ("namespace Foo {}\n") generates the merge partner and the
+    # TS2395 vanishes. Non-final segment => the forward-resolvable code is DEFERRED, not
+    # rolled back. Fails on pre-fix code: TS2395 isn't a TS1xxx, so filter_diagnostics keeps
+    # it and the loop over-repairs the still-forming declaration.
+    lm = ScriptedFakeLM(_linear_script("export const Foo\n"),
+                        alt_script=_linear_script("namespace Foo {}\n"),
+                        alt_trigger="export const Foo")
+    result = generate_slow_loop(lm, _merged_decl_diag, "", repair="hard",
+                                 budget="block", block_size=34, max_retries=5)
+    assert result.n_rollbacks == 0                    # forward-resolvable code was deferred
+    assert "export const Foo" in result.completion    # generation continued past segment 1
+    assert "namespace Foo" in result.completion        # the merge partner was generated
+
+
+def test_forward_resolvable_ts2xxx_still_caught_on_final_segment():
+    # The SAME forward-resolvable code at the block's FINAL segment (budget exhausts on a
+    # one-token boundary segment) must still be caught -- deferral is non-final-only. The
+    # merge partner never comes (persistent TS2395), so on the final segment the loop acts.
+    persistent = lambda source: (
+        [Diagnostic(code="TS2395", line=1, col=1,
+                    message="merged declaration must be all exported or all local",
+                    offset=source.find("Foo"))] if "Foo" in source else [])
+    lm = ScriptedFakeLM(_linear_script(";\n"))         # first token ';' is a boundary
+    result = generate_slow_loop(lm, persistent, "export const Foo", repair="hard",
+                                 budget="block", block_size=1, max_retries=3)
+    # is_final_segment is True (this one boundary segment exhausts block_size=1), so the
+    # committed TS2395 is NOT deferred -> the loop acts on it (rolls back or gives up).
+    assert result.n_rollbacks > 0 or result.unrepaired is True
+
+
+def test_cannot_find_name_still_repaired_on_non_final_segment():
+    # TS2304 (cannot-find-name) is DELIBERATELY EXCLUDED from FORWARD_RESOLVABLE_CODES: it is
+    # the loop's core error-catching competency, so it must STILL be rolled back at an
+    # intermediate (non-final) boundary even though it's a committed TS2xxx. Guards that the
+    # non-final deferral does not leak into the excluded family.
+    lm = ScriptedFakeLM(_linear_script("bad\n"))
+    diagnose = _contains_diagnose("bad", code="TS2304")
+    result = generate_slow_loop(lm, diagnose, "", repair="hard",
+                                 budget="block", block_size=6, max_retries=3)
+    assert result.n_rollbacks > 0                     # the excluded family is still caught early
+
+
 def test_suppression_hack_with_no_diagnostic_does_not_crash():
     # A suppression hack (`as any`) makes `_is_clean` return False, but the diagnose
     # fn reports NO diagnostics -> `filtered` is empty. Hard repair is diagnostic-guided

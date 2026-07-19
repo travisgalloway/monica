@@ -74,6 +74,30 @@ _TS1XXX_RE = re.compile(r"^TS1\d{3}$")
 # `is_incomplete` tells apart "still typing" TS1xxx from a genuine defect.
 _CONTROL_FLOW_COMPLETENESS_CODES = frozenset({"TS2355", "TS2366"})
 
+# Forward-resolvable semantic codes (#201, second hardening pass — the sibling of
+# `_CONTROL_FLOW_COMPLETENESS_CODES` for TS2xxx). #212's final-segment gate cut the
+# transient-TS1xxx over-repair and surfaced a second source: committed TS2xxx
+# *semantic* codes that fire only because a LATER top-level construct hasn't been
+# generated yet, and self-resolve as generation continues. On multi-top-level-
+# statement real code (forward references, hoisting, merged declarations) a
+# diagnostic committed at segment k is routinely resolved by segment k+1 — the same
+# greedy generation reaches a clean final artifact, so the loop's rollback is pure
+# over-repair. The harness defers these on NON-FINAL block segments only (symmetric
+# with #212's TS1xxx final-segment reinstatement); on the final segment they pass
+# through `filter_diagnostics` unchanged and are still caught.
+#
+# Deliberately NARROW — each member is an artifact of a not-yet-generated later
+# construct, NOT a genuine defect:
+#   - TS2395 "individual declarations in merged declaration must be all exported or
+#     all local" — fires until all merge partners are generated.
+#   - TS2449 "class/block-scoped variable used before its declaration" — a forward
+#     reference resolved when the declaration is generated later (hoisting).
+# The `cannot-find-name` family (TS2304/TS2552) is EXCLUDED on purpose: it is the
+# loop's core error-catching competency (and the #194 injected-error set's staple),
+# so deferring it would blunt the mechanism to chase a metric. TS7006 (noImplicitAny
+# lint) and TS2366 (already in _CONTROL_FLOW_COMPLETENESS_CODES) are also out.
+FORWARD_RESOLVABLE_CODES = frozenset({"TS2395", "TS2449"})
+
 # Module-resolution diagnostics. Real TypeScript `import`s things, and under the
 # pinned isolated tsconfig those raise TS2307 ("cannot find module") etc. For the
 # real-code over-repair probe (#201) the files are selected to compile clean *ignoring*
