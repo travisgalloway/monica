@@ -2,13 +2,25 @@
 
 [← Index](README.md)
 
-Once a capable hybrid base exists (via [distillation](10-distillation.md)), post-training builds
-**three capability layers in order**. Instruct is the substrate that makes the model usable at
-all; thinking is the headline skill of this POC; tool use is the extensibility layer enabled when
-the product needs it. All three are taught by **SFT** on data from the shared post-training track,
-with **GRPO** as a final reinforcement pass on the thinking layer. The tracker is
-[issue #65](https://github.com/travisgalloway/monica/issues/65); the data lives under the
-`shared/` prefix ([corpus pipeline](08-corpus-pipeline.md)) and reuses the M9 SFT/DPO machinery
+> **Status note (2026-07-19).** This is a design record; the base model it post-trains does not
+> exist yet under either plan. It was written against the M10 distillation program (issue #65,
+> **dropped 2026-07-19** — reserve under
+> [`../reserve/10-distillation.md`](../reserve/10-distillation.md)). The live program is **M12**
+> ([issue #198](https://github.com/travisgalloway/monica/issues/198)), whose post-training arms
+> are **#101 (SFT)** and **#103 (RLVR)**, currently **parked** behind the MHM spine
+> (corpus/tokenizer/MoE backend/ablation sweep/full run — see
+> [`13-code-model-moe.md`](13-code-model-moe.md)). The instruct → thinking → GRPO shape and the
+> chat-template invariant below carry over regardless of which base model they land on.
+
+Once a capable hybrid base exists (via the **M12 MoE base run**, or as originally envisioned via
+[distillation, reserve](../reserve/10-distillation.md)), post-training builds **three capability
+layers in order**. Instruct is the substrate that makes the model usable at all; thinking is the
+headline skill of this POC; tool use is the extensibility layer enabled when the product needs it.
+All three are taught by **SFT** on data from the shared post-training track, with **GRPO** as a
+final reinforcement pass on the thinking layer. This design record was tracked under
+[issue #65](https://github.com/travisgalloway/monica/issues/65) (reserve); live tracking is under
+issue #198's #101/#103. The data lives under the `shared/` prefix
+([corpus pipeline](08-corpus-pipeline.md)) and reuses the M9 SFT/DPO machinery
 (`make_sft_train_step`, `make_dpo_train_step`, the response-masked loaders).
 
 The order matters: instruct is assumed by everything later, thinking is the point, tool use is
@@ -91,5 +103,8 @@ precomputed once and reused everywhere.
 ## Related
 
 - [Corpus pipeline](08-corpus-pipeline.md) — the `shared/` SFT corpora and verifiable RL sets.
-- [Distillation](10-distillation.md) — how the base these layers post-train is built.
+- [Distillation, reserve](../reserve/10-distillation.md) — how the base these layers post-train
+  was envisioned to be built under the (dropped) M10 program.
+- [`13-code-model-moe.md`](13-code-model-moe.md) — the live M12 program; #101/#103 are these
+  layers' current (parked) tracking.
 - [Training](05-training.md) — the SFT/DPO machinery (M9) these layers reuse.

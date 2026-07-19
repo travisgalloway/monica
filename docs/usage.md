@@ -5,11 +5,20 @@ serve/chat → eval**. For *why* the project is built this way, see
 [`design/`](design/README.md); for running this pipeline on cloud storage + rented GPUs
 (R2 + RunPod), see [`infrastructure.md`](infrastructure.md).
 
-The project has **two training paths**:
+> **Status note (2026-07-19).** The **live program is M12** — a from-scratch TypeScript-first
+> Mamba-2 hybrid **MoE** code model ([issue #198](https://github.com/travisgalloway/monica/issues/198),
+> design: [`design/13-code-model-moe.md`](design/13-code-model-moe.md)). The M10 distillation
+> program (issue #65) was **dropped 2026-07-19**; its design record moved to
+> [`reserve/10-distillation.md`](reserve/10-distillation.md). M12's own commands (own-BPE
+> tokenizer #191, Essential-Web + Stack-v2 corpus #193, MoE training) land as that work is built
+> out. The two paths below remain accurate for what they cover; the distillation path is now
+> **reserve**, not active.
 
-- **Distillation (current focus)** — build a compact **~1B** Mamba-2 hybrid student from a
-  larger frozen teacher (Qwen3 tokenizer → uint32 packing). *In progress:* the building
-  blocks exist; the end-to-end run harness is being wired up.
+The project has **two training paths** (see the status note above for which is active):
+
+- **Distillation (reserve)** — build a compact **~1B** Mamba-2 hybrid student from a
+  larger frozen teacher (Qwen3 tokenizer → uint32 packing). The building blocks exist; the
+  end-to-end run harness was never fully wired up before the program was dropped.
 - **From-scratch pretrain (validated foundation / production reserve)** — train a ~100M POC
   from scratch (OLMo tokenizer → uint16). Complete and exercised by the smoke gate.
 
@@ -39,8 +48,8 @@ needs network once):
 
 - **OLMo** (`allenai/OLMo-7B-hf`, vocab 50,280 < 65,536) → **uint16** packing — the
   from-scratch POC path.
-- **Qwen3** (vocab ~151,669 ≥ 65,536) → **uint32** packing — the distillation path, fixed by
-  the conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`).
+- **Qwen3** (vocab ~151,669 ≥ 65,536) → **uint32** packing — the (reserve) distillation path,
+  fixed by the conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`).
 
 Run the tests to confirm the install (on Linux the MLX-only tests skip, not fail):
 
@@ -52,7 +61,7 @@ Run the tests to confirm the install (on Linux the MLX-only tests skip, not fail
 
 ## 2. Build a corpus
 
-### 2a. Distillation corpus (current focus — Qwen3, uint32)
+### 2a. Distillation corpus (reserve — Qwen3, uint32)
 
 [`src/data/distill_corpus.py`](../src/data/distill_corpus.py) is a thin orchestrator that
 builds the **frozen** distillation corpus every student trial consumes: it cleans text into
@@ -165,13 +174,16 @@ The smaller `config/toy.yaml` (vocab 256, fp32) backs the exact-resume smoke gat
 .venv/bin/python scripts/smoke_test.py --data data/split    # use a byte-fallback split
 ```
 
-### 3b. Distillation (in progress)
+### 3b. Distillation (reserve)
 
 Distillation builds a hybrid student from a **frozen teacher**, reaching capability at <1% of
-from-scratch tokens — so several architecture layouts can be swept cheaply. The pieces exist
-today; the **single end-to-end run driver and the cloud plumbing are still being built**
+from-scratch tokens — so several architecture layouts can be swept cheaply. This was the M10
+program (issue #65), **dropped 2026-07-19** in favor of M12
+([`design/13-code-model-moe.md`](design/13-code-model-moe.md)) before its end-to-end run driver
+and cloud plumbing were fully wired up
 ([#80](https://github.com/travisgalloway/monica/issues/80),
-[#81](https://github.com/travisgalloway/monica/issues/81)):
+[#81](https://github.com/travisgalloway/monica/issues/81)). The pieces below remain in the tree
+and functional as reserve machinery:
 
 | Piece | Module | Role |
 |---|---|---|
@@ -193,7 +205,7 @@ state size). Sibling manifests must share one frozen teacher signal:
 A manifest names the frozen artifacts (corpus, teacher outputs, SFT/RL sets) and the swept
 layout; the student layout is **downstream of every frozen artifact**, so changing it
 invalidates nothing upstream. See
-[`design/10-distillation.md`](design/10-distillation.md) for the full rationale.
+[`reserve/10-distillation.md`](reserve/10-distillation.md) for the full rationale (reserve).
 
 ### 3c. Post-training (M9) — SFT → DPO → RLVR
 

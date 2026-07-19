@@ -8,7 +8,9 @@ regenerate) beats re-reading diagnostics as tool-call tokens. **#199 is the gate
 program**: build a `tsc`-in-the-loop autoregressive harness on an off-the-shelf model (no
 training) and measure it against the [#194 eval set](../../eval_sets/ts_error_injection/README.md)
 before funding the P1 tier (#191/#192/#193/#200/#201/#101/#103/#104). This doc is the design
-record and the measurement.
+record, the measurement, and — at the end — the **arc-level assessment/conclusion**. For where
+this sits in the live program, see [`13-code-model-moe.md`](13-code-model-moe.md) (M12, #198),
+which demotes this LSP signal to a secondary axis on the strength of the conclusion below.
 
 **Model**: `mlx-community/Qwen2.5-Coder-1.5B-bf16` (base, not instruct — see risks below).
 **Locked decisions** (user): build and run locally on MLX-LM; implement both hard and soft
@@ -708,3 +710,60 @@ program gate (#198): the clean-but-wrong gap is real and a syntactic idiom-match
 of it precisely* but not enough of it to carry the functional metric — the correctness-bearing signal
 for this class lives in semantics (tests, execution, type-aware analysis), which is where the AR
 harness ablation (#201) and the LSP-verifier reward work (#103) should aim.
+
+## Assessment / conclusion (arc-level)
+
+Rolling the whole arc up, the answer is partly negative and useful:
+
+- **Proven — a clean-rate tool.** Diagnostic-guided rollback/regeneration reliably raises
+  *type-cleanliness*: the persistent-LSP swap moved it **0.887 → 0.962 (p=0.0005)**, robust and
+  well-instrumented, with over-repair understood and mostly neutralized (#212 final-segment gate,
+  the forward-resolvable TS2xxx deferral, and #211 confirming the oracle isn't dropping
+  diagnostics).
+- **Bounded — it can't touch the functional gap.** The gap this program exists to close is
+  clean-but-wrong: bodies are **88.7% type-clean but only 50.3% functionally correct**. Persistent
+  LSP leaves **pass@1 flat (0.503, p=0.69, ns)** because the failures are *algorithmic*, which a
+  type/lint checker structurally cannot see. opengrep sees a genuine but far-too-sparse corner
+  (4/159, 4/4 precise). And over-repair on multi-statement code is **trajectory-bound, not
+  trigger-bound** (this session's A1): specific triggers trim at zero F1 cost, but the aggregate
+  and per-row outcomes don't budge — the over-firing is structural to incremental repair.
+- **The bright spot, resolved — it is exploration variance, not detection.** Batch `tsc` moved
+  **pass@1 (0.491 → 0.560, p=0.001)** where open-document LSP did not (0.503). Investigated directly
+  (`scripts/analyze_tsc_lsp_divergence.py`, `scripts/probe_tsc_lsp_divergence_subcause.py`,
+  `results/tsc_lsp_divergence*.json`): the gap is **9 records LSP finishes `clean` but functionally
+  wrong** (76 vs tsc's 67 of 159), and tsc does **3.4× more rollbacks** (0.711 vs 0.208). But driving
+  tsc's winning trajectory and querying both oracles on identical text yields **0/10 forks** (tsc
+  never flags where LSP is clean — LSP in fact emits *more* codes on incomplete candidates, doing
+  error-recovery semantic analysis tsc can't), and running batch tsc on LSP's 9 clean-but-wrong final
+  artifacts **clears all 9**: the wrong code type-checks *even to the whole-program compiler*. So both
+  loops bottom out at **type-clean endpoints the type oracle cannot rank**; tsc's edge is
+  **trajectory/exploration variance** (≈ best-of-N via more regeneration), **not** a correctness
+  signal — which only sharpens the "bounded" bullet above. The "gating artifact" branch wins; the
+  "whole-program catches real cross-statement errors" branch is refuted.
+
+**Bottom line:** inference-time type/lint-guided rollback on a *frozen* model is a validated
+clean-rate tool, **not** the lever for the functional gap. The correctness-bearing signal lives in
+semantics/execution, and the untested high-value question is whether it helps as a **training
+signal** rather than an inference-time patch.
+
+**Next-steps ledger (evidence-to-cost order):**
+
+1. ~~**Resolve the tsc-vs-LSP pass@1 divergence**~~ — **DONE** (see the "bright spot, resolved"
+   bullet above): it was exploration variance among type-clean endpoints, not a real signal. It did
+   not flip the conclusion — it reinforced it, and killed the "stricter LSP stopping gate" lever.
+2. **Put the signal in training** — the oracle as a reward (#230 / the parked #103) and/or the
+   fast/slow/both ablation (#201) on a *trained* model, not the frozen base coder. This is where
+   the value proposition actually lives; it costs a training run and a Track-B decision.
+3. **Swap in a semantic/execution oracle** — execution against tests/spec as the `DiagnoseFn`;
+   pairs naturally with (2) as a train-time reward.
+4. **Exploratory** — the #203 diffusion discriminator (diagnostic-guided denoising); #211 cleared
+   its prerequisite.
+5. **The honest #198 gate call** — write up "validated clean-rate tool, functional ceiling found,
+   functional signal needs semantics-as-training" and shelve. A legitimate, well-earned outcome.
+
+Recommendation: with (1) now resolved — and resolved *against* a cheap inference-time fix — the
+fork is between (2)+(3) as the serious next thrust and the (5) gate call. The divergence result
+removes the last hope that oracle tuning alone moves the functional metric, so the honest read is
+that LSP-in-the-loop only becomes worth more investment as a **training** signal ((2)/(3),
+semantics/execution as a reward); absent appetite for that training run, (5) is the well-earned
+shelve. With M10 off the plan, this is the moment to make that call.

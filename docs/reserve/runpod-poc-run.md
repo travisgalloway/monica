@@ -1,9 +1,15 @@
 # RunPod POC run — session handoff (`poc-qwen`, ~205M)
 
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
+> active — see [`../design/13-code-model-moe.md`](../design/13-code-model-moe.md) and
+> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. The ~205M `poc-qwen` run this documents is **complete** (val-ppl 75.7); kept as a RunPod
+> provisioning/run record and R2 asset inventory.
+
 Self-contained runbook to train the ~205M Qwen2.5 POC on a RunPod GPU pod, eval it, and sync
 checkpoints to R2. Written so a fresh session (or a clean pod clone) can execute it with no prior
-context. Related: [`infrastructure.md`](infrastructure.md) (general pod flow),
-[`config/poc-qwen.yaml`](../config/poc-qwen.yaml) (the config + its header runbook).
+context. Related: [`infrastructure.md`](../infrastructure.md) (general pod flow),
+[`config/poc-qwen.yaml`](../../config/poc-qwen.yaml) (the config + its header runbook).
 
 ## Current state (already done)
 

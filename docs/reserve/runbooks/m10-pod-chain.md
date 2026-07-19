@@ -1,5 +1,12 @@
 # M10 pod-chain — ready-to-fire staging (steps 3–4)
 
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
+> active — the "ready-to-fire" chain below is **parked**, not live. See
+> [`../../design/13-code-model-moe.md`](../../design/13-code-model-moe.md) and
+> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. Retained as the inventory of R2 assets (corpus + ~566 GB teacher cache) that may still
+> occupy paid storage.
+
 > **Update (2026-07-03).** Step 3 (teacher precompute) below completed for the **base** corpus on
 > 2026-07-02. The corpus was then extended with new domains (#176); extending the teacher cache to
 > cover those new chunks is a separate **append** step (3′) that must run **before** Step 4, reusing
@@ -13,7 +20,7 @@ gives the exact copy-paste block to fire steps 3–4 the moment a pod is up.
 
 It is intentionally short and defers all reasoning (cost, sizing, gotchas, the full step-by-step) to
 **[`../path-b-run.md`](../path-b-run.md)**, the authoritative Path B runbook. Read that for *why*;
-read this to *go fast*. See also [`../infrastructure.md`](../infrastructure.md) (generic R2 + RunPod).
+read this to *go fast*. See also [`../infrastructure.md`](../../infrastructure.md) (generic R2 + RunPod).
 
 ## Status: staging validated (no pod, no GPU run)
 

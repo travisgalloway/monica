@@ -1,5 +1,11 @@
 # Path B run — session handoff (full-scale M10 distillation, ~1B student)
 
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
+> active — see [`../design/13-code-model-moe.md`](../design/13-code-model-moe.md) and
+> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. Retained as a design record and as the inventory of R2 assets (corpus + ~566 GB teacher
+> cache) that may still occupy paid storage.
+
 > **Update (2026-07-03) — Steps 1 & 3 are DONE for the base corpus; don't re-run them as-is.**
 > The base 8k corpus build (Step 1) and the base teacher precompute (Step 3) both completed
 > 2026-07-02 (566 GB merged cache at `poc-distill/teacher-outputs/topk-logits-merged/`, 230,318
@@ -23,10 +29,10 @@ at **full scale and seq_len 8192**, retargeted to the new **Qwen3-4B-Thinking-25
 eval tokenizer selection (#139, extended to `qwen3` under #65). **There is no code to write — this is
 execution** (the one data step the switch adds is re-tokenizing the corpus to the Qwen3 vocab, Step 1).
 
-Related: [`infrastructure.md`](infrastructure.md) (generic R2 + RunPod flow; this doc is its concrete
-Path B companion), [`design/10-distillation.md`](design/10-distillation.md) (why distil / the staged
-loss), [`config/manifests/student-1b-attn-hi.yaml`](../config/manifests/student-1b-attn-hi.yaml) +
-[`student-1b-attn-lo.yaml`](../config/manifests/student-1b-attn-lo.yaml) (the two sweep trials).
+Related: [`infrastructure.md`](../infrastructure.md) (generic R2 + RunPod flow; this doc is its concrete
+Path B companion), [`design/10-distillation.md`](10-distillation.md) (why distil / the staged
+loss), [`config/manifests/student-1b-attn-hi.yaml`](../../config/manifests/student-1b-attn-hi.yaml) +
+[`student-1b-attn-lo.yaml`](../../config/manifests/student-1b-attn-lo.yaml) (the two sweep trials).
 
 ## Current state (already done)
 

@@ -1,12 +1,18 @@
 # Distillation (teacher → hybrid student)
 
-[← Index](README.md)
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
+> active — see [`../design/13-code-model-moe.md`](../design/13-code-model-moe.md) and
+> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. Retained as a design record and as the inventory of R2 assets (corpus + ~566 GB teacher
+> cache) that may still occupy paid storage.
+
+[← Design index](../design/README.md)
 
 Why the POC **distills** a compact Mamba-2 hybrid from a frozen transformer teacher instead of
 pretraining from scratch, and how that makes an architecture search cheap. The tracker is
 [issue #65](https://github.com/travisgalloway/monica/issues/65); the corpus + teacher-output
-storage is in [corpus pipeline](08-corpus-pipeline.md); the model is in
-[hybrid architectures](09-hybrid-architectures.md).
+storage is in [corpus pipeline](../design/08-corpus-pipeline.md); the model is in
+[hybrid architectures](../design/09-hybrid-architectures.md).
 
 ## Why distill, not pretrain
 
@@ -149,7 +155,7 @@ few added control tokens incl. the `<think>`/`</think>` pair, so the student can
 delimiters as **native ids** (the headline lever). It is token-aligned with the Qwen2.5 family, so
 the prior Qwen2.5 teachers stay usable. Adopted for the production model too, which collapses the
 POC-to-production tokenizer question. This exceeds the uint16 bound → **uint32 packing** (#90,
-unchanged: ~151,669 < 2³²); see [corpus pipeline](08-corpus-pipeline.md). The tokenizer key is
+unchanged: ~151,669 < 2³²); see [corpus pipeline](../design/08-corpus-pipeline.md). The tokenizer key is
 `qwen3` (`src/train/distill_manifest.py`, `src/data/tokenize.py`).
 
 ## Precompute once, sweep students cheaply (#94, #98)
@@ -162,7 +168,7 @@ time and reused by every trial:
   with doc-boundary sidecars and a corpus manifest — the exact path the manifests below name.
 - **Teacher outputs** over it: top-50..100 logits + indices per token (#94); optionally hidden
   states for MOHAWK matching. The teacher forward pass is the dominant cost — paid **once**.
-- The shared SFT corpora and verifiable RL sets ([post-training](11-post-training.md)).
+- The shared SFT corpora and verifiable RL sets ([post-training](../design/11-post-training.md)).
 
 Each student trial is then a lightweight **manifest** naming the frozen artifacts + the layout:
 
@@ -213,7 +219,7 @@ until then.
 
 ## Related
 
-- [Corpus pipeline](08-corpus-pipeline.md) — the distillation corpus, teacher outputs, storage layout.
-- [Hybrid architectures](09-hybrid-architectures.md) — the student the teacher converts into.
-- [Post-training](11-post-training.md) — the three capability layers applied after conversion.
-- [Training](05-training.md) — the backend-free loop the distill train step plugs into.
+- [Corpus pipeline](../design/08-corpus-pipeline.md) — the distillation corpus, teacher outputs, storage layout.
+- [Hybrid architectures](../design/09-hybrid-architectures.md) — the student the teacher converts into.
+- [Post-training](../design/11-post-training.md) — the three capability layers applied after conversion.
+- [Training](../design/05-training.md) — the backend-free loop the distill train step plugs into.

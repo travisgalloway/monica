@@ -1,17 +1,16 @@
 # Local development on Apple Silicon (MLX)
 
-MLX is the **dev/validation backend**: it exists so you can prove a change correct, generate
-small amounts of teacher signal, and train test-scale models *locally* before paying for a CUDA
-cloud run. Scale training itself runs on CUDA/RunPod (see
-[`docs/infrastructure.md`](infrastructure.md)) — so this page is about **developer velocity**, not
-throughput. (The MLX *train-step throughput* optimizations were deliberately retired; see issue
-#30's decision record before reopening that.)
+MLX is the **dev/validation backend**: it exists so you can prove a change correct and train
+test-scale models *locally* before paying for a CUDA cloud run. Scale training itself runs on
+CUDA/RunPod (see [`docs/infrastructure.md`](infrastructure.md)) — so this page is about
+**developer velocity**, not throughput. (The MLX *train-step throughput* optimizations were
+deliberately retired; see issue #30's decision record before reopening that.)
 
 Three things live here:
 
 1. [Validate every stage locally in one command](#1-validate-every-stage-locally)
 2. [Train test models locally (`small.yaml`, `poc-small.yaml`)](#2-train-test-models-locally)
-3. [Generate teacher signal locally (Qwen3 via MLX, or LM Studio)](#3-generate-teacher-signal-locally)
+3. [Generate teacher signal locally (Qwen3 via MLX, or LM Studio) — reserve, M10 distillation](#3-generate-teacher-signal-locally)
 
 All commands assume the Apple-Silicon install (`pip install -e ".[dev,data,mlx]"`) and the venv
 at `.venv`.
@@ -31,12 +30,13 @@ One offline command (no network / HF / weights) that fails fast through every pi
 | 1 data | `download --dummy` → `tokenize --byte-fallback` → `pack` → `split` | the data pipeline end-to-end |
 | 2 smoke | `scripts/smoke_test.py` on a **fresh** byte split | resume is bit-exact + val eval runs (fp32) |
 | 3 train | `scripts/train.py --config config/small.yaml` | the real fp16 + loss-scaling training path |
-| 4 distill | `scripts/distill_smoke.py` | the 3 staged losses (mixing-match → hidden-align → logit-distill) |
-| 5 teacher | `scripts/precompute_teacher.py --backend mlx --synthetic --compile` | the #94 precompute + the `mx.compile` lever |
+| 4 distill (reserve) | `scripts/distill_smoke.py` | the 3 staged losses (mixing-match → hidden-align → logit-distill), M10 machinery |
+| 5 teacher (reserve) | `scripts/precompute_teacher.py --backend mlx --synthetic --compile` | the #94 precompute + the `mx.compile` lever, M10 machinery |
 
 Knobs (env vars): `PYTHON` (default `.venv/bin/python`), `WORK` (default `runs/local-validate`),
 `STEPS` (default 20), `KEEP=1` to keep the work dir. Use this as the pre-push gate for any change
-to the loop, the SSD scan, mixed precision, checkpointing, or the distill stages.
+to the loop, the SSD scan, mixed precision, checkpointing, or (for stages 4–5) the reserve distill
+stages.
 
 > The smoke gate must run on a **freshly built byte split**, not the real `data/split` (which is
 > the OLMo-vocab corpus) — `local_validate.sh` builds one for you.
@@ -74,10 +74,18 @@ scale). Both carry their measured step-time in the YAML header.
 
 ---
 
-## 3. Generate teacher signal locally
+## 3. Generate teacher signal locally (reserve — M10 distillation)
 
-The distillation student trains against **cached teacher top-k logits** (the #94 precompute), then
-the `logit-distill` stage matches them with KL. You can produce that signal locally two ways.
+> **Reserve.** This section describes the M10 distillation program's teacher-signal precompute
+> (issue #65, **dropped 2026-07-19** — design record at
+> [`reserve/10-distillation.md`](reserve/10-distillation.md)). It is not part of the live M12
+> dev loop (sections 1–2 above); it is kept because the machinery still works and may be useful
+> reference. See [`design/13-code-model-moe.md`](design/13-code-model-moe.md) for the current
+> program.
+
+The (reserve) distillation student trained against **cached teacher top-k logits** (the #94
+precompute), then the `logit-distill` stage matched them with KL. You can still produce that
+signal locally two ways.
 
 ### 3a. Real Qwen3 teacher via MLX — *the recommended path*
 
@@ -134,5 +142,7 @@ is already serving.
 
 ---
 
-See also: [`docs/usage.md`](usage.md) (full flow), [`docs/design/10-distillation.md`](design/10-distillation.md)
-(distillation design), [`docs/infrastructure.md`](infrastructure.md) (cloud R2 + RunPod).
+See also: [`docs/usage.md`](usage.md) (full flow),
+[`docs/design/13-code-model-moe.md`](design/13-code-model-moe.md) (the live M12 plan),
+[`docs/reserve/10-distillation.md`](reserve/10-distillation.md) (reserve distillation design),
+[`docs/infrastructure.md`](infrastructure.md) (cloud R2 + RunPod).

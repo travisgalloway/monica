@@ -3,28 +3,37 @@
 This is the operational runbook for taking the data and training pipeline off a laptop and onto
 **durable object storage + on-demand GPU hosts**. It is written **generically first** (any
 S3-compatible store + any CUDA host), then with the **specifics we use: Cloudflare R2 + RunPod**.
+The generic topology, R2 specifics, and RunPod pod-role split below are reusable foundation for
+any cloud run, including the live M12 program; the **distillation-specific stages** (frozen
+teacher-signal precompute, the three-class `poc-distill/` layout, the Path B run) are **reserve**,
+inherited from the dropped M10 program.
 
 For the *why* behind the corpus design, see
-[`design/08-corpus-pipeline.md`](design/08-corpus-pipeline.md); for the distillation strategy
-these artifacts feed, see [`design/10-distillation.md`](design/10-distillation.md).
+[`design/08-corpus-pipeline.md`](design/08-corpus-pipeline.md); for the (reserve) distillation
+strategy these artifacts fed, see [`reserve/10-distillation.md`](reserve/10-distillation.md); for
+the live M12 plan, see [`design/13-code-model-moe.md`](design/13-code-model-moe.md).
 
 > **Status.** The storage **layout** is implemented and is the single source of truth
 > ([`src/data/storage.py`](../src/data/storage.py)); the same path strings are valid local
-> directories *and* object-store prefixes. The actual **R2/RunPod readers/writers and the cloud
-> run harness are in progress** ([#80](https://github.com/travisgalloway/monica/issues/80),
-> [#81](https://github.com/travisgalloway/monica/issues/81)). What follows is the **intended**
-> flow — build and unit-test it locally first, then rent a pod for the few stages that need one.
+> directories *and* object-store prefixes. The **R2/RunPod readers/writers and the M10 cloud run
+> harness** described below were **never finished** — they were mid-build
+> ([#80](https://github.com/travisgalloway/monica/issues/80),
+> [#81](https://github.com/travisgalloway/monica/issues/81)) when M10 was dropped 2026-07-19 —
+> treat those pieces as reserve, not a live build target. What follows is the **M10-era intended**
+> flow, kept for its generic R2/RunPod topology; build and unit-test locally first, then rent a
+> pod for the few stages that need one.
 
 ---
 
 ## Principle: cloud is on-demand
 
 Almost the entire stack is **Mac-doable today** (MLX, or CUDA-on-torch-CPU for conformance):
-the data pipeline on a slice, the manifest/sizing tooling, the teacher loader and student init
-at toy scale, the distillation loss + train step, and the SFT/DPO/GRPO machinery. **Build and
-unit-test all of it locally before renting anything.**
+the data pipeline on a slice, the manifest/sizing tooling, the SFT/DPO/GRPO machinery, and — for
+the reserve M10 path — the teacher loader, student init at toy scale, and the distillation loss +
+train step. **Build and unit-test all of it locally before renting anything.** This principle
+carries over to M12; the paid-stage table below is the M10-era example (reserve).
 
-Rent a pod only for the handful of stages that genuinely need one:
+Rent a pod only for the handful of stages that genuinely need one (M10-era example, reserve):
 
 | Paid stage | Why it needs a pod | Issue |
 |---|---|---|
@@ -56,10 +65,11 @@ provider:
    outputs to a fast local/volume disk, trains, and **pushes checkpoints back** to the store.
 4. **Keep compute network-close to storage** so the train-time pull is fast and egress is cheap.
 
-### The three-class storage layout
+### The three-class storage layout (reserve — M10 distillation)
 
 One layout keeps the **student architecture downstream of every frozen artifact**, so a layout
-sweep invalidates nothing upstream (the whole point of the distillation strategy):
+sweep invalidates nothing upstream (the whole point of the M10 distillation strategy — kept here
+as reserve/example; the live M12 corpus build, #193, has no frozen-teacher class to isolate):
 
 ```
 <store>://<bucket>/
@@ -206,11 +216,12 @@ A40); the fused kernels auto-detect at runtime and degrade gracefully when absen
 
 ---
 
-## End-to-end intended flow (once #80/#81 land)
+## End-to-end intended flow (M10-era, reserve — #80/#81 never fully landed before the pivot)
 
-For the concrete, command-by-command Path B execution of this flow (the full-scale ~1B distillation
-run — exact commands, pod sizing, R2 paths, cost, and the Path A gotchas), see
-[`path-b-run.md`](path-b-run.md). The steps below are the generic shape.
+This flow is specific to the (dropped) M10 distillation program; kept as reserve/history, not a
+live target. For the concrete, command-by-command Path B execution of this flow (the full-scale
+~1B distillation run — exact commands, pod sizing, R2 paths, cost, and the Path A gotchas), see
+[`reserve/path-b-run.md`](reserve/path-b-run.md). The steps below are the generic shape.
 
 1. **Local (Mac):** build + unit-test the data pipeline on a slice, the teacher loader, student
    init, distillation loss, and the manifest/sweep — all at toy scale.

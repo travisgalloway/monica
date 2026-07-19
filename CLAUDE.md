@@ -7,13 +7,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A proof-of-concept **Mamba-2 hybrid** (selective state-space + a few attention layers)
 language model, developed and validated on **Apple Silicon with MLX**, architected behind
 **one hardware seam** so it migrates to **CUDA** for a larger run with minimal rewrite. The
-active program is to **distil** a compact **~1B** hybrid student from a larger frozen teacher
-(`Qwen/Qwen3-4B-Thinking-2507`, Qwen3 tokenizer ~151,669; thinking-mode CoT is the headline lever),
-sweep a few architecture layouts cheaply, then post-train the winner for reasoning — tracked in
-[issue #65](https://github.com/travisgalloway/monica/issues/65). The original from-scratch
-pretrain path (OLMo tokenizer) is complete and is the validated foundation / production reserve.
-POC success is a smoothly decreasing held-out validation-perplexity curve plus a local-hardware
-win (context length + tok/s) — not benchmark scores.
+**active program is M12** — a from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts
+(MoE) code model** (the "MHM" spine): a mostly Mamba-2/SSD backbone with ~12.5% attention layers
+for cross-file recall and Jamba-style MoE on the MLPs, trained on a general multilingual
+Essential-Web + Stack-v2 corpus with its own byte-level BPE and FIM, at two sizes (small
+~120M-active/700M-total; large "Large A" ~700M-active/3.5B-total, sparse-upcycled from the small
+dense checkpoint). A **secondary axis (SSI)** studies feeding language-server / static-analysis
+signal into the model — a *validated clean-rate tool with a found functional ceiling*, not the
+lever for functional correctness (see `docs/design/13-code-model-moe.md`). Tracked in
+[issue #198](https://github.com/travisgalloway/monica/issues/198); design record in
+`docs/design/13-code-model-moe.md`. **Reserve/history:** the M10 distillation program (distil a
+~1B student from a frozen `Qwen/Qwen3-4B-Thinking-2507` teacher, #65) was dropped 2026-07-19 — its
+machinery is built and its design record kept under `docs/reserve/`. The original from-scratch
+pretrain path (OLMo tokenizer) is complete and is a validated foundation / production reserve.
+POC success is a smoothly improving curve plus a local-hardware win (context length + tok/s), with
+**BPB** the primary small-model metric — not benchmark scores.
 
 ## Commands
 
@@ -77,8 +85,9 @@ Consequences of the seam that shape how code is written:
 Model dims and run params live in `config/toy.yaml` and `config/poc.yaml`, loaded into
 `MambaConfig` (`src/model/blocks.py`). `MambaConfig.validate()` enforces cross-cutting
 invariants; **token packing is dtype-aware (#90)** — `vocab < 65536` packs as **uint16**
-(the original POC: OLMo-7B-hf), at/above it packs as **uint32** (the distillation student:
-Qwen3, vocab 151,669 — see `config/student-1b.yaml` and `docs/design/10-distillation.md`).
+(the original POC: OLMo-7B-hf), at/above it packs as **uint32** (the reserve distillation
+student: Qwen3, vocab 151,669 — see `config/student-1b.yaml` and
+`docs/reserve/10-distillation.md`).
 The ceiling `validate()` enforces is now uint32 (`2**32`). The YAML **comments are the
 decision record** — read them before changing values. Key locked decisions:
 
@@ -88,9 +97,9 @@ decision record** — read them before changing values. Key locked decisions:
   confirmed `<65536`, uint16), `precision fp16` + (dynamic) loss scaling (~16% faster than bf16
   on Metal per the M1 micro-benchmark — **do not assume bf16**), tied embedding **mandatory**
   (~38M of ~127M params), `grad_checkpoint: true` (required at this depth — see below).
-- **poc-qwen.yaml** (the **active ~205M POC run**): `poc.yaml`'s layers retargeted to
-  `vocab_size 151646` (Qwen2.5, uint32) so it trains on the distillation corpus
-  (`s3://monica-training/reserve-pretrain`) and mirrors the ~1B student's tokenizer/data path.
+- **poc-qwen.yaml** (the **completed ~205M POC run**, now reserve — val-ppl 75.7): `poc.yaml`'s
+  layers retargeted to `vocab_size 151646` (Qwen2.5, uint32) so it trained on the reserve corpus
+  (`s3://monica-training/reserve-pretrain`) and mirrored the (reserve) ~1B student's data path.
   Layers are unchanged (~88M); the larger tied embedding (~116M) dominates → **~205M total**,
   embedding-heavy (a deliberate trade for tokenizer alignment, not a clean 100M). Runs on CUDA
   via RunPod (see `config/poc-qwen.yaml`'s header runbook); split the R2 shard corpus into
@@ -148,54 +157,37 @@ The smoke gate stresses exactly this round-trip.
   serving/rewind, and the **CUDA backend (M8, A40-verified)**. **M9 post-training is done** —
   SFT/DPO/GRPO machinery on MLX with CUDA step-factory parity. The full 2–5B-token from-scratch
   run is still pending (user-driven).
-- The **active program is M10 — distillation** (**GitHub issue #65**, the live tracker): distil a
-  compact Mamba-2 hybrid student from a frozen teacher, sweep layouts, post-train the winner. The
-  core machinery is implemented — teacher loader (#93), student init (#99), staged distill loss
-  (#100), sweep harness (#98), and the distillation driver `scripts/distill.py` (#81). The
-  **remaining work is pod-gated runs**, not builds: the 8k corpus build, the teacher top-k
-  precompute (#94), the two-layout sweep (#81), and post-training/eval — per the #65 ordered chain.
+- The **active program is M12 — the from-scratch Mamba-2 hybrid MoE code model** (**GitHub issue
+  #198**, the live tracker; design record `docs/design/13-code-model-moe.md`): the "MHM" spine
+  (own BPE #191 → Essential-Web + Stack-v2 corpus #193 → aux-loss-free MoE router #213 → CUDA MoE
+  backend #214 → FIM/curriculum/eval build → ablation sweep #219 → small full run #222 →
+  sparse-upcycled large run #223), with **SSI** (structural-signal integration) as a secondary
+  measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
+  #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
+  gate). The bulk of the net-new work is the MoE build (#213/#214) — MoE is MLX-toy-only today.
+- **Reserve/history — M10 distillation (#65) was dropped 2026-07-19.** Its machinery is built
+  (teacher loader #93, student init #99, staged loss #100, sweep #98, `scripts/distill.py` #81)
+  and its design record + corpus/decontamination guidance + pod runbooks live under `docs/reserve/`
+  (e.g. `docs/reserve/10-distillation.md`). Do **not** describe distillation as active work.
 - `docs/design/` documents the design choices and rationale (start at
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
-  a milestone, tick its box in the relevant tracker (#2 / #65).
+  a milestone, tick its box in the relevant tracker (#2 / #198).
 - After finishing a milestone or backend change, run the smoke gate, not just pytest.
-- **The corpus-extension domains that chain multiple named sources under one pooled
-  `char_budget_cap`** (`conversation`, `reasoning`, `code_problems`, `code_instruct` in
-  `src/data/distill_sources.py`) **only exercise later sources in the list once the earlier
-  ones exhaust their real data** — a large source (e.g. `ultrachat`, `mot`, `opencodereasoning`,
-  `opencodeinstruct`) can single-handedly consume the whole pooled budget and starve its
-  siblings entirely (confirmed live, 2026-07-05: the first real corpus-extension build silently
-  produced zero docs from `oasst1`/`openthoughts2`/`rosetta-code`/`mceval`/`kodcode`/
-  `codefeedback`). To guarantee a specific source contributes, run it **alone** in its own
-  `distill_corpus_from_jsonl.py` invocation with its own token budget, then merge (renumber
-  shards to continue the existing manifest's sequence, merge `manifest.json`'s `shards` list +
-  aggregate counts, merge `provenance.json` — see the merge done for `poc-distill-ext`,
-  2026-07-05).
-- **Before trusting a new corpus-extension domain, decontamination-check it against the real
-  eval sets** (MATH-500, AIME25, LiveCodeBench, IFEval, or whichever this project's actual eval
-  axes are), not just against the license/field-shape dry run — a source named after or derived
-  from a benchmark (e.g. McEval-Instruct/McEval) is a contamination risk even when its license is
-  fine. Checked 2026-07-05 for the `poc-distill-ext` corpus: zero overlap for LiveCodeBench/
-  AIME25/IFEval; **5/500 MATH-500 problems (1%) matched `openwebmath`** (verbatim AoPS-forum
-  content that any large web crawl picks up — a known, low-severity, expected issue for this
-  class of source, not specific to a bad choice here). Accepted as-is; re-check if `openwebmath`
-  or the eval suite changes.
 
-## Licensing / usage-policy compliance (M10 distillation)
-
-M10 distils from **`Qwen/Qwen3-4B-Thinking-2507`, licensed plain unmodified Apache-2.0** (no
-distillation or competing-model restriction — confirmed against the live LICENSE file
-2026-07-05) using third-party corpora (the-stack, open-web-math, Wikipedia, OpenCodeReasoning,
-etc.), not Claude-generated content. Anthropic's Usage Policy's "model scraping/distillation"
-clause restricts using **Claude's own** inputs/outputs to train another model without
-authorization — it does not restrict using Claude as a coding assistant to build an ML pipeline
-that distills a *different* (non-Anthropic) model, confirmed against the live Usage Policy the
-same date. On that basis M10 does not appear to cross either line.
+## Licensing / usage-policy compliance
 
 **Standing rule — flag before crossing the actual boundary:** if any future task would have
 Claude *generate* text (synthetic examples, code samples, explanations) that gets fed into the
-pretrain/SFT/RL corpus as a training signal for the student model, **stop and flag it for
-review** rather than proceeding — that is the specific thing Anthropic's policy restricts, and
-this project has otherwise been careful to keep the corpus entirely third-party/non-Claude.
-Re-check both the teacher model's license and Anthropic's Usage Policy if either changes, or if
-the teacher model itself ever changes — this assessment is not a legal ruling and is only as
-current as the sources checked on the date above.
+pretrain/SFT/RL corpus as a training signal, **stop and flag it for review** rather than
+proceeding — that is the specific thing Anthropic's Usage Policy restricts. This project keeps
+its training corpus entirely third-party/non-Claude, and that must hold for M12 too (including any
+SSI reward / SFT corpus, e.g. #230's RLVR data). Anthropic's policy restricts training a model on
+**Claude's own** inputs/outputs; it does not restrict using Claude as a coding assistant to build
+the pipeline. Re-check the Usage Policy if it changes; this is not a legal ruling and is only as
+current as the last check.
+
+**Reserve (M10 distillation, dropped 2026-07-19):** the earlier assessment cleared distilling from
+**`Qwen/Qwen3-4B-Thinking-2507`, plain unmodified Apache-2.0** (no distillation/competing-model
+restriction — confirmed against the live LICENSE 2026-07-05) using third-party corpora, not
+Claude-generated content. Retained under `docs/reserve/` for the record; re-check both the teacher
+license and the Usage Policy if that path is ever revived.
