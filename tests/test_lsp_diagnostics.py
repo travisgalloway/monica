@@ -6,7 +6,8 @@ Real-compiler format pinning lives in `test_lsp_tsc.py`; this file only exercise
 
 from __future__ import annotations
 
-from src.lsp.diagnostics import (Diagnostic, MODULE_RESOLUTION_CODES, SUPPRESSION_RE,
+from src.lsp.diagnostics import (Diagnostic, FORWARD_RESOLVABLE_CODES,
+                                  MODULE_RESOLUTION_CODES, SUPPRESSION_RE,
                                   close_open_delimiters, drop_codes, filter_diagnostics,
                                   is_incomplete, is_source_balanced, line_col_to_offset,
                                   parse_tsc_output, statement_boundary, strip_suggestion)
@@ -309,6 +310,18 @@ def test_module_resolution_codes_membership():
     assert "TS2305" in MODULE_RESOLUTION_CODES        # no exported member
     # A genuine type error is NOT in the ignore set.
     assert "TS2339" not in MODULE_RESOLUTION_CODES     # property does not exist
+
+
+def test_forward_resolvable_codes_membership():
+    # #201 second hardening pass: codes whose firing is an artifact of a not-yet-generated
+    # later top-level construct (deferred on non-final block segments by the harness).
+    assert "TS2395" in FORWARD_RESOLVABLE_CODES        # merged-declaration export mismatch
+    assert "TS2449" in FORWARD_RESOLVABLE_CODES        # used before its declaration (hoisting)
+    # The cannot-find-name family is DELIBERATELY EXCLUDED (the loop's core error-catching
+    # competency), as is the noImplicitAny lint.
+    assert "TS2304" not in FORWARD_RESOLVABLE_CODES     # cannot find name
+    assert "TS2552" not in FORWARD_RESOLVABLE_CODES     # cannot find name (did you mean)
+    assert "TS7006" not in FORWARD_RESOLVABLE_CODES     # parameter implicitly 'any' (lint)
 
 
 def test_drop_codes_filters_only_the_named_codes():

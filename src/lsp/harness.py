@@ -42,9 +42,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..serve.sampling import sample
-from .diagnostics import (Diagnostic, SUPPRESSION_RE, close_open_delimiters,
-                           filter_diagnostics, is_incomplete, is_source_balanced,
-                           statement_boundary, strip_suggestion)
+from .diagnostics import (Diagnostic, FORWARD_RESOLVABLE_CODES, SUPPRESSION_RE,
+                           close_open_delimiters, filter_diagnostics, is_incomplete,
+                           is_source_balanced, statement_boundary, strip_suggestion)
 from .lm import LMAdapter, token_index_at
 
 DiagnoseFn = Callable[[str], List[Diagnostic]]
@@ -462,6 +462,17 @@ def generate_slow_loop(
             raw = _diag(source)
             filtered = filter_diagnostics(raw, frontier=frontier, generation_start=segment_start,
                                           source=source)
+            if not is_final_segment:
+                # Symmetric with the TS1xxx reinstatement below (#201/#212): a committed
+                # forward-resolvable TS2xxx (merged-declaration / used-before-declaration)
+                # at an INTERMEDIATE boundary is an artifact of a later top-level construct
+                # not yet generated, so it self-resolves as generation continues -- rolling
+                # back on it is over-repair. Defer it here, on non-final segments only; on
+                # the final segment it flows through `filter_diagnostics` unchanged above
+                # and is still caught. `filter_diagnostics` stays is_final_segment-agnostic;
+                # the harness owns that signal. (Mutually exclusive with the block below,
+                # which fires only when is_final_segment is True.)
+                filtered = [d for d in filtered if d.code not in FORWARD_RESOLVABLE_CODES]
             if hit_boundary and not filtered and is_source_balanced(source) and is_final_segment:
                 # filter_diagnostics unconditionally drops TS1xxx as mid-generation
                 # "still typing" noise -- correct while more tokens might still be
