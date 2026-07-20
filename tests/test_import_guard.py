@@ -52,6 +52,7 @@ PORTABLE_MODULES = [
     "src.data.pack",
     "src.data.split",
     "src.data.download",
+    "src.data.tokenizer_train",
     "src.data.instruct_format",
     "src.data.chat_template",
     "src.data.instruct_sft",
