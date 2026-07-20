@@ -89,9 +89,18 @@ def perplexity(mean_ce_nats: float) -> float:
     return float(np.exp(mean_ce_nats))
 
 
+def bits_per_byte(total_ce_nats: float, n_bytes: float) -> float:
+    """Tokenizer-invariant bits-per-byte (#192): total cross-entropy (nats) over a token
+    span, converted to bits (÷ ln2) and normalized by the UTF-8 byte length of that span.
+    BPB = total_ce_nats / (ln2 * n_bytes)."""
+    return float(total_ce_nats / (np.log(2.0) * n_bytes))
+
+
 def evaluate(model: ModelInterface, loader: PackedLoader,
              max_batches: Optional[int] = None, to_numpy=np.asarray) -> dict:
-    """Run `forward` over held-out batches; return {val_loss, val_perplexity}.
+    """Run `forward` over held-out batches; return {val_loss, val_perplexity}, plus
+    `val_bpb` (#192, tokenizer-invariant) when `loader` exposes corpus byte/token totals
+    (`.n_bytes`/`.n_tokens`) — omitted otherwise (legacy artifacts, no byte count).
 
     `to_numpy` converts backend logits to numpy (identity by default; on MLX pass
     a converter). Backend-free otherwise.
@@ -111,7 +120,14 @@ def evaluate(model: ModelInterface, loader: PackedLoader,
         # masks a misconfigured eval (empty/missing val split, wrong path).
         raise ValueError("evaluate(): no tokens evaluated — val loader is empty")
     mean_ce = total_ce / total_tokens
-    return {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}
+    result = {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}
+    n_bytes = getattr(loader, "n_bytes", None)
+    n_tokens_total = getattr(loader, "n_tokens", None)
+    if n_bytes and n_tokens_total:                 # both present and non-zero
+        bytes_per_token = n_bytes / n_tokens_total
+        effective_bytes = total_tokens * bytes_per_token
+        result["val_bpb"] = bits_per_byte(total_ce, effective_bytes)
+    return result
 
 
 def evaluate_masked(model: ModelInterface, loader,
@@ -120,7 +136,9 @@ def evaluate_masked(model: ModelInterface, loader,
 
     `loader` yields `(inputs, targets, mask)` (an `SFTLoader`). Each batch's masked CE is
     weighted by its response-token count so partial final batches do not bias the mean.
-    Returns {val_loss, val_perplexity}.
+    Returns {val_loss, val_perplexity}, plus `val_bpb` (#192) when `loader` exposes
+    `.n_bytes`/`.n_tokens` — SFT loaders don't carry byte counts today, so this is the
+    common case (omitted); kept for the day a byte-aware loader is passed.
     """
     total_ce, total_tokens = 0.0, 0.0
     for i, (inputs, targets, mask) in enumerate(loader.epoch()):
@@ -137,4 +155,11 @@ def evaluate_masked(model: ModelInterface, loader,
         raise ValueError("evaluate_masked(): no response tokens evaluated — "
                          "val loader is empty or fully masked")
     mean_ce = total_ce / total_tokens
-    return {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}
+    result = {"val_loss": mean_ce, "val_perplexity": perplexity(mean_ce)}
+    n_bytes = getattr(loader, "n_bytes", None)
+    n_tokens_total = getattr(loader, "n_tokens", None)
+    if n_bytes and n_tokens_total:
+        bytes_per_token = n_bytes / n_tokens_total
+        effective_bytes = total_tokens * bytes_per_token
+        result["val_bpb"] = bits_per_byte(total_ce, effective_bytes)
+    return result

@@ -43,12 +43,16 @@ def typecode_for(dtype) -> str:
 
 
 def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
-             chunk: int = 1 << 20, dtype=DTYPE) -> int:
+             chunk: int = 1 << 20, dtype=DTYPE, n_bytes: int | None = None) -> int:
     """Write a flat token file in `dtype` (uint16 or uint32). Returns the tokens written.
 
     Validates the ORIGINAL ids against `dtype`'s range before casting (casting first would
     silently wrap out-of-range / negative ids). The chosen dtype is recorded in the
-    `.meta.json` sidecar so `open_packed` reads the file back correctly."""
+    `.meta.json` sidecar so `open_packed` reads the file back correctly.
+
+    `n_bytes`, when given, is the UTF-8 byte count of the source text (#192, for the
+    tokenizer-invariant bits-per-byte metric) and is recorded in the sidecar too. Omitted
+    by default so legacy meta files stay byte-identical."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dtype = np.dtype(dtype)
@@ -79,8 +83,11 @@ def pack_ids(ids: Iterable[int] | np.ndarray, out_path: Path,
                 np.asarray(buf, dtype=dtype).tofile(f)
                 n += len(buf)
 
+    meta = {"dtype": dtype.name, "n_tokens": int(n)}
+    if n_bytes is not None:
+        meta["n_bytes"] = int(n_bytes)
     with open(out_path.with_suffix(".meta.json"), "w") as f:
-        json.dump({"dtype": dtype.name, "n_tokens": int(n)}, f)
+        json.dump(meta, f)
     return n
 
 
@@ -90,6 +97,30 @@ def packed_dtype(path: Path) -> np.dtype:
     if meta_path.exists():
         return np.dtype(json.loads(meta_path.read_text()).get("dtype", "uint16"))
     return np.dtype(DTYPE)
+
+
+def packed_n_bytes(path: Path) -> int | None:
+    """UTF-8 byte count recorded in `<name>.meta.json`, or None if absent (legacy/np path)."""
+    meta_path = Path(path).with_suffix(".meta.json")
+    if meta_path.exists():
+        v = json.loads(meta_path.read_text()).get("n_bytes")
+        return int(v) if v is not None else None
+    return None
+
+
+def set_packed_n_bytes(path: Path, n_bytes: int) -> None:
+    """Patch the `n_bytes` field into `<name>.meta.json` after the fact (#192).
+
+    For streaming callers (tokenize.py's `.bin` path) the byte count is only known once
+    the token generator has been fully drained BY `pack_ids` — it can't be passed as a
+    `pack_ids(..., n_bytes=...)` kwarg, because Python evaluates call arguments (including
+    a `stats["n_bytes"]` lookup) before the function body runs and drains the generator,
+    which would capture 0. Call this only after the `pack_ids` call that wrote `path`
+    returns."""
+    meta_path = Path(path).with_suffix(".meta.json")
+    meta = json.loads(meta_path.read_text())
+    meta["n_bytes"] = int(n_bytes)
+    meta_path.write_text(json.dumps(meta))
 
 
 def open_packed(path: Path) -> np.memmap:

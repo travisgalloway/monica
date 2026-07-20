@@ -7,8 +7,8 @@ import json
 import numpy as np
 import pytest
 
-from src.data.pack import (DTYPE, open_packed, pack_ids, packed_dtype, packing_dtype_for,
-                          typecode_for)
+from src.data.pack import (DTYPE, open_packed, pack_ids, packed_dtype, packed_n_bytes,
+                          packing_dtype_for, typecode_for)
 from src.data.loader import PackedLoader
 from src.data.shard import open_shard, pack_sequences
 from src.model.blocks import MambaConfig, load_config
@@ -78,6 +78,41 @@ def test_legacy_file_without_dtype_meta_defaults_uint16(tmp_path):
     (tmp_path / "legacy.meta.json").write_text(json.dumps({"n_tokens": 3}))
     assert packed_dtype(p) == np.dtype(np.uint16)
     assert list(open_packed(p)) == [1, 2, 3]
+
+
+# --- n_bytes (#192, bits-per-byte) ----------------------------------------------------
+def test_pack_ids_writes_n_bytes(tmp_path):
+    p = tmp_path / "bpb.bin"
+    pack_ids([1, 2, 3], p, n_bytes=17)
+    meta = json.loads((tmp_path / "bpb.meta.json").read_text())
+    assert meta["n_bytes"] == 17
+    assert packed_n_bytes(p) == 17
+
+
+def test_pack_ids_omits_n_bytes_by_default(tmp_path):
+    p = tmp_path / "no_bpb.bin"
+    pack_ids([1, 2, 3], p)
+    meta = json.loads((tmp_path / "no_bpb.meta.json").read_text())
+    assert "n_bytes" not in meta
+    assert packed_n_bytes(p) is None
+    # No regression: open_packed/packed_dtype still work with the key absent.
+    assert list(open_packed(p)) == [1, 2, 3]
+    assert packed_dtype(p) == np.dtype(np.uint16)
+
+
+def test_loader_exposes_n_bytes(tmp_path):
+    p_with = tmp_path / "with_bytes.bin"
+    ids = list(range(64))
+    pack_ids(ids, p_with, n_bytes=1000)
+    loader = PackedLoader(p_with, seq_len=4, batch_size=2, shuffle=False)
+    assert loader.n_bytes == 1000
+    assert loader.n_tokens == len(ids)
+
+    p_without = tmp_path / "without_bytes.bin"
+    pack_ids(ids, p_without)
+    loader2 = PackedLoader(p_without, seq_len=4, batch_size=2, shuffle=False)
+    assert loader2.n_bytes is None
+    assert loader2.n_tokens == len(ids)
 
 
 # --- shard path ----------------------------------------------------------------------

@@ -11,7 +11,7 @@ import sys
 import numpy as np
 
 from src.data.download import _normalize_doc
-from src.data.pack import pack_ids, open_packed
+from src.data.pack import pack_ids, open_packed, packed_n_bytes, set_packed_n_bytes
 from src.data.split import split_packed
 from src.data.loader import PackedLoader
 from src.data.tokenize import ByteTokenizer, tokenize_texts, _capped
@@ -58,6 +58,39 @@ def test_tokenize_streams_to_bin(tmp_path):
     assert n == len(expected)
     assert (tmp_path / "packed.meta.json").exists()
     assert np.array_equal(np.asarray(open_packed(out)), np.asarray(expected, np.uint16))
+
+
+def test_tokenize_counts_bytes(tmp_path):
+    # stats["n_bytes"] accumulates the UTF-8 byte length of each doc as it is consumed.
+    # It's only fully populated once the (lazy) generator has been drained by pack_ids,
+    # so n_bytes is patched into the sidecar afterward via set_packed_n_bytes (#192) --
+    # passing stats["n_bytes"] as a pack_ids(..., n_bytes=) kwarg would capture 0, since
+    # Python evaluates call arguments before pack_ids's body runs the generator.
+    tok = ByteTokenizer()
+    texts = ["abc", "de"]
+    out = tmp_path / "packed.bin"
+    stats = {"n_bytes": 0}
+    n = pack_ids(_capped(tokenize_texts(texts, tok, stats=stats), None), out)
+    set_packed_n_bytes(out, stats["n_bytes"])
+    assert stats["n_bytes"] == 5
+    assert n == 5
+    assert packed_n_bytes(out) == 5
+
+
+def test_split_propagates_n_bytes(tmp_path):
+    ids = np.arange(2000, dtype=np.uint16)
+    packed = tmp_path / "packed.bin"
+    pack_ids(ids, packed, n_bytes=4000)
+    train_p, val_p = split_packed(packed, tmp_path / "split", val_tokens=200)
+    assert packed_n_bytes(val_p) == round(4000 * 200 / 2000) == 400
+    assert packed_n_bytes(train_p) == 3600
+
+    # Legacy packed file (no n_bytes) -> both split metas carry no n_bytes either.
+    legacy = tmp_path / "legacy.bin"
+    pack_ids(ids, legacy)
+    train_p2, val_p2 = split_packed(legacy, tmp_path / "split_legacy", val_tokens=200)
+    assert packed_n_bytes(train_p2) is None
+    assert packed_n_bytes(val_p2) is None
 
 
 def test_capped_truncates_stream():
