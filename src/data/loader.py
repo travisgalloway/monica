@@ -15,7 +15,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 
-from .pack import open_packed
+from .pack import open_packed, packed_n_bytes
 
 
 class PackedLoader:
@@ -24,6 +24,8 @@ class PackedLoader:
                  vocab_size: Optional[int] = None):
         self.path = packed_path
         self.data = open_packed(packed_path)
+        self.n_tokens = int(self.data.shape[0])      # full packed token count (all tokens)
+        self.n_bytes = packed_n_bytes(packed_path)    # UTF-8 bytes if recorded, else None (#192)
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.shuffle = shuffle

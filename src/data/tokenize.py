@@ -130,10 +130,17 @@ def load_code_tokenizer(path):
     return CodeTokenizer(Tokenizer.from_file(str(p)))
 
 
-def tokenize_texts(texts: Iterable[str], tokenizer) -> Iterable[int]:
-    """Yield a flat stream of token ids across all documents (with EOS if available)."""
+def tokenize_texts(texts: Iterable[str], tokenizer, stats: dict | None = None) -> Iterable[int]:
+    """Yield a flat stream of token ids across all documents (with EOS if available).
+    When `stats` is given, accumulate the total UTF-8 byte count of the consumed docs
+    into stats['n_bytes'] (used for the tokenizer-invariant bits-per-byte metric, #192).
+    Counting happens per doc as it is pulled from this generator, so with `--max-tokens`
+    capping the stream mid-corpus only fully-started docs are counted (the final partial
+    doc may be slightly over-counted) — a coarse-cap corner, not special-cased."""
     eos = getattr(tokenizer, "eos_token_id", None)
     for text in texts:
+        if stats is not None:
+            stats["n_bytes"] += len(text.encode("utf-8"))
         for tid in tokenizer.encode(text):
             yield tid
         if eos is not None:
@@ -215,15 +222,22 @@ def main() -> None:
     dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen3)
     # Input is either a one-doc-per-line text file or corpus Parquet shards (dir/.parquet).
     with _open_texts(args.inp) as texts:
-        stream = _capped(tokenize_texts(texts, tok), args.max_tokens)
+        stats = {"n_bytes": 0}
+        stream = _capped(tokenize_texts(texts, tok, stats=stats), args.max_tokens)
         if args.out.suffix == ".bin":
             # Stream straight into the packed format (chunked, bounded memory) — this
             # folds the `pack` stage in for the scale run and writes the .meta.json
             # sidecar, so `split` can consume the output directly.
-            from .pack import pack_ids
+            from .pack import pack_ids, set_packed_n_bytes
 
+            # n_bytes can't be passed as a pack_ids(..., n_bytes=...) kwarg here: `stats`
+            # is only fully populated once pack_ids's internal loop has drained `stream`
+            # (a lazy generator), which happens *after* call-time argument evaluation.
+            # Patch it into the sidecar once pack_ids returns instead (#192).
             n = pack_ids(stream, args.out, dtype=dtype)
-            print(f"tokenized+packed {n} ids ({dtype.name}, vocab {tok.vocab_size}) -> {args.out}")
+            set_packed_n_bytes(args.out, stats["n_bytes"])
+            print(f"tokenized+packed {n} ids ({dtype.name}, vocab {tok.vocab_size}, "
+                  f"{stats['n_bytes']} bytes) -> {args.out}")
         else:
             import numpy as np
 

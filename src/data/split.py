@@ -14,7 +14,7 @@ from typing import Tuple
 
 import numpy as np
 
-from .pack import open_packed, packed_dtype
+from .pack import open_packed, packed_dtype, packed_n_bytes
 
 
 def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
@@ -27,6 +27,7 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
     out_dir.mkdir(parents=True, exist_ok=True)
     data = open_packed(packed_path)
     dtype = packed_dtype(packed_path)          # uint16 (POC) / uint32 (Qwen3) — preserved
+    src_bytes = packed_n_bytes(packed_path)     # UTF-8 byte count if recorded, else None (#192)
     n = data.shape[0]
     if val_tokens >= n:
         raise ValueError(f"val_tokens={val_tokens} >= total tokens={n}")
@@ -39,9 +40,19 @@ def split_packed(packed_path: Path, out_dir: Path, val_tokens: int,
     train_path, val_path = out_dir / "train.bin", out_dir / "val.bin"
     np.asarray(train, dtype=dtype).tofile(train_path)
     np.asarray(val, dtype=dtype).tofile(val_path)
-    for p, a in ((train_path, train), (val_path, val)):
+    # Propagate the corpus byte count proportionally to the token cut, preserving the
+    # uniform bytes/token ratio the bits-per-byte metric assumes (#192). None on legacy
+    # (no-n_bytes) packed files — val_bpb is simply omitted downstream.
+    val_bytes = train_bytes = None
+    if src_bytes is not None and n > 0:
+        val_bytes = round(src_bytes * (val_tokens / n))
+        train_bytes = src_bytes - val_bytes
+    for p, a, nb in ((train_path, train, train_bytes), (val_path, val, val_bytes)):
+        meta = {"dtype": dtype.name, "n_tokens": int(a.shape[0])}
+        if nb is not None:
+            meta["n_bytes"] = int(nb)
         with open(p.with_suffix(".meta.json"), "w") as f:
-            json.dump({"dtype": dtype.name, "n_tokens": int(a.shape[0])}, f)
+            json.dump(meta, f)
     return train_path, val_path
 
 
@@ -53,7 +64,12 @@ def split_shards(shard_dir: Path, out_dir: Path, val_tokens: int) -> Tuple[Path,
 
     Streams shard-by-shard (memmap -> file), so it is bounded in memory regardless of corpus size.
     Drops the `.bounds` sidecars — `PackedLoader` packs flat `seq_len` windows and ignores doc
-    boundaries (the #68 boundary-aware path is separate)."""
+    boundaries (the #68 boundary-aware path is separate).
+
+    Out of scope for #192: the shard manifest does not record UTF-8 byte counts, so the
+    outputs here carry no `n_bytes` and `val_bpb` is simply omitted downstream (graceful
+    degradation). Recording per-shard bytes in `shard.py`'s manifest is the follow-up needed
+    to light up BPB on this path (likely #193)."""
     from .shard import open_shard, read_manifest
 
     shard_dir = Path(shard_dir)
