@@ -32,6 +32,10 @@ mlx = ["mlx>=0.18"]
 # mlx_lm wraps `mlx` with prompt-cache trimming (make_prompt_cache/trim_prompt_cache)
 # the harness's rollback needs. Apple Silicon only, same as `mlx` above.
 lsp = ["mlx-lm>=0.28"]
+# Stage 1 of the #193 TS "LSP-clean" pipeline (src/data/stack_v2.py): resolves Stack v2
+# file content from Software Heritage's public S3 bucket. Lazy-imported inside
+# `resolve_swh_s3`/`download_contents` only, so the seam/import-guard stay clean.
+stack-v2 = ["boto3>=1.34"]
 # tree-sitter TypeScript parser for the #201 real-code over-repair probe builder
 # (true top-level statement boundaries; src/lsp/ts_boundaries.py, imported lazily so
 # the seam/import-guard are unaffected). Lightweight cross-platform wheels — kept out
