@@ -125,6 +125,15 @@ class MambaConfig:
     top_k: int = 2              # experts routed per token (1 <= top_k <= n_experts)
     # Expert FFN hidden width. None => d_inner (the Mamba inner width), a natural scale.
     moe_d_ff: Optional[int] = None
+    # fp8 expert GEMMs via NVIDIA Transformer Engine (#240), CUDA/Hopper-only. A separate
+    # bool rather than a `precision` value: fp8 applies ONLY to the three expert linears
+    # (gate/up/down), not the whole model — everything else stays at `precision`. A no-op
+    # on MLX and on non-Hopper CUDA (the `cuda_backend._te_linear_cls()` probe falls back
+    # to a plain bf16/fp16 `nn.Linear` when TE is absent or the device is pre-sm_90).
+    # DESIGN-ONLY today: #240 is blocked on #214 (no CUDA MoE experts exist yet to attach
+    # fp8 to) — this field and its validate() rule land now so #214 can wire fp8 in
+    # mechanically. See `cuda_backend.py`'s `# BLOCKED-ON-#214` block.
+    fp8_experts: bool = False
 
     # --- training-free long-context extension (#54) ---
     # INFERENCE-TIME receptive-field enlargement (LongMamba). Divides the SSM
@@ -347,6 +356,20 @@ class MambaConfig:
                 raise ValueError(
                     f"moe_every={self.moe_every} selects no layer at n_layers="
                     f"{self.n_layers} (after attention precedence)."
+                )
+        if self.fp8_experts:
+            # n_moe_layers==0 also catches moe_every=None (fp8 applies to expert GEMMs
+            # only, so it needs an actual MoE model, not just moe_every set).
+            if self.n_moe_layers == 0:
+                raise ValueError(
+                    "fp8_experts requires an MoE model (set moe_every); fp8 applies "
+                    "only to the expert GEMMs."
+                )
+            if self.precision not in ("bf16", "fp16"):
+                raise ValueError(
+                    f"fp8_experts requires precision in (bf16, fp16), got "
+                    f"{self.precision!r} (bf16 recommended: no loss-scaler conflict "
+                    "with Transformer Engine's DelayedScaling)."
                 )
 
     def to_dict(self) -> dict:

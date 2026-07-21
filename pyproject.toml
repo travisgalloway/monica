@@ -49,6 +49,12 @@ cuda = ["torch>=2.0"]
 # Note: mamba-ssm 2.x top-level package requires a compatible transformers version;
 # the ops submodule used here (mamba_ssm.ops.triton) works independently.
 cuda-fast = ["torch>=2.0", "mamba-ssm>=2.0", "causal-conv1d>=1.0"]
+# fp8 MoE-expert linears via NVIDIA Transformer Engine (#240), separate from `cuda-fast`:
+# TE is Hopper-only (sm_90+) and a heavy dependency, and fp8 applies only to the expert
+# GEMMs (gate/up/down), not the whole model. Auto-detected at runtime by
+# `cuda_backend._te_linear_cls()` and degrades to bf16/fp16 `nn.Linear` when absent or
+# pre-Hopper. DESIGN-ONLY today (blocked on #214's CUDA MoE experts).
+cuda-fp8 = ["torch>=2.0", "transformer-engine>=1.0"]
 # Experiment logging.
 logging = ["wandb>=0.16"]
 # Tier-2 OLMES/lm-eval benchmark harness. A heavy optional dependency (some

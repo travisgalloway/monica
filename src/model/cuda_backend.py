@@ -109,6 +109,86 @@ def _report_fast_path_once(device: "torch.device") -> None:
             RuntimeWarning, stacklevel=2)
 
 
+# --------------------------------------------------------------------------- #
+# fp8 MoE-expert linears (#240, DESIGN-ONLY, blocked on #214): NVIDIA Transformer
+# Engine (TE) `te.Linear` on Hopper+ (sm_90) for the expert gate/up/down GEMMs only.
+# Mirrors the `_fused_scan()` / `_report_fast_path_once()` lazy-probe + warn-once
+# pattern above. TE is not wired to any expert module yet — #214 has not built the
+# CUDA MoE `_Expert`/`MoEBlock` (that lives only in `mlx_backend.py:499-560` today) —
+# so this probe is complete and tested, but has no live caller besides its own tests.
+# --------------------------------------------------------------------------- #
+_TE_LINEAR_CLS = None      # sentinel: None = untried, False = unavailable/pre-Hopper
+
+
+def _te_linear_cls():
+    """Return `transformer_engine.pytorch.Linear`, or None if TE is unavailable or the
+    device is pre-Hopper. Mirrors `_fused_scan()`. Hopper check uses
+    `get_device_capability()[0] >= 9`: TE also runs on Blackwell (sm_100+), so `>= 9`
+    is the correct forward-compatible lower bound, not an exact sm_90 match."""
+    global _TE_LINEAR_CLS
+    if _TE_LINEAR_CLS is None:
+        try:
+            if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+                _TE_LINEAR_CLS = False
+                return None
+            from transformer_engine.pytorch import Linear as _TELinear
+            _TE_LINEAR_CLS = _TELinear
+        except Exception:
+            _TE_LINEAR_CLS = False
+    return _TE_LINEAR_CLS if _TE_LINEAR_CLS else None
+
+
+def fp8_status() -> bool:
+    """Is the fp8 expert-linear path (TE + Hopper) available? Mirrors `fast_path_status()`."""
+    return _te_linear_cls() is not None
+
+
+_FP8_STATUS_REPORTED = False
+
+
+def _report_fp8_status_once(device: "torch.device") -> None:
+    """On the first CUDA model built with `fp8_experts=True`, log whether TE fp8 is
+    active. Like `_report_fast_path_once`, a silent bf16 fallback on a GPU is a
+    throughput trap during a sweep — make it loud. Not called yet: no CUDA model
+    build path sets `fp8_experts` until #214 adds the CUDA MoE experts."""
+    global _FP8_STATUS_REPORTED
+    if _FP8_STATUS_REPORTED or device.type != "cuda":
+        return
+    _FP8_STATUS_REPORTED = True
+    if fp8_status():
+        print("[cuda] fp8 MoE experts ACTIVE (Transformer Engine, Hopper+).")
+    else:
+        import warnings
+        warnings.warn(
+            "[cuda] fp8_experts=True but Transformer Engine is unavailable or the "
+            "device is pre-Hopper — MoE experts fall back to bf16/fp16 nn.Linear. "
+            "Install the fp8 path with: pip install -e \".[dev,data,cuda-fp8]\" on a "
+            "Hopper+ (sm_90) GPU (#240).",
+            RuntimeWarning, stacklevel=2)
+
+
+# === BLOCKED-ON-#214: CUDA MoE experts do not exist yet ======================
+# When #214 adds the CUDA `_Expert`/`MoEBlock` (mirroring `mlx_backend.py:499-560`),
+# its three expert linears (gate/up/down) build via this helper: `te.Linear` when fp8
+# is available (TE keeps fp32 master weights and casts to fp8 at the GEMM, analogous
+# to `_linear`'s cast-at-matmul above), else a plain bf16/fp16 `nn.Linear`. This
+# function is DEFINED BUT NEVER CALLED until #214 lands — no CUDA `_Expert` exists to
+# call it. Un-dormanting is mechanical:
+#   _Expert.__init__: self.gate/up/down = _expert_linear(d_in, d_out, config, device)
+#   MoE grad-checkpoint wraps in `transformer_engine.pytorch.checkpoint`, NOT
+#     `torch.utils.checkpoint` — plain checkpoint double-updates the fp8 amax history
+#     on the recompute pass.
+#   model build calls `_report_fp8_status_once(device)` once fp8_experts is wired.
+# `te.Linear` graph-breaks `torch.compile` like `mamba-ssm` (safe/opaque, same as the
+# fused scan above).
+def _expert_linear(d_in: int, d_out: int, config: MambaConfig, device):
+    cls = _te_linear_cls() if getattr(config, "fp8_experts", False) else None
+    if cls is not None:
+        return cls(d_in, d_out, bias=False)        # TE fp8 GEMM, fp32 master weights
+    return nn.Linear(d_in, d_out, bias=False)       # bf16/fp16 fallback (no TE / pre-Hopper)
+# ===========================================================================
+
+
 def _silu(x: Array) -> Array:
     return F.silu(x)
 

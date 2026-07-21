@@ -35,6 +35,14 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   balancing router (#213, *land first*) → CUDA MoE backend (#214: dropless routing, shared expert,
   FSDP, sparse-upcycle init) → FIM collator (#215), length curriculum + dataloader-state resume
   (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
+  **Training-efficiency levers** (folded 2026-07-20 from the efficiency-survey review): hybrid
+  Muon+AdamW optimizer at the `make_optimizer` seam (#237), WSD warmup-stable-decay LR schedule
+  (#238), and `torch.compile` default-on for real CUDA runs (#239) — all sequenced to land
+  *before* the #219 sweep so it and the #222/#223 runs carry them; plus fp8 MoE-expert linears
+  (Transformer Engine / Hopper, #240), *gated on #214* and ahead of the #223 large run. (The repo
+  is already mature on the survey's biggest axes — data dedup/filtering, fused AdamW, SDPA, the
+  mamba-ssm kernels, grad-checkpoint — so these four are the net-new levers; #216 is the
+  length-curriculum lever.)
 - **MHM-P2e — Evals** (build first): code eval suite (#221), BPB (#192, primary).
 - **MHM-P3 — Small-model ablation sweep** (#219, ~$80–120 each): attention ratio 8/12/16%,
   d_state 128 vs 256, Jamba vs Routing-Mamba.
