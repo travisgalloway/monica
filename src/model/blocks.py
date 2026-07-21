@@ -66,6 +66,19 @@ class MambaConfig:
     # fp16 + loss scaling is the likely Metal-friendly choice).
     precision: str = "fp32"
 
+    # --- optimizer (#237) ---
+    # "adamw" (default) or "muon". Muon (MomentUm Orthogonalized by Newton-schulz) applies
+    # Newton-Schulz orthogonalization to 2D hidden weight matrices (see `is_muon_param`
+    # below); everything else (embeddings, norms, biases, 1D/3D params) stays on AdamW in
+    # a hybrid optimizer. CUDA-only for now (see `backend.py`); MLX raises NotImplementedError.
+    optimizer: str = "adamw"
+    # Matrix-group LR for Muon params. None => derived at optimizer-build time as `base_lr`
+    # (lr_scale 1.0) — a conservative starting point, NOT a tuned value. Published Muon runs
+    # typically use 10-50x the Adam LR; tune `muon_lr` explicitly for a real run.
+    muon_lr: Optional[float] = None
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+
     # SSD chunk length Q. None => the backend default (64). The chunked-matmul scan
     # processes the sequence in chunks of Q; the sequence is padded up to a multiple
     # of Q (padded steps carry zero input, trimmed from the output).
@@ -281,6 +294,14 @@ class MambaConfig:
             )
         if self.precision not in ("fp32", "fp16", "bf16"):
             raise ValueError(f"unknown precision {self.precision!r}")
+        if self.optimizer not in ("adamw", "muon"):
+            raise ValueError(f"unknown optimizer {self.optimizer!r}")
+        if not (0.0 <= self.muon_momentum < 1.0):
+            raise ValueError(f"muon_momentum={self.muon_momentum} must be in [0, 1)")
+        if self.muon_ns_steps < 1:
+            raise ValueError("muon_ns_steps must be >= 1")
+        if self.muon_lr is not None and self.muon_lr <= 0:
+            raise ValueError("muon_lr must be positive or None")
         if self.chunk_size is not None and self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive or None")
         if self.long_ctx_factor < 1.0:
@@ -332,3 +353,28 @@ def load_config(path: Union[str, Path]) -> MambaConfig:
     cfg = MambaConfig(**raw)
     cfg.validate()
     return cfg
+
+
+# --- Muon optimizer parameter taxonomy (#237) ---
+# Which named params route to Muon vs AdamW in the hybrid optimizer (`cuda_muon.py`).
+# Pure str/int logic, no backend import, so it lives above the seam and is shared by
+# the (below-seam) CUDA optimizer construction and the portable taxonomy test.
+_MUON_EXCLUDE_EXACT = {"embedding.weight", "lm_head.weight"}
+_MUON_EXCLUDE_SUFFIX = (".router.weight", ".dt_proj.weight")
+
+
+def is_muon_param(name: str, ndim: int) -> bool:
+    """True if the named parameter (given its `named_parameters()` dotted name and
+    `.ndim`) is a Muon candidate: 2D hidden weight matrices (Mamba in/out/x_proj,
+    attention qkv/o_proj, MoE expert gate/up/down), EXCLUDING the embedding, LM head,
+    router, and dt_proj (the dt-bias init is load-bearing — see `dt_min`/`dt_max`
+    above). Everything else (1D norms/biases/A_log/D, 3D conv weights, and the
+    excluded 2D matrices) stays on AdamW.
+    """
+    if ndim != 2:
+        return False
+    if name in _MUON_EXCLUDE_EXACT:
+        return False
+    if name.endswith(_MUON_EXCLUDE_SUFFIX):
+        return False
+    return True
