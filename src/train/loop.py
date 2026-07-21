@@ -7,7 +7,7 @@ Mac). This keeps the seam intact: the loop never imports MLX/CUDA.
 
 Required "robust run" features (wired on the Mac):
   * mixed precision (precision decided on MLX in M1; toy/smoke = fp32)
-  * warmup + cosine LR (schedule.CosineSchedule)
+  * warmup + cosine or WSD LR (schedule.make_schedule)
   * gradient accumulation
   * gradient clipping (proven necessary at toy scale)
   * checkpointing (portable weights + within-backend resume bundle)
@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 from ..model.interface import ModelInterface
 from ..data.loader import PackedLoader
-from .schedule import CosineSchedule
+from .schedule import make_schedule
 
 
 @dataclass
@@ -38,6 +38,8 @@ class TrainConfig:
     ckpt_every: int = 100
     out_dir: str = "runs/toy"
     seed: int = 0
+    lr_schedule: str = "cosine"
+    decay_frac: float = 0.2
 
 
 # A backend-provided step: (model, micro_batches, lr) -> dict(loss=, grad_norm=, ...).
@@ -85,7 +87,7 @@ def train(
     `val_eval(model)` returns a metrics dict (e.g. {val_loss, val_perplexity}) that
     is merged into the logged payload.
     """
-    schedule = CosineSchedule(cfg.base_lr, cfg.warmup_steps, cfg.total_steps)
+    schedule = make_schedule(cfg)
     step = start_step
     log = logger or (lambda payload: print(payload))
     tokens_per_step = train_loader.batch_size * train_loader.seq_len * cfg.grad_accum

@@ -49,6 +49,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--base-lr", type=float, default=3e-4)
     ap.add_argument("--warmup-steps", type=int, default=None,
                     help="default: total_steps // 100 (min 1)")
+    ap.add_argument("--lr-schedule", choices=("cosine", "wsd"), default="cosine")
+    ap.add_argument("--decay-frac", type=float, default=0.2,
+                    help="WSD: fraction of total_steps spent decaying")
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--eval-every", type=int, default=200)
@@ -136,11 +139,13 @@ def main() -> None:
         grad_accum=args.grad_accum, grad_clip=args.grad_clip,
         log_every=args.log_every, eval_every=args.eval_every,
         ckpt_every=args.ckpt_every, out_dir=str(out), seed=args.seed,
+        lr_schedule=args.lr_schedule, decay_frac=args.decay_frac,
     )
 
     n_params = sum(int(np.asarray(v).size) for _, v in model._portable_state_dict().items())
     print(f"[run] params~{n_params/1e6:.1f}M  total_steps={total_steps}  warmup={warmup}  "
-          f"tokens/step={tokens_per_step}  precision={cfg.precision}")
+          f"tokens/step={tokens_per_step}  precision={cfg.precision}  "
+          f"schedule={args.lr_schedule}")
 
     train(model, train_loader, tcfg, train_step,
           val_eval=val_eval, logger=logger, on_checkpoint=on_checkpoint,
