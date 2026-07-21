@@ -90,12 +90,17 @@ class MambaConfig:
     # 32GB and swaps). Off for toy/smoke (tiny; keep exact-resume cheap).
     grad_checkpoint: bool = False
 
-    # CUDA-only (#145): compile the student forward with torch.compile (inductor) to fuse
-    # the SSD scan + hybrid forward's many small ops (~1.3-2x on GPU). Opt-in and default
-    # OFF so every parity/conformance/smoke path runs the eager code unchanged. A no-op on
-    # MLX (the MLX backend never reads it) and on the eager torch path. The optional
-    # mamba-ssm/causal-conv1d kernels (#40) graph-break inductor around them (safe).
-    torch_compile: bool = False
+    # CUDA-only (#145, #239): compile the student forward with torch.compile (inductor) to
+    # fuse the SSD scan + hybrid forward's many small ops (~1.3-2x on GPU). Tri-state:
+    #   None  (default) = AUTO — the CUDA backend compiles iff it is built on a real CUDA
+    #     device and torch >= 2.1; eager everywhere else (CPU parity, MLX). This makes
+    #     compile the default for real (CUDA) runs without touching the CPU parity surface.
+    #   True  = force compile on whatever device the model is built on (used by the parity
+    #     tests below, which build on CPU).
+    #   False = force eager.
+    # A no-op on MLX (the MLX backend never reads it). The optional mamba-ssm/causal-conv1d
+    # kernels (#40) graph-break inductor around them (safe).
+    torch_compile: Optional[bool] = None
 
     # --- hybrid attention (#67) ---
     # Make the model a Mamba-2 HYBRID: every Nth block is a causal multi-head
@@ -296,6 +301,8 @@ class MambaConfig:
             raise ValueError(f"unknown precision {self.precision!r}")
         if self.optimizer not in ("adamw", "muon"):
             raise ValueError(f"unknown optimizer {self.optimizer!r}")
+        if self.torch_compile not in (None, True, False):
+            raise ValueError("torch_compile must be None (auto), True, or False")
         if not (0.0 <= self.muon_momentum < 1.0):
             raise ValueError(f"muon_momentum={self.muon_momentum} must be in [0, 1)")
         if self.muon_ns_steps < 1:
