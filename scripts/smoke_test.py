@@ -36,6 +36,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("runs/smoke"))
     ap.add_argument("--atol", type=float, default=1e-4)
+    ap.add_argument("--compile", action="store_true",
+                    help="also run ONE torch.compile'd training step (CUDA + .[cuda-fast] "
+                         "pod) and assert it does not hard-error; the main resume-exactness "
+                         "run stays eager. Verifies the Triton graph-break path on hardware.")
     args = ap.parse_args()
 
     # Backend selection stays behind the seam factory; only portable modules are
@@ -127,6 +131,28 @@ def main() -> None:
                               args.batch_size, shuffle=False, drop_last=False)
     val = evaluate(model_b, val_loader, max_batches=4, to_numpy=np_to)
     print(f"[eval] val_loss={val['val_loss']:.4f}  val_perplexity={val['val_perplexity']:.4f}")
+
+    # --- 5) optional: one torch.compile'd step (#239) ---------------------------
+    # Isolated from the resume math above (fresh model, own optimizer/step_fn) so
+    # --compile can never perturb the gated eager comparison; this only asserts the
+    # compiled Triton graph-break path runs without a hard error on real hardware.
+    if args.compile:
+        if backend.name != "cuda":
+            print("[compile] skipped (only meaningful on the CUDA backend)")
+        else:
+            import dataclasses
+            import math as _math
+
+            ccfg = dataclasses.replace(cfg, torch_compile=True)
+            backend.seed(args.seed)
+            cmodel = backend.model_cls(ccfg)
+            copt = backend.make_optimizer(cmodel, sched.base_lr)
+            cstep = backend.make_train_step(cmodel, copt, grad_clip=1.0)
+            inp, tgt = batches[0]
+            out_c = cstep(cmodel, [(inp, tgt)], sched.lr_at(0))
+            assert _math.isfinite(float(out_c["loss"])), \
+                f"compiled step loss not finite: {out_c['loss']}"
+            print(f"[compile] one compiled step OK  loss={float(out_c['loss']):.5f}")
 
     print("\nSMOKE TEST PASSED ✅  resume is exact and eval runs.")
 

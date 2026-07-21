@@ -563,6 +563,13 @@ class AttentionBlock(nn.Module):
         return x + _linear(self.o_proj, _cast(out, cd), cd), (k_cache, v_cache)
 
 
+def _torch_ge_21() -> bool:
+    # "2.3.1+cu121" -> (2, 3); robust to the +cuXXX / +cpu local suffix.
+    parts = torch.__version__.split("+")[0].split(".")
+    major, minor = int(parts[0]), int(parts[1])
+    return (major, minor) >= (2, 1)
+
+
 # --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
@@ -594,11 +601,22 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self._state = None
         self.to(self._device)
         _report_fast_path_once(self._device)
-        # torch.compile (#145): fuse the pure-tensor forward (layer loop + head) via inductor.
-        # Opt-in (default off) so the eager path — and every parity/conformance run — is
-        # untouched. We compile the inner `_forward_compute` rather than `forward`, which
-        # opens with a numpy->tensor boundary that isn't cleanly traceable. A no-op when off.
-        if config.torch_compile:
+        # torch.compile (#145, #239): fuse the pure-tensor forward (layer loop + head) via
+        # inductor. Tri-state config.torch_compile: None = AUTO (compile only on a real CUDA
+        # device with torch>=2.1 — the real-run path), True/False = explicit override honored
+        # on any device. NEVER auto-compile on CPU: CPU is the fp32 parity/conformance surface
+        # (tests/test_cuda_parity.py builds on CPU) and must stay eager. We compile the inner
+        # `_forward_compute` (not `forward`, which opens with an untraceable numpy->tensor
+        # boundary). Bare torch.compile — no max-autotune (long autotune + fragile capture);
+        # inductor's automatic dynamic-shape promotion handles varying (B, L). The optional
+        # mamba-ssm/causal-conv1d kernels graph-break inductor around them (safe).
+        # CUDA graphs: DEFERRED (out of scope) — follow-up is to profile launch-overhead at
+        # the small M12 rung and add mode="reduce-overhead" only if a stall shows.
+        if config.torch_compile is None:
+            self._compiled = self._device.type == "cuda" and _torch_ge_21()
+        else:
+            self._compiled = bool(config.torch_compile)
+        if self._compiled:
             self._forward_compute = torch.compile(self._forward_compute)
 
     def _head(self, h: Array) -> Array:

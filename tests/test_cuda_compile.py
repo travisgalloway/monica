@@ -79,3 +79,42 @@ def test_compiled_grad_checkpoint_backward_runs(_compile_works):
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads, "no gradients populated"
     assert all(torch.isfinite(g).all() for g in grads), "non-finite gradient"
+
+
+def test_compiled_forward_matches_eager_pure_mamba(_compile_works):
+    """Compiled == eager at fp32 ~1e-4 for a PURE-Mamba config (no attention block)."""
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    eager = CUDAMambaModel(cfg)
+    eager.eval()
+
+    cfg_c = load_config("config/toy.yaml")
+    cfg_c.torch_compile = True
+    compiled = CUDAMambaModel(cfg_c)
+    compiled.load_state_dict(eager.state_dict())
+    compiled.eval()
+
+    B, L = 2, cfg.seq_len
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+    with torch.no_grad():
+        y_eager = _np(eager.forward(tokens))
+        y_comp = _np(compiled.forward(tokens))
+    max_abs = float(np.max(np.abs(y_eager - y_comp)))
+    assert np.allclose(y_eager, y_comp, rtol=1e-4, atol=1e-5), f"max|diff|={max_abs:.3e}"
+
+
+def test_torch_compile_auto_resolves_eager_on_cpu():
+    """Default (None) => AUTO: a CPU-built model must NOT compile (CPU is the parity
+    surface). Asserted via the resolved `_compiled` decision flag."""
+    cfg = load_config("config/toy.yaml")
+    assert cfg.torch_compile is None          # tri-state default
+    model = CUDAMambaModel(cfg)               # device defaults to CPU
+    assert model._compiled is False
+
+
+def test_torch_compile_explicit_true_compiles_on_cpu(_compile_works):
+    """Explicit True is honored on ANY device (the parity tests rely on this)."""
+    cfg = load_config("config/toy.yaml")
+    cfg.torch_compile = True
+    model = CUDAMambaModel(cfg)
+    assert model._compiled is True
