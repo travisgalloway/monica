@@ -1,0 +1,32 @@
+# Toy config for the milestone-1..4 smoke test, hybrid Muon + AdamW optimizer (#237).
+# Same tiny/fp32 shape as toy.yaml (exact-resume) but exercises `optimizer: muon` — CUDA
+# backend only; the CUDA backend runs on CPU on the Mac dev box (fused=False fallback),
+# so this is fully validatable locally via `scripts/smoke_test.py --backend cuda`.
+d_model: 64
+n_layers: 2
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
+d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 256        # byte fallback tokenizer for offline smoke testing
+seq_len: 128
+tie_embeddings: true
+
+precision: fp32        # correctness first; also keeps Newton-Schulz's fp32 path exact
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny model -> not needed; keep smoke exact-resume cheap
+
+# --- optimizer (#237) ---
+optimizer: muon
+# muon_lr omitted on purpose: derives to base_lr at optimizer-build time (lr_scale ==
+# 1.0), the simplest/most-deterministic path for the smoke gate. NOT a tuned value —
+# published Muon runs typically use 10-50x the Adam LR.
+muon_momentum: 0.95
+muon_ns_steps: 5
+
+# dt-projection bias init (load-bearing)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

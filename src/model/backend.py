@@ -128,15 +128,25 @@ def _mlx_backend() -> Backend:
         from .mlx_distill import make_distill_train_step
         return make_distill_train_step(*args, **kwargs)
 
+    def _make_optimizer(model, base_lr):
+        # MLX AdamW holds no parameter refs at construction (params arrive at update);
+        # `model` is read only for `.config.optimizer` (a uniform signature otherwise).
+        # Muon (#237) is CUDA-only for now — raise loudly rather than silently falling
+        # back to AdamW on a config that asked for Muon.
+        if model.config.optimizer == "muon":
+            raise NotImplementedError(
+                "Muon is CUDA-only (#237); the MLX Newton-Schulz port is a scoped "
+                "follow-up."
+            )
+        return optim.AdamW(learning_rate=base_lr)
+
     return Backend(
         name="mlx",
         model_cls=MLXMambaModel,
         make_train_step=make_train_step,
         save_optimizer=save_optimizer,
         load_optimizer=load_optimizer,
-        # MLX AdamW holds no parameter refs at construction (params arrive at update);
-        # `model` is accepted for a uniform signature and ignored.
-        make_optimizer=lambda model, base_lr: optim.AdamW(learning_rate=base_lr),
+        make_optimizer=_make_optimizer,
         seed=lambda value: mx.random.seed(value),
         to_numpy=lambda a: np.array(a),
         make_sft_train_step=make_sft_train_step,
@@ -227,7 +237,25 @@ def _cuda_backend() -> Backend:
         # on H100 (fewer kernel launches), no numerical change. It requires all params on a
         # CUDA device, so gate on it; on CPU (torch-CPU parity runs) fall back to the default.
         fused = _dev.startswith("cuda")
-        return torch.optim.AdamW(model.parameters(), lr=base_lr, fused=fused)
+        cfg = model.config
+        if cfg.optimizer == "adamw":
+            return torch.optim.AdamW(model.parameters(), lr=base_lr, fused=fused)
+        if cfg.optimizer == "muon":
+            # Hybrid optimizer (#237): 2D hidden weight matrices go through Newton-Schulz
+            # orthogonalization (Muon); everything else stays on AdamW. `is_muon_param` is
+            # portable (src.model.blocks); the Muon/HybridOptimizer classes are torch-only
+            # and stay lazily imported here, matching this module's lazy-import style.
+            from .blocks import is_muon_param
+            from .cuda_muon import Muon, HybridOptimizer
+            muon_params, adam_params = [], []
+            for name, p in model.named_parameters():
+                (muon_params if is_muon_param(name, p.ndim) else adam_params).append(p)
+            muon_lr = cfg.muon_lr if cfg.muon_lr is not None else base_lr
+            adam = torch.optim.AdamW(adam_params, lr=base_lr, fused=fused) if adam_params else None
+            muon = Muon(muon_params, lr=base_lr, lr_scale=muon_lr / base_lr,
+                       momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps) if muon_params else None
+            return HybridOptimizer(adam, muon)
+        raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
     return Backend(
         name="cuda",
