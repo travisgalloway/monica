@@ -18,6 +18,12 @@ public enum TokenizerError: Error, CustomStringConvertible {
 }
 
 public struct TokenizerFormat: Codable, Equatable {
+    /// The only on-disk schema version this build understands. A newer artifact is rejected by
+    /// `validate()` rather than silently decoded with v1 semantics.
+    public static let supportedVersion = 1
+    /// The reserved EOS / document-separator token, fixed at id 0.
+    public static let eosToken = "<|endoftext|>"
+
     public var version: Int
     /// Reserved special tokens, ids 0 ..< count. Index 0 is EOS/document separator.
     public var specialTokens: [String]
@@ -56,11 +62,20 @@ public struct TokenizerFormat: Codable, Equatable {
     /// `specialTokens.count + 256 + m`, so its two parent ids must reference only tokens
     /// defined before it (< that id).
     public func validate() throws {
+        guard version == Self.supportedVersion else {
+            throw TokenizerError.invalidFormat(
+                "unsupported version \(version) (this build supports version \(Self.supportedVersion))")
+        }
         guard digitGroup > 0 else {
             throw TokenizerError.invalidFormat("digit_group must be positive, got \(digitGroup)")
         }
-        guard !specialTokens.isEmpty else {
-            throw TokenizerError.invalidFormat("special_tokens must be non-empty")
+        // EOS is reserved at id 0; the Tokenizer relies on that, so enforce it rather than
+        // only checking non-emptiness (a malformed artifact could otherwise terminate/pack on
+        // the wrong token).
+        guard specialTokens.first == Self.eosToken else {
+            let got = specialTokens.first.map { "\"\($0)\"" } ?? "none"
+            throw TokenizerError.invalidFormat(
+                "special_tokens[0] must be \"\(Self.eosToken)\" (the reserved EOS/id 0), got \(got)")
         }
         let baseOffset = specialTokens.count + 256
         for (m, pair) in merges.enumerated() {

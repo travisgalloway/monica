@@ -137,7 +137,7 @@ def test_run_pipeline_applies_prettier_when_runner_given(tmp_path):
 
 def test_manifest_written(tmp_path):
     # The manifest + cleaned.jsonl are always written, even for a tiny corpus (this is a
-    # SAMPLE run). n_cleaned_docs == 0 is valid, not an error.
+    # SAMPLE run). Here the single clean doc survives, so n_cleaned_docs == 1.
     records = _records(["const x=1"])
     out_dir = tmp_path / "out6"
     manifest = run_pipeline(records, out_dir, seq_len=1_000_000, tsc_runner=_StubTsc())

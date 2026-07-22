@@ -57,6 +57,10 @@ do {
           "malformed merge (not a pair) is rejected")
     check(rejects(TokenizerFormat(specialTokens: SPECIALS, digitGroup: 0, merges: [])),
           "non-positive digit_group is rejected")
+    check(rejects(TokenizerFormat(version: 2, specialTokens: SPECIALS, digitGroup: 3, merges: [])),
+          "unsupported version is rejected")
+    check(rejects(TokenizerFormat(specialTokens: ["<mask>", "<|endoftext|>"], digitGroup: 3, merges: [])),
+          "EOS not at id 0 is rejected")
 }
 
 // MARK: specials

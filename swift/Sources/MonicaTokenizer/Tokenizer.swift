@@ -15,6 +15,10 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
     public var vocabSize: Int { bpe.vocabSize }
 
     public init(format: TokenizerFormat) {
+        // Fail deterministically on a hand-constructed invalid format (the throwing
+        // `init(contentsOf:)` path reports the same message cleanly before reaching here);
+        // without this, a bad format would crash with an index-out-of-range inside BPE.init.
+        do { try format.validate() } catch { preconditionFailure("\(error)") }
         bpe = BPE(format: format)
         digitGroup = format.digitGroup
         eosTokenId = 0
