@@ -138,6 +138,10 @@ do {
           "pack throws on non-positive seqLen")
     check(packThrows { _ = try Packing.pack(docs: [[70000]], outDir: dir, seqLen: 8) },
           "pack throws on out-of-uint16 token id")
+    check(packThrows { _ = try Packing.pack(docs: [[1]], outDir: dir, seqLen: 8, shardSizeMB: 0) },
+          "pack throws on non-positive shardSizeMB")
+    check(packThrows { _ = try Packing.pack(docs: [[1]], outDir: dir, seqLen: 8, shardSizeMB: Int.max) },
+          "pack throws on overflowing shardSizeMB")
 }
 
 // MARK: report

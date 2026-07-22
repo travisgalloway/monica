@@ -64,8 +64,16 @@ public enum Packing {
         }
         try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
+        guard shardSizeMB > 0 else {
+            throw PackingError.invalidArgument("shardSizeMB must be positive, got \(shardSizeMB)")
+        }
         let bytesPerToken = 2
-        var budget = max(seqLen, (shardSizeMB * (1 << 20)) / bytesPerToken)
+        // Guard the MB→bytes multiply against Int overflow for an unreasonable --shard-size-mb.
+        let (byteBudget, overflow) = shardSizeMB.multipliedReportingOverflow(by: 1 << 20)
+        guard !overflow else {
+            throw PackingError.invalidArgument("shardSizeMB \(shardSizeMB) is too large")
+        }
+        var budget = max(seqLen, byteBudget / bytesPerToken)
         budget -= budget % seqLen
 
         var tokBuf: [UInt16] = []
