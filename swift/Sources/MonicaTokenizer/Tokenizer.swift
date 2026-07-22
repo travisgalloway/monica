@@ -38,15 +38,26 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
     public func decode(_ ids: [Int]) -> String { bpe.decode(ids) }
 
     /// Encode many documents concurrently (data-parallel across docs; identical on Mac/Linux).
-    public func batchEncode(_ texts: [String]) async -> [[Int]] {
+    /// Concurrency is **bounded** to `maxConcurrency` in-flight tasks (default = core count):
+    /// a large corpus would otherwise spawn one task per document and pile up memory. Output
+    /// order matches input order regardless of completion order.
+    public func batchEncode(_ texts: [String],
+                            maxConcurrency: Int = ProcessInfo.processInfo.activeProcessorCount) async -> [[Int]] {
+        var result = [[Int]](repeating: [], count: texts.count)
+        let limit = max(1, maxConcurrency)
         await withTaskGroup(of: (Int, [Int]).self) { group in
-            for (i, t) in texts.enumerated() {
-                group.addTask { (i, self.encode(t)) }
+            var next = 0
+            while next < texts.count && next < limit {           // prime up to `limit` tasks
+                let i = next; group.addTask { (i, self.encode(texts[i])) }; next += 1
             }
-            var result = [[Int]](repeating: [], count: texts.count)
-            for await (i, ids) in group { result[i] = ids }
-            return result
+            for await (i, ids) in group {                        // drain, refilling one-for-one
+                result[i] = ids
+                if next < texts.count {
+                    let j = next; group.addTask { (j, self.encode(texts[j])) }; next += 1
+                }
+            }
         }
+        return result
     }
 
     // MARK: - internals

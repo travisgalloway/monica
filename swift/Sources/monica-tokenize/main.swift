@@ -26,6 +26,10 @@ func fail(_ msg: String) -> Never {
     exit(1)
 }
 
+func warn(_ msg: String) {
+    FileHandle.standardError.write(Data("warning: \(msg)\n".utf8))
+}
+
 /// Minimal `--flag value` parser. Bare flags (no following value) map to "".
 func parseFlags(_ args: [String]) -> [String: String] {
     var out: [String: String] = [:]
@@ -71,18 +75,33 @@ func readDocs(_ path: String) -> [String] {
         // Sort for a stable, deterministic doc order — `enumerator` traversal order is not
         // guaranteed, and for `pack` that would make shard output nondeterministic.
         files.sort { $0.path < $1.path }
-        return files.compactMap { try? String(contentsOf: $0, encoding: .utf8) }
+        var docs: [String] = []
+        var skipped = 0
+        for f in files {
+            if let t = try? String(contentsOf: f, encoding: .utf8) { docs.append(t) } else { skipped += 1 }
+        }
+        if skipped > 0 { warn("skipped \(skipped) unreadable file(s) under \(path)") }
+        return docs
     }
     guard let content = try? String(contentsOf: url, encoding: .utf8) else {
         fail("cannot read \(path)")
     }
     if path.hasSuffix(".jsonl") {
-        return content.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-            else { return nil }
-            return obj["text"] as? String
+        // Skip is deterministic (same input -> same result), but not silent: report the count
+        // so a malformed corpus doesn't quietly change the training set unnoticed.
+        var docs: [String] = []
+        var skipped = 0
+        for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
+            if let d = line.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let text = obj["text"] as? String {
+                docs.append(text)
+            } else {
+                skipped += 1
+            }
         }
+        if skipped > 0 { warn("skipped \(skipped) malformed/text-less JSONL line(s) in \(path)") }
+        return docs
     }
     return [content]
 }
