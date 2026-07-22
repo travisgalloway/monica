@@ -156,8 +156,13 @@ func cmdEncode(_ flags: [String: String]) {
 
 func cmdDecode(_ flags: [String: String]) {
     let tok = loadTokenizer(flags)
+    // Fail fast on any non-integer token — silently dropping it would decode the wrong text
+    // (a real hazard when debugging pack/unpack), so a stray character is an error, not a skip.
     let ids = readInput(flags).split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "," })
-        .compactMap { Int($0) }
+        .map { field -> Int in
+            guard let id = Int(field) else { fail("decode: non-integer token id '\(field)'") }
+            return id
+        }
     print(tok.decode(ids), terminator: "")
 }
 
