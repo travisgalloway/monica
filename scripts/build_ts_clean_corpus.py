@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build the M12 TS "LSP-clean" corpus: Stack v2 TypeScript -> dedup -> prettier -> the
-LSP-clean filter -> tokenize/pack (#193).
+LSP-clean filter -> cleaned JSONL (#193). Tokenize + pack is now the native Swift
+`monica-tokenize pack` step (`swift/`, #191/M13), which consumes this stage's `cleaned.jsonl`.
 
 WHY THIS EXISTS. Locked composability decision #3 (`docs/design/13-code-model-moe.md`):
 train the code model only on TypeScript `tsc --noEmit` already accepts with **zero**
@@ -10,9 +11,11 @@ of tsc-flagged code. #199's Phase-0 gate is CLOSED with a positive lift (logit-l
 hard-ban raised diagnostic-clean rate 0.312 -> 0.688), so the pipeline this script drives
 is validated machinery, not a speculative bet.
 
-This issue's acceptance is a **sample** end-to-end run + a uint16-verified packed corpus +
-a manifest recording the LSP-clean filter rate -- NOT the full ~2-3B-token build (that
-spend is a separate, user-driven decision once #199 unblocks it).
+This issue's acceptance is a **sample** end-to-end run -> a `cleaned.jsonl` + a manifest
+recording the LSP-clean filter rate -- NOT the full ~2-3B-token build (that spend is a
+separate, user-driven decision once #199 unblocks it). The uint16 packing is verified
+separately by the Swift `monica-tokenize` toolchain (swift/, its self-check + the
+Python-reads-Swift-shards smoke).
 
 THE FIVE STAGES:
   1. Stream Stack v2 TypeScript metadata (`bigcode/the-stack-v2-dedup`), resolve each
@@ -28,8 +31,9 @@ THE FIVE STAGES:
      real-world files aren't all marked dirty -- the load-bearing lesson from
      `scripts/build_clean_prefix_set.py`). Gracefully skipped (pass-through, unfiltered,
      filter rate recorded as `null`) on a host with no local `tsc`.
-  5. Tokenize with the #191 shared code BPE and pack into fixed-length uint16 sequences
-     (`src.data.tokenize.load_code_tokenizer` + `src.data.shard.pack_sequences`).
+  5. Write the surviving cleaned files as `{"text": ...}` JSONL (`cleaned.jsonl`). The
+     native Swift `monica-tokenize pack` then tokenizes + packs this into fixed-length
+     uint16 shards (same `src/data/shard.py` layout the training loop reads).
 
 Stages 2-5's logic lives in `run_pipeline` below (importable, not locked inside `main`), so
 `tests/test_build_ts_clean_corpus.py` can drive the whole chain OFFLINE with a stub tsc
@@ -38,13 +42,16 @@ with no SWH/AWS credentials.
 
 RUN RECIPES.
 
-Offline dry-run (no creds, no toolchain -- exercises Stages 2-5 + the manifest + uint16
-packing against a tiny local JSONL of `{"text": ...}` rows):
+Offline dry-run (no creds, no toolchain -- exercises Stages 2-5 + the manifest against a
+tiny local JSONL of `{"text": ...}` rows):
 
     .venv/bin/python scripts/build_ts_clean_corpus.py \\
         --from-jsonl /tmp/sample.jsonl \\
-        --tokenizer-path artifacts/code-tokenizer/tokenizer.json \\
         --out /tmp/ts-clean-sample
+    # then tokenize + pack natively:
+    ( cd swift && swift run monica-tokenize pack \\
+        --tokenizer /tmp/tokenizer.json \\
+        --in /tmp/ts-clean-sample/cleaned.jsonl --out /tmp/ts-clean-shards )
 
 True sample end-to-end (needs AWS creds for Software Heritage S3 + the `stack-v2` extra,
 and a local prettier/tsc toolchain for Stages 3-4):
@@ -52,9 +59,7 @@ and a local prettier/tsc toolchain for Stages 3-4):
     pip install -e ".[stack-v2]"
     ( cd eval_sets/ts_error_injection && npm install )
     set -a; . ./.env; set +a          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-    .venv/bin/python scripts/build_ts_clean_corpus.py --limit 50 \\
-        --tokenizer-path artifacts/code-tokenizer/tokenizer.json \\
-        --out /tmp/ts-clean-swh
+    .venv/bin/python scripts/build_ts_clean_corpus.py --limit 50 --out /tmp/ts-clean-swh
 """
 
 from __future__ import annotations
@@ -71,7 +76,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.corpus import Record  # noqa: E402
 from src.data.filters import license_ok, normalize_license  # noqa: E402
 from src.data.stack_v2 import iter_stack_v2_ts, resolve_swh_s3  # noqa: E402
-from src.data.storage import tokenized_dir_name  # noqa: E402
 from src.lsp.prettier import PrettierRunner, resolve_prettier  # noqa: E402
 from src.lsp.tsc import SET_DIR, TscRunner, resolve_tsc  # noqa: E402
 
@@ -101,12 +105,21 @@ def iter_jsonl_records(path) -> Iterator[Record]:
 # --------------------------------------------------------------------------- #
 # Stages 2-5 -- composable, importable (no argparse/CLI state), tested offline
 # --------------------------------------------------------------------------- #
-def run_pipeline(records: Iterable[Record], out_dir, *, tokenizer_path, seq_len: int = 1024,
+def run_pipeline(records: Iterable[Record], out_dir, *, seq_len: int = 1024,
                  threshold: float = 0.8, prettier_runner: Optional[PrettierRunner] = None,
                  tsc_runner: Optional[TscRunner] = None, ignore_module_resolution: bool = True,
                  dedup_stats=None, clean_stats=None) -> dict:
     """Stage 2 (near-dedup) -> Stage 3 (prettier) -> Stage 4 (LSP-clean filter) ->
-    Stage 5 (tokenize + pack). Writes `<out_dir>/manifest.json` and returns it as a dict.
+    Stage 5 (write cleaned text as JSONL). Writes `<out_dir>/cleaned.jsonl` and
+    `<out_dir>/manifest.json`, and returns the manifest dict.
+
+    Tokenize + pack is NO LONGER done here. The code tokenizer (#191) is now the native
+    Swift `monica-tokenize` toolchain (`swift/`, cross-platform), which reads the
+    `cleaned.jsonl` this stage emits and writes the uint16 `.bin`/`.bounds`/`manifest.json`
+    training shards in the same `src/data/shard.py` layout the training loop consumes:
+
+        monica-tokenize pack --tokenizer <tokenizer.json> --in <out_dir>/cleaned.jsonl \\
+                             --out <shards_dir> --seq-len <N>
 
     `prettier_runner`/`tsc_runner` being `None` means "skip that stage, pass records
     through unchanged" -- the graceful-degrade behavior for a host missing the optional
@@ -115,12 +128,10 @@ def run_pipeline(records: Iterable[Record], out_dir, *, tokenizer_path, seq_len:
     records *whether* it ran, in the manifest's `prettier_applied`/`tsc_clean_applied`.
     """
     from src.data.dedup import DedupStats, near_dedup
-    from src.data.pack import packing_dtype_for
-    from src.data.shard import pack_sequences
-    from src.data.tokenize import load_code_tokenizer, tokenize_docs
     from src.data.ts_clean import CleanRateStats, tsc_clean
 
     out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     dedup_stats = dedup_stats if dedup_stats is not None else DedupStats()
     clean_stats = clean_stats if clean_stats is not None else CleanRateStats()
 
@@ -147,11 +158,11 @@ def run_pipeline(records: Iterable[Record], out_dir, *, tokenizer_path, seq_len:
     else:
         cleaned = formatted
 
-    # Stage 5: tokenize with the #191 shared code BPE, pack into uint16 sequences.
-    tokenizer = load_code_tokenizer(tokenizer_path)
-    dtype = packing_dtype_for(tokenizer.vocab_size)
-    docs = tokenize_docs((r.text for r in cleaned), tokenizer)
-    pack_manifest = pack_sequences(docs, out_dir, seq_len=seq_len, tokenizer="code", dtype=dtype)
+    # Stage 5: write the cleaned corpus as {"text": ...} JSONL for the Swift packer.
+    cleaned_path = out_dir / "cleaned.jsonl"
+    with open(cleaned_path, "w", encoding="utf-8") as f:
+        for r in cleaned:
+            f.write(json.dumps({"text": r.text}) + "\n")
 
     manifest = {
         "stage_counts": {
@@ -166,18 +177,13 @@ def run_pipeline(records: Iterable[Record], out_dir, *, tokenizer_path, seq_len:
         # The acceptance-critical LSP-clean filter rate -- null when Stage 4 was skipped
         # (no tsc toolchain), never a stand-in number.
         "clean_rate": clean_stats.as_dict() if tsc_runner is not None else None,
-        "tokenizer_path": str(tokenizer_path),
+        "n_cleaned_docs": len(cleaned),
+        "cleaned_jsonl": cleaned_path.name,
         "seq_len": seq_len,
-        "dtype": pack_manifest["dtype"],
-        "n_documents": pack_manifest["n_documents"],
-        "n_sequences": pack_manifest["n_sequences"],
-        "n_tokens": pack_manifest["n_tokens"],
-        "shards": pack_manifest["shards"],
+        # Tokenize + pack is now the native Swift step (see the docstring); this pipeline
+        # stops at cleaned text.
+        "pack_note": "tokenize+pack with `monica-tokenize pack` (native Swift, #191/M13)",
     }
-    assert manifest["dtype"] == "uint16", (
-        f"expected uint16 packing for the code tokenizer (vocab {tokenizer.vocab_size}), "
-        f"got {manifest['dtype']}")
-
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 
@@ -188,12 +194,13 @@ def run_pipeline(records: Iterable[Record], out_dir, *, tokenizer_path, seq_len:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", type=Path, required=True, help="output dir for the packed shards")
+    ap.add_argument("--out", type=Path, required=True,
+                    help="output dir for cleaned.jsonl + manifest.json (feed cleaned.jsonl "
+                    "to `monica-tokenize pack` for the uint16 training shards)")
     ap.add_argument("--limit", type=int, default=-1,
                     help="cap the number of Stage-1 source records (-1: no cap)")
-    ap.add_argument("--tokenizer-path", type=Path, required=True,
-                    help="the #191 code tokenizer.json artifact (or its containing dir)")
-    ap.add_argument("--seq-len", type=int, default=1024)
+    ap.add_argument("--seq-len", type=int, default=1024,
+                    help="recorded in the manifest as a hint for the Swift pack step")
     ap.add_argument("--threshold", type=float, default=0.8,
                     help="MinHash-LSH near-dedup Jaccard threshold")
     ap.add_argument("--no-prettier", action="store_true", help="skip Stage 3 (prettier)")
@@ -250,19 +257,20 @@ def main() -> int:
         print(f"Stage 4 SKIPPED: no node/tsc toolchain resolvable (run `npm install` in "
              f"{SET_DIR}); the LSP-clean filter rate will be recorded as null.")
 
-    out_dir = args.out / tokenized_dir_name("code", args.seq_len)
+    out_dir = args.out
     try:
-        manifest = run_pipeline(records, out_dir, tokenizer_path=args.tokenizer_path,
-                                seq_len=args.seq_len, threshold=args.threshold,
+        manifest = run_pipeline(records, out_dir, seq_len=args.seq_len,
+                                threshold=args.threshold,
                                 prettier_runner=prettier_runner, tsc_runner=tsc_runner)
     finally:
         if tsc_runner is not None:
             tsc_runner.close()
 
-    print(f"packed {manifest['n_sequences']} seq x {args.seq_len} "
-         f"({manifest['n_tokens']} tokens, {manifest['dtype']}) -> {out_dir}")
+    print(f"cleaned {manifest['n_cleaned_docs']} doc(s) -> {out_dir}/{manifest['cleaned_jsonl']}")
     print(f"  stage counts: {manifest['stage_counts']}")
     print(f"  LSP-clean filter rate: {manifest['clean_rate']}")
+    print(f"  next: monica-tokenize pack --tokenizer <tokenizer.json> "
+         f"--in {out_dir}/{manifest['cleaned_jsonl']} --out <shards> --seq-len {args.seq_len}")
     return 0
 
 

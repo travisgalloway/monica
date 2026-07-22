@@ -12,10 +12,11 @@ The packed token dtype follows the tokenizer vocab (`pack.packing_dtype_for`):
   (the DeepSeek-R1-Distill-Qwen variants share it).
 - **StarCoder2** (vocab ~49,152) — a legacy code-corpus tokenizer (the old uint16 scale
   pick, now superseded by Qwen2.5).
-- **code** (vocab <=16,384) — the shared multilingual code BPE (#191, M11), trained
-  locally by `src/data/tokenizer_train.py` and loaded from a filesystem artifact (not
-  HF `AutoTokenizer.from_pretrained`). uint16-packable; the from-scratch M12/M13 model's
-  tokenizer.
+
+The **code tokenizer (#191) is now native Swift** — trained/encoded/packed by the
+`swift/` `monica-tokenize` toolchain (own format, cross-platform), which emits the same
+`shard.py` `.bin`/`.bounds`/`manifest.json` shards this pipeline's training loop reads.
+It is no longer loadable here; the Python `code` path was retired with the Swift port.
 
 A byte-level fallback tokenizer is provided ONLY for offline pipeline testing; it is not
 vocab-compatible with any real tokenizer and must not be used for a real run.
@@ -99,37 +100,6 @@ class ByteTokenizer:
         return bytes(int(i) & 0xFF for i in ids).decode("utf-8", "replace")
 
 
-class CodeTokenizer:
-    """Wraps a locally-trained `tokenizers` byte-level BPE (issue #191) in the minimal object
-    shape the pipeline needs (like ByteTokenizer): vocab_size / encode / decode / eos_token_id.
-    Loaded from a filesystem path, NOT AutoTokenizer.from_pretrained."""
-
-    def __init__(self, tok):
-        self._tok = tok
-        self.vocab_size = tok.get_vocab_size()
-        # <|endoftext|> is reserved as the doc separator; tokenize_texts/tokenize_docs append
-        # it per doc via getattr(tokenizer, "eos_token_id", None).
-        self.eos_token_id = tok.token_to_id("<|endoftext|>")
-
-    def encode(self, text: str) -> List[int]:
-        return self._tok.encode(text).ids
-
-    def decode(self, ids: Iterable[int]) -> str:
-        return self._tok.decode(list(ids))
-
-
-def load_code_tokenizer(path):
-    """Load the shared code BPE (#191) trained by src/data/tokenizer_train.py from `path`
-    (a tokenizer.json file, or a directory containing one). uint16-packable (vocab ~16k)."""
-    from tokenizers import Tokenizer            # lazy — tokenize.py is not in the import guard
-    p = Path(path)
-    if p.is_dir():
-        p = p / "tokenizer.json"
-    if not p.exists():
-        raise FileNotFoundError(f"code tokenizer artifact not found: {p}")
-    return CodeTokenizer(Tokenizer.from_file(str(p)))
-
-
 def tokenize_texts(texts: Iterable[str], tokenizer, stats: dict | None = None) -> Iterable[int]:
     """Yield a flat stream of token ids across all documents (with EOS if available).
     When `stats` is given, accumulate the total UTF-8 byte count of the consumed docs
@@ -193,14 +163,11 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True, help="uint16/uint32 ids; .bin streams "
                     "straight into the packed format, .npy goes through `pack` separately")
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
-    ap.add_argument("--tokenizer", choices=("olmo", "qwen3", "qwen25", "starcoder2", "code"),
+    ap.add_argument("--tokenizer", choices=("olmo", "qwen3", "qwen25", "starcoder2"),
                     default="olmo",
                     help="HF tokenizer; the packed dtype is uint16/uint32 per its vocab. "
-                    "'code' loads a locally-trained artifact via --tokenizer-path (#191)")
+                    "(The code tokenizer #191 is now native Swift — see swift/monica-tokenize.)")
     ap.add_argument("--model-id", default=None)
-    ap.add_argument("--tokenizer-path", type=Path, default=None,
-                    help="path to the trained code-BPE artifact (tokenizer.json or its "
-                    "dir); required for --tokenizer code")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="stop after this many tokens (caps the scale run)")
     args = ap.parse_args()
@@ -209,14 +176,9 @@ def main() -> None:
 
     from .pack import packing_dtype_for
     _loaders = {"olmo": load_olmo_tokenizer, "qwen3": load_qwen3_tokenizer,
-                "qwen25": load_qwen25_tokenizer, "starcoder2": load_starcoder2_tokenizer,
-                "code": load_code_tokenizer}
+                "qwen25": load_qwen25_tokenizer, "starcoder2": load_starcoder2_tokenizer}
     if args.byte_fallback:
         tok = ByteTokenizer()
-    elif args.tokenizer == "code":
-        if args.tokenizer_path is None:
-            ap.error("--tokenizer code requires --tokenizer-path")
-        tok = _loaders["code"](args.tokenizer_path)
     else:
         tok = _loaders[args.tokenizer](args.model_id)
     dtype = packing_dtype_for(tok.vocab_size)   # uint16 (POC) / uint32 (Qwen3)
