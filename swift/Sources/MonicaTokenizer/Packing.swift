@@ -10,6 +10,20 @@
 
 import Foundation
 
+/// Raised by `Packing.pack` on bad arguments or data, so a mistyped CLI flag or a mismatched
+/// tokenizer artifact surfaces as a catchable, clean error rather than a process trap.
+public enum PackingError: Error, CustomStringConvertible {
+    case invalidArgument(String)
+    case tokenOutOfRange(Int)
+    public var description: String {
+        switch self {
+        case .invalidArgument(let m): return "invalid pack argument: \(m)"
+        case .tokenOutOfRange(let v): return "token id \(v) out of uint16 range [0, 65535] " +
+            "(is the tokenizer artifact consistent with this data?)"
+        }
+    }
+}
+
 public enum Packing {
 
     public struct ShardInfo: Codable, Equatable {
@@ -36,9 +50,17 @@ public enum Packing {
                             seqLen: Int = 8192, shardSizeMB: Int = 512,
                             tokenizer: String = "code",
                             chunkAlign: Int? = nil, padId: Int = 0) throws -> Manifest {
-        precondition(seqLen > 0, "seqLen must be positive")
+        guard seqLen > 0 else {
+            throw PackingError.invalidArgument("seqLen must be positive, got \(seqLen)")
+        }
         if let ca = chunkAlign {
-            precondition(ca > 0 && seqLen % ca == 0, "seqLen must be a multiple of chunkAlign")
+            guard ca > 0 else {
+                throw PackingError.invalidArgument("chunkAlign must be positive, got \(ca)")
+            }
+            guard seqLen % ca == 0 else {
+                throw PackingError.invalidArgument(
+                    "seqLen \(seqLen) must be a multiple of chunkAlign \(ca)")
+            }
         }
         try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
@@ -75,7 +97,7 @@ public enum Packing {
                 if rem != 0 { ids += Array(repeating: padId, count: ca - rem) }
             }
             for v in ids {
-                precondition(v >= 0 && v <= 0xffff, "token id \(v) out of uint16 range")
+                guard v >= 0 && v <= 0xffff else { throw PackingError.tokenOutOfRange(v) }
                 tokBuf.append(UInt16(v))
             }
             bndBuf.append(1)

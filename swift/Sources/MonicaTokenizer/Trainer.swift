@@ -19,6 +19,11 @@ public enum Trainer {
                              digitGroup: Int) -> TokenizerFormat {
         let specialCount = specialTokens.count
         let baseOffset = specialCount + 256
+        // The vocab can never be smaller than the specials + 256 base bytes, so a smaller
+        // `vocabSize` isn't an achievable cap — fail immediately rather than silently emitting
+        // a vocab that exceeds the requested size.
+        precondition(vocabSize >= baseOffset,
+                     "vocabSize \(vocabSize) must be >= specialTokens.count + 256 (\(baseOffset))")
 
         // 1. Count unique pre-tokens (by raw bytes) across the corpus.
         var wordCounts: [[UInt8]: Int] = [:]

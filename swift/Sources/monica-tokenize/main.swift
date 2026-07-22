@@ -51,6 +51,14 @@ func readStdin() -> String {
     String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
 }
 
+/// An integer flag, or `def` when absent. Fails fast on a present-but-non-integer value
+/// (e.g. `--seq-len foo`) rather than silently falling back to the default.
+func intFlag(_ flags: [String: String], _ name: String, default def: Int) -> Int {
+    guard let raw = flags[name], !raw.isEmpty else { return def }
+    guard let v = Int(raw) else { fail("--\(name) must be an integer, got '\(raw)'") }
+    return v
+}
+
 /// Text from `--in <file>` (failing fast if it can't be read — never a silent empty
 /// string that would tokenize the wrong input), or stdin when `--in` is absent.
 func readInput(_ flags: [String: String]) -> String {
@@ -117,7 +125,14 @@ func loadTokenizer(_ flags: [String: String]) -> Tokenizer {
 func cmdTrain(_ flags: [String: String]) {
     guard let inPath = flags["in"] else { fail("train: --in <corpus> is required") }
     guard let outPath = flags["out"] else { fail("train: --out <tokenizer.json> is required") }
-    let vocab = flags["vocab-size"].flatMap { Int($0) } ?? DEFAULT_VOCAB_SIZE
+    let vocab = intFlag(flags, "vocab-size", default: DEFAULT_VOCAB_SIZE)
+    let minVocab = SPECIAL_TOKENS.count + 256   // specials + the 256 base bytes
+    guard vocab >= minVocab else {
+        fail("--vocab-size must be >= \(minVocab) (specials + 256 base bytes), got \(vocab)")
+    }
+    guard vocab <= 65536 else {
+        fail("--vocab-size must be <= 65536 for the uint16 packing path, got \(vocab)")
+    }
     let docs = readDocs(inPath)
     if docs.isEmpty { fail("train: no documents read from \(inPath)") }
     let fmt = Trainer.train(corpus: docs, vocabSize: vocab,
@@ -150,9 +165,15 @@ func cmdPack(_ flags: [String: String]) {
     let tok = loadTokenizer(flags)
     guard let inPath = flags["in"] else { fail("pack: --in <jsonl|txt> is required") }
     guard let outPath = flags["out"] else { fail("pack: --out <dir> is required") }
-    let seqLen = flags["seq-len"].flatMap { Int($0) } ?? 8192
-    let shardMB = flags["shard-size-mb"].flatMap { Int($0) } ?? 512
-    let chunkAlign = flags["chunk-align"].flatMap { Int($0) }
+    let seqLen = intFlag(flags, "seq-len", default: 8192)
+    let shardMB = intFlag(flags, "shard-size-mb", default: 512)
+    let chunkAlign: Int?
+    if let raw = flags["chunk-align"], !raw.isEmpty {
+        guard let v = Int(raw) else { fail("--chunk-align must be an integer, got '\(raw)'") }
+        chunkAlign = v
+    } else {
+        chunkAlign = nil
+    }
 
     let docs = readDocs(inPath)
     let eos = tok.eosTokenId
