@@ -17,6 +17,10 @@ public enum Pretokenizer {
     /// Split `text` into pre-tokens, each returned as its raw UTF-8 bytes (BPE operates
     /// on bytes). `digitGroup` caps a digit pre-token's length (3 = o200k-style).
     public static func pretokenize(_ text: String, digitGroup: Int) -> [[UInt8]] {
+        // A non-positive cap would make the digit branch consume zero scalars and never
+        // advance `i` on digit-leading input (infinite loop). Trained/validated formats
+        // always carry a positive `digit_group`; this guards the direct-API path too.
+        precondition(digitGroup > 0, "digitGroup must be positive, got \(digitGroup)")
         let sc = Array(text.unicodeScalars)
         let n = sc.count
         var out: [[UInt8]] = []

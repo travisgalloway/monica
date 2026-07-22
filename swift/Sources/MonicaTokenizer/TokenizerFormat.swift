@@ -8,6 +8,15 @@
 
 import Foundation
 
+/// Raised when a loaded `tokenizer.json` is structurally invalid, so failures are
+/// deterministic and actionable instead of an index-out-of-range crash deep in `BPE.init`.
+public enum TokenizerError: Error, CustomStringConvertible {
+    case invalidFormat(String)
+    public var description: String {
+        switch self { case .invalidFormat(let m): return "invalid tokenizer format: \(m)" }
+    }
+}
+
 public struct TokenizerFormat: Codable, Equatable {
     public var version: Int
     /// Reserved special tokens, ids 0 ..< count. Index 0 is EOS/document separator.
@@ -40,5 +49,29 @@ public struct TokenizerFormat: Codable, Equatable {
 
     public static func load(from url: URL) throws -> TokenizerFormat {
         try JSONDecoder().decode(TokenizerFormat.self, from: Data(contentsOf: url))
+    }
+
+    /// Structural invariants a `BPE` relies on. A corrupt/hand-edited artifact fails here with
+    /// an actionable message rather than crashing later. Each merge `m` produces id
+    /// `specialTokens.count + 256 + m`, so its two parent ids must reference only tokens
+    /// defined before it (< that id).
+    public func validate() throws {
+        guard digitGroup > 0 else {
+            throw TokenizerError.invalidFormat("digit_group must be positive, got \(digitGroup)")
+        }
+        guard !specialTokens.isEmpty else {
+            throw TokenizerError.invalidFormat("special_tokens must be non-empty")
+        }
+        let baseOffset = specialTokens.count + 256
+        for (m, pair) in merges.enumerated() {
+            guard pair.count == 2 else {
+                throw TokenizerError.invalidFormat("merge \(m) must have exactly 2 ids, got \(pair.count)")
+            }
+            let ceiling = baseOffset + m
+            for id in pair where id < 0 || id >= ceiling {
+                throw TokenizerError.invalidFormat(
+                    "merge \(m) references out-of-range id \(id) (valid range 0..<\(ceiling))")
+            }
+        }
     }
 }

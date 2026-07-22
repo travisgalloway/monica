@@ -43,6 +43,22 @@ do {
     check(vocab <= 65536, "vocab is uint16-packable (\(vocab) <= 65536)")
 }
 
+// MARK: format validation (a corrupt artifact must fail with an actionable error, not crash)
+
+do {
+    do { try trained().validate() } catch { failures.append("valid format rejected: \(error)") }
+
+    func rejects(_ fmt: TokenizerFormat) -> Bool {
+        do { try fmt.validate(); return false } catch { return true }
+    }
+    check(rejects(TokenizerFormat(specialTokens: SPECIALS, digitGroup: 3, merges: [[99999, 0]])),
+          "out-of-range merge id is rejected")
+    check(rejects(TokenizerFormat(specialTokens: SPECIALS, digitGroup: 3, merges: [[0, 1, 2]])),
+          "malformed merge (not a pair) is rejected")
+    check(rejects(TokenizerFormat(specialTokens: SPECIALS, digitGroup: 0, merges: [])),
+          "non-positive digit_group is rejected")
+}
+
 // MARK: specials
 
 do {

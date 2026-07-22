@@ -24,7 +24,9 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
     }
 
     public convenience init(contentsOf url: URL) throws {
-        self.init(format: try TokenizerFormat.load(from: url))
+        let format = try TokenizerFormat.load(from: url)
+        try format.validate()   // deterministic, actionable failure on a corrupt artifact
+        self.init(format: format)
     }
 
     public func encode(_ text: String) -> [Int] {

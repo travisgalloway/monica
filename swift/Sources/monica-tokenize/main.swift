@@ -47,6 +47,16 @@ func readStdin() -> String {
     String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
 }
 
+/// Text from `--in <file>` (failing fast if it can't be read — never a silent empty
+/// string that would tokenize the wrong input), or stdin when `--in` is absent.
+func readInput(_ flags: [String: String]) -> String {
+    guard let path = flags["in"] else { return readStdin() }
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+        fail("cannot read --in file \(path)")
+    }
+    return text
+}
+
 /// Load documents for train/pack. jsonl → each row's "text"; dir → each source file; else one doc.
 func readDocs(_ path: String) -> [String] {
     let url = URL(fileURLWithPath: path)
@@ -54,13 +64,14 @@ func readDocs(_ path: String) -> [String] {
     FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
     if isDir.boolValue {
         let exts: Set<String> = ["ts", "tsx", "js", "jsx", "py", "txt", "md", "json", "swift"]
-        var docs: [String] = []
+        var files: [URL] = []
         if let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {
-            for case let f as URL in en where exts.contains(f.pathExtension) {
-                if let t = try? String(contentsOf: f, encoding: .utf8) { docs.append(t) }
-            }
+            for case let f as URL in en where exts.contains(f.pathExtension) { files.append(f) }
         }
-        return docs
+        // Sort for a stable, deterministic doc order — `enumerator` traversal order is not
+        // guaranteed, and for `pack` that would make shard output nondeterministic.
+        files.sort { $0.path < $1.path }
+        return files.compactMap { try? String(contentsOf: $0, encoding: .utf8) }
     }
     guard let content = try? String(contentsOf: url, encoding: .utf8) else {
         fail("cannot read \(path)")
@@ -100,11 +111,10 @@ func cmdTrain(_ flags: [String: String]) {
 
 func cmdEncode(_ flags: [String: String]) {
     let tok = loadTokenizer(flags)
-    let text = flags["in"].map { (try? String(contentsOfFile: $0, encoding: .utf8)) ?? "" } ?? readStdin()
-    let ids = tok.encode(text)
+    let ids = tok.encode(readInput(flags))
     if flags["json"] != nil {
-        let data = try! JSONSerialization.data(withJSONObject: ids)
-        print(String(decoding: data, as: UTF8.self))
+        // ids are non-negative Ints -> always valid JSON; build the array directly (no throwing).
+        print("[" + ids.map(String.init).joined(separator: ",") + "]")
     } else {
         print(ids.map(String.init).joined(separator: " "))
     }
@@ -112,8 +122,8 @@ func cmdEncode(_ flags: [String: String]) {
 
 func cmdDecode(_ flags: [String: String]) {
     let tok = loadTokenizer(flags)
-    let raw = flags["in"].map { (try? String(contentsOfFile: $0, encoding: .utf8)) ?? "" } ?? readStdin()
-    let ids = raw.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "," }).compactMap { Int($0) }
+    let ids = readInput(flags).split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "," })
+        .compactMap { Int($0) }
     print(tok.decode(ids), terminator: "")
 }
 
