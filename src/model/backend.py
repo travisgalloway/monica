@@ -40,15 +40,6 @@ class Backend:
     make_sft_train_step: Callable[..., Callable]
     make_dpo_train_step: Callable[..., Callable]
     make_grpo_train_step: Callable[..., Callable]
-    # Distillation (M10): build a frozen, forward-only conversion teacher behind the seam
-    # (`ConversionTeacher`). MLX-only for now; the CUDA branch raises NotImplementedError.
-    make_teacher: Callable[..., Any]
-    # Distillation (M10/#99): initialize a student model from a teacher (Mamba-in-the-Llama /
-    # MOHAWK), returning an `InitReport`. MLX-only for now; CUDA raises NotImplementedError.
-    init_student: Callable[..., Any]
-    # Distillation (M10/#100): staged distill train-step factory (mixing-match / hidden-align /
-    # logit-distill), mirroring make_*_train_step. MLX-only; CUDA raises NotImplementedError.
-    make_distill_train_step: Callable[..., Callable]
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -102,32 +93,6 @@ def _mlx_backend() -> Backend:
         from .mlx_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
-    def _make_teacher(config=None, *, pretrained=None, seed=0,
-                      compute_dtype="fp32", compile=False):
-        """Frozen conversion teacher (#93): `pretrained` (an HF checkpoint dir / repo id)
-        loads real weights; otherwise a synthetic teacher is built from `config`.
-
-        `compute_dtype` ("fp32" default; "fp16" a local Apple-Silicon opt-in that halves teacher
-        memory) and `compile` (opt-in `mx.compile` of the logits-only forward) are MLX-local
-        precompute levers — both default to the bit-identical eager fp32 path."""
-        from .mlx_teacher import MLXConversionTeacher
-        opts = dict(compute_dtype=compute_dtype, compile=compile)
-        if pretrained is not None:
-            return MLXConversionTeacher.from_pretrained(pretrained, config, **opts)
-        if config is None:
-            raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
-                             "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
-        return MLXConversionTeacher.from_config(config, seed=seed, **opts)
-
-    def _init_student(student, teacher, method):
-        """Initialize a student from a teacher (#99); `method` is an `InitMethod`."""
-        from .mlx_student_init import init_student
-        return init_student(student, teacher, method)
-
-    def _make_distill_train_step(*args, **kwargs):
-        from .mlx_distill import make_distill_train_step
-        return make_distill_train_step(*args, **kwargs)
-
     def _make_optimizer(model, base_lr):
         # MLX AdamW holds no parameter refs at construction (params arrive at update);
         # `model` is read only for `.config.optimizer` (a uniform signature otherwise).
@@ -152,9 +117,6 @@ def _mlx_backend() -> Backend:
         make_sft_train_step=make_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
-        make_teacher=_make_teacher,
-        init_student=_init_student,
-        make_distill_train_step=_make_distill_train_step,
     )
 
 
@@ -202,31 +164,6 @@ def _cuda_backend() -> Backend:
         from .cuda_train_step import make_grpo_train_step
         return make_grpo_train_step(*args, **kwargs)
 
-    def _make_teacher(config=None, *, pretrained=None, seed=0,
-                      compute_dtype="fp32", compile=False):
-        """Frozen conversion teacher (#93/#94), torch port. `pretrained` (an HF checkpoint dir /
-        repo id) loads real weights — this is how the dominant teacher precompute runs on the
-        cloud GPU; otherwise a synthetic teacher is built from `config`.
-
-        `compute_dtype`/`compile` are accepted for a uniform `make_teacher` signature but are
-        MLX-local levers; the CUDA teacher's own dtype/torch.compile path is separate (#145)."""
-        from .cuda_teacher import CUDATeacher
-        if pretrained is not None:
-            return CUDATeacher.from_pretrained(pretrained, config)
-        if config is None:
-            raise ValueError("make_teacher needs a TeacherConfig for the synthetic path "
-                             "(pass `config=...`), or `pretrained=<dir/repo>` for real weights")
-        return CUDATeacher.from_config(config, seed=seed)
-
-    def _init_student(student, teacher, method):
-        """Initialize a student from a teacher (#99), torch port; `method` is an `InitMethod`."""
-        from .cuda_student_init import init_student
-        return init_student(student, teacher, method)
-
-    def _make_distill_train_step(*args, **kwargs):
-        from .cuda_distill import make_distill_train_step
-        return make_distill_train_step(*args, **kwargs)
-
     _dev = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     def _model_cls(cfg):
@@ -269,7 +206,4 @@ def _cuda_backend() -> Backend:
         make_sft_train_step=_make_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
-        make_teacher=_make_teacher,
-        init_student=_init_student,
-        make_distill_train_step=_make_distill_train_step,
     )

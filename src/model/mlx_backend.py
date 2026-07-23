@@ -651,9 +651,9 @@ class MLXMambaModel(ModelInterface, nn.Module):
 
     # --- distillation matching accessors (#100) ------------------------------
     def hidden_states(self, token_batch: Array) -> Tuple[Array, ...]:
-        """Per-layer hidden states for the `hidden-align` stage: the embedding output
-        followed by each layer's output (length n_layers + 1) — the HF/teacher convention
-        (`mlx_teacher.MLXConversionTeacher.forward(return_hidden=True)`)."""
+        """Per-layer hidden states: the embedding output followed by each layer's output
+        (length n_layers + 1) — the HF hidden-states convention. (Was the `hidden-align`
+        distillation accessor #100; the M10 distillation consumers were removed in #189.)"""
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)
         hs = [h]
         # Use the checkpointed layer closures (not raw forward_seq) so the hidden-align

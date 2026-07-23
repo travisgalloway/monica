@@ -27,10 +27,6 @@ def test_poc_distill_layout():
     assert storage.corpus_cleaned_dir(r).as_posix() == "data/poc-distill/corpus/cleaned"
     assert storage.corpus_tokenized_dir(r, "qwen25", 8192).as_posix() == \
         "data/poc-distill/corpus/tokenized/qwen25-8k"
-    assert storage.teacher_outputs_dir(r).as_posix() == \
-        "data/poc-distill/teacher-outputs/topk-logits"
-    assert storage.teacher_outputs_dir(r, "hidden-states").as_posix() == \
-        "data/poc-distill/teacher-outputs/hidden-states"
     assert storage.manifests_dir(r).as_posix() == "data/poc-distill/manifests"
 
 

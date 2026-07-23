@@ -61,11 +61,6 @@ def corpus_tokenized_dir(poc_distill_root, tokenizer: str, seq_len: int) -> Path
     return Path(poc_distill_root) / "corpus" / "tokenized" / tokenized_dir_name(tokenizer, seq_len)
 
 
-def teacher_outputs_dir(poc_distill_root, kind: str = "topk-logits") -> Path:
-    """Precomputed teacher outputs (#94): `topk-logits` or `hidden-states`."""
-    return Path(poc_distill_root) / "teacher-outputs" / kind
-
-
 def manifests_dir(poc_distill_root) -> Path:
     return Path(poc_distill_root) / "manifests"
 
