@@ -11,6 +11,13 @@ All hardware-specific code lives behind **one abstraction**,
 (`src/model/mlx_backend.py`, `src/model/mlx_train_step.py`,
 `src/model/cuda_backend.py`) touch a hardware library.
 
+**Outside this Python seam entirely:** the `swift/` native toolchain (the repo's first Swift
+package — the code tokenizer `MonicaTokenizer` + `monica-tokenize` CLI, #191/#245). It is neither
+above-seam Python nor a Python hardware backend; it builds and runs natively on macOS **and**
+Linux/CUDA with bit-identical output and is not covered by the import guard below. It emits the
+same `src/data/shard.py` shard layout, so the Python data/training path consumes its output
+unchanged. This is the M13 "native, no-Python-runtime" engine direction (#163/#167).
+
 ## Why
 
 The POC is developed and validated on Apple Silicon (MLX), but a successful POC is

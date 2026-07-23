@@ -17,7 +17,8 @@ layers** for the cross-file symbol recall that pure SSMs are weak at, and **MoE 
 balancing). It targets two sizes — a **small** rung (~120M active / ~700M total) and a **large**
 rung ("Large A", ~700M active / ~3.5B total, the default), the large one **sparse-upcycled** from
 the small dense checkpoint. It trains on a general multilingual **Essential-Web + Stack-v2**
-mixture with its **own byte-level BPE** and **fill-in-the-middle (FIM)**. Success stays the POC
+mixture with its **own byte-level BPE** (a native cross-platform Swift tokenizer, #191/#245 — see
+MHM-P1b) and **fill-in-the-middle (FIM)**. Success stays the POC
 bar: a smoothly improving curve plus a local-hardware win (context length + tok/s), with **BPB**
 elevated to the primary small-model metric — not leaderboard scores.
 
@@ -25,15 +26,29 @@ elevated to the primary small-model metric — not leaderboard scores.
 
 Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 
-- **MHM-P0 — Decisions.** From-scratch, own BPE, RunPod (CUDA) + M1 (MLX) dev. Carried decisions:
+- **MHM-P0 — Decisions.** From-scratch, own BPE (shipped as a **native cross-platform Swift**
+  tokenizer, not Python/MLX — see MHM-P1b), RunPod (CUDA) + M1 (MLX) dev. Carried decisions:
   D4 Jamba-vs-Routing-Mamba, D5 Large A vs Large B, vocab size.
 - **MHM-P1 — Corpus** (#193): general multilingual Essential-Web + Stack-v2 mixture, repo-context
   packing, decontamination blocklist. (Rescopes the earlier FineWeb-Edu + Stack-v1 corpus.)
-- **MHM-P1b — Tokenizer** (#191): own byte-level BPE trained on the final mixture. Blocks
-  everything downstream.
+- **MHM-P1b — Tokenizer** (#191, **done** — PR #245): own byte-level BPE, shipped as a **native
+  Swift package** (`swift/MonicaTokenizer` + the `monica-tokenize` CLI) rather than a Python build.
+  Its own **tiktoken-style JSON format**, **raw-byte** BPE (no GPT-2 `bytes_to_unicode` remap), and
+  an **o200k-style pretokenizer** (digit runs split ≤3; whitespace/indentation runs grouped so BPE
+  learns indentation merges). It **builds and runs on macOS *and* Linux/CUDA with bit-identical
+  trained vocab and token ids** (Swift stdlib only in the BPE core; no regex engine). This makes it
+  the M13 native engine's tokenizer directly (#163/#167) and the corpus tokenizer for training.
+  **MLX is deliberately not used here** — BPE is branchy integer/hash work, not tensor math, so a
+  GPU buys nothing and would threaten the cross-platform bit-exact guarantee; MLX's role stays the
+  *model* (#163). The Python code-tokenizer path was retired with this switch
+  (`src/data/tokenizer_train.py` deleted; `CodeTokenizer`/`load_code_tokenizer`/`--tokenizer code`
+  removed). New corpus split: **Python cleans → Swift tokenizes+packs.** `monica-tokenize pack`
+  emits the exact `src/data/shard.py` shard layout (uint16 `.bin` + `.bounds` + `manifest.json`),
+  so the Python training loop reads Swift-produced shards unchanged.
 - **MHM-P2 — Architecture & harness build** (the large net-new engineering): aux-loss-free
   balancing router (#213, *land first*) → CUDA MoE backend (#214: dropless routing, shared expert,
-  FSDP, sparse-upcycle init) → FIM collator (#215), length curriculum + dataloader-state resume
+  FSDP, sparse-upcycle init) → FIM collator (#215 — consumes the Swift-packed shards; the FIM
+  insertion transform may live in the Swift `pack` path), length curriculum + dataloader-state resume
   (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
   **Training-efficiency levers** (folded 2026-07-20 from the efficiency-survey review): hybrid
   Muon+AdamW optimizer at the `make_optimizer` seam (#237), WSD warmup-stable-decay LR schedule

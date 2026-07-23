@@ -10,7 +10,8 @@ language model, developed and validated on **Apple Silicon with MLX**, architect
 **active program is M12** — a from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts
 (MoE) code model** (the "MHM" spine): a mostly Mamba-2/SSD backbone with ~12.5% attention layers
 for cross-file recall and Jamba-style MoE on the MLPs, trained on a general multilingual
-Essential-Web + Stack-v2 corpus with its own byte-level BPE and FIM, at two sizes (small
+Essential-Web + Stack-v2 corpus with its own byte-level BPE (a native cross-platform Swift
+tokenizer — `swift/`, #191/#245; not Python/MLX) and FIM, at two sizes (small
 ~120M-active/700M-total; large "Large A" ~700M-active/3.5B-total, sparse-upcycled from the small
 dense checkpoint). A **secondary axis (SSI)** studies feeding language-server / static-analysis
 signal into the model — a *validated clean-rate tool with a found functional ceiling*, not the
@@ -68,6 +69,15 @@ and asserts no backend leaked into `sys.modules`. **When adding code above the s
 do not import a backend — and add new portable modules to that test's
 `PORTABLE_MODULES` list.** Keep MLX-only imports local (inside functions), as
 `scripts/smoke_test.py` does, when a portable-ish entry point needs the backend.
+
+**A third category — the `swift/` native toolchain (the repo's first Swift package).** The
+code tokenizer (#191, PR #245) is a native, cross-platform Swift package (`swift/MonicaTokenizer`
++ the `monica-tokenize` CLI) that trains/encodes/packs entirely outside the Python seam — it is
+neither above-seam Python nor a hardware backend behind `ModelInterface`, and the import guard
+does not cover it. It builds and runs on macOS **and** Linux/CUDA with bit-identical output (Swift
+stdlib only in the BPE core; **no MLX** — BPE is CPU/integer work). It emits the same
+`src/data/shard.py` shard layout, so Python training reads its shards unchanged. This is the M13
+"native, no-Python-runtime" direction (#163/#167) landing first for the tokenizer.
 
 Consequences of the seam that shape how code is written:
 - The training loop (`src/train/loop.py`) is backend-free and receives the
@@ -159,9 +169,10 @@ The smoke gate stresses exactly this round-trip.
   run is still pending (user-driven).
 - The **active program is M12 — the from-scratch Mamba-2 hybrid MoE code model** (**GitHub issue
   #198**, the live tracker; design record `docs/design/13-code-model-moe.md`): the "MHM" spine
-  (own BPE #191 → Essential-Web + Stack-v2 corpus #193 → aux-loss-free MoE router #213 → CUDA MoE
-  backend #214 → FIM/curriculum/eval build → ablation sweep #219 → small full run #222 →
-  sparse-upcycled large run #223), with **SSI** (structural-signal integration) as a secondary
+  (own BPE #191 **— done: native Swift, PR #245** → Essential-Web + Stack-v2 corpus #193 →
+  aux-loss-free MoE router #213 → CUDA MoE backend #214 → FIM/curriculum/eval build → ablation
+  sweep #219 → small full run #222 → sparse-upcycled large run #223), with **SSI**
+  (structural-signal integration) as a secondary
   measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
   #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
   gate). The bulk of the net-new work is the MoE build (#213/#214) — MoE is MLX-toy-only today.

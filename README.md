@@ -55,7 +55,9 @@ training the big one from zero).
 **The intended process, in order:**
 
 1. **Build the corpus + tokenizer** — a general multilingual code+text mixture (Essential-Web +
-   Stack-v2) and Monica's own byte-level BPE trained on it.
+   Stack-v2) and Monica's own byte-level BPE trained on it. The tokenizer is a **native
+   cross-platform Swift** package (`swift/`, #191/#245): Python cleans the corpus, Swift
+   tokenizes+packs it.
 2. **Build the MoE architecture & harness** — load-balancing router, the CUDA MoE backend,
    fill-in-the-middle, a length curriculum, and the evals (bits-per-byte is the primary metric).
 3. **Sweep small designs, then run** — cheaply ablate attention ratio / state size / routing,
@@ -97,6 +99,8 @@ src/model/                 interface (seam) · blocks (config + hybrid/MoE gatin
 src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint16/uint32) · split · loader
                            corpus · shard (doc-boundary bounds) · distill_corpus · storage (R2 layout)
                            sft_*/dpo_*/reasoning_* (post-training corpora)
+swift/                     native code tokenizer (#191/#245): MonicaTokenizer + monica-tokenize CLI
+                           (train · encode · decode · pack) — cross-platform, bit-identical, no MLX
 src/train/                 loop · schedule (warmup+cosine) · checkpoint · loss_scale
                            sft · dpo · grpo · verifiers · distill_manifest · sweep
 src/eval/                  val_loss (Tier-1) · olmes_adapter (Tier-2 lm-eval) · long_context · probes
@@ -136,7 +140,7 @@ from-scratch Mamba-2 hybrid MoE code model**
 **M12 — the active program.** A from-scratch **TypeScript-first Mamba-2 hybrid MoE code model**
 (tracker [#198](https://github.com/travisgalloway/monica/issues/198); design record
 [`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md)). The spine: own byte-level
-BPE (#191) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
+BPE (#191 — **done: native Swift, #245**) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
 backend (#214) → FIM / length curriculum / evals → ablation sweep (#219) → small full run (#222) →
 sparse-upcycled large run (#223). The bulk of the net-new work is the MoE build — MoE is
 MLX-toy-only today. A **secondary axis (SSI)** studies language-server / static-analysis signal:

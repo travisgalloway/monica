@@ -50,7 +50,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
     clean-rate tool (0.887→0.962) that leaves functional pass@1 flat (0.503) — the recorded
     rationale for demoting the LSP signal to secondary.
 13. **[The M12 code model — Mamba-2 hybrid MoE + SSI](13-code-model-moe.md)** — the **live
-    program** (#198): the MHM spine (own BPE → Essential-Web + Stack-v2 → aux-loss-free MoE →
+    program** (#198): the MHM spine (own BPE — **native Swift**, #191/#245 → Essential-Web + Stack-v2 → aux-loss-free MoE →
     CUDA MoE backend → FIM/curriculum/evals → ablation sweep → sparse-upcycled large run) and the
     secondary SSI structural-signal fold (#225/#226/#227/#230).
 
@@ -67,7 +67,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Decision | Choice | Why | Source |
 |---|---|---|---|
 | Hardware isolation | one seam (`ModelInterface`) | clean MLX→CUDA migration | `src/model/interface.py` |
-| Token storage | uint16/uint32 packing (per vocab, #90) | uint16 when vocab < 65536, uint32 at/above it (e.g. the M12 code BPE, or the reserve Qwen3 vocab 151,669) | `src/data/pack.py` |
+| Token storage | uint16/uint32 packing (per vocab, #90) | uint16 when vocab < 65536, uint32 at/above it (the M12 code BPE is uint16; the reserve Qwen3 vocab 151,669 is uint32). The native Swift packer emits this same layout | `src/data/pack.py` (Python), `swift/` `monica-tokenize pack` (M12 code path) |
 | Tokenizer (POC) | `allenai/OLMo-7B-hf` (vocab 50280) | fits uint16; matches AI2 for comparison | `src/data/tokenize.py` |
 | Embedding | tied (input = output) | ~38M of ~100M budget at POC scale | `config/poc.yaml` |
 | dt-bias init | inverse-softplus, log-uniform (per head) | **load-bearing** — model can't learn recall without it | `src/model/mlx_backend.py` |
@@ -81,8 +81,8 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Success metric | held-out val perplexity (Tier-1) | a smoothly decreasing curve *is* the POC goal | `src/eval/val_loss.py` |
 | OLMES / lm-eval | implemented (Tier-2); scores near chance at POC scale | loglikelihood + generative tasks run end-to-end | `src/eval/olmes_adapter.py` |
 | Build method (M12) | **from-scratch** Mamba-2 hybrid **MoE** code model (not distillation) | model quality is the primary axis; MoE = capability per active param | `docs/design/13-code-model-moe.md` |
-| Tokenizer (M12) | **own byte-level BPE** on the final mixture (#191) | code-first vocab, no external-teacher alignment constraint; uint32 packing (#90) | `docs/design/13-code-model-moe.md` |
+| Tokenizer (M12) | **own byte-level BPE — native Swift** (`swift/MonicaTokenizer`, #191/#245) | cross-platform (macOS + Linux/CUDA), bit-identical; own tiktoken-style format; o200k-style pretokenizer (digit-split ≤3, indentation merge); uint16; **MLX deliberately not used** (BPE is CPU/integer work). Python code-path retired | `docs/design/13-code-model-moe.md` (MHM-P1b) |
 | Model sizes (M12) | small ~120M-act/700M-tot; large "Large A" ~700M-act/3.5B-tot | large is **sparse-upcycled** from the small dense ckpt; ablation sweep picks the layout (#219) | `docs/design/13-code-model-moe.md` |
 | Structural signal (M12, secondary) | LSP/opengrep as measurement + training signal (SSI) | validated clean-rate tool, functional ceiling found; #225/#226/#227/#230 | `docs/design/13-code-model-moe.md` |
-| Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data | `docs/design/08-corpus-pipeline.md` |
+| Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data. For the M12 code corpus, Python **cleans** (→ `cleaned.jsonl`); the native Swift `monica-tokenize pack` **tokenizes+packs** | `docs/design/08-corpus-pipeline.md` |
 | Build method (reserve) | **distillation** from a frozen teacher — Qwen3 vocab, `Qwen/Qwen3-4B-Thinking-2507`, ~1B student | M10 program, **dropped 2026-07-19**; machinery built, kept as history | `docs/reserve/10-distillation.md` |

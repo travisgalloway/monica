@@ -145,6 +145,12 @@ in `src/data/datatrove_pipeline.py` + `scripts/build_corpus.py`. It reuses the p
 *logic* (`filters.py`/`dedup.py`) as datatrove blocks and writes **cleaned text shards**; the
 existing `src/data/shard.py` tokenizes them to the Qwen2.5 uint32 trainer shards.
 
+> **M12 code corpus differs.** The reserve build above tokenizes in Python (`src/data/shard.py`,
+> Qwen2.5). The **M12 code path** (`scripts/build_ts_clean_corpus.py`) instead stops at cleaned
+> text (`cleaned.jsonl`); the native Swift `monica-tokenize pack` (`swift/`, #191/#245) tokenizes
+> + packs it into the same uint16 shard layout. So for M12: **Python cleans → Swift
+> tokenizes+packs** — `src/data/shard.py`'s `--tokenizer code` path no longer exists.
+
 **Environment caveat.** datatrove supports Python ≤3.12 and pulls C-extension/`spacy` deps, so it
 runs in a **dedicated py3.11 venv** matching the RunPod `py3.11` images — *not* the main py3.14
 `.venv`:

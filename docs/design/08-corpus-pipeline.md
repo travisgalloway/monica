@@ -93,7 +93,10 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 > the #75 production-reserve corpus reuses these clean-corpus *stages* under **uint32 packing**
 > (the already-built reserve corpus uses Qwen2.5). **M12** (the live program) sidesteps this
 > tokenizer question with its **own byte-level BPE** trained on the M12 mixture (#191) — see
-> [`13-code-model-moe.md`](13-code-model-moe.md).
+> [`13-code-model-moe.md`](13-code-model-moe.md). **For M12, tokenize + shard is no longer a
+> Python stage:** Python only *cleans* the corpus (→ `cleaned.jsonl`), and the native Swift
+> `monica-tokenize pack` (`swift/`, #191/#245) tokenizes + packs it — emitting the same
+> `.bin`/`.bounds`/`manifest.json` layout described below, so the training loop is unchanged.
 
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
   (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`
