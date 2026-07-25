@@ -114,8 +114,9 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 
 The M10 distillation reserve plan adopted a **three-class** layout (#97), so the student layout
 stayed downstream of every frozen artifact. `src/data/storage.py` is the single source of truth
-for these prefixes; the data drivers (`distill_corpus.py`, `instruct_sft.py`, `reasoning_sft.py`)
-build their paths through it, and #80 pointed the R2 `s3fs` readers/writers at the same prefixes.
+for these prefixes; the data drivers (`instruct_sft.py`, `reasoning_sft.py`; the M10
+`distill_corpus.py` driver was removed with #189) build their paths through it, and #80 pointed
+the R2 `s3fs` readers/writers at the same prefixes.
 This layout is kept as reserve/example; the live M12 corpus build (#193) has no frozen-teacher
 class to isolate, so it may adopt a simpler layout.
 

@@ -1,10 +1,12 @@
 # Distillation (teacher → hybrid student)
 
-> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19).** This program is no longer
-> active — see [`../design/13-code-model-moe.md`](../design/13-code-model-moe.md) and
-> [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
-> arc. Retained as a design record and as the inventory of R2 assets (corpus + ~566 GB teacher
-> cache) that may still occupy paid storage.
+> **⛔ Reserve / historical (M10 distillation, superseded 2026-07-19; code removed #189).** This
+> program is no longer active — see [`../design/13-code-model-moe.md`](../design/13-code-model-moe.md)
+> and [issue #198](https://github.com/travisgalloway/monica/issues/198) for the live M12 code-model
+> arc. The **implementation was removed from the tree** with #189 (teacher/student/distill modules,
+> `scripts/distill.py`/`precompute_teacher.py`/`sweep.py`, the corpus builder, manifests) — this
+> document is the retained **design record**; the code is recoverable from git history. Also kept as
+> the inventory of R2 assets (corpus + ~566 GB teacher cache) that may still occupy paid storage.
 
 [← Design index](../design/README.md)
 

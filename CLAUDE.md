@@ -19,7 +19,8 @@ lever for functional correctness (see `docs/design/13-code-model-moe.md`). Track
 [issue #198](https://github.com/travisgalloway/monica/issues/198); design record in
 `docs/design/13-code-model-moe.md`. **Reserve/history:** the M10 distillation program (distil a
 ~1B student from a frozen `Qwen/Qwen3-4B-Thinking-2507` teacher, #65) was dropped 2026-07-19 — its
-machinery is built and its design record kept under `docs/reserve/`. The original from-scratch
+code machinery was **removed from the tree** (#189, recoverable via git history); its design record
+is kept under `docs/reserve/`. The original from-scratch
 pretrain path (OLMo tokenizer) is complete and is a validated foundation / production reserve.
 POC success is a smoothly improving curve plus a local-hardware win (context length + tok/s), with
 **BPB** the primary small-model metric — not benchmark scores.
@@ -176,10 +177,12 @@ The smoke gate stresses exactly this round-trip.
   measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
   #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
   gate). The bulk of the net-new work is the MoE build (#213/#214) — MoE is MLX-toy-only today.
-- **Reserve/history — M10 distillation (#65) was dropped 2026-07-19.** Its machinery is built
-  (teacher loader #93, student init #99, staged loss #100, sweep #98, `scripts/distill.py` #81)
-  and its design record + corpus/decontamination guidance + pod runbooks live under `docs/reserve/`
-  (e.g. `docs/reserve/10-distillation.md`). Do **not** describe distillation as active work.
+- **Reserve/history — M10 distillation (#65) was dropped 2026-07-19; its code was removed from the
+  tree (#189).** The teacher/student/distill modules, `scripts/distill.py`/`sweep.py`/
+  `precompute_teacher.py`, `distill_manifest`, and the corpus tooling are gone (recoverable via git
+  history). Its design record + corpus/decontamination guidance + pod runbooks remain under
+  `docs/reserve/` (e.g. `docs/reserve/10-distillation.md`). Do **not** describe distillation as
+  active work, and do not assume the machinery is present in the tree.
 - `docs/design/` documents the design choices and rationale (start at
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
   a milestone, tick its box in the relevant tracker (#2 / #198).

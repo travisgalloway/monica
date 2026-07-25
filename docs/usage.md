@@ -61,38 +61,15 @@ Run the tests to confirm the install (on Linux the MLX-only tests skip, not fail
 
 ## 2. Build a corpus
 
-### 2a. Distillation corpus (reserve — Qwen3, uint32)
+### 2a. Distillation corpus (reserve — removed from the tree, #189)
 
-[`src/data/distill_corpus.py`](../src/data/distill_corpus.py) is a thin orchestrator that
-builds the **frozen** distillation corpus every student trial consumes: it cleans text into
-durable Parquet, then Qwen3-tokenizes and packs it into fixed-length training shards with a
-**document-boundary sidecar** (`.bounds`, for SSM state reset at doc edges, #68). It adds no
-new logic over the stages below — only the `poc-distill/` layout and a corpus-level manifest.
-
-```bash
-# From a one-document-per-line text file (use --source dummy for an offline smoke).
-# --out-root is the poc-distill class root; it defaults to data/poc-distill (omit to use it):
-.venv/bin/python -m src.data.distill_corpus --source text --in data/raw/slice.txt \
-    --tokenizer qwen3 --seq-len 8192 --out-root data/poc-distill
-```
-
-This writes:
-
-```
-data/poc-distill/corpus/
-  cleaned/      part-*.parquet          durable, re-mixable text
-  tokenized/qwen3-8k/
-    part-*.bin      uint32 tokens (Qwen3 vocab ~151,669 → uint32, #90)
-    part-*.bounds   uint8 doc-start flags
-    manifest.json   {seq_len, dtype, tokenizer, n_tokens, ...}
-  manifest.json     two-stage summary (the artifact teacher-logit precompute freezes against)
-```
-
-The corpus is **precomputed once**: the teacher-logit precompute and every student layout
-sweep read it unchanged. The three-class storage layout (`poc-distill/` · `shared/` ·
-`reserve-pretrain/`) is defined in [`src/data/storage.py`](../src/data/storage.py) and doubles
-as the R2 prefix scheme — see [`infrastructure.md`](infrastructure.md). For reasoning traces
-that must not straddle a sequence boundary, [`src/data/shard.py`](../src/data/shard.py)'s
+The M10 distillation corpus builder (`src/data/distill_corpus.py`) and its multi-domain source
+loaders were **removed** with the distillation program (#189); the design record is preserved in
+[`docs/reserve/10-distillation.md`](../docs/reserve/10-distillation.md) and the code is recoverable
+from git history. The **three-class storage layout** (`poc-distill/` · `shared/` ·
+`reserve-pretrain/`) it used still lives in [`src/data/storage.py`](../src/data/storage.py) and
+doubles as the R2 prefix scheme (see [`infrastructure.md`](infrastructure.md)). For reasoning
+traces that must not straddle a sequence boundary, [`src/data/shard.py`](../src/data/shard.py)'s
 `pack_atomic` mode bin-packs each document whole (#96).
 
 ### 2b. From-scratch corpus (secondary — OLMo, uint16)
@@ -182,30 +159,11 @@ program (issue #65), **dropped 2026-07-19** in favor of M12
 ([`design/13-code-model-moe.md`](design/13-code-model-moe.md)) before its end-to-end run driver
 and cloud plumbing were fully wired up
 ([#80](https://github.com/travisgalloway/monica/issues/80),
-[#81](https://github.com/travisgalloway/monica/issues/81)). The pieces below remain in the tree
-and functional as reserve machinery:
-
-| Piece | Module | Role |
-|---|---|---|
-| Conversion teacher | [`src/model/mlx_teacher.py`](../src/model/mlx_teacher.py) | frozen forward; cached top-k logits + attention projections |
-| Student init | [`src/model/mlx_student_init.py`](../src/model/mlx_student_init.py) | Mamba-in-the-Llama / MOHAWK; maps teacher attention → student SSM |
-| Staged loss | [`src/model/mlx_distill.py`](../src/model/mlx_distill.py) | mixing-match → hidden-align → logit-distill (KL on top-k + CE) |
-| Manifest | [`src/train/distill_manifest.py`](../src/train/distill_manifest.py) | parse `config/manifests/*.yaml` → resolved `MambaConfig` |
-| Sweep table | [`scripts/sweep.py`](../scripts/sweep.py) | per-trial param/memory + layout table (not a runner) |
-
-Inspect a sweep over the three architecture variables (attention fraction, layer placement,
-state size). Sibling manifests must share one frozen teacher signal:
-
-```bash
-.venv/bin/python scripts/sweep.py                    # all of config/manifests/
-.venv/bin/python scripts/sweep.py \
-    config/manifests/student-1b-attn-lo.yaml config/manifests/student-1b-attn-hi.yaml
-```
-
-A manifest names the frozen artifacts (corpus, teacher outputs, SFT/RL sets) and the swept
-layout; the student layout is **downstream of every frozen artifact**, so changing it
-invalidates nothing upstream. See
-[`reserve/10-distillation.md`](reserve/10-distillation.md) for the full rationale (reserve).
+[#81](https://github.com/travisgalloway/monica/issues/81)). Its code was **removed from the tree**
+(#189): the conversion teacher, student-init (Mamba-in-the-Llama / MOHAWK), staged loss
+(mixing-match → hidden-align → logit-distill), manifest parser, and sweep table are gone —
+recoverable from git history. The design record + full rationale are preserved under
+[`reserve/10-distillation.md`](reserve/10-distillation.md).
 
 ### 3c. Post-training (M9) — SFT → DPO → RLVR
 

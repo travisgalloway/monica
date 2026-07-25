@@ -4,7 +4,7 @@ Offline via the handauthored trace set + ByteTokenizer (no backend, no network).
 import json
 
 from src.data.chat_template import IM_END
-from src.data.distill_corpus import tokenized_subdir
+from src.data.storage import tokenized_dir_name as tokenized_subdir
 from src.data.reasoning_sft import build_reasoning_sft
 from src.data.reasoning_traces import handauthored_trace_records, trace_to_messages
 from src.data.shard import doc_start_offsets, open_shard, read_manifest

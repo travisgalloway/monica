@@ -133,8 +133,7 @@ from `AWS_ENDPOINT_URL_S3` (see `.env.example`). Build locally, then push:
 
 ```bash
 set -a; . ./.env; set +a                                   # load HF/R2 secrets
-python -m src.data.distill_corpus --source text --in <slice> --tokenizer qwen3 \
-    --push s3://<bucket>/poc-distill                        # build, then mirror out-root to R2
+python -m src.data.r2_sync up   data/poc-distill s3://<bucket>/poc-distill   # mirror a built tree to R2
 python -m src.data.r2_sync down s3://<bucket>/poc-distill data/poc-distill   # pull on a pod
 ```
 
@@ -227,7 +226,9 @@ A40); the fused kernels auto-detect at runtime and degrade gracefully when absen
 This flow is specific to the (dropped) M10 distillation program; kept as reserve/history, not a
 live target. For the concrete, command-by-command Path B execution of this flow (the full-scale
 ~1B distillation run — exact commands, pod sizing, R2 paths, cost, and the Path A gotchas), see
-[`reserve/path-b-run.md`](reserve/path-b-run.md). The steps below are the generic shape.
+[`reserve/path-b-run.md`](reserve/path-b-run.md); for the completed ~205M `poc-qwen` run's pod
+recipe + asset inventory, see [`reserve/runpod-poc-run.md`](reserve/runpod-poc-run.md). The steps
+below are the generic shape.
 
 1. **Local (Mac):** build + unit-test the data pipeline on a slice, the teacher loader, student
    init, distillation loss, and the manifest/sweep — all at toy scale.

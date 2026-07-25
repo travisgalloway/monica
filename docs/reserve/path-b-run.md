@@ -30,7 +30,7 @@ eval tokenizer selection (#139, extended to `qwen3` under #65). **There is no co
 execution** (the one data step the switch adds is re-tokenizing the corpus to the Qwen3 vocab, Step 1).
 
 Related: [`infrastructure.md`](../infrastructure.md) (generic R2 + RunPod flow; this doc is its concrete
-Path B companion), [`design/10-distillation.md`](10-distillation.md) (why distil / the staged
+Path B companion), [`10-distillation.md`](10-distillation.md) (why distil / the staged
 loss), [`config/manifests/student-1b-attn-hi.yaml`](../../config/manifests/student-1b-attn-hi.yaml) +
 [`student-1b-attn-lo.yaml`](../../config/manifests/student-1b-attn-lo.yaml) (the two sweep trials).
 
