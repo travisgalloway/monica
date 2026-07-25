@@ -48,6 +48,20 @@ Linear warmup from 0 to `base_lr`, then cosine decay to a floor of `min_lr_ratio
 base_lr` (default ratio 0.1). The floor matters — letting LR reach exactly zero stalls
 learning at the tail. Being pure math, it is unit-tested anywhere (no MLX needed).
 
+### WSD is the second schedule (#238)
+
+`schedule.py` also provides `WSDSchedule` — linear warmup → **constant `base_lr`
+plateau** → `1-sqrt` decay to a floor over the trailing `decay_steps`. A factory selects
+between the two from a duck-typed config (`lr_schedule`, `decay_frac`, …).
+
+WSD exists for the M12 shape, not as a general upgrade: a **stable trunk checkpoint can
+be re-decayed independently downstream** (cheap re-decay per branch — e.g. per
+sparse-upcycle branch, #223), which cosine cannot give you without re-running the trunk.
+Both schedules are indexed by `step` over `total_steps` and WSD's decay window is a
+*fraction* (`decay_frac`) of it, so nothing here depends on `total_steps` being fixed —
+which is what keeps it compatible with the length curriculum (#216), where tokens/step
+varies.
+
 ## The backend step: clipping + loss scaling
 
 From `src/model/mlx_train_step.py`:
@@ -131,8 +145,40 @@ on ~1M repetitive bytes — it is fine for short smoke/validation runs but will 
 destabilize in fp32 if pushed far past that regime; the poc run (100M params, fp16 +
 dynamic scaling, ~3B diverse tokens) is the regime M5 actually targets.
 
+## Efficiency levers (M12, landed 2026-07-20/21)
+
+Four levers were folded in from the efficiency-survey review, sequenced to land *before*
+the #219 ablation sweep so the sweep and the #222/#223 runs all carry them. The repo was
+already mature on the survey's biggest axes (dedup/filtering, fused AdamW, SDPA, the
+mamba-ssm kernels, grad checkpointing), so these are the net-new ones.
+
+| Lever | Issue / commit | Where | Status |
+|---|---|---|---|
+| Hybrid **Muon + AdamW** optimizer | #237 / `3b02e6b` | `src/model/cuda_muon.py`, selected at the `make_optimizer` seam in `src/model/backend.py` | **landed** |
+| **WSD** LR schedule | #238 / `8fe62f7` | `src/train/schedule.py` (`WSDSchedule`) — see above | **landed** |
+| **`torch.compile`** default-on for real CUDA runs | #239 / `7a71073` | `src/model/cuda_backend.py` | **landed** |
+| **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240 / `c57a8e6` | `src/model/cuda_backend.py` (`_te_linear_cls`, `fp8_status`) | **design-only**, gated on #214 |
+
+Two details worth carrying:
+
+- **Muon lives behind `make_optimizer`, not in the loop.** `HybridOptimizer` deliberately
+  does *not* subclass `torch.optim.Optimizer` — it composes an Adam and a Muon and
+  forwards `param_groups`/`zero_grad`/`step`/`state_dict`/`load_state_dict`. The loop
+  above the seam is unchanged; the optimizer is a backend concern by construction.
+- **`config.torch_compile` is tri-state.** `None` = AUTO, which compiles **only on a real
+  CUDA device**; `True`/`False` force it on any device. CPU is never auto-compiled, because
+  CPU is the fp32 parity/conformance surface (`tests/test_cuda_parity.py`) and must stay
+  eager. fp8's `te.Linear` graph-breaks `torch.compile` the same way `mamba-ssm` does —
+  safe, but it is why the fp8 path is opaque to inductor.
+
+The fp8 code is **defined but never called** until the CUDA MoE backend (#214) lands, since
+there are no CUDA expert linears to attach it to yet. Do not read `fp8_experts: bool` in
+`MambaConfig` as a working switch.
+
 ## Related
 
 - [Architecture: the hardware seam](01-architecture-seam.md)
 - [Smoke gate & eval](06-smoke-gate-and-eval.md) — checkpointing under test.
 - [Configs & locked decisions](07-configs-and-decisions.md) — fp16 vs fp32.
+- [M12 code model](13-code-model-moe.md) — the program these levers were sequenced for;
+  MoE, hybrid attention, and the sparse-upcycle plan live there.

@@ -6,10 +6,23 @@
 
 All hardware-specific code lives behind **one abstraction**,
 [`ModelInterface`](../../src/model/interface.py). Everything above the seam —
-`data/`, `train/`, `serve/`, `eval/`, `conformance/` — is portable Python that
-**never imports MLX or CUDA**. Only the backend modules
-(`src/model/mlx_backend.py`, `src/model/mlx_train_step.py`,
-`src/model/cuda_backend.py`) touch a hardware library.
+`data/`, `train/`, `serve/`, `eval/`, `conformance/`, `lsp/` — is portable Python that
+**never imports MLX or CUDA**. Exactly six modules touch a hardware library:
+
+| Module | Role |
+|---|---|
+| `src/model/mlx_backend.py` | MLX model |
+| `src/model/mlx_train_step.py` | MLX backprop/optimizer primitive |
+| `src/model/cuda_backend.py` | CUDA/PyTorch model |
+| `src/model/cuda_train_step.py` | CUDA backprop/optimizer primitive |
+| `src/model/cuda_muon.py` | Muon + AdamW hybrid optimizer (#237) |
+| `src/model/mlx_lm_adapter.py` | the LSP harness's `LMAdapter` (see [12-lsp-in-the-loop.md](12-lsp-in-the-loop.md)) |
+
+`src/model/backend.py` is deliberately **not** on that list: it is the portable
+backend-factory registry (`BackendSpec`, `make_optimizer`) and keeps its backend imports
+**inside the factory closures**, so importing it above the seam pulls in nothing. That is
+what lets `make_optimizer` select Muon-vs-AdamW without the training loop knowing a
+backend exists.
 
 **Outside this Python seam entirely:** the `swift/` native toolchain (the repo's first Swift
 package — the code tokenizer `MonicaTokenizer` + `monica-tokenize` CLI, #191/#245). It is neither
@@ -34,16 +47,23 @@ From `src/model/interface.py`:
 
 ## The contract
 
-`ModelInterface` defines exactly six concerns:
+`ModelInterface` defines exactly seven concerns:
 
 | Method | Role |
 |---|---|
-| `forward(token_batch)` | Full-sequence **parallel** training path → logits `(B, T, vocab)` |
+| `forward(token_batch, seg_ids=None)` | Full-sequence **parallel** training path → logits `(B, T, vocab)`; `seg_ids` marks document boundaries within a packed sequence |
 | `step(token, state)` | Single-token **recurrence** inference path; must agree with `forward` |
 | `init_state(batch_size)` | Fresh, zeroed recurrent state |
 | `get_state()` / `set_state(state)` | Snapshot / restore (for serving + rewind) |
+| `clone_state(state)` | Independent snapshot of a state, safe to retain while stepping |
 | `save(path)` / `load(path)` | Persist weights in a portable format (safetensors) |
 | `config` | The `MambaConfig` |
+
+`clone_state` is separate from `get_state` because the serving layer
+(`serve/sessions`, `serve/rewind`) holds many states at once and snapshots them at turn
+boundaries. On an immutable-array backend (MLX) a structural copy suffices; a backend whose
+`step` mutates buffers in place **must** deep-copy here, or a retained snapshot silently
+aliases a later step.
 
 The two compute paths (`forward` and `step`) are separate implementations that must
 produce identical logits — enforced by [conformance](03-conformance.md).
@@ -65,7 +85,7 @@ the seam knows or cares.
 `MambaConfig` ([`src/model/blocks.py`](../../src/model/blocks.py)) is the single
 source of truth for model dimensions and run parameters, loaded from
 `config/*.yaml`. It is backend-free and carries a `validate()` that enforces
-cross-cutting invariants (e.g. the uint16 vocab bound — see
+cross-cutting invariants (e.g. the vocab/packing-dtype bound — see
 [data pipeline](04-data-pipeline.md)). Backends consume the same config object, so a
 decision like the load-bearing dt-bias init is defined once and "carried into every
 backend."

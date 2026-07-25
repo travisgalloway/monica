@@ -243,6 +243,12 @@ This runbook covers only the append leg. Downstream:
   [`../path-b-run.md`](../path-b-run.md) Step 5. Use `--config config/student-1b-attn-hi.yaml` if
   the hi layout wins, `--config config/student-1b-attn-lo.yaml` if lo wins — both are resolved
   MambaConfig YAMLs (not manifests) for `scripts/sft.py`/`scripts/rlvr.py`'s `--config` flag.
+  > **Both config files were deleted 2026-07-25** — they described derivation from
+  > `config/manifests/*.yaml` via `manifest_to_config`, and that directory and converter were
+  > removed with #189/#248 when M10 was dropped. Recover them from git history
+  > (`git show 92f9c45^:config/student-1b-attn-hi.yaml`) if this leg is ever revived; do **not**
+  > substitute `config/student-1b.yaml`, whose attention fraction differs from both — that
+  > difference is the entire point of the hi/lo sweep.
   **Known gap, not fixed here:** `scripts/rlvr.py` (#103) wires only math/exact-match rewards and
   takes **no `--backend` flag** (MLX-only, via the serving recurrence) — the code-sandbox
   `CodeVerifier` mentioned in #103's scope is not wired into the driver. A ~1B GRPO run on Mac/MLX

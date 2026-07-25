@@ -59,8 +59,9 @@ Every claim here is sourced from a docstring or config comment in the code, with
 > secondary axis (topic 12 is its measurement record + assessment). Topics 8/9/11 are reusable
 > **foundation** (corpus pipeline, hybrid-architecture sizing, post-training design). Topic 10 (the
 > M10 distillation design record, epic #65) was **dropped 2026-07-19** and moved to
-> [`../reserve/`](../reserve/10-distillation.md); its machinery still exists but the program is not
-> active. The from-scratch pretraining in 08 remains a production reserve (#75).
+> [`../reserve/`](../reserve/10-distillation.md); its **machinery was removed from the tree**
+> (#189/#248 — recoverable via git history), so only the design record survives. The from-scratch
+> pretraining in 08 remains a production reserve (#75).
 
 ## Locked decisions at a glance
 
@@ -85,4 +86,4 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Model sizes (M12) | small ~120M-act/700M-tot; large "Large A" ~700M-act/3.5B-tot | large is **sparse-upcycled** from the small dense ckpt; ablation sweep picks the layout (#219) | `docs/design/13-code-model-moe.md` |
 | Structural signal (M12, secondary) | LSP/opengrep as measurement + training signal (SSI) | validated clean-rate tool, functional ceiling found; #225/#226/#227/#230 | `docs/design/13-code-model-moe.md` |
 | Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data. For the M12 code corpus, Python **cleans** (→ `cleaned.jsonl`); the native Swift `monica-tokenize pack` **tokenizes+packs** | `docs/design/08-corpus-pipeline.md` |
-| Build method (reserve) | **distillation** from a frozen teacher — Qwen3 vocab, `Qwen/Qwen3-4B-Thinking-2507`, ~1B student | M10 program, **dropped 2026-07-19**; machinery built, kept as history | `docs/reserve/10-distillation.md` |
+| Build method (reserve) | **distillation** from a frozen teacher — Qwen3 vocab, `Qwen/Qwen3-4B-Thinking-2507`, ~1B student | M10 program, **dropped 2026-07-19**; machinery built then pruned from the tree (#189/#248), design record kept as history | `docs/reserve/10-distillation.md` |

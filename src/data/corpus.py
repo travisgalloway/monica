@@ -8,10 +8,12 @@ ingest -> normalize -> filter -> write Parquet shards. At scale (#80) the same s
 runs on HF `datatrove` with the writer pointed at R2 via `s3fs` — the `out_uri` seam
 below (an fsspec URI) is exactly where that swap happens: `file://` now, `s3://` later.
 
-Under the distillation-first plan (docs/design/10-distillation.md) this corpus builds the
-**teacher corpus + the production-reserve from-scratch data (#75)**, not the distillation
-student's training data — the student consumes pre-tokenized Qwen3 artifacts + teacher
-top-k logits (#92/#94), which are precomputed once, not re-derived through these stages.
+Historical scope note: this machinery was built under the M10 distillation-first plan
+(dropped 2026-07-19; record in docs/reserve/10-distillation.md), where it produced the
+**teacher corpus + the production-reserve from-scratch data (#75)** rather than the
+student's own training data. Under the live M12 plan it is the general-purpose
+normalize/filter/shard stage — the M12 code corpus (#193) runs through the same
+Parquet-shard contract before the Swift tokenizer packs it.
 
 ABOVE THE SEAM — no `mlx`/`torch`. Heavy data deps (pyarrow, fsspec) are imported
 LAZILY inside the IO functions, mirroring download.py/tokenize.py, so importing this

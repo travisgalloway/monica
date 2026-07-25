@@ -2,7 +2,7 @@
 
 The packed dtype follows the tokenizer vocab: **uint16** for the original POC path
 (OLMo, vocab ~50k < 65536) and **uint32** for the distillation student (Qwen3, vocab
-151,669 — see #90 and docs/design/10-distillation.md). `packing_dtype_for` picks it; the
+151,669 — see #90 and docs/reserve/10-distillation.md). `packing_dtype_for` picks it; the
 dtype is recorded in the `<name>.meta.json` sidecar so the loader reads the file back
 correctly with no JSON parsing during training. Defaults preserve the uint16 behavior, so
 existing artifacts are unchanged.

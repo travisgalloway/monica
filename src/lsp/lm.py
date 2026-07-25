@@ -6,9 +6,10 @@ reuse of `SessionStore` itself: that class is `MambaConfig`-shaped (a fixed-size
 recurrent state snapshot per session) and cannot back a transformer's growing KV
 cache, which needs trim-in-place rollback instead of clone/restore.
 
-Implementations live below the seam (`src/model/mlx_lm_adapter.py` on `mlx_lm`, or
-an `hf_lm_adapter.py` fallback on `transformers`). This module only defines the
-`Protocol` and the backend-agnostic helpers built on top of `encode`/`decode`
+Implementations live below the seam — today exactly one, `src/model/mlx_lm_adapter.py`
+on `mlx_lm`. (A `transformers`-backed fallback for non-Mac hosts is an option the
+`Protocol` deliberately leaves open, but none is implemented.) This module only defines
+the `Protocol` and the backend-agnostic helpers built on top of `encode`/`decode`
 (`offset_map`, `token_index_at`) — pure stdlib, works against any adapter (including
 `FakeLM` test doubles), no `mlx`/`torch` import anywhere.
 

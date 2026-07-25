@@ -22,9 +22,9 @@ Two things this file gets right that a naive version wouldn't:
    a genuine token-boundary round trip and doesn't have this problem.
 
 Skips entirely if `mlx_lm` isn't installed or the pinned test model can't be reached
-(no network / not yet downloaded) — this repo's harness falls back to
-`hf_lm_adapter.py` in that case (see the design doc), and that fallback gets its own
-gate when/if it exists.
+(no network / not yet downloaded). `MLXLMAdapter` is currently the only `LMAdapter`
+implementation in the tree, so on a non-Mac host this gate simply doesn't run; a
+`transformers`-backed fallback would need its own equivalent gate.
 """
 
 from __future__ import annotations

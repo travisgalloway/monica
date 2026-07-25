@@ -13,10 +13,19 @@ intact.
 > loader and training loop below are unchanged. See [13-code-model-moe.md](13-code-model-moe.md)
 > (MHM-P1b).
 
-## uint16 packing
+## Dtype-aware packing (uint16 / uint32)
 
-Token ids are packed as a flat `uint16` array on disk. From
-[`src/data/pack.py`](../../src/data/pack.py):
+Token ids are packed as a flat array on disk whose dtype **follows the vocab** (#90):
+`uint16` when `vocab_size < 65536`, `uint32` at or above it. `packing_dtype_for` picks it
+and the `<name>.meta.json` sidecar records it, so the loader reads the file back correctly
+with no JSON parsing during training.
+
+> **History.** The original POC path was uint16-only, and the text quoted below reflects
+> that. #90 generalized it so the reserve Qwen3 student (vocab 151,669) could be packed.
+> The uint16 *rule* still holds — it is just no longer the only option, and it is **not**
+> what `validate()` rejects on (see below).
+
+From [`src/data/pack.py`](../../src/data/pack.py):
 
 > uint16 because the OLMo vocab (~50k) fits under 65536 — confirm the actual vocab
 > before committing (see MambaConfig.validate / tokenize.load_olmo_tokenizer). The
@@ -28,8 +37,11 @@ A sidecar `<name>.meta.json` records dtype and token count. The packer validates
 > Validate the ORIGINAL values: casting to uint16 first would silently wrap
 > out-of-range / negative ids and defeat the check.
 
-The same bound is enforced structurally by `MambaConfig.validate()`, which raises if
-`vocab_size >= 65536`. This is *why* the tokenizer choice below matters.
+`MambaConfig` exposes the choice as `packing_dtype` (`'uint16'` if `vocab_size < 65536`,
+else `'uint32'`). The **ceiling** `MambaConfig.validate()` enforces is uint32 capacity —
+it raises only above `2**32` — not 65536. At POC scale the uint16 bound was still treated
+as a hard constraint on tokenizer choice, which is why the discussion below reads that
+way; today it is a storage-cost tradeoff (uint32 ≈ 2× shard bytes), not a hard gate.
 
 ## The tokenizer
 
@@ -46,6 +58,13 @@ From [`src/data/tokenize.py`](../../src/data/tokenize.py):
 
 So the tokenizer and the storage format are a linked decision: OLMo-7B-hf is chosen
 partly *because* its vocab fits uint16, and OLMo-2 is rejected *because* it doesn't.
+
+> **Superseded in part (#90).** The last clause of that quote is now stale:
+> `validate()` no longer rejects `>= 65536`, so a 100278-vocab tokenizer is *packable*
+> (as uint32). The POC decision itself stands — OLMo-7B-hf remains the from-scratch
+> path's tokenizer — but for new work the vocab bound is a cost consideration, not a
+> veto. The M12 code model uses its own byte-level BPE (uint16) via the Swift
+> tokenizer; the reserve Qwen3 student is uint32.
 
 A byte-level fallback tokenizer exists, but only for plumbing tests:
 

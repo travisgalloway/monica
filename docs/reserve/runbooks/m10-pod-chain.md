@@ -96,6 +96,9 @@ exists (no repo runner needed — it's the loop below).
 > tuning a layout: `config/manifests/student-1b-attn-{hi,lo}.yaml` (read by this Step-4 sweep) vs.
 > the flat `config/student-1b-attn-{hi,lo}.yaml` at the config root (resolved `MambaConfig` YAMLs
 > read by Step-5's `scripts/sft.py`/`scripts/rlvr.py`, **not** by `distill.py`).
+> **Neither family exists any more:** the manifests went with #189/#248, and the flat configs were
+> deleted 2026-07-25. Both are recoverable from git history. This note is retained because the
+> two-families-in-sync hazard is the kind of thing that would recur if the sweep were rebuilt.
 ```bash
 for M in student-1b-attn-hi student-1b-attn-lo; do
   python scripts/distill.py --manifest config/manifests/$M.yaml \

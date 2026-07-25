@@ -3,9 +3,9 @@
 [← Index](README.md)
 
 Conformance checks guard the seam's central promise: the model behaves identically
-across its two compute paths, and (eventually) across its two backends. Both live in
-[`src/conformance/`](../../src/conformance/) and both compare in **fp32 at ~1e-4
-relative tolerance**.
+across its two compute paths, across its two backends, and across document boundaries in
+a packed sequence. All three live in [`src/conformance/`](../../src/conformance/) and all
+three compare in **fp32 at ~1e-4 relative tolerance**.
 
 ## forward-vs-step parity
 
@@ -53,6 +53,22 @@ to the Mac. The only layout subtlety is the depthwise-conv weight: the portable 
 is MLX-canonical `(out, k, in/groups)`, and the torch backend transposes to/from torch's
 `(out, in/groups, k)` in `_portable_state_dict`/`_load_portable`.
 
+## document-boundary parity
+
+When several documents are packed into one training sequence, recurrent SSM state (and
+attention) must not bleed across the boundaries: a packed multi-document `forward` has to
+equal running each document on its own. This is the gate for the `seg_ids` argument on
+`ModelInterface.forward` (#68). From
+[`src/conformance/doc_boundary_parity.py`](../../src/conformance/doc_boundary_parity.py):
+
+> a silent leak across a boundary corrupts training in a way ordinary losses don't
+> surface (mirrors `forward_step_parity` for the SSD scan).
+
+`check_doc_boundary_parity(model, docs, chunk_size, to_numpy=..., pad_id=0, rtol=1e-4,
+atol=1e-5)` pads each document up to a multiple of `chunk_size` (boundaries must be
+**chunk-aligned**), packs them with `seg_ids`, and checks each document's logit slice
+against its standalone forward. Returns `{max_abs_diff, ok, failed_doc}`.
+
 ## Why fp32, ~1e-4
 
 bf16's machine epsilon is too coarse for a meaningful equivalence check. From
@@ -72,6 +88,7 @@ CUDA backend on torch-CPU). `backend_parity` is implemented and exercised by
 `tests/test_backend_parity.py`; the cross-backend cases need both backends present, so
 they **skip cleanly** on a single-backend host (e.g. a Linux/CUDA box without mlx, or a
 Mac without torch) and run in full on a Mac with torch-CPU installed.
+`doc_boundary_parity` is implemented and has its own dedicated tests.
 
 ## Related
 

@@ -1,6 +1,6 @@
 # ~1B Mamba-2 HYBRID student — distillation sweep seed (epic #65, distillation-first).
 # This is the seed layout the student sweep (#98) searches over: attention fraction,
-# layer placement, and state size are the FREE variables (see docs/design/10-distillation.md).
+# layer placement, and state size are the FREE variables (see docs/reserve/10-distillation.md).
 # Distilled from Qwen/Qwen3-4B-Thinking-2507 (#65/#91/#93), NOT pretrained from scratch.
 #
 # 2048 x 28 -> ~1.03B params (verify: `python scripts/model_size.py --config config/student-1b.yaml`).
