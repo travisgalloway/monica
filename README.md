@@ -95,7 +95,6 @@ config/                    model dims + run params (single source of truth)
   1b.yaml                                    ~1B from-scratch target (OLMo vocab, bf16, CUDA)
   student-1b.yaml  manifests/student-1b-*.yaml   ~1B distillation student + sweep manifests
 src/model/                 interface (seam) · blocks (config + hybrid/MoE gating) · mlx/cuda backends
-                           teacher · mlx_teacher · mlx_student_init · mlx_distill (distillation)
 src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint16/uint32) · split · loader
                            corpus · shard (doc-boundary bounds) · storage (R2 layout)
                            sft_*/dpo_*/reasoning_* (post-training corpora)
