@@ -90,20 +90,22 @@ enforces this.
 
 ```
 config/                    model dims + run params (single source of truth)
-  toy.yaml toy-hybrid.yaml toy-moe.yaml      tiny smoke/correctness configs
-  poc.yaml                                   ~127M from-scratch POC / dev rung (OLMo vocab, fp16)
+  toy.yaml toy-hybrid.yaml toy-moe.yaml toy-muon.yaml   tiny smoke/correctness configs
+  small.yaml                                 ~2.6M byte-vocab, fast local iteration
+  poc.yaml  poc-small.yaml                   ~127M / ~97M from-scratch POC rungs (OLMo vocab, fp16)
+  poc-qwen.yaml                              ~205M Qwen2.5-vocab run — COMPLETE (val-ppl 75.7)
   1b.yaml                                    ~1B from-scratch target (OLMo vocab, bf16, CUDA)
-  student-1b.yaml  manifests/student-1b-*.yaml   ~1B distillation student + sweep manifests
+  student-1b.yaml                            ~1B distillation student (reserve; also the uint32 packing fixture)
 src/model/                 interface (seam) · blocks (config + hybrid/MoE gating) · mlx/cuda backends
 src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint16/uint32) · split · loader
                            corpus · shard (doc-boundary bounds) · storage (R2 layout)
                            sft_*/dpo_*/reasoning_* (post-training corpora)
 swift/                     native code tokenizer (#191/#245): MonicaTokenizer + monica-tokenize CLI
                            (train · encode · decode · pack) — cross-platform, bit-identical, no MLX
-src/train/                 loop · schedule (warmup+cosine) · checkpoint · loss_scale
+src/train/                 loop · schedule (warmup+cosine, WSD) · checkpoint · loss_scale
                            sft · dpo · grpo · verifiers
 src/eval/                  val_loss (Tier-1) · olmes_adapter (Tier-2 lm-eval) · long_context · probes
-src/conformance/           forward_step_parity · backend_parity (fp32 guards)
+src/conformance/           forward_step_parity · backend_parity · doc_boundary_parity (fp32 guards)
 src/serve/                 sessions · rewind · sampling · generate · spec_decode
 scripts/train.py           pretrain driver       scripts/generate.py   serve + chat CLI
 scripts/smoke_test.py      milestone-4 gate
@@ -224,7 +226,7 @@ offline command — and for the small local-training configs (`config/small.yaml
 [`docs/local-development.md`](docs/local-development.md):
 
 ```bash
-scripts/local_validate.sh      # data → smoke gate → small.yaml train → distill smoke → teacher precompute
+scripts/local_validate.sh      # data → smoke gate → small.yaml train  (M10 distill/teacher stages removed with #189)
 ```
 
 Run the smoke gate (the M4 gate) to confirm the backend, training loop, and exact-resume all

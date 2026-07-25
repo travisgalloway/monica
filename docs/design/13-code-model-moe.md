@@ -38,7 +38,19 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 
 - **MHM-P0 — Decisions.** From-scratch, own BPE (shipped as a **native cross-platform Swift**
   tokenizer, not Python/MLX — see MHM-P1b), RunPod (CUDA) + M1 (MLX) dev. Carried decisions:
-  D4 Jamba-vs-Routing-Mamba, D5 Large A vs Large B, vocab size.
+  D4 Jamba-vs-Routing-Mamba, D5 Large A vs Large B.
+
+  > **Vocab size — provisionally 16384, must be re-derived before the corpus is packed.**
+  > 16k is the Swift trainer's `DEFAULT_VOCAB_SIZE` and what #193/#200 assume, so it is decided in
+  > practice. But that number was chosen when #193 was scoped as *"TS LSP-clean pipeline (Stack v2
+  > **TS subset**)"* — 16k is reasonable for TypeScript alone. #198 then **rescoped the corpus to
+  > general multilingual Essential-Web + Stack-v2 and the vocab never moved.** On multilingual
+  > prose + multi-language code, 16k compresses poorly, and that costs twice: worse **BPB** (the
+  > program's primary metric) and fewer characters per token, which directly undercuts the
+  > context-length half of the local-hardware win. 32k still fits the uint16 ceiling with room.
+  > Re-derive by training candidate vocabs (16k/32k/48k) on a corpus sample and comparing
+  > bytes/token — hours of work with `monica-tokenize train --vocab-size`, and it must happen
+  > **before** the corpus is packed, since redoing it after is a full re-tokenize.
 - **MHM-P1 — Corpus** (#193): general multilingual Essential-Web + Stack-v2 mixture, repo-context
   packing, decontamination blocklist. (Rescopes the earlier FineWeb-Edu + Stack-v1 corpus.)
 - **MHM-P1b — Tokenizer** (#191, **done** — PR #245): own byte-level BPE, shipped as a **native
@@ -74,9 +86,26 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 - **MHM-P2e — Evals** (build first): code eval suite (#221), BPB (#192, primary).
 - **MHM-P3 — Small-model ablation sweep** (#219, ~$80–120 each): attention ratio 8/12/16%,
   d_state 128 vs 256, Jamba vs Routing-Mamba.
-- **MHM-P4 — Small-model full run** (#222, 50–70B tokens → the dense checkpoint to upcycle).
-- **MHM-P5 — Large-model run** (#223): sparse-upcycle from the dense ckpt, Large A default,
-  ~150B tokens; gated on P4 + D5.
+- **MHM-P4 — Small-model full run** (#222, 50–70B tokens): the small **MoE** rung
+  (~120M-active/700M-total), sparse-upcycled from #200's dense checkpoint.
+- **MHM-P5 — Large-model run** (#223): sparse-upcycle **from #200's dense checkpoint** (not from
+  #222), Large A default, ~150B tokens; gated on P4 + D5.
+
+> **Resolved 2026-07-25 — where the dense checkpoint comes from.** An earlier draft had #222
+> producing "the dense checkpoint to upcycle" while also describing the small rung as
+> ~120M-active/700M-total. Those cannot both hold: sparse upcycling initializes MoE experts as
+> copies of a **dense** FFN, so an already-MoE checkpoint is not a valid source. The roles are now:
+>
+> | Issue | Produces | Role |
+> |---|---|---|
+> | **#200** | the **dense** small checkpoint, at the small rung's backbone dims | the single upcycle source for both MoE runs |
+> | **#222** | small **MoE** (~120M-active/700M-total), upcycled from #200 | validates the whole #213/#214 MoE build cheaply, before the expensive run |
+> | **#223** | **Large A** (~700M-active/3.5B-total), upcycled from **#200** | the headline model |
+>
+> This costs one extra dense run but buys the thing that matters: the MoE machinery is proven at
+> ~$100s rather than first being exercised on the ~$1.2k large run. It also means **#200 must be
+> re-dimensioned** off `poc-small.yaml`'s 97M shape to match the small rung's non-expert backbone
+> — otherwise the upcycle won't line up.
 - **Cross-cutting:** rented-pod ops runbook (#224). **Parked:** post-training SFT (#101) / RLVR
   (#103).
 

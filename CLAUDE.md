@@ -60,9 +60,13 @@ design), and only the portable tests run.
 All hardware-specific code lives behind `src/model/interface.py`
 (`ModelInterface`). Everything above the seam — `src/data/`, `src/train/`,
 `src/serve/`, `src/eval/`, `src/conformance/`, `src/lsp/` — is **portable Python that
-must never import `mlx` or `torch`/CUDA**. Only `src/model/mlx_backend.py`,
-`src/model/mlx_train_step.py`, `src/model/cuda_backend.py`, and the LSP-harness's
-model adapter (`src/model/mlx_lm_adapter.py`) may touch a hardware library.
+must never import `mlx` or `torch`/CUDA**. Exactly six modules may touch a hardware
+library: `src/model/mlx_backend.py`, `src/model/mlx_train_step.py`,
+`src/model/cuda_backend.py`, `src/model/cuda_train_step.py`, `src/model/cuda_muon.py`
+(#237's Muon/AdamW hybrid), and the LSP-harness's model adapter
+`src/model/mlx_lm_adapter.py`. Note `src/model/backend.py` is **not** one of them — it is
+the portable backend-factory registry and keeps its backend imports inside the factory
+closures.
 
 This is enforced by `tests/test_import_guard.py`, which imports every portable module
 and asserts no backend leaked into `sys.modules`. **When adding code above the seam,

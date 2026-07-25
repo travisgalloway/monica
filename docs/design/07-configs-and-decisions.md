@@ -21,7 +21,14 @@ scale run) — but they are no longer the whole surface.
 | `poc-small.yaml` | ~97M, real-but-slow local POC (the "≤100M trained locally" target) | reserve |
 | `poc-qwen.yaml` | poc.yaml retargeted to Qwen2.5 — the **completed** ~205M run (val-ppl 75.7) | reserve (done) |
 | `1b.yaml` | ~1B from-scratch, OLMo vocab | reserve (#75) |
-| `student-1b.yaml`, `student-1b-attn-lo.yaml`, `student-1b-attn-hi.yaml` | ~1B hybrid distillation-student sweep seed + attention-fraction siblings | **history** — M10 dropped 2026-07-19; kept for the sizing/attention-fraction record |
+| `student-1b.yaml` | ~1B hybrid distillation-student sweep seed | **history** (M10 dropped 2026-07-19) but still **live as a fixture**: `tests/test_packing_dtype.py` uses it as the uint32 case, and [09-hybrid-architectures.md](09-hybrid-architectures.md) cites it as the hybrid sizing example |
+
+> The `student-1b-attn-lo.yaml` / `-attn-hi.yaml` sweep siblings were **deleted** (2026-07-25).
+> They documented themselves as derived from `config/manifests/*.yaml` via `manifest_to_config`,
+> and both the manifest directory and that converter were removed with #189/#248 — so they
+> described tooling that no longer exists and nothing in the tree referenced them. The
+> attention-fraction reasoning they encoded survives as prose in
+> [09-hybrid-architectures.md](09-hybrid-architectures.md); the files themselves are in git history.
 
 The M12 code model's own configs (small ~120M-active/700M-total, "Large A"
 ~700M-active/3.5B-total) do **not** exist yet — they arrive with #200/#219. See

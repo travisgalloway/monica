@@ -1,6 +1,7 @@
 # ~1B Mamba-2 config (epic #65) — the single target model size (100M poc -> 1B; no 2B/4B ladder).
 # This is the FROM-SCRATCH 1B (OLMo vocab, production reserve #75); the distillation student of
-# the same size class is config/student-1b.yaml (Qwen2.5 vocab, the current focus).
+# the same size class is config/student-1b.yaml (Qwen3 vocab) — M10 reserve, NOT the current
+# focus (M10 dropped 2026-07-19; the live program is M12, see docs/design/13-code-model-moe.md).
 # d_model 2048 x 36 layers -> ~1.03B params (verify: `python scripts/model_size.py`).
 # bf16 weights ~2.0 GB; Mamba has no KV cache so that ~= the inference footprint.
 # Fits L4 / A10 24GB for training; everything below the seam is validated on the Mac first.

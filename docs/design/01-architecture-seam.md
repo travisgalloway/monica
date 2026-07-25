@@ -6,10 +6,23 @@
 
 All hardware-specific code lives behind **one abstraction**,
 [`ModelInterface`](../../src/model/interface.py). Everything above the seam —
-`data/`, `train/`, `serve/`, `eval/`, `conformance/` — is portable Python that
-**never imports MLX or CUDA**. Only the backend modules
-(`src/model/mlx_backend.py`, `src/model/mlx_train_step.py`,
-`src/model/cuda_backend.py`) touch a hardware library.
+`data/`, `train/`, `serve/`, `eval/`, `conformance/`, `lsp/` — is portable Python that
+**never imports MLX or CUDA**. Exactly six modules touch a hardware library:
+
+| Module | Role |
+|---|---|
+| `src/model/mlx_backend.py` | MLX model |
+| `src/model/mlx_train_step.py` | MLX backprop/optimizer primitive |
+| `src/model/cuda_backend.py` | CUDA/PyTorch model |
+| `src/model/cuda_train_step.py` | CUDA backprop/optimizer primitive |
+| `src/model/cuda_muon.py` | Muon + AdamW hybrid optimizer (#237) |
+| `src/model/mlx_lm_adapter.py` | the LSP harness's `LMAdapter` (see [12-lsp-in-the-loop.md](12-lsp-in-the-loop.md)) |
+
+`src/model/backend.py` is deliberately **not** on that list: it is the portable
+backend-factory registry (`BackendSpec`, `make_optimizer`) and keeps its backend imports
+**inside the factory closures**, so importing it above the seam pulls in nothing. That is
+what lets `make_optimizer` select Muon-vs-AdamW without the training loop knowing a
+backend exists.
 
 **Outside this Python seam entirely:** the `swift/` native toolchain (the repo's first Swift
 package — the code tokenizer `MonicaTokenizer` + `monica-tokenize` CLI, #191/#245). It is neither
