@@ -69,25 +69,26 @@ The POC has no external benchmark requirement. From
 final batch (`drop_last=False`) doesn't bias the result. The numeric core is
 backend-free numpy; `to_numpy` converts backend logits at the boundary.
 
-## OLMES / lm-eval is deferred (Tier-2)
+## OLMES / lm-eval is implemented, but stays Tier-2
 
-Standardized benchmarks are explicitly out of scope for the POC. From
-[`src/eval/olmes_adapter.py`](../../src/eval/olmes_adapter.py):
+**Status: built.** This section previously described
+[`src/eval/olmes_adapter.py`](../../src/eval/olmes_adapter.py) as a deferred stub. It is not —
+the adapter implements the harness's model class over `ModelInterface.forward`, and
+`scripts/eval_olmes.py` runs loglikelihood and generative tasks end to end. It keeps the same
+split as `val_loss`: a pure-numpy scoring core (`score_continuation`,
+`disjoint_rolling_windows`) that is testable anywhere, and a thin lm-eval shell built by
+`make_lm_eval_adapter`. lm-eval is a heavy optional dependency (some versions pull in torch),
+so it is imported **only inside the factory** — which is how the module stays above the seam.
 
-> Tier-2 evaluation: OLMES / lm-evaluation-harness adapter — STUB (deferred).
->
-> Evaluating a custom MLX Mamba requires implementing the harness's model class (the
-> loglikelihood-style methods) ... This is its own milestone-sized task, NOT wiring.
->
-> Known trap: off-by-one errors in loglikelihood token indexing. ... For a 100M
-> model, absolute scores will be poor — judge the harness by whether it runs end to
-> end, not by leaderboard position.
->
-> Deferred for the POC (success = Tier-1 val perplexity).
+The documented indexing trap is real and is what the numpy core exists to pin down: `forward`
+logits at position `i` predict the token at `i+1`, so the model input is `(ctx + cont)[:-1]`
+and the continuation is scored by the **last `len(cont)` logit rows**.
 
-So: Tier-1 (val perplexity) defines POC success; Tier-2 (OLMES) is a later,
-milestone-sized effort with a documented indexing pitfall, and a reminder that a 100M
-model's job is to *run* the harness, not top a leaderboard.
+What keeps OLMES at **Tier-2** is no longer implementation effort but the finding: at POC scale
+scores land near chance (confirmed on the completed ~205M `poc-qwen` run). So **Tier-1 (val
+perplexity / BPB) defines POC success**, and the harness's job is to *run*, not to place on a
+leaderboard. For the M12 code model, **BPB** is the primary small-model metric
+([13-code-model-moe.md](13-code-model-moe.md)) and the code-specific suite is #221.
 
 ## Related
 

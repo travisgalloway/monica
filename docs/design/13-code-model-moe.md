@@ -10,6 +10,16 @@ from-scratch code model, described below.
 
 ## What this is
 
+> **Read this section as the target design, not as shipped state.** As of 2026-07-25 the only
+> MHM component that is **built** is the tokenizer (MHM-P1b, #191/#245). `MambaConfig` carries the
+> MoE and hybrid-attention knobs (`moe_every`, `n_experts`, `top_k`, `attn_every`, `fp8_experts`)
+> and the MLX backend has a **toy** `MoEBlock` — a plain softmax top-k router with **no shared
+> expert and no load balancing**, which collapses at the target 64×top-6 shape. The CUDA backend
+> still raises `NotImplementedError` for MoE (#214). The shared expert, aux-loss-free balancing,
+> FIM, the Essential-Web + Stack-v2 mixture, and repo-context packing described below are **designed,
+> not implemented**. Per-item status is in the MHM-P# list that follows; when the two disagree,
+> the P# list wins.
+
 A from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code model**. The
 backbone is mostly Mamba-2/SSD state-space layers with a **minority (~12.5%) of full-attention
 layers** for the cross-file symbol recall that pure SSMs are weak at, and **MoE on the MLP layers**
@@ -51,10 +61,13 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   insertion transform may live in the Swift `pack` path), length curriculum + dataloader-state resume
   (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
   **Training-efficiency levers** (folded 2026-07-20 from the efficiency-survey review): hybrid
-  Muon+AdamW optimizer at the `make_optimizer` seam (#237), WSD warmup-stable-decay LR schedule
-  (#238), and `torch.compile` default-on for real CUDA runs (#239) — all sequenced to land
-  *before* the #219 sweep so it and the #222/#223 runs carry them; plus fp8 MoE-expert linears
-  (Transformer Engine / Hopper, #240), *gated on #214* and ahead of the #223 large run. (The repo
+  Muon+AdamW optimizer at the `make_optimizer` seam (#237, **done** — `3b02e6b`), WSD
+  warmup-stable-decay LR schedule (#238, **done** — `8fe62f7`), and `torch.compile` default-on for
+  real CUDA runs (#239, **done** — `7a71073`) — all three landed ahead of the #219 sweep, so it
+  and the #222/#223 runs carry them; plus fp8 MoE-expert linears
+  (Transformer Engine / Hopper, #240 — **design-only**, `c57a8e6`: the probe landed but the code is
+  never called), *gated on #214* and ahead of the #223 large run. See
+  [05-training.md](05-training.md#efficiency-levers-m12-landed-2026-07-2021). (The repo
   is already mature on the survey's biggest axes — data dedup/filtering, fused AdamW, SDPA, the
   mamba-ssm kernels, grad-checkpoint — so these four are the net-new levers; #216 is the
   length-curriculum lever.)

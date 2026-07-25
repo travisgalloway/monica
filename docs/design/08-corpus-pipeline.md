@@ -98,12 +98,13 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 > `monica-tokenize pack` (`swift/`, #191/#245) tokenizes + packs it — emitting the same
 > `.bin`/`.bounds`/`manifest.json` layout described below, so the training loop is unchanged.
 
-- **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing bound
-  (`vocab < 65536`)** in mind — enforced by `src/data/pack.py` and `MambaConfig.validate()`
-  (see [data pipeline](04-data-pipeline.md)). **StarCoder2** (vocab ~49,152) **fits**;
-  **Llama-3** (vocab ~128,256) **does not** — choosing it forces uint32 packing (≈2× shard
-  storage) and relaxing the bound. This is the linked storage/tokenizer decision, the same
-  shape as the OLMo-vs-OLMo-2 choice at POC scale.
+- **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing
+  threshold (`vocab < 65536`)** in mind — `src/data/pack.py` and `MambaConfig.packing_dtype`
+  select the dtype from the vocab (see [data pipeline](04-data-pipeline.md)). **StarCoder2**
+  (vocab ~49,152) packs as uint16; **Llama-3** (vocab ~128,256) forces uint32 (≈2× shard
+  storage). Since #90 this is a **cost tradeoff, not a hard bound** — `validate()` rejects
+  only above uint32 capacity. Superseded in practice for M12: the code model trains on its
+  **own byte-level BPE** (#191/#245, uint16) rather than a reused tokenizer.
 - **Pack:** fixed-length sequences of **8192** with document-boundary markers; **reset the
   SSM state at boundaries** so recurrent state can't bleed across docs (the packing hazard —
   see #68 and [hybrid architectures](09-hybrid-architectures.md)).

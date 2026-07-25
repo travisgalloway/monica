@@ -6,7 +6,7 @@ The packed token dtype follows the tokenizer vocab (`pack.packing_dtype_for`):
 - **Qwen3** (vocab ~151,669) — fixed by the distillation conversion teacher
   (Qwen/Qwen3-4B-Thinking-2507); the unified Qwen3 BPE, token-aligned with Qwen2.5 plus
   a few added control tokens (incl. <think>/</think>). Exceeds uint16, so it packs as
-  **uint32** (#90, see docs/design/10-distillation.md). M10/Qwen distillation is retired;
+  **uint32** (#90, see docs/reserve/10-distillation.md). M10/Qwen distillation is retired;
   kept for back-compat.
 - **Qwen2.5** (vocab 151,646) — the prior teacher's tokenizer; uint32. Kept for back-compat
   (the DeepSeek-R1-Distill-Qwen variants share it).

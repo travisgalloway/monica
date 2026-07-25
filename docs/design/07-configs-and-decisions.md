@@ -2,10 +2,30 @@
 
 [← Index](README.md)
 
-Two configs are the single source of truth for model dimensions and run parameters,
-loaded into [`MambaConfig`](../../src/model/blocks.py): `toy.yaml` (correctness /
-smoke) and `poc.yaml` (the ~100M scale run). The comments in these files *are* the
-decision record — reproduced verbatim below.
+`config/*.yaml` is the single source of truth for model dimensions and run parameters,
+loaded into [`MambaConfig`](../../src/model/blocks.py). **The comments in these files
+*are* the decision record.** Two of them carry the load-bearing decisions and are
+reproduced verbatim below — `toy.yaml` (correctness / smoke) and `poc.yaml` (the ~100M
+scale run) — but they are no longer the whole surface.
+
+### The full config surface
+
+| Config | Role | Status |
+|---|---|---|
+| `toy.yaml` | milestone-1..4 smoke test; tiny + fp32 so fixed-seed resume is exactly reproducible | **live** (the gate) |
+| `toy-hybrid.yaml` | tiny Mamba-2 with config-gated attention layers (#67) — parity + sizing tests exercise both block types | live |
+| `toy-moe.yaml` | tiny Mamba-2 with config-gated sparse-MoE FFN layers (#53) — parity + sizing tests exercise the MoE block | live |
+| `toy-muon.yaml` | toy.yaml's shape with `optimizer: muon` (#237) — exercises the hybrid optimizer | live |
+| `small.yaml` | ~2.6M params, byte vocab — fast local iteration | live |
+| `poc.yaml` | ~127M OLMo-vocab from-scratch scale run | reserve (validated foundation, #75) |
+| `poc-small.yaml` | ~97M, real-but-slow local POC (the "≤100M trained locally" target) | reserve |
+| `poc-qwen.yaml` | poc.yaml retargeted to Qwen2.5 — the **completed** ~205M run (val-ppl 75.7) | reserve (done) |
+| `1b.yaml` | ~1B from-scratch, OLMo vocab | reserve (#75) |
+| `student-1b.yaml`, `student-1b-attn-lo.yaml`, `student-1b-attn-hi.yaml` | ~1B hybrid distillation-student sweep seed + attention-fraction siblings | **history** — M10 dropped 2026-07-19; kept for the sizing/attention-fraction record |
+
+The M12 code model's own configs (small ~120M-active/700M-total, "Large A"
+~700M-active/3.5B-total) do **not** exist yet — they arrive with #200/#219. See
+[13-code-model-moe.md](13-code-model-moe.md).
 
 ## `config/toy.yaml`
 
@@ -111,10 +131,14 @@ in `src/train/loss_scale.py`), while toy/smoke stay **fp32** for exact resume. N
 this contradicts the common assumption that bf16 is the safe default — on Metal it
 isn't. Re-run `python scripts/bench_precision.py` on new hardware to re-confirm.
 
-### Vocab is locked to uint16
+### Vocab determines the packing dtype
 
-`vocab_size: 50280` (OLMo-7B-hf) is confirmed `< 65536`, the bound required by the
-[uint16 packing](04-data-pipeline.md) and enforced by `MambaConfig.validate()`.
+`vocab_size: 50280` (OLMo-7B-hf) is confirmed `< 65536`, so `poc.yaml` packs as
+**uint16** — half the shard bytes of the alternative. This is a *dtype selection*, not a
+hard bound: since #90, `MambaConfig.packing_dtype` returns `'uint32'` at or above 65536,
+and `validate()` only rejects above uint32 capacity (`2**32`). See
+[dtype-aware packing](04-data-pipeline.md). The reserve `poc-qwen.yaml`/`student-1b.yaml`
+configs are uint32; the M12 code BPE is uint16.
 
 ### dt-bias parameters are shared
 

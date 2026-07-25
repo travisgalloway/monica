@@ -34,16 +34,23 @@ From `src/model/interface.py`:
 
 ## The contract
 
-`ModelInterface` defines exactly six concerns:
+`ModelInterface` defines exactly seven concerns:
 
 | Method | Role |
 |---|---|
-| `forward(token_batch)` | Full-sequence **parallel** training path → logits `(B, T, vocab)` |
+| `forward(token_batch, seg_ids=None)` | Full-sequence **parallel** training path → logits `(B, T, vocab)`; `seg_ids` marks document boundaries within a packed sequence |
 | `step(token, state)` | Single-token **recurrence** inference path; must agree with `forward` |
 | `init_state(batch_size)` | Fresh, zeroed recurrent state |
 | `get_state()` / `set_state(state)` | Snapshot / restore (for serving + rewind) |
+| `clone_state(state)` | Independent snapshot of a state, safe to retain while stepping |
 | `save(path)` / `load(path)` | Persist weights in a portable format (safetensors) |
 | `config` | The `MambaConfig` |
+
+`clone_state` is separate from `get_state` because the serving layer
+(`serve/sessions`, `serve/rewind`) holds many states at once and snapshots them at turn
+boundaries. On an immutable-array backend (MLX) a structural copy suffices; a backend whose
+`step` mutates buffers in place **must** deep-copy here, or a retained snapshot silently
+aliases a later step.
 
 The two compute paths (`forward` and `step`) are separate implementations that must
 produce identical logits — enforced by [conformance](03-conformance.md).
@@ -65,7 +72,7 @@ the seam knows or cares.
 `MambaConfig` ([`src/model/blocks.py`](../../src/model/blocks.py)) is the single
 source of truth for model dimensions and run parameters, loaded from
 `config/*.yaml`. It is backend-free and carries a `validate()` that enforces
-cross-cutting invariants (e.g. the uint16 vocab bound — see
+cross-cutting invariants (e.g. the vocab/packing-dtype bound — see
 [data pipeline](04-data-pipeline.md)). Backends consume the same config object, so a
 decision like the load-bearing dt-bias init is defined once and "carried into every
 backend."

@@ -36,7 +36,7 @@ pip install -e ".[dev,data,cuda]"          # base CUDA backend (pure-PyTorch)
 pip install -e ".[dev,data,cuda-fast]"     # + mamba-ssm Triton scan + causal-conv1d (#40)
 
 # Tests (uses the venv at .venv):
-.venv/bin/python -m pytest                                   # full suite (36 tests)
+.venv/bin/python -m pytest                                   # full suite
 .venv/bin/python -m pytest tests/test_mlx_parity.py          # one file
 .venv/bin/python -m pytest tests/test_mlx_parity.py::test_forward_step_parity_toy  # one test
 .venv/bin/python -m pytest -q -rs                            # quiet, report skips
@@ -62,8 +62,7 @@ All hardware-specific code lives behind `src/model/interface.py`
 `src/serve/`, `src/eval/`, `src/conformance/`, `src/lsp/` — is **portable Python that
 must never import `mlx` or `torch`/CUDA**. Only `src/model/mlx_backend.py`,
 `src/model/mlx_train_step.py`, `src/model/cuda_backend.py`, and the LSP-harness's
-model adapter (`src/model/mlx_lm_adapter.py`, or its `hf_lm_adapter.py` fallback) may
-touch a hardware library.
+model adapter (`src/model/mlx_lm_adapter.py`) may touch a hardware library.
 
 This is enforced by `tests/test_import_guard.py`, which imports every portable module
 and asserts no backend leaked into `sys.modules`. **When adding code above the seam,
