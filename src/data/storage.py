@@ -2,13 +2,13 @@
 artifact lives, so the student layout stays downstream of all of them and #80's R2 readers/writers
 point at one canonical prefix scheme (docs/design/08-corpus-pipeline.md, #65).
 
-    poc-distill/      corpus/{cleaned,tokenized/<tok>-<k>}/  teacher-outputs/{topk-logits,hidden-states}/  manifests/
+    poc-distill/      corpus/{cleaned,tokenized/<tok>-<k>}/  manifests/
     shared/           sft/{cleaned/<kind>,tokenized/<tok>-<k>}/  rl/{math-verifiable,code-verifiable}/  eval/
     reserve-pretrain/ cleaned/  tokenized/<ver>-<tok>-<k>/  manifests/
 
 The three classes:
-- **poc-distill** — the tokenized distillation corpus (#92) + teacher outputs (#94); drives the
-  distillation matching only. Invalidated only by a teacher/tokenizer change, never by the student.
+- **poc-distill** — the tokenized distillation corpus (#92). (The M10 teacher-outputs subtree +
+  its `teacher_outputs_dir` helper were removed with #189; the corpus-prefix helpers remain.)
 - **shared** — the instruct (#95) / reasoning-trace (#96) / tool-use (#102) SFT corpora + the
   verifiable RL sets (#103). Curated once (much of it teacher inference) and reused unchanged by
   both the POC and the production-reserve run.
@@ -49,7 +49,7 @@ def tokenized_dir_name(tokenizer: str, seq_len: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# poc-distill/ — distillation corpus (#92) + teacher outputs (#94)
+# poc-distill/ — distillation corpus (#92)  [teacher-outputs subtree removed with #189]
 # --------------------------------------------------------------------------- #
 def corpus_cleaned_dir(poc_distill_root) -> Path:
     """Tokenizer-agnostic cleaned distillation text."""
@@ -59,11 +59,6 @@ def corpus_cleaned_dir(poc_distill_root) -> Path:
 def corpus_tokenized_dir(poc_distill_root, tokenizer: str, seq_len: int) -> Path:
     """Tokenized distillation shards, name-pinned by tokenizer + seq_len."""
     return Path(poc_distill_root) / "corpus" / "tokenized" / tokenized_dir_name(tokenizer, seq_len)
-
-
-def teacher_outputs_dir(poc_distill_root, kind: str = "topk-logits") -> Path:
-    """Precomputed teacher outputs (#94): `topk-logits` or `hidden-states`."""
-    return Path(poc_distill_root) / "teacher-outputs" / kind
 
 
 def manifests_dir(poc_distill_root) -> Path:

@@ -13,8 +13,8 @@ studies feeding language-server / static-analysis signal into the model. See
 [issue #198](https://github.com/travisgalloway/monica/issues/198).
 
 > The earlier **M10 distillation program** (distil a ~1B student from a frozen
-> `Qwen/Qwen3-4B-Thinking-2507` teacher) was dropped 2026-07-19; its machinery is built and its
-> design record is kept under [`docs/reserve/`](docs/reserve/10-distillation.md). The from-scratch
+> `Qwen/Qwen3-4B-Thinking-2507` teacher) was dropped 2026-07-19; its code was removed from the tree
+> (#189) and its design record is kept under [`docs/reserve/`](docs/reserve/10-distillation.md). The from-scratch
 > OLMo pretrain path is complete and stays in reserve.
 
 **Usage:** [`docs/usage.md`](docs/usage.md) — end-to-end commands (install → data →
@@ -55,7 +55,9 @@ training the big one from zero).
 **The intended process, in order:**
 
 1. **Build the corpus + tokenizer** — a general multilingual code+text mixture (Essential-Web +
-   Stack-v2) and Monica's own byte-level BPE trained on it.
+   Stack-v2) and Monica's own byte-level BPE trained on it. The tokenizer is a **native
+   cross-platform Swift** package (`swift/`, #191/#245): Python cleans the corpus, Swift
+   tokenizes+packs it.
 2. **Build the MoE architecture & harness** — load-balancing router, the CUDA MoE backend,
    fill-in-the-middle, a length curriculum, and the evals (bits-per-byte is the primary metric).
 3. **Sweep small designs, then run** — cheaply ablate attention ratio / state size / routing,
@@ -93,17 +95,18 @@ config/                    model dims + run params (single source of truth)
   1b.yaml                                    ~1B from-scratch target (OLMo vocab, bf16, CUDA)
   student-1b.yaml  manifests/student-1b-*.yaml   ~1B distillation student + sweep manifests
 src/model/                 interface (seam) · blocks (config + hybrid/MoE gating) · mlx/cuda backends
-                           teacher · mlx_teacher · mlx_student_init · mlx_distill (distillation)
 src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint16/uint32) · split · loader
-                           corpus · shard (doc-boundary bounds) · distill_corpus · storage (R2 layout)
+                           corpus · shard (doc-boundary bounds) · storage (R2 layout)
                            sft_*/dpo_*/reasoning_* (post-training corpora)
+swift/                     native code tokenizer (#191/#245): MonicaTokenizer + monica-tokenize CLI
+                           (train · encode · decode · pack) — cross-platform, bit-identical, no MLX
 src/train/                 loop · schedule (warmup+cosine) · checkpoint · loss_scale
-                           sft · dpo · grpo · verifiers · distill_manifest · sweep
+                           sft · dpo · grpo · verifiers
 src/eval/                  val_loss (Tier-1) · olmes_adapter (Tier-2 lm-eval) · long_context · probes
 src/conformance/           forward_step_parity · backend_parity (fp32 guards)
 src/serve/                 sessions · rewind · sampling · generate · spec_decode
-scripts/train.py           pretrain driver       scripts/sweep.py      student sweep table
-scripts/smoke_test.py      milestone-4 gate      scripts/generate.py   serve + chat CLI
+scripts/train.py           pretrain driver       scripts/generate.py   serve + chat CLI
+scripts/smoke_test.py      milestone-4 gate
 scripts/sft.py dpo.py rlvr.py   post-training    scripts/eval_olmes.py lm-eval harness
 tests/                     unit tests
 docs/usage.md              usage guide   docs/infrastructure.md  cloud runbook   docs/design/  rationale
@@ -116,7 +119,7 @@ done and verified on a rented A40** (full suite green on both). The active progr
 from-scratch Mamba-2 hybrid MoE code model**
 ([issue #198](https://github.com/travisgalloway/monica/issues/198)); the M1–M8 core was tracked in
 [issue #2](https://github.com/travisgalloway/monica/issues/2). The earlier M10 distillation program
-(#65) was **dropped 2026-07-19** — machinery built, kept as reserve under
+(#65) was **dropped 2026-07-19** (code removed #189) — design record kept as reserve under
 [`docs/reserve/`](docs/reserve/10-distillation.md).
 
 | Milestone                 | State                                                                             |
@@ -136,17 +139,16 @@ from-scratch Mamba-2 hybrid MoE code model**
 **M12 — the active program.** A from-scratch **TypeScript-first Mamba-2 hybrid MoE code model**
 (tracker [#198](https://github.com/travisgalloway/monica/issues/198); design record
 [`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md)). The spine: own byte-level
-BPE (#191) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
+BPE (#191 — **done: native Swift, #245**) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
 backend (#214) → FIM / length curriculum / evals → ablation sweep (#219) → small full run (#222) →
 sparse-upcycled large run (#223). The bulk of the net-new work is the MoE build — MoE is
 MLX-toy-only today. A **secondary axis (SSI)** studies language-server / static-analysis signal:
 a validated clean-rate tool with a found functional ceiling (#225/#226/#227/#230).
 
-**Reserve — M10 distillation (dropped 2026-07-19).** The frozen-teacher machinery is built (teacher
-loader `src/model/mlx_teacher.py`, student init `src/model/mlx_student_init.py`, staged loss
-`src/model/mlx_distill.py`, manifest parser, sweep table, `scripts/distill.py`) but the program is
-no longer active; the design record and run playbook are kept under
-[`docs/reserve/`](docs/reserve/path-b-run.md).
+**Reserve — M10 distillation (dropped 2026-07-19; code removed #189).** The frozen-teacher
+machinery (teacher/student-init/staged-loss modules, manifest parser, sweep table,
+`scripts/distill.py`) was **removed from the tree** (#189, recoverable via git history); the
+design record and run playbook are kept under [`docs/reserve/`](docs/reserve/path-b-run.md).
 
 **Two training paths (both reserve now).** The original **from-scratch pretrain** path
 (`scripts/train.py`, OLMo tokenizer, uint16) is complete and validated — the POC's foundation and
@@ -251,19 +253,13 @@ python scripts/train.py --config config/poc.yaml --data data/split --out runs/po
 **POC success = a smoothly decreasing `val_perplexity` in `runs/poc/metrics.jsonl`** with a
 stable `grad_norm` — not a benchmark score.
 
-### Distillation (reserve — dropped 2026-07-19)
+### Distillation (reserve — dropped 2026-07-19, code removed #189)
 
-The distillation corpus, teacher loader, student init, and staged loss exist but the program is
-**no longer active**. The machinery still runs — a candidate sweep over attention fraction /
-placement / state size:
-
-```bash
-python scripts/sweep.py                    # all of config/manifests/
-python scripts/sweep.py config/manifests/student-1b-attn-lo.yaml config/manifests/student-1b-attn-hi.yaml
-```
-
-See [`docs/reserve/10-distillation.md`](docs/reserve/10-distillation.md) for the full (reserve)
-picture.
+The M10 distillation program is no longer active and its code (distillation corpus, teacher
+loader, student init, staged loss, manifest parser, sweep table) was **removed from the tree**
+(#189). The design record and run playbook are preserved under
+[`docs/reserve/10-distillation.md`](docs/reserve/10-distillation.md); the code is recoverable from
+git history if the program is ever revived.
 
 ### Post-training (M9)
 

@@ -30,13 +30,12 @@ One offline command (no network / HF / weights) that fails fast through every pi
 | 1 data | `download --dummy` → `tokenize --byte-fallback` → `pack` → `split` | the data pipeline end-to-end |
 | 2 smoke | `scripts/smoke_test.py` on a **fresh** byte split | resume is bit-exact + val eval runs (fp32) |
 | 3 train | `scripts/train.py --config config/small.yaml` | the real fp16 + loss-scaling training path |
-| 4 distill (reserve) | `scripts/distill_smoke.py` | the 3 staged losses (mixing-match → hidden-align → logit-distill), M10 machinery |
-| 5 teacher (reserve) | `scripts/precompute_teacher.py --backend mlx --synthetic --compile` | the #94 precompute + the `mx.compile` lever, M10 machinery |
+
+(The former stages 4–5 exercised the M10 distillation/teacher machinery, removed with #189.)
 
 Knobs (env vars): `PYTHON` (default `.venv/bin/python`), `WORK` (default `runs/local-validate`),
 `STEPS` (default 20), `KEEP=1` to keep the work dir. Use this as the pre-push gate for any change
-to the loop, the SSD scan, mixed precision, checkpointing, or (for stages 4–5) the reserve distill
-stages.
+to the loop, the SSD scan, mixed precision, checkpointing, or eval.
 
 > The smoke gate must run on a **freshly built byte split**, not the real `data/split` (which is
 > the OLMo-vocab corpus) — `local_validate.sh` builds one for you.
@@ -74,71 +73,14 @@ scale). Both carry their measured step-time in the YAML header.
 
 ---
 
-## 3. Generate teacher signal locally (reserve — M10 distillation)
+## 3. Generate teacher signal locally (reserve — removed with #189)
 
-> **Reserve.** This section describes the M10 distillation program's teacher-signal precompute
-> (issue #65, **dropped 2026-07-19** — design record at
-> [`reserve/10-distillation.md`](reserve/10-distillation.md)). It is not part of the live M12
-> dev loop (sections 1–2 above); it is kept because the machinery still works and may be useful
-> reference. See [`design/13-code-model-moe.md`](design/13-code-model-moe.md) for the current
-> program.
-
-The (reserve) distillation student trained against **cached teacher top-k logits** (the #94
-precompute), then the `logit-distill` stage matched them with KL. You can still produce that
-signal locally two ways.
-
-### 3a. Real Qwen3 teacher via MLX — *the recommended path*
-
-`MLXConversionTeacher.from_pretrained` runs the actual Qwen3 weights on Apple Silicon (white-box:
-full forward, hidden states, and Q/K/V/O projections — so it supports init #99 and **all** matching
-stages #100, not just logit-distill):
-
-```bash
-.venv/bin/python scripts/precompute_teacher.py \
-    --manifest config/manifests/student-1b-attn-hi.yaml \
-    --data data/poc-distill/split --backend mlx \
-    --pretrained Qwen/Qwen3-4B-Thinking-2507 \
-    --teacher-dtype fp16 --compile --k 50 --out runs/teacher-local
-```
-
-Two **local levers** (both opt-in; default is the bit-identical eager fp32 path, so conformance and
-the smoke gate are untouched):
-
-- `--teacher-dtype fp16` — hold/compute the teacher in fp16. Halves teacher memory (a 4B teacher
-  ~16 GB → ~8 GB), so it fits comfortably on a 32 GB Mac. RMSNorm/softmax stay fp32 internally.
-- `--compile` — `mx.compile` the teacher's logits-only forward (fixed-shape, forward-only — *not*
-  the student forward/eval path #30 rejected). Fuses the per-layer op stream; the cached top-k
-  **indices are identical** to eager (values within fp tolerance).
-
-> The `--pretrained` id must be one `precompute_teacher.py` knows (`_teacher_config_for`), so the
-> teacher's `effective_vocab_size` matches the manifest tokenizer vocab — otherwise it fails loudly
-> rather than caching unusable indices. At real corpus scale the footprint is large (k=50 ≈ 300
-> B/token); keep local runs to a small split.
-
-### 3b. LM Studio / OpenAI-compatible endpoint — *partial, convenience only*
-
-If a Qwen3 model is already loaded in [LM Studio](https://lmstudio.ai) (or llama.cpp `--server`,
-vLLM, …), point the precompute at its endpoint:
-
-```bash
-.venv/bin/python scripts/precompute_teacher.py \
-    --manifest config/toy-distill.yaml --data <split> --backend mlx \
-    --teacher-endpoint http://localhost:1234/v1 --endpoint-model qwen3-4b --k 10 \
-    --out runs/teacher-lmstudio
-```
-
-**This path is partial and approximate** (`src/model/api_teacher.py` documents it in full):
-
-- It implements **only** `topk_logits`, so it feeds the **logit-distill** stage only. An HTTP
-  endpoint exposes no weights/hidden states, so init (#99), `hidden-align`, and `mixing-match`
-  (#100) are **not** available — use 3a for those.
-- Values are **log-probs, not logits** (the KL temperature scaling is exact only at T=1), the
-  top-k count is **server-capped** (often ≤10–20), and top tokens are mapped string→id **best
-  effort** with the Qwen3 tokenizer (re-tokenization can drift the per-position alignment; the
-  teacher warns once).
-
-Prefer 3a for any real local validation; reach for 3b only as a quick convenience when the model
-is already serving.
+> **Reserve, code removed.** The M10 distillation program (issue #65, **dropped 2026-07-19**) had a
+> local teacher-signal precompute (`scripts/precompute_teacher.py` — a real Qwen3 MLX teacher, or an
+> LM-Studio/OpenAI-compatible endpoint). That code was **removed from the tree** with #189; the
+> design record is preserved at [`reserve/10-distillation.md`](reserve/10-distillation.md) and the
+> code is recoverable from git history. See [`design/13-code-model-moe.md`](design/13-code-model-moe.md)
+> for the live M12 program.
 
 ---
 

@@ -133,8 +133,7 @@ from `AWS_ENDPOINT_URL_S3` (see `.env.example`). Build locally, then push:
 
 ```bash
 set -a; . ./.env; set +a                                   # load HF/R2 secrets
-python -m src.data.distill_corpus --source text --in <slice> --tokenizer qwen3 \
-    --push s3://<bucket>/poc-distill                        # build, then mirror out-root to R2
+python -m src.data.r2_sync up   data/poc-distill s3://<bucket>/poc-distill   # mirror a built tree to R2
 python -m src.data.r2_sync down s3://<bucket>/poc-distill data/poc-distill   # pull on a pod
 ```
 
@@ -144,6 +143,12 @@ The full-source build (FineWeb-Edu + supplements, cross-source MinHash) runs the
 in `src/data/datatrove_pipeline.py` + `scripts/build_corpus.py`. It reuses the project filter/dedup
 *logic* (`filters.py`/`dedup.py`) as datatrove blocks and writes **cleaned text shards**; the
 existing `src/data/shard.py` tokenizes them to the Qwen2.5 uint32 trainer shards.
+
+> **M12 code corpus differs.** The reserve build above tokenizes in Python (`src/data/shard.py`,
+> Qwen2.5). The **M12 code path** (`scripts/build_ts_clean_corpus.py`) instead stops at cleaned
+> text (`cleaned.jsonl`); the native Swift `monica-tokenize pack` (`swift/`, #191/#245) tokenizes
+> + packs it into the same uint16 shard layout. So for M12: **Python cleans → Swift
+> tokenizes+packs** — `src/data/shard.py`'s `--tokenizer code` path no longer exists.
 
 **Environment caveat.** datatrove supports Python ≤3.12 and pulls C-extension/`spacy` deps, so it
 runs in a **dedicated py3.11 venv** matching the RunPod `py3.11` images — *not* the main py3.14
@@ -221,7 +226,9 @@ A40); the fused kernels auto-detect at runtime and degrade gracefully when absen
 This flow is specific to the (dropped) M10 distillation program; kept as reserve/history, not a
 live target. For the concrete, command-by-command Path B execution of this flow (the full-scale
 ~1B distillation run — exact commands, pod sizing, R2 paths, cost, and the Path A gotchas), see
-[`reserve/path-b-run.md`](reserve/path-b-run.md). The steps below are the generic shape.
+[`reserve/path-b-run.md`](reserve/path-b-run.md); for the completed ~205M `poc-qwen` run's pod
+recipe + asset inventory, see [`reserve/runpod-poc-run.md`](reserve/runpod-poc-run.md). The steps
+below are the generic shape.
 
 1. **Local (Mac):** build + unit-test the data pipeline on a slice, the teacher loader, student
    init, distillation loss, and the manifest/sweep — all at toy scale.

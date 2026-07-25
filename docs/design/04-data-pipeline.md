@@ -7,6 +7,12 @@ plus a loader, all under [`src/data/`](../../src/data/). It yields numpy arrays;
 backend converts them inside `forward`, keeping the [seam](01-architecture-seam.md)
 intact.
 
+> This is the OLMo/byte-fallback path (POC + reserve Qwen paths). The **M12 code model** tokenizes
+> + packs in **native Swift** instead (`swift/` `monica-tokenize`, #191/#245 — Python cleans the
+> corpus, Swift tokenizes+packs); the Swift packer emits this same uint16 shard layout, so the
+> loader and training loop below are unchanged. See [13-code-model-moe.md](13-code-model-moe.md)
+> (MHM-P1b).
+
 ## uint16 packing
 
 Token ids are packed as a flat `uint16` array on disk. From

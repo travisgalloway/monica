@@ -10,7 +10,8 @@ language model, developed and validated on **Apple Silicon with MLX**, architect
 **active program is M12** — a from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts
 (MoE) code model** (the "MHM" spine): a mostly Mamba-2/SSD backbone with ~12.5% attention layers
 for cross-file recall and Jamba-style MoE on the MLPs, trained on a general multilingual
-Essential-Web + Stack-v2 corpus with its own byte-level BPE and FIM, at two sizes (small
+Essential-Web + Stack-v2 corpus with its own byte-level BPE (a native cross-platform Swift
+tokenizer — `swift/`, #191/#245; not Python/MLX) and FIM, at two sizes (small
 ~120M-active/700M-total; large "Large A" ~700M-active/3.5B-total, sparse-upcycled from the small
 dense checkpoint). A **secondary axis (SSI)** studies feeding language-server / static-analysis
 signal into the model — a *validated clean-rate tool with a found functional ceiling*, not the
@@ -18,7 +19,8 @@ lever for functional correctness (see `docs/design/13-code-model-moe.md`). Track
 [issue #198](https://github.com/travisgalloway/monica/issues/198); design record in
 `docs/design/13-code-model-moe.md`. **Reserve/history:** the M10 distillation program (distil a
 ~1B student from a frozen `Qwen/Qwen3-4B-Thinking-2507` teacher, #65) was dropped 2026-07-19 — its
-machinery is built and its design record kept under `docs/reserve/`. The original from-scratch
+code machinery was **removed from the tree** (#189, recoverable via git history); its design record
+is kept under `docs/reserve/`. The original from-scratch
 pretrain path (OLMo tokenizer) is complete and is a validated foundation / production reserve.
 POC success is a smoothly improving curve plus a local-hardware win (context length + tok/s), with
 **BPB** the primary small-model metric — not benchmark scores.
@@ -68,6 +70,15 @@ and asserts no backend leaked into `sys.modules`. **When adding code above the s
 do not import a backend — and add new portable modules to that test's
 `PORTABLE_MODULES` list.** Keep MLX-only imports local (inside functions), as
 `scripts/smoke_test.py` does, when a portable-ish entry point needs the backend.
+
+**A third category — the `swift/` native toolchain (the repo's first Swift package).** The
+code tokenizer (#191, PR #245) is a native, cross-platform Swift package (`swift/MonicaTokenizer`
++ the `monica-tokenize` CLI) that trains/encodes/packs entirely outside the Python seam — it is
+neither above-seam Python nor a hardware backend behind `ModelInterface`, and the import guard
+does not cover it. It builds and runs on macOS **and** Linux/CUDA with bit-identical output (Swift
+stdlib only in the BPE core; **no MLX** — BPE is CPU/integer work). It emits the same
+`src/data/shard.py` shard layout, so Python training reads its shards unchanged. This is the M13
+"native, no-Python-runtime" direction (#163/#167) landing first for the tokenizer.
 
 Consequences of the seam that shape how code is written:
 - The training loop (`src/train/loop.py`) is backend-free and receives the
@@ -159,16 +170,19 @@ The smoke gate stresses exactly this round-trip.
   run is still pending (user-driven).
 - The **active program is M12 — the from-scratch Mamba-2 hybrid MoE code model** (**GitHub issue
   #198**, the live tracker; design record `docs/design/13-code-model-moe.md`): the "MHM" spine
-  (own BPE #191 → Essential-Web + Stack-v2 corpus #193 → aux-loss-free MoE router #213 → CUDA MoE
-  backend #214 → FIM/curriculum/eval build → ablation sweep #219 → small full run #222 →
-  sparse-upcycled large run #223), with **SSI** (structural-signal integration) as a secondary
+  (own BPE #191 **— done: native Swift, PR #245** → Essential-Web + Stack-v2 corpus #193 →
+  aux-loss-free MoE router #213 → CUDA MoE backend #214 → FIM/curriculum/eval build → ablation
+  sweep #219 → small full run #222 → sparse-upcycled large run #223), with **SSI**
+  (structural-signal integration) as a secondary
   measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
   #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
   gate). The bulk of the net-new work is the MoE build (#213/#214) — MoE is MLX-toy-only today.
-- **Reserve/history — M10 distillation (#65) was dropped 2026-07-19.** Its machinery is built
-  (teacher loader #93, student init #99, staged loss #100, sweep #98, `scripts/distill.py` #81)
-  and its design record + corpus/decontamination guidance + pod runbooks live under `docs/reserve/`
-  (e.g. `docs/reserve/10-distillation.md`). Do **not** describe distillation as active work.
+- **Reserve/history — M10 distillation (#65) was dropped 2026-07-19; its code was removed from the
+  tree (#189).** The teacher/student/distill modules, `scripts/distill.py`/`sweep.py`/
+  `precompute_teacher.py`, `distill_manifest`, and the corpus tooling are gone (recoverable via git
+  history). Its design record + corpus/decontamination guidance + pod runbooks remain under
+  `docs/reserve/` (e.g. `docs/reserve/10-distillation.md`). Do **not** describe distillation as
+  active work, and do not assume the machinery is present in the tree.
 - `docs/design/` documents the design choices and rationale (start at
   `docs/design/README.md`); `docs/infrastructure.md` is the R2 + RunPod runbook. After completing
   a milestone, tick its box in the relevant tracker (#2 / #198).

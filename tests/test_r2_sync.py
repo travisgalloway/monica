@@ -1,12 +1,9 @@
 """Object-storage sync (#80): mirror a locally-built artifact tree to/from an fsspec backend.
 
-Exercised against `memory://` and `file://` so the round-trip (and the distill-corpus `--push`
-wiring) is fully covered offline, with no network or R2 credentials. The same code path resolves
-`s3://` to R2 on a real host — only the backend differs.
+Exercised against `memory://` and `file://` so the round-trip is fully covered offline, with no
+network or R2 credentials. The same code path resolves `s3://` to R2 on a real host — only the
+backend differs.
 """
-
-import subprocess
-import sys
 
 import pytest
 
@@ -70,19 +67,3 @@ def test_r2_endpoint_reads_env(monkeypatch):
     assert r2_endpoint() == "https://acc.r2.cloudflarestorage.com"
 
 
-def test_distill_corpus_push_to_local_uri(tmp_path):
-    # The `--push` wiring mirrors the built corpus to the destination prefix (file:// here).
-    pytest.importorskip("pyarrow")
-    out_root = tmp_path / "pd"
-    push_dst = tmp_path / "remote"
-    r = subprocess.run(
-        [sys.executable, "-m", "src.data.distill_corpus", "--source", "dummy",
-         "--max-docs", "200", "--byte-fallback", "--tokenizer", "qwen25",
-         "--seq-len", "1024", "--out-root", str(out_root), "--push", str(push_dst)],
-        capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    assert "pushed" in r.stdout
-    # The mirrored tree carries the corpus + tokenized manifests under the same layout.
-    assert (push_dst / "corpus" / "manifest.json").exists()
-    assert (push_dst / "corpus" / "tokenized" / "qwen25-1k" / "manifest.json").exists()
-    assert (push_dst / "corpus" / "tokenized" / "qwen25-1k" / "part-00000.bin").exists()

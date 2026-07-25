@@ -27,10 +27,6 @@ def test_poc_distill_layout():
     assert storage.corpus_cleaned_dir(r).as_posix() == "data/poc-distill/corpus/cleaned"
     assert storage.corpus_tokenized_dir(r, "qwen25", 8192).as_posix() == \
         "data/poc-distill/corpus/tokenized/qwen25-8k"
-    assert storage.teacher_outputs_dir(r).as_posix() == \
-        "data/poc-distill/teacher-outputs/topk-logits"
-    assert storage.teacher_outputs_dir(r, "hidden-states").as_posix() == \
-        "data/poc-distill/teacher-outputs/hidden-states"
     assert storage.manifests_dir(r).as_posix() == "data/poc-distill/manifests"
 
 
@@ -65,23 +61,18 @@ def test_cleaned_and_rl_are_tokenizer_free():
 
 
 def test_drivers_write_under_the_right_class_prefixes(tmp_path):
-    # End-to-end: one base, the drivers land artifacts under base/poc-distill and base/shared.
-    from src.data.corpus import ingest_dummy
-    from src.data.distill_corpus import build_distill_corpus
+    # End-to-end: the SFT drivers land artifacts under base/shared with the right prefixes.
     from src.data.instruct_sft import build_instruct_sft
     from src.data.reasoning_sft import build_reasoning_sft
     from src.data.sft_sources import handauthored_records
     from src.data.reasoning_traces import handauthored_trace_records
 
     pytest.importorskip("pyarrow")
-    build_distill_corpus(ingest_dummy(300, seed=3), class_root(tmp_path, POC_DISTILL),
-                         tokenizer="qwen25", byte_fallback=True, seq_len=1024)
     build_instruct_sft(handauthored_records(), class_root(tmp_path, SHARED),
                        tokenizer="qwen25", byte_fallback=True, seq_len=1024)
     build_reasoning_sft(handauthored_trace_records(), class_root(tmp_path, SHARED),
                         tokenizer="qwen25", byte_fallback=True, seq_len=1024, chunk_align=64)
 
-    assert (tmp_path / "poc-distill" / "corpus" / "tokenized" / "qwen25-1k" / "manifest.json").exists()
     assert (tmp_path / "shared" / "sft" / "tokenized" / "qwen25-1k" / "instruct.jsonl").exists()
     assert (tmp_path / "shared" / "sft" / "tokenized" / "qwen25-1k" / "reasoning.jsonl").exists()
     # The two SFT kinds share the tokenized prefix but split cleaned by kind.
