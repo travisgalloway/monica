@@ -46,7 +46,9 @@ jobs:
   # Separate job from `portable`, not a step in it, so torch never enters
   # portable's environment. Installs the CPU torch wheel first so the later
   # editable install (which never requests the `cuda` extra) doesn't pull a
-  # different torch.
+  # different torch. That editable install is bare (no `[dev,data]`): this
+  # job runs no pytest (dev/pytest unused) and the smoke path below has no
+  # module-level pyarrow/fsspec/datasets/transformers imports (data unused).
   smoke-linux:
     name: smoke gate (Linux, CPU torch)
     runs-on: ubuntu-latest
@@ -62,7 +64,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install -e ".[dev,data]"
+          pip install -e .
       - name: Build a fresh toy split
         # The gotcha this encodes: scripts/smoke_test.py needs a FRESHLY BUILT
         # toy split, never data/split (which holds the real OLMo-vocab
