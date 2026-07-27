@@ -44,8 +44,9 @@ to the loop, the SSD scan, mixed precision, checkpointing, or eval.
 `pytest -q -rs` with no mlx/torch installed (the unambiguous seam-guard environment); a Linux
 `smoke-linux` job installs CPU-only torch and runs the same fresh-toy-split →
 `smoke_test.py --backend cuda` steps as above, under `$RUNNER_TEMP` instead of `data/`; and a
-macOS `full-macos` job runs the full `pytest -q -rs` plus `smoke_test.py --backend mlx`. Nothing
-above requires network/HF/weights, so all three jobs run on every PR.
+macOS `full-macos` job runs the full `pytest -q -rs` plus `smoke_test.py --backend mlx`. The
+smoke-gate data build is offline (dummy corpus + byte fallback — no corpus, weights, or HF token
+needed), so all three jobs run on every PR.
 
 ---
 
