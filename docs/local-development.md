@@ -40,6 +40,13 @@ to the loop, the SSD scan, mixed precision, checkpointing, or eval.
 > The smoke gate must run on a **freshly built byte split**, not the real `data/split` (which is
 > the OLMo-vocab corpus) — `local_validate.sh` builds one for you.
 
+**CI mirrors this recipe** (`.github/workflows/ci.yml`, #249): a Linux `portable` job runs
+`pytest -q -rs` with no mlx/torch installed (the unambiguous seam-guard environment); a Linux
+`smoke-linux` job installs CPU-only torch and runs the same fresh-toy-split → `smoke_test.py
+--backend cuda` steps as above, under `$RUNNER_TEMP` instead of `data/`; and a macOS `full-macos`
+job runs the full `pytest -q -rs` plus `smoke_test.py --backend mlx`. Nothing above requires
+network/HF/weights, so all three jobs run on every PR.
+
 ---
 
 ## 2. Train test models locally

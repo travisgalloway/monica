@@ -51,9 +51,13 @@ python -m src.data.pack  --in data/ids.npy --out data/packed.bin
 python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 2000
 ```
 
-There is no separate lint/format/build step — pytest is the gate. `mlx` is not
-installable on Linux; on a non-Mac host the MLX backend simply won't import (by
-design), and only the portable tests run.
+There is no separate lint/format/build step — pytest is the gate, and it now runs in CI
+(`.github/workflows/ci.yml`, #249): a Linux `portable` job (`pytest -q -rs`, no mlx/torch —
+where `test_import_guard.py` is unambiguous), a Linux `smoke-linux` job (CPU-torch,
+`scripts/smoke_test.py --backend cuda`), and a macOS `full-macos` job (mlx installed,
+`pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not installable on Linux;
+on a non-Mac host the MLX backend simply won't import (by design), and only the portable
+tests run.
 
 ## The seam — the most important architectural rule
 
