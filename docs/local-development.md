@@ -45,8 +45,11 @@ to the loop, the SSD scan, mixed precision, checkpointing, or eval.
 `smoke-linux` job installs CPU-only torch and runs the same fresh-toy-split →
 `smoke_test.py --backend cuda` steps as above, under `$RUNNER_TEMP` instead of `data/`; and a
 macOS `full-macos` job runs the full `pytest -q -rs` plus `smoke_test.py --backend mlx`. The
-smoke-gate data build is offline (dummy corpus + byte fallback — no corpus, weights, or HF token
-needed), so all three jobs run on every PR.
+smoke-gate data build itself is fully offline (dummy corpus + byte fallback — no network, no HF
+token, no corpus or model weights ever fetched); CI as a whole does need network for dependency
+installs, and a few tests opportunistically fetch an HF tokenizer. Those degrade gracefully —
+`tests/test_chat_template.py` wraps the load in `except Exception: pytest.skip("OLMo tokenizer
+unavailable")`, so an HF outage produces a skip, not a red build.
 
 ---
 
