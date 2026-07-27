@@ -1,0 +1,126 @@
+name: CI
+
+# Standing CI for the portable test suite, the seam guard, and the M4 smoke gate
+# (resume-exactness + eval). See issue #249 for the design record and #246 for
+# the Swift toolchain job this workflow is structured to accept as a drop-in.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 1: portable suite + seam guard (Linux, no mlx, no torch) ──────────
+  # This is the one environment where test_import_guard.py's
+  # test_portable_modules_do_not_import_backends is unambiguous: mlx isn't
+  # installable on Linux, and torch is deliberately not installed in this job
+  # (it lives in smoke-linux instead), so any backend import above the seam
+  # fails loudly rather than being masked by a locally-present backend.
+  portable:
+    name: portable (pytest, no backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: pytest
+        run: pytest -q -rs
+
+  # ── Job 2: smoke gate on Linux/CPU-torch (hardware-independent guarantee) ─
+  # Separate job from `portable`, not a step in it, so torch never enters
+  # portable's environment. Installs the CPU torch wheel first so the later
+  # editable install (which never requests the `cuda` extra) doesn't pull a
+  # different torch. That editable install is bare (no `[dev,data]`): this
+  # job runs no pytest (dev/pytest unused) and the smoke path below has no
+  # module-level pyarrow/fsspec/datasets/transformers imports (data unused).
+  smoke-linux:
+    name: smoke gate (Linux, CPU torch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -e .
+      - name: Build a fresh toy split
+        # The gotcha this encodes: scripts/smoke_test.py needs a FRESHLY BUILT
+        # toy split, never data/split (which holds the real OLMo-vocab
+        # corpus). config/toy.yaml is vocab_size 256 (byte-fallback), so this
+        # needs no network, no HF token, and not even the `data` extra.
+        # Built under $RUNNER_TEMP so nothing lands in the checkout.
+        run: |
+          python -m src.data.download --dummy --out "$RUNNER_TEMP/toy/raw" --max-docs 2000
+          python -m src.data.tokenize --in "$RUNNER_TEMP/toy/raw/dummy.txt" \
+                 --out "$RUNNER_TEMP/toy/ids.npy" --byte-fallback
+          python -m src.data.pack  --in "$RUNNER_TEMP/toy/ids.npy" --out "$RUNNER_TEMP/toy/packed.bin"
+          python -m src.data.split --packed "$RUNNER_TEMP/toy/packed.bin" \
+                 --out "$RUNNER_TEMP/toy/split" --val-tokens 2000
+      - name: Smoke gate (CUDA backend, CPU device)
+        run: |
+          python scripts/smoke_test.py --backend cuda \
+                 --data "$RUNNER_TEMP/toy/split" --out "$RUNNER_TEMP/smoke"
+
+  # ── Job 3: full suite + smoke gate on macOS/MLX (arm64) ───────────────────
+  # macos-latest is arm64, so the mlx wheel installs and the ~19 mlx-gated
+  # test files actually run instead of skipping.
+  full-macos:
+    name: full suite + smoke gate (macOS, MLX)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data,mlx]"
+      - name: pytest
+        run: pytest -q -rs
+      - name: Build a fresh toy split
+        run: |
+          python -m src.data.download --dummy --out "$RUNNER_TEMP/toy/raw" --max-docs 2000
+          python -m src.data.tokenize --in "$RUNNER_TEMP/toy/raw/dummy.txt" \
+                 --out "$RUNNER_TEMP/toy/ids.npy" --byte-fallback
+          python -m src.data.pack  --in "$RUNNER_TEMP/toy/ids.npy" --out "$RUNNER_TEMP/toy/packed.bin"
+          python -m src.data.split --packed "$RUNNER_TEMP/toy/packed.bin" \
+                 --out "$RUNNER_TEMP/toy/split" --val-tokens 2000
+      - name: Smoke gate (MLX backend)
+        run: |
+          python scripts/smoke_test.py --backend mlx \
+                 --data "$RUNNER_TEMP/toy/split" --out "$RUNNER_TEMP/smoke"
+
+  # ── Swift toolchain (#246) drops in here ──────────────────────────────
+  # swift:
+  #   strategy: { matrix: { os: [macos-latest, ubuntu-latest] } }
+  #   runs-on: ${{ matrix.os }}
+  #   steps: ... cd swift && swift build && swift run monica-selfcheck
+  # Note: swift/Package.swift declares NO .testTarget and there is no Tests/ dir,
+  # so `swift test` finds nothing today — monica-selfcheck is the actual runner
+  # (dependency-free, no XCTest, exits non-zero on any failure).
