@@ -1,4 +1,4 @@
-"""Backend parity (write at the CUDA scale-up) — SKELETON.
+"""Backend parity (#38): MLX vs CUDA cross-backend agreement.
 
 Fixed seed, fixed weights, fixed input batch. Run `forward` through both the MLX
 and CUDA backends and assert agreement. Run the comparison in FP32 on BOTH sides:
@@ -6,8 +6,11 @@ bf16's machine epsilon (~8e-3) is larger than a meaningful tolerance, so compari
 low-precision paths yields false failures. In fp32 a tight tolerance (~1e-4
 relative) is meaningful: within = correct port, beyond = a real math bug.
 
-Requires both backends present, so this runs only where CUDA is available; until
-then it stays a stub the seam can point at.
+Requires both backends *installed*, not a GPU — the torch/CUDA backend runs on
+CPU, so MLX<->torch parity runs entirely on a Mac with both installed
+(`tests/test_backend_parity.py`), and skips cleanly wherever either backend is
+missing (no mlx on Linux, no CUDA on a Mac — `tests/test_cuda_parity.py::
+test_backend_parity_mlx_cuda`).
 """
 
 from __future__ import annotations
