@@ -117,8 +117,11 @@ train-time pulls. Concretely:
 - **Secrets:** R2 key/secret + HF token live in the pod's secrets/env, never in the repo.
 - **Sizing:** target ~1–2 TB working set, growing with the reserve corpus. Few large shards
   (R2 Class A ops cost per million).
-- **Checkpoints:** synced to `s3://<bucket>/ckpt/<run>/` (the R2 bucket) from the GPU host on a
-  cadence — the durable copy, since the pod is ephemeral.
+- **Checkpoints:** the durable copy belongs at `s3://<bucket>/ckpt/<run>/` — but nothing syncs it
+  there automatically. `scripts/train.py` only writes checkpoints to local/volume disk
+  (`store.save(...)`); pushing that tree to R2 is an **operator-driven** step via
+  `src/data/r2_sync.py up` (see [Checkpoint cadence on interruptible
+  pods](#checkpoint-cadence-on-interruptible-pods) below), not a cadence the trainer runs itself.
 - **Install:** the data extras pull `fsspec`/`pyarrow` — `pip install -e ".[data]"` — but the
   S3 filesystem backend is separate: also `pip install "s3fs==<fsspec-pin>"` so `s3://` URLs
   resolve (pin `s3fs` to the same release as `fsspec`, since `datasets` caps `fsspec<=2026.2.0`;
@@ -181,8 +184,119 @@ RunPod provides the on-demand compute. Two roles, kept separate:
 - **GPU pod** — training only. Pull the tokenized subset + teacher outputs from R2 to a network
   volume, train, checkpoint back to R2.
 
-**Region:** RunPod network volumes are region-locked — keep the pod region network-close to R2
-so the pull is fast and free.
+### Region pin — a one-way decision
+
+RunPod network volumes are **region-locked** and cannot be moved once created — every later pod
+that needs the corpus + checkpoints must be schedulable in that same region, so the pin is
+effectively permanent. Choose the region by **where the card you will actually train on has
+capacity** — H100 for the M12 large run (#223) — not by proximity to R2. R2 has no egress fee
+(above), so "network-close to R2" is a *latency*, not a *cost*, consideration: worth weighing once
+the H100-capacity region is chosen, but subordinate to it.
+
+### Instance tiering — never pay H100 rates for CPU work
+
+The pod-role split above says *which stage* runs where; this is *which tier*. Every CPU-bound
+stage — datatrove clean/dedup (`scripts/build_corpus.py`), the M12 TS corpus build
+(`scripts/build_ts_clean_corpus.py`), and BPE train/encode/pack via the native Swift
+`monica-tokenize` CLI (`swift/`, #191/#245) — is integer/CPU work with **no CUDA path at all** (no
+MLX either — BPE is CPU/integer work). Run these on an **A40/4090-class** pod, or a plain CPU pod;
+an H100 there buys nothing and burns the most expensive hour on the menu.
+
+The same rule picks the card for the dress rehearsal in the bring-up order below: steps 2–3 (toy
+smoke gate, train-step bench) are deliberately cheap-card work before step 4 commits to the real
+card — tier the pod to the step, not to the run.
+
+Ordering only, no $/hr figures: **H100 ≫ A40/4090 ≫ CPU**. Rates are an external market that
+changes; re-price at rental time (the same discipline the reserve run's cost notes keep,
+[`reserve/path-b-run.md`](reserve/path-b-run.md)).
+
+### Billing hygiene — stop is not terminate; the Startup Program
+
+**Stop ≠ terminate.** A *stopped* RunPod pod still bills — its container disk is retained. The
+state that must survive a pod is the **network volume** plus whatever was pushed to R2; neither
+needs the pod alive. So the concrete mechanics of "no pod stands idle" (above): sync off, then
+**terminate** — let the volume carry state to the next pod, not a stopped instance.
+
+**Network volume storage bills independently of any pod**, for as long as the volume exists —
+the other half of why the region pin above is effectively permanent: a wrong region pin costs
+money until the volume is deleted, not just until the pod is stopped.
+
+**RunPod Startup Program** offers eligible projects up to **≤1000 free H100-hours** — check
+eligibility and apply *before* spending on the M12 large run (#223), the program's dominant GPU
+cost. Terms are external and change; verify at application time, same as the external-rate
+discipline above.
+
+### Checkpoint cadence on interruptible pods
+
+1. **Target: a committed checkpoint every 20–30 minutes.** Interruptible/spot capacity can vanish
+   without warning; the exposure window between commits is the loss budget.
+2. **The knob is a step count, not wall-clock.** `--ckpt-every` (`scripts/train.py:58`, CLI
+   default **500**) sets `TrainConfig.ckpt_every` (`src/train/loop.py:38`, dataclass default
+   **100** — the CLI default wins for `scripts/train.py`; the two must not be conflated), and the
+   loop fires on `step % cfg.ckpt_every == 0` (`src/train/loop.py:120`). There is **no timer** —
+   the operator must convert minutes to steps.
+3. **The arithmetic:**
+
+   ```
+   ckpt_every ≈ target_minutes × 60 / measured_s_per_step
+   ```
+
+   Worked against the repo's only published baseline — **~99 s/step on an M1 Pro / MLX** run,
+   batch 32 × grad_accum 4 × seq 1024 = 131,072 tok/step, fp16 (`scripts/bench_train_step.py`,
+   #31/#30) — **not** a CUDA or H100 number: 20 min → `1200/99 ≈ 12` steps; 30 min →
+   `1800/99 ≈ 18` steps. At that rate the shipped CLI default of 500 is **~13.7 hours of
+   exposure** and must be lowered explicitly. Invert it: on a card fast enough to hit ~2 s/step,
+   the same 20–30 min window is ~600–900 steps and 500 is already about right. The number is
+   **per-pod and must be computed from a measurement**, never copied from this doc — measure with
+   `scripts/bench_cuda_train_step.py` (step 3 of the bring-up order below) before setting the
+   flag.
+4. **Cost of the write.** Each commit rewrites the inactive slot in full — weights, optimizer
+   state, and `resume_meta.json`, every file fsync'd, then the `LATEST` flip
+   (`src/train/checkpoint.py:179-200`). Time one `store.save` on the pod and keep the interval a
+   comfortable multiple of it; the repo has not measured this cost, so don't quote a number here.
+5. **Where the checkpoint lands — and does not.** `store` roots at `<out>/resume`, on the pod's
+   local disk / volume (`scripts/train.py:117-118`), and `on_checkpoint` calls only
+   `store.save(...)` (`scripts/train.py:130-134`). **`scripts/train.py` does not push to R2.**
+   Getting the checkpoint durable is an operator responsibility: a side loop calling
+   `python -m src.data.r2_sync up <out>/resume s3://<bucket>/ckpt/<run>/`
+   (`src/data/r2_sync.py`) — the correction to the R2-specifics checkpoint note above. The
+   double-buffered layout makes a mid-sync copy safe to interpret: `LATEST` is the single commit
+   point (`src/train/checkpoint.py:126-139`).
+
+> **Status.** A checkpoint restores **model weights, optimizer state, step, and fp16 loss-scale
+> state — and nothing else.** `resume_meta.json` holds exactly `{step, loss_scale_state}`
+> (`src/train/checkpoint.py:189`), and resume reads back only those
+> (`scripts/train.py:120-126`). **No dataloader/stream state is saved.** The data position is
+> *re-derived* from `start_step * grad_accum` (`src/train/loop.py:95-96`) against the loader's
+> epoch length (`src/train/loop.py:60-67`, `src/data/loader.py:46-48`).
+
+The operational consequence is the whole point of the callout: the stream is reproduced **only if
+every implicit input is byte-identical** across the kill —
+
+- `--seed`
+- `--batch-size`
+- `--grad-accum`
+- `seq_len` (from the config)
+- the packed `train.bin` itself (its token count sets `n_chunks`, hence `len(train_loader)`)
+
+Change any one of these — resize the batch to fit a different card, repack the corpus, resume
+against a different split — and the resumed run silently reads a **different** data order,
+re-reading seen data and corrupting epoch accounting. **Nothing detects this.** That is precisely
+the gap [#216](https://github.com/travisgalloway/monica/issues/216) is open to close
+("interruptible pods need explicit dataloader state saved alongside model/optimizer"); until it
+lands, the invariance is an **operator discipline**, enforced by the checklist below.
+
+One genuine positive, verified: the fast-forward itself is **free** —
+`epoch(skip_batches=...)` slices the already-shuffled index (`src/data/loader.py:64-65`) without
+reading any chunk, so a resume deep into the corpus costs no replay time.
+
+### Shard dtype
+
+Trainer shards pack as **uint16** when the vocab is `< 65536` (`src/data/pack.py:30-33`, #90),
+with the dtype recorded in the `.meta.json` sidecar so the loader reads it back without parsing
+during training (`pack.py:86`, `pack.py:94-99`). M12's own BPE is well under the ceiling, so M12
+shards are uint16 — half the bytes to move and mmap per pull. Already implemented, and the Swift
+packer emits the same layout (above); nothing to do here.
 
 **GPU pod spec.** The card choice is driven by **precision**, not a blanket rule: the **1B
 training** configs (`config/student-1b.yaml`, `config/1b.yaml`) are **bf16**, which needs an
@@ -218,6 +332,51 @@ python scripts/train.py --backend cuda --config config/<student-or-poc>.yaml \
 Bring the pod up **in that order** so a config or throughput problem surfaces *before* the long
 run. The CUDA backend is already done and A40-verified (the full suite is green on a rented
 A40); the fused kernels auto-detect at runtime and degrade gracefully when absent.
+
+---
+
+## Resumable-job checklist
+
+A rented pod is interruptible; everything above exists to make an interruption a non-event. Work
+through these before/during/after a run — grouped cheapest-first, so a failure surfaces before the
+dominant spend.
+
+### A. Before renting
+
+- [ ] RunPod Startup Program eligibility checked (up to ≤1000 free H100-hours).
+- [ ] Region chosen by **H100 availability**, not R2 proximity; network volume created there
+      (effectively permanent once created).
+- [ ] Instance tier picked per stage — CPU-bound work (corpus/tokenizer) kept off H100.
+
+### B. Pod bring-up
+
+- [ ] `[cuda-fast]` installed and the fused kernels actually engaged (#40) — the CUDA backend
+      warns at model build if they're missing.
+- [ ] `s3fs` pinned to the same release as `fsspec` (above).
+- [ ] `r2_sync down` verified working in-region.
+- [ ] Toy CUDA smoke gate green: `scripts/smoke_test.py --backend cuda`.
+
+### C. Cadence sizing
+
+- [ ] `scripts/bench_cuda_train_step.py` run at the real shape; `s/step` and peak memory recorded.
+- [ ] `--ckpt-every` computed for the 20–30 min target and **explicitly passed** (not left at the
+      500 default).
+- [ ] One `store.save` timed and confirmed small against the checkpoint interval.
+
+### D. Resume invariance (until #216 lands)
+
+- [ ] The exact `scripts/train.py` command line recorded verbatim alongside the run.
+- [ ] `--seed` / `--batch-size` / `--grad-accum` / config `seq_len` / `--data` pinned and reused
+      byte-identically on resume.
+- [ ] A deliberate kill-and-resume rehearsed once, early in the run — confirm
+      `[resume] from step N` (`scripts/train.py:127`) and a continuous `metrics.jsonl`.
+
+### E. Durability + teardown
+
+- [ ] Checkpoints synced to `s3://<bucket>/ckpt/<run>/` via `r2_sync up` (manual — not automatic).
+- [ ] Final `weights.safetensors` materialized (`scripts/train.py:161`).
+- [ ] Pod **terminated**, not stopped.
+- [ ] Volume kept only if the next stage needs it — otherwise deleted (it bills independently).
 
 ---
 
