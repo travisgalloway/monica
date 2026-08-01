@@ -85,6 +85,20 @@ installs, and a few tests opportunistically fetch an HF tokenizer. Those degrade
 `tests/test_chat_template.py` wraps the load in `except Exception: pytest.skip("OLMo tokenizer
 unavailable")`, so an HF outage produces a skip, not a red build.
 
+Three more jobs (#246) gate the `swift/` native tokenizer (outside this Python seam entirely —
+see [`01-architecture-seam.md`](design/01-architecture-seam.md)): `swift-macos` and `swift-linux`
+(the official `swift:latest` container) each build the package, run `monica-selfcheck`
+(`swift test` is still a no-op — there's no `.testTarget`), then train the fixed fixture corpus
+`swift/Fixtures/parity-corpus.jsonl` into a `tokenizer.json` artifact; `swift-parity` downloads
+both artifacts and `cmp`s them, so #191/#245's bit-identical-output claim is CI-enforced, not
+just asserted. Reproduce locally:
+
+```bash
+cd swift && swift build && swift run monica-selfcheck
+docker run --rm -v "$PWD/swift:/s" -w /s swift:latest \
+  bash -c 'swift build && swift run monica-selfcheck'
+```
+
 ---
 
 ## 2. Train test models locally

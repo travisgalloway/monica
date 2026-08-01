@@ -57,7 +57,12 @@ where `test_import_guard.py` is unambiguous), a Linux `smoke-linux` job (CPU-tor
 `scripts/smoke_test.py --backend cuda`), and a macOS `full-macos` job (mlx installed,
 `pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not installable on Linux;
 on a non-Mac host the MLX backend simply won't import (by design), and only the portable
-tests run.
+tests run. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
+suite entirely: `swift-macos` and `swift-linux` (the official `swift:latest` container) each
+build the package and run `monica-selfcheck` — `swift test` is still a no-op, there is no
+`.testTarget` — then train a fixed fixture corpus (`swift/Fixtures/parity-corpus.jsonl`) into
+a `tokenizer.json` artifact; `swift-parity` downloads both artifacts and `cmp`s them, turning
+#191/#245's bit-identical-output claim into an enforced gate rather than a comment.
 
 ## The seam — the most important architectural rule
 

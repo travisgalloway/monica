@@ -1,0 +1,16 @@
+{"text": "export function add(a: number, b: number): number { return a + b; }"}
+{"text": "export const greet = (name: string): string => `hello ${name}`;"}
+{"text": "interface Point { x: number; y: number; label?: string; }"}
+{"text": "export class Vec2 { constructor(public x: number, public y: number) {} }"}
+{"text": "for (let i = 0; i < 1000; i++) { total += values[i]; }"}
+{"text": "const ids = [1, 22, 333, 4444, 55555, 666666, 1234567];"}
+{"text": "async function load(url: string): Promise<Response> { return await fetch(url); }"}
+{"text": "type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };"}
+{"text": "if (x) {\n\treturn 0;\n} else {\n\t\treturn 1;\n}"}
+{"text": "const ratio = 'π≈3.14'; // 数字とコメント — multi-byte UTF-8 on purpose"}
+{"text": "const emoji = '🚀🧪'; // surrogate-pair scalars, byte-level BPE must agree"}
+{"text": "def add(a: int, b: int) -> int:\n    return a + b\n"}
+{"text": "class Vec2:\n    def __init__(self, x: float, y: float) -> None:\n        self.x = x\n        self.y = y\n"}
+{"text": "public struct Point: Equatable { public var x: Int; public var y: Int }"}
+{"text": "let total = values.reduce(0) { $0 + $1 }"}
+{"text": "{\"name\": \"monica\", \"version\": \"1.0.0\", \"private\": true}"}

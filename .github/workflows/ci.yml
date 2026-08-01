@@ -1,8 +1,9 @@
 name: CI
 
-# Standing CI for the portable test suite, the seam guard, and the M4 smoke gate
-# (resume-exactness + eval). See issue #249 for the design record and #246 for
-# the Swift toolchain job this workflow is structured to accept as a drop-in.
+# Standing CI for the portable test suite, the seam guard, the M4 smoke gate
+# (resume-exactness + eval), and the native Swift tokenizer's cross-platform
+# parity gate. See issue #249 for the Python design record and #246 for the
+# Swift jobs.
 
 on:
   pull_request:
@@ -116,11 +117,100 @@ jobs:
           python scripts/smoke_test.py --backend mlx \
                  --data "$RUNNER_TEMP/toy/split" --out "$RUNNER_TEMP/smoke"
 
-  # ── Swift toolchain (#246) drops in here ──────────────────────────────
-  # swift:
-  #   strategy: { matrix: { os: [macos-latest, ubuntu-latest] } }
-  #   runs-on: ${{ matrix.os }}
-  #   steps: ... cd swift && swift build && swift run monica-selfcheck
-  # Note: swift/Package.swift declares NO .testTarget and there is no Tests/ dir,
-  # so `swift test` finds nothing today — monica-selfcheck is the actual runner
-  # (dependency-free, no XCTest, exits non-zero on any failure).
+  # ── Job 4: native Swift toolchain, macOS (#246) ───────────────────────────
+  # swift/Package.swift declares NO .testTarget and there is no Tests/ dir, so
+  # `swift test` finds nothing — monica-selfcheck is the actual runner
+  # (dependency-free, no XCTest, exits non-zero on any failure). Swift ships
+  # with Xcode on macos-latest, so there is no toolchain install step.
+  swift-macos:
+    name: swift selfcheck (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Build
+        working-directory: swift
+        run: swift build
+      - name: Self-check
+        working-directory: swift
+        run: swift run monica-selfcheck
+      - name: Train the parity corpus
+        # Fixed corpus in, tokenizer.json out — compared byte-for-byte against
+        # the Linux job's copy in swift-parity below. TokenizerFormat.save uses
+        # JSONEncoder [.prettyPrinted, .sortedKeys] over Int/String-only fields,
+        # so identical merges must serialize to identical bytes.
+        working-directory: swift
+        run: |
+          swift run monica-tokenize train \
+            --in Fixtures/parity-corpus.jsonl \
+            --out "$RUNNER_TEMP/tokenizer.json" --vocab-size 2000
+          shasum -a 256 "$RUNNER_TEMP/tokenizer.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-macos
+          path: ${{ runner.temp }}/tokenizer.json
+          retention-days: 7
+
+  # ── Job 5: native Swift toolchain, Linux (#246) ───────────────────────────
+  # The official swift image (Ubuntu 24.04, glibc 2.39) — the same toolchain the
+  # CUDA host would use. Zero external package dependencies, and the image
+  # already carries git/tar, so no apt step is needed.
+  swift-linux:
+    name: swift selfcheck (Linux, swift:latest)
+    runs-on: ubuntu-latest
+    container:
+      image: swift:latest
+    timeout-minutes: 20
+    steps:
+      # checkout runs as root inside the container; pre-trusting the workspace
+      # keeps git's dubious-ownership check from tripping the build.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Build
+        working-directory: swift
+        run: swift build
+      - name: Self-check
+        working-directory: swift
+        run: swift run monica-selfcheck
+      - name: Train the parity corpus
+        working-directory: swift
+        run: |
+          swift run monica-tokenize train \
+            --in Fixtures/parity-corpus.jsonl \
+            --out "$RUNNER_TEMP/tokenizer.json" --vocab-size 2000
+          sha256sum "$RUNNER_TEMP/tokenizer.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-linux
+          path: ${{ runner.temp }}/tokenizer.json
+          retention-days: 7
+
+  # ── Job 6: the bit-identical guarantee itself (#246) ──────────────────────
+  # #191/#245's whole premise is that the Swift tokenizer produces identical
+  # vocab/ids on the Mac dev box and the Linux/CUDA host. This job is what
+  # makes that claim a gate rather than a comment.
+  swift-parity:
+    name: tokenizer bit-identity (macOS vs Linux)
+    runs-on: ubuntu-latest
+    needs: [swift-macos, swift-linux]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tokenizer-macos
+          path: macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: tokenizer-linux
+          path: linux
+      - name: Diff the two tokenizer.json
+        # cmp reports the first differing byte/line, which is far more useful
+        # than a bare hash mismatch when this ever does fail.
+        run: |
+          sha256sum macos/tokenizer.json linux/tokenizer.json
+          cmp macos/tokenizer.json linux/tokenizer.json

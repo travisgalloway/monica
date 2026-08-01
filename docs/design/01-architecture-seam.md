@@ -27,7 +27,10 @@ backend exists.
 **Outside this Python seam entirely:** the `swift/` native toolchain (the repo's first Swift
 package — the code tokenizer `MonicaTokenizer` + `monica-tokenize` CLI, #191/#245). It is neither
 above-seam Python nor a Python hardware backend; it builds and runs natively on macOS **and**
-Linux/CUDA with bit-identical output and is not covered by the import guard below. It emits the
+Linux/CUDA with bit-identical output and is not covered by the import guard below. The
+bit-identical claim is CI-enforced, not just asserted: `.github/workflows/ci.yml`'s
+`swift-macos`/`swift-linux`/`swift-parity` jobs (#246) build and self-check on both platforms,
+train a fixed fixture corpus on each, and `cmp` the resulting `tokenizer.json` files. It emits the
 same `src/data/shard.py` shard layout, so the Python data/training path consumes its output
 unchanged. This is the M13 "native, no-Python-runtime" engine direction (#163/#167).
 
