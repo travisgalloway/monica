@@ -40,6 +40,40 @@ to the loop, the SSD scan, mixed precision, checkpointing, or eval.
 > The smoke gate must run on a **freshly built byte split**, not the real `data/split` (which is
 > the OLMo-vocab corpus) — `local_validate.sh` builds one for you.
 
+### Debug a forward pass on MPS (no pod)
+
+The torch/CUDA backend's SSD scan is pure PyTorch by default; the fused `mamba-ssm` scan and
+`causal-conv1d` only engage when `x.device.type == "cuda"`, and `torch.compile`'s AUTO mode stays
+eager off CUDA. So `CUDAMambaModel(cfg, device="mps")` runs the same math on Apple Silicon GPU as
+the CPU/no-`mamba-ssm` path — use it to catch a forward-pass typo or shape/logic bug locally
+instead of spinning up a pod (#218).
+
+```bash
+# forward/step parity on Apple Silicon GPU — the pure-PyTorch path, no CUDA:
+.venv/bin/python -m pytest tests/test_cuda_parity.py -q -rs
+```
+
+```python
+from src.model.blocks import load_config
+from src.model.cuda_backend import CUDAMambaModel
+from src.conformance.forward_step_parity import check_forward_step_parity
+
+cfg = load_config("config/toy.yaml")
+model = CUDAMambaModel(cfg, device="mps")
+model.eval()
+# ... build a (B, L) int token batch, then:
+check_forward_step_parity(model, tokens, to_numpy=lambda a: a.detach().cpu().numpy())
+```
+
+Measured (fp32, `rtol=1e-4, atol=1e-5`): `config/toy.yaml` → `max_abs_diff ≈ 2.3e-5`, `ok=True`;
+`config/toy-hybrid.yaml` (adds the attention block) → `≈ 3.1e-5`, `ok=True`.
+
+**Caveat:** this validates the *pure-PyTorch* path only. It does **not** validate the fused CUDA
+kernel — that's `tests/test_cuda_parity.py::test_fused_scan_matches_vanilla`, which needs a real
+GPU with `mamba-ssm` installed and skips everywhere else. MPS is for catching typos and
+shape/logic bugs, not for signing off kernel numerics or performance — for that, see
+[`docs/infrastructure.md`](infrastructure.md) for the pod path.
+
 **CI mirrors this recipe** (`.github/workflows/ci.yml`, #249): a Linux `portable` job runs
 `pytest -q -rs` with no mlx/torch installed (the unambiguous seam-guard environment); a Linux
 `smoke-linux` job installs CPU-only torch and runs the same fresh-toy-split →

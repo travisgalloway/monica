@@ -145,6 +145,26 @@ def test_forward_step_parity_hybrid():
     assert result["ok"], result
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS device")
+def test_forward_step_parity_mps():
+    """forward/step parity on Apple Silicon GPU (#218): debug the pure-PyTorch scan
+    without a CUDA pod.
+
+    `CUDAMambaModel(cfg, device="mps")` exercises the same pure-torch chunked scan as
+    CPU/CUDA-without-mamba-ssm — the fused `mamba-ssm` kernel and `causal-conv1d` only
+    engage when `x.device.type == "cuda"`, and `torch.compile` AUTO mode stays eager off
+    CUDA, so this is a faithful check of the math, not the fused kernel."""
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = CUDAMambaModel(cfg, device="mps")
+    model.eval()
+    B, L = 2, 32
+    tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+    with torch.no_grad():
+        result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
+    assert result["ok"], result
+
+
 def test_fused_scan_matches_vanilla():
     """Fused mamba_chunk_scan_combined (#40) agrees with pure-PyTorch scan on CUDA.
 
