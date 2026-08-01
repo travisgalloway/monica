@@ -3,11 +3,13 @@
 //   monica-tokenize train  --in <corpus> --out <tokenizer.json> [--vocab-size 16384]
 //   monica-tokenize encode --tokenizer <tokenizer.json> [--in <file>] [--json]
 //   monica-tokenize decode --tokenizer <tokenizer.json> [--in <file>]
-//   monica-tokenize pack   --tokenizer <tokenizer.json> --in <jsonl|txt> --out <dir>
+//   monica-tokenize pack   --tokenizer <tokenizer.json> --in <parquet|jsonl|txt|dir> --out <dir>
 //                          [--seq-len 8192] [--shard-size-mb 512] [--chunk-align N]
 //
-// `--in` reads stdin when omitted (encode/decode). `train` corpus = a directory of source
-// files (one doc each), a `.jsonl` of {"text": ...} rows, or a single text file (one doc).
+// `--in` reads stdin when omitted (encode/decode). `train`/`pack` corpus = a `.parquet` file or
+// a directory of `.parquet` shards (reads the `text` column directly, #247 — only
+// UNCOMPRESSED/SNAPPY-compressed shards are supported, never zstd), a directory of source files
+// (one doc each), a `.jsonl` of {"text": ...} rows, or a single text file (one doc).
 
 import Foundation
 import MonicaTokenizer
@@ -69,13 +71,14 @@ func readInput(_ flags: [String: String]) -> String {
     return text
 }
 
-/// Load documents for train/pack. jsonl → each row's "text"; dir → each source file; else one doc.
+/// Load documents for train/pack. parquet (file or dir of shards) → the `text` column (#247);
+/// jsonl → each row's "text"; dir → each source file; else one doc.
 func readDocs(_ path: String) -> [String] {
     let url = URL(fileURLWithPath: path)
     var isDir: ObjCBool = false
     FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
     if isDir.boolValue {
-        let exts: Set<String> = ["ts", "tsx", "js", "jsx", "py", "txt", "md", "json", "swift"]
+        let exts: Set<String> = ["ts", "tsx", "js", "jsx", "py", "txt", "md", "json", "swift", "parquet"]
         var files: [URL] = []
         if let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {
             for case let f as URL in en where exts.contains(f.pathExtension) { files.append(f) }
@@ -83,6 +86,24 @@ func readDocs(_ path: String) -> [String] {
         // Sort for a stable, deterministic doc order — `enumerator` traversal order is not
         // guaranteed, and for `pack` that would make shard output nondeterministic.
         files.sort { $0.path < $1.path }
+        // Parquet-wins: a directory of corpus shards may also contain a stray `manifest.json`
+        // or similar — if any `.parquet` file is present, read only those (mirrors Python's
+        // `_shard_paths`/`has_jsonl_shards` precedence). Directories with no Parquet are
+        // byte-for-byte unchanged from before #247.
+        let parquetFiles = files.filter { $0.pathExtension == "parquet" }
+        if !parquetFiles.isEmpty {
+            var docs: [String] = []
+            var totalNulls = 0
+            for f in parquetFiles {
+                do {
+                    let (d, nulls) = try Parquet.readStringColumn(contentsOf: f)
+                    docs.append(contentsOf: d)
+                    totalNulls += nulls
+                } catch { fail("cannot read Parquet \(f.path): \(error)") }
+            }
+            if totalNulls > 0 { warn("skipped \(totalNulls) null `text` row(s) under \(path)") }
+            return docs
+        }
         var docs: [String] = []
         var skipped = 0
         for f in files {
@@ -90,6 +111,13 @@ func readDocs(_ path: String) -> [String] {
         }
         if skipped > 0 { warn("skipped \(skipped) unreadable file(s) under \(path)") }
         return docs
+    }
+    if path.hasSuffix(".parquet") {
+        do {
+            let (docs, nulls) = try Parquet.readStringColumn(contentsOf: url)
+            if nulls > 0 { warn("skipped \(nulls) null `text` row(s) in \(path)") }
+            return docs
+        } catch { fail("cannot read Parquet \(path): \(error)") }
     }
     guard let content = try? String(contentsOf: url, encoding: .utf8) else {
         fail("cannot read \(path)")

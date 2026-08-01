@@ -152,6 +152,12 @@ existing `src/data/shard.py` tokenizes them to the Qwen2.5 uint32 trainer shards
 > text (`cleaned.jsonl`); the native Swift `monica-tokenize pack` (`swift/`, #191/#245) tokenizes
 > + packs it into the same uint16 shard layout. So for M12: **Python cleans → Swift
 > tokenizes+packs** — `src/data/shard.py`'s `--tokenizer code` path no longer exists.
+> `scripts/build_ts_clean_corpus.py` itself is unchanged by #247 (still emits `cleaned.jsonl`
+> directly, no Parquet stage). Separately, `src/data/corpus.py`'s `build_corpus`/`write_shards`
+> Parquet shards (the general pipeline used above) are now **directly** readable by
+> `monica-tokenize` (a minimal pure-Swift Parquet reader, #247) — no `cleaned.jsonl` round trip
+> needed for that path either, as long as the shards are written `compression="snappy"`
+> (`--compression snappy`; the pure-Swift reader has no zstd decoder).
 
 **Environment caveat.** datatrove supports Python ≤3.12 and pulls C-extension/`spacy` deps, so it
 runs in a **dedicated py3.11 venv** matching the RunPod `py3.11` images — *not* the main py3.14

@@ -119,6 +119,12 @@ def write_shards(records: Iterable[Record], out_uri, shard_size_mb: int = 128,
     `file://` now, `s3://` later via s3fs at #80 — same code path). Rolls a new shard
     once the buffered text passes `shard_size_mb`, so output is FEW LARGE files (the R2
     Class-A-ops constraint). Returns the shard paths written, in order.
+
+    `compression`: `zstd` (default) is the storage/R2 default — smallest on disk, best for
+    the durable corpus artifact. Shards destined for the native Swift `monica-tokenize pack`
+    path (#247) must be written `compression="snappy"` (or `"none"`): the pure-Swift Parquet
+    reader deliberately implements no zstd decoder (see `swift/Sources/MonicaTokenizer/Parquet/`),
+    so a zstd shard handed to it fails with a named error rather than a silent misread.
     """
     import fsspec
     import pyarrow.parquet as pq
@@ -226,7 +232,7 @@ def build_corpus(records: Iterable[Record], out_uri, *, min_chars: int = 1,
                  quality: bool = False, license_filter: bool = False,
                  drop_minified: bool = False, drop_autogen: bool = False,
                  scrub: bool = False, dedup: str | None = None, near_threshold: float = 0.8,
-                 decontaminator=None, shard_size_mb: int = 128,
+                 decontaminator=None, shard_size_mb: int = 128, compression: str = "zstd",
                  stats=None, dedup_stats=None) -> List[str]:
     """The Stage 2–5 flow end to end: normalize -> filter -> (dedup) -> (decontaminate) ->
     write Parquet shards. Returns the shard paths written; pass a `filters.FilterStats` as
@@ -234,7 +240,9 @@ def build_corpus(records: Iterable[Record], out_uri, *, min_chars: int = 1,
     work is opt-in (the #69 local gate is unchanged).
 
     `dedup`: None | "exact" | "minhash" ("minhash" runs exact first, then MinHash-LSH).
-    `decontaminator`: an optional `dedup.Decontaminator` (benchmark n-gram stripping)."""
+    `decontaminator`: an optional `dedup.Decontaminator` (benchmark n-gram stripping).
+    `compression`: forwarded to `write_shards` — see its docstring for the snappy-for-Swift
+    contract (#247)."""
     cleaned = filter_records(normalize(records), min_chars=min_chars, quality=quality,
                              license_filter=license_filter, drop_minified=drop_minified,
                              drop_autogen=drop_autogen, scrub=scrub, stats=stats)
@@ -248,7 +256,7 @@ def build_corpus(records: Iterable[Record], out_uri, *, min_chars: int = 1,
     if decontaminator is not None:
         from .dedup import decontaminate
         cleaned = decontaminate(cleaned, decontaminator, stats=dedup_stats)
-    return write_shards(cleaned, out_uri, shard_size_mb=shard_size_mb)
+    return write_shards(cleaned, out_uri, shard_size_mb=shard_size_mb, compression=compression)
 
 
 def main() -> None:
@@ -280,6 +288,10 @@ def main() -> None:
                          "strip (13-gram + 7-gram overlap)")
     ap.add_argument("--shard-size-mb", type=int, default=128,
                     help="roll a new shard past this size (few large shards)")
+    ap.add_argument("--compression", choices=("zstd", "snappy", "none"), default="zstd",
+                    help="Parquet codec (default zstd, the storage/R2 default). `snappy` is "
+                         "required for shards the native Swift `monica-tokenize pack` will "
+                         "read directly (#247) — its pure-Swift reader has no zstd decoder.")
     args = ap.parse_args()
 
     if args.source == "dummy":
@@ -307,7 +319,7 @@ def main() -> None:
                           drop_minified=args.drop_minified, drop_autogen=args.drop_autogen,
                           scrub=args.scrub, dedup=args.dedup, near_threshold=args.near_threshold,
                           decontaminator=decon, shard_size_mb=args.shard_size_mb,
-                          stats=stats, dedup_stats=dedup_stats)
+                          compression=args.compression, stats=stats, dedup_stats=dedup_stats)
     extra = f"  dedup={dedup_stats.as_dict()}" if dedup_stats else ""
     print(f"wrote {len(shards)} shard(s) -> {args.out}  filter={stats.as_dict()}{extra}")
 

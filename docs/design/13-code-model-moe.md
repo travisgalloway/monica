@@ -66,7 +66,12 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   (`src/data/tokenizer_train.py` deleted; `CodeTokenizer`/`load_code_tokenizer`/`--tokenizer code`
   removed). New corpus split: **Python cleans → Swift tokenizes+packs.** `monica-tokenize pack`
   emits the exact `src/data/shard.py` shard layout (uint16 `.bin` + `.bounds` + `manifest.json`),
-  so the Python training loop reads Swift-produced shards unchanged.
+  so the Python training loop reads Swift-produced shards unchanged. Since #247,
+  `monica-tokenize` reads the corpus pipeline's Parquet shards **directly** (a minimal
+  pure-Swift reader, `swift/Sources/MonicaTokenizer/Parquet/` — UNCOMPRESSED/SNAPPY only, no
+  zstd), so a full corpus build no longer round-trips through `cleaned.jsonl`; shards must be
+  written `compression="snappy"` (`src/data/corpus.py --compression snappy`) for the Swift
+  packer to read them.
 - **MHM-P2 — Architecture & harness build** (the large net-new engineering): aux-loss-free
   balancing router (#213, *land first*) → CUDA MoE backend (#214: dropless routing, shared expert,
   FSDP, sparse-upcycle init) → FIM collator (#215 — consumes the Swift-packed shards; the FIM

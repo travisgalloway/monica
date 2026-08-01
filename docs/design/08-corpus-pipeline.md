@@ -94,9 +94,16 @@ it early (only the IDs stream from the Hub; the blobs come from SWH S3).
 > (the already-built reserve corpus uses Qwen2.5). **M12** (the live program) sidesteps this
 > tokenizer question with its **own byte-level BPE** trained on the M12 mixture (#191) — see
 > [`13-code-model-moe.md`](13-code-model-moe.md). **For M12, tokenize + shard is no longer a
-> Python stage:** Python only *cleans* the corpus (→ `cleaned.jsonl`), and the native Swift
-> `monica-tokenize pack` (`swift/`, #191/#245) tokenizes + packs it — emitting the same
-> `.bin`/`.bounds`/`manifest.json` layout described below, so the training loop is unchanged.
+> Python stage:** Python only *cleans* the corpus (`build_corpus` → Parquet shards via
+> `write_shards`), and the native Swift `monica-tokenize pack` (`swift/`, #191/#245) tokenizes +
+> packs it — emitting the same `.bin`/`.bounds`/`manifest.json` layout described below, so the
+> training loop is unchanged. Since #247, `monica-tokenize` reads those Parquet shards
+> **directly** (a minimal pure-Swift reader, `swift/Sources/MonicaTokenizer/Parquet/`) — the
+> earlier `cleaned.jsonl` round trip is no longer required. The pure-Swift reader deliberately
+> supports only `UNCOMPRESSED`/`SNAPPY` codecs (no zstd decoder), so shards destined for it must
+> be written `write_shards(..., compression="snappy")` (`--compression snappy` on the
+> `src/data/corpus` CLI) — `zstd` (the storage/R2 default) still works for `read_shards`/
+> `iter_shard_texts` on the Python side, just not for the Swift packer.
 
 - **Tokenizer:** reuse a mixed prose+code tokenizer, chosen with the **uint16 packing
   threshold (`vocab < 65536`)** in mind — `src/data/pack.py` and `MambaConfig.packing_dtype`

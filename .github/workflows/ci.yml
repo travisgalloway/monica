@@ -102,6 +102,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,data,mlx]"
+      - name: Build the Swift tokenizer (for the Parquet parity test)
+        # This is the only job with both Python/pyarrow and a Swift toolchain, so it's what
+        # turns tests/test_swift_parquet.py from a local check into a gate (#247). ~30s.
+        working-directory: swift
+        run: swift build
       - name: pytest
         run: pytest -q -rs
       - name: Build a fresh toy split

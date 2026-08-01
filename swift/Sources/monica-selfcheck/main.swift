@@ -144,6 +144,126 @@ do {
           "pack throws on overflowing shardSizeMB")
 }
 
+// MARK: parquet
+//
+// Covers the pure-Swift Parquet reader (swift/Sources/MonicaTokenizer/Parquet/, #247) on both
+// macOS and Linux — the fixture parity test (tests/test_swift_parquet.py) needs Python +
+// pyarrow + a built binary in the same environment, which only the macOS CI job has, so this is
+// what makes the reader a real gate on `swift-linux` too.
+
+/// Resolve `swift/Fixtures/`: `$MONICA_FIXTURES` override, then `#filePath` (this file is
+/// `.../swift/Sources/monica-selfcheck/main.swift` — three `deletingLastPathComponent()`s up is
+/// `swift/`), then `./Fixtures` (running from the `swift/` directory). `nil` if none resolves —
+/// callers must treat that as a failure, not a skip.
+func resolveFixturesDir() -> URL? {
+    let fm = FileManager.default
+    if let env = ProcessInfo.processInfo.environment["MONICA_FIXTURES"], !env.isEmpty {
+        let u = URL(fileURLWithPath: env)
+        if fm.fileExists(atPath: u.path) { return u }
+    }
+    let fromSource = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // Sources/monica-selfcheck/ -> drop main.swift
+        .deletingLastPathComponent()   // Sources/monica-selfcheck -> Sources/
+        .deletingLastPathComponent()   // Sources/ -> swift/
+        .appendingPathComponent("Fixtures")
+    if fm.fileExists(atPath: fromSource.path) { return fromSource }
+    let cwd = URL(fileURLWithPath: "Fixtures")
+    if fm.fileExists(atPath: cwd.path) { return cwd }
+    return nil
+}
+
+if let fixturesDir = resolveFixturesDir() {
+    func parquetThrows(_ body: () throws -> Void) -> Bool {
+        do { try body(); return false } catch { return true }
+    }
+
+    // 7 rows, nulls, single row group, dictionary-encoded, snappy — the exact worked example
+    // from the #247 plan (dictionary "a"=0, ""=1, "ccc"=2; def levels 1,0,1,1,1,0,1).
+    do {
+        let url = fixturesDir.appendingPathComponent("parquet-snappy-dict.parquet")
+        do {
+            let (values, nulls) = try Parquet.readStringColumn(contentsOf: url)
+            eq(values, ["a", "", "ccc", "a", ""], "parquet snappy+dict values")
+            eq(nulls, 2, "parquet snappy+dict nullsSkipped")
+        } catch {
+            failures.append("parquet snappy+dict fixture threw: \(error)")
+        }
+    }
+
+    // PLAIN encoding, multiple row groups, multiple data pages per row group.
+    do {
+        let url = fixturesDir.appendingPathComponent("parquet-plain-multipage.parquet")
+        do {
+            let (values, nulls) = try Parquet.readStringColumn(contentsOf: url)
+            eq(values.count, 24, "parquet PLAIN multipage row count")
+            eq(nulls, 0, "parquet PLAIN multipage has no nulls")
+            if values.count == 24 {
+                eq(values[0], "doc 000 " + String(repeating: "x", count: 250),
+                   "parquet PLAIN multipage first value")
+                eq(values[23], "doc 023 " + String(repeating: "x", count: 250),
+                   "parquet PLAIN multipage last value")
+            }
+        } catch {
+            failures.append("parquet PLAIN multipage fixture threw: \(error)")
+        }
+    }
+
+    // zstd is a named, actionable error — not a silent skip and not a trap.
+    do {
+        let url = fixturesDir.appendingPathComponent("parquet-zstd.parquet")
+        do {
+            _ = try Parquet.readStringColumn(contentsOf: url)
+            failures.append("parquet zstd fixture: expected a thrown error, got none")
+        } catch {
+            let msg = "\(error)"
+            check(msg.contains("ZSTD"), "parquet zstd error names the codec: \(msg)")
+            check(msg.contains("snappy"), "parquet zstd error names the fix: \(msg)")
+        }
+    }
+
+    // Corrupted input throws (catchable), never traps. Built in memory from a valid fixture's
+    // bytes, written to scratch files (the public API reads from a URL, not raw bytes).
+    do {
+        let validURL = fixturesDir.appendingPathComponent("parquet-snappy-dict.parquet")
+        if let validData = try? Data(contentsOf: validURL) {
+            let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("monica-parquet-corrupt-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+
+            func writeAndCheck(_ name: String, _ bytes: Data, _ desc: String) {
+                let f = scratch.appendingPathComponent(name)
+                do {
+                    try bytes.write(to: f)
+                    check(parquetThrows { _ = try Parquet.readStringColumn(contentsOf: f) },
+                          "parquet \(desc) throws, not traps")
+                } catch {
+                    failures.append("could not write corrupted fixture \(name): \(error)")
+                }
+            }
+
+            // Truncated: drop the last 20 bytes (loses part or all of the footer).
+            writeAndCheck("truncated.parquet", validData.dropLast(20), "truncated file")
+
+            // Corrupt the leading PAR1 magic.
+            var badHead = validData
+            badHead.replaceSubrange(0..<4, with: [0, 0, 0, 0])
+            writeAndCheck("bad-head-magic.parquet", badHead, "corrupt head magic")
+
+            // Absurd footer length (bigger than the file).
+            var badFooterLen = validData
+            let n = badFooterLen.count
+            let hugeLen: [UInt8] = [0xff, 0xff, 0xff, 0x7f]   // ~2 GB, far larger than this file
+            badFooterLen.replaceSubrange((n - 8)..<(n - 4), with: hugeLen)
+            writeAndCheck("absurd-footer-len.parquet", badFooterLen, "absurd footer length")
+        } else {
+            failures.append("could not read parquet-snappy-dict.parquet to build corrupted variants")
+        }
+    }
+} else {
+    failures.append("could not resolve swift/Fixtures (checked $MONICA_FIXTURES, #filePath, ./Fixtures)")
+}
+
 // MARK: report
 
 if failures.isEmpty {

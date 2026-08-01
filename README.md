@@ -57,7 +57,8 @@ training the big one from zero).
 1. **Build the corpus + tokenizer** — a general multilingual code+text mixture (Essential-Web +
    Stack-v2) and Monica's own byte-level BPE trained on it. The tokenizer is a **native
    cross-platform Swift** package (`swift/`, #191/#245): Python cleans the corpus, Swift
-   tokenizes+packs it.
+   tokenizes+packs it — reading the cleaned Parquet shards **directly** (#247, a minimal
+   pure-Swift reader — no `cleaned.jsonl` round trip needed).
 2. **Build the MoE architecture & harness** — load-balancing router, the CUDA MoE backend,
    fill-in-the-middle, a length curriculum, and the evals (bits-per-byte is the primary metric).
 3. **Sweep small designs, then run** — cheaply ablate attention ratio / state size / routing,
@@ -102,6 +103,8 @@ src/data/                  download · tokenize (olmo/qwen3/qwen25) · pack(uint
                            sft_*/dpo_*/reasoning_* (post-training corpora)
 swift/                     native code tokenizer (#191/#245): MonicaTokenizer + monica-tokenize CLI
                            (train · encode · decode · pack) — cross-platform, bit-identical, no MLX
+                           Parquet/ (#247): minimal pure-Swift Parquet reader (UNCOMPRESSED/SNAPPY),
+                           lets `pack` read corpus shards directly
 src/train/                 loop · schedule (warmup+cosine, WSD) · checkpoint · loss_scale
                            sft · dpo · grpo · verifiers
 src/eval/                  val_loss (Tier-1) · olmes_adapter (Tier-2 lm-eval) · long_context · probes
