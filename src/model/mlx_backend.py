@@ -196,7 +196,7 @@ class SelectiveSSM(nn.Module):
         return delta, a, B, C
 
     def parallel(self, x: Array, seg_ids: Array = None, *,
-                 return_state: bool = False) -> Array:
+                 return_state: bool = False) -> Array | Tuple[Array, Array]:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Pads L up to a multiple of the chunk length Q (padded steps carry zero

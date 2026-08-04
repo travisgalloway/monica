@@ -327,7 +327,7 @@ class SelectiveSSM(nn.Module):
         return delta, a, B, C
 
     def parallel(self, x: Array, seg_ids: Array = None, *,
-                 return_state: bool = False) -> Array:
+                 return_state: bool = False) -> Array | Tuple[Array, Array]:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Dispatches to `mamba_chunk_scan_combined` (#40) when the tensor is on CUDA and

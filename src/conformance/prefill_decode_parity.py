@@ -46,11 +46,13 @@ def _leaves(obj) -> Iterator:
         yield obj
 
 
-def _state_diff(state_a, state_b, to_numpy) -> tuple:
+def _state_diff(state_a, state_b, to_numpy, rtol: float = 1e-4, atol: float = 1e-5) -> tuple:
     """Max |a - b| over the two states' leaves, plus the first mismatching leaf index.
 
     A per-leaf index is what makes a failure diagnosable — it says "layer 3's conv
-    window", not "something differs". Returns `(max_abs, first_bad_leaf)`.
+    window", not "something differs". Returns `(max_abs, first_bad_leaf)`. `rtol`/`atol`
+    default to the module's standard tolerance but are threaded through from the caller
+    so state-parity checks honor the same tolerance as the logit checks.
     """
     a = [np.asarray(to_numpy(x), dtype=np.float64) for x in _leaves(state_a)]
     b = [np.asarray(to_numpy(x), dtype=np.float64) for x in _leaves(state_b)]
@@ -68,7 +70,7 @@ def _state_diff(state_a, state_b, to_numpy) -> tuple:
         d = float(np.max(np.abs(x - y), initial=0.0))
         if d > max_abs:
             max_abs = d
-        if first_bad is None and not np.allclose(x, y, rtol=1e-4, atol=1e-5):
+        if first_bad is None and not np.allclose(x, y, rtol=rtol, atol=atol):
             first_bad = i
     return max_abs, first_bad
 
@@ -106,7 +108,7 @@ def check_prefill_decode_parity(model: ModelInterface, token_batch: np.ndarray,
     for t in range(seq_len):
         logits_t, stepped = model.step(token_batch[:, t], stepped)
         step_logits.append(np.asarray(to_numpy(logits_t), dtype=np.float64))
-    max_state, first_bad = _state_diff(pre_state, stepped, to_numpy)
+    max_state, first_bad = _state_diff(pre_state, stepped, to_numpy, rtol=rtol, atol=atol)
     ok = ok and first_bad is None
 
     # 4) prefill-then-decode vs pure step-by-step over the same ids. This is the property

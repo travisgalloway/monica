@@ -131,7 +131,7 @@ class SessionStore:
                 "only (the seam seeds attention RoPE positions from 0 — see "
                 "ModelInterface.prefill). Use `step` to extend a live session, or create a "
                 "fresh session and prefill the full context.")
-        ids = np.asarray([[int(t) for t in prompt_ids]], dtype=np.int64)   # (1, L)
+        ids = np.asarray(prompt_ids, dtype=np.int64)[None]                 # (1, L)
         logits, state = self.model.prefill(ids, last_only=True)            # logits (1, V)
         # Clone on the way in, mirroring `set_state`'s discipline: the store must own an
         # independent copy that a later in-place `step` cannot alias.
