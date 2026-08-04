@@ -42,6 +42,18 @@ class FakeModel:
         logits = np.eye(self.config.vocab_size)[np.asarray(token) % self.config.vocab_size]
         return logits, new_state
 
+    def prefill(self, token_batch, seg_ids=None, *, last_only=False):
+        """Seam `prefill` stand-in (#165): an internal step loop, so `SessionStore.prefill`
+        is checked against the same running-sum arithmetic as `step`."""
+        assert seg_ids is None
+        token_batch = np.asarray(token_batch)
+        state = self.init_state(token_batch.shape[0])
+        rows = []
+        for t in range(token_batch.shape[1]):
+            logits, state = self.step(token_batch[:, t], state)
+            rows.append(logits)
+        return (rows[-1] if last_only else np.stack(rows, axis=1)), state
+
     def clone_state(self, state):
         return np.array(state, copy=True)
 
@@ -125,6 +137,74 @@ def test_remove_then_step_raises():
     assert "a" not in store
     with pytest.raises(KeyError):
         store.step("a", 1)
+
+
+# --- prefill (#165) -----------------------------------------------------------------
+
+def test_prefill_matches_step_loop():
+    """One `prefill` call must leave the session exactly where a `step` loop would."""
+    prompt = [1, 2, 3, 4]
+    a = SessionStore(FakeModel())
+    a.create("a")
+    logits_pre = a.prefill("a", prompt)
+
+    b = SessionStore(FakeModel())
+    b.create("b")
+    for t in prompt:
+        logits_step = b.step("b", t)
+
+    assert int(a.get_state("a")[0]) == int(b.get_state("b")[0]) == sum(prompt)
+    assert np.array_equal(logits_pre, logits_step)      # last position's logits
+
+
+def test_prefill_marks_session_most_recently_used():
+    store = SessionStore(FakeModel(), max_concurrent=2)
+    store.create("a")
+    store.create("b")
+    store.prefill("a", [1, 2])     # a is now MRU; b is the LRU
+    assert store.create("c") == ["b"]
+
+
+def test_prefill_on_stepped_session_raises():
+    # Fresh-session only: the seam seeds attention RoPE from position 0, so prefilling a
+    # session that already consumed tokens would mis-position the prompt.
+    store = SessionStore(FakeModel())
+    store.create("a")
+    store.step("a", 1)
+    with pytest.raises(ValueError):
+        store.prefill("a", [2, 3])
+
+
+def test_prefill_after_prefill_raises():
+    store = SessionStore(FakeModel())
+    store.create("a")
+    store.prefill("a", [1, 2])
+    with pytest.raises(ValueError):
+        store.prefill("a", [3, 4])
+
+
+def test_prefill_on_restored_session_raises():
+    # A snapshot's token position is unknowable above the seam; unknown must not be
+    # treated as fresh.
+    store = SessionStore(FakeModel())
+    store.create("a")
+    snap = store.get_state("a")
+    store.set_state("a", snap)
+    with pytest.raises(ValueError):
+        store.prefill("a", [1, 2])
+
+
+def test_prefill_empty_prompt_raises():
+    store = SessionStore(FakeModel())
+    store.create("a")
+    with pytest.raises(ValueError):
+        store.prefill("a", [])
+
+
+def test_prefill_unknown_session_raises():
+    store = SessionStore(FakeModel())
+    with pytest.raises(KeyError):
+        store.prefill("missing", [1])
 
 
 # --- LRU eviction -------------------------------------------------------------------

@@ -16,15 +16,15 @@ Usage::
 
     store = SessionStore(model, memory_budget_bytes=2 * 1024**3)
     store.create("s1")
-    for tok in prompt_ids:
-        logits = store.step("s1", tok)   # caller samples the next token from logits
+    logits = store.prefill("s1", prompt_ids)   # whole prompt in ONE parallel scan
+    logits = store.step("s1", next_id)         # then one token at a time
     snapshot = store.get_state("s1")     # hand to serve.rewind.RewindTree.commit(...)
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -74,6 +74,10 @@ class SessionStore:
                  max_concurrent: Optional[int] = None):
         self.model = model
         self._states: "OrderedDict[str, State]" = OrderedDict()
+        # Tokens consumed per session, tracked ONLY to enforce prefill's fresh-session-only
+        # contract (#165). `None` means "unknown" — a restored snapshot's position is not
+        # recoverable above the seam, and unknown must not be mistaken for fresh.
+        self._positions: "dict[str, Optional[int]]" = {}
         self._per_session_bytes = per_session_state_bytes(model.config)
 
         if max_concurrent is not None:
@@ -96,18 +100,55 @@ class SessionStore:
         if session_id in self._states:
             raise ValueError(f"session {session_id!r} already exists")
         self._states[session_id] = self.model.init_state(batch_size=1)
+        self._positions[session_id] = 0
         return self._maybe_evict()
 
     def remove(self, session_id: str) -> None:
         del self._states[session_id]  # KeyError if absent — explicit
+        self._positions.pop(session_id, None)
 
     # --- advance ---
+    def prefill(self, session_id: str, prompt_ids: Sequence[int]) -> Array:
+        """Consume a whole prompt in ONE parallel scan; return the last position's logits.
+
+        Equivalent to `step`-ing every id in `prompt_ids` — same state, same final logits
+        (gated by `src/conformance/prefill_decode_parity.py`) — but one parallel pass
+        instead of `len(prompt_ids)` sequential graph evaluations.
+
+        **Fresh sessions only.** The seam's `prefill` seeds attention RoPE from absolute
+        position 0, so it cannot extend a session that has already consumed tokens; a
+        session restored via `set_state` has an unknowable position and is refused too.
+        Raises `ValueError` in both cases rather than silently mis-positioning a prompt.
+        """
+        if len(prompt_ids) == 0:
+            raise ValueError("prompt_ids must be non-empty")
+        pos = self._positions.get(session_id)
+        if session_id not in self._states:
+            raise KeyError(session_id)
+        if pos != 0:
+            raise ValueError(
+                f"session {session_id!r} is at position {pos!r}; prefill is fresh-session "
+                "only (the seam seeds attention RoPE positions from 0 — see "
+                "ModelInterface.prefill). Use `step` to extend a live session, or create a "
+                "fresh session and prefill the full context.")
+        ids = np.asarray(prompt_ids, dtype=np.int64)[None]                 # (1, L)
+        logits, state = self.model.prefill(ids, last_only=True)            # logits (1, V)
+        # Clone on the way in, mirroring `set_state`'s discipline: the store must own an
+        # independent copy that a later in-place `step` cannot alias.
+        self._states[session_id] = self.model.clone_state(state)
+        self._states.move_to_end(session_id)
+        self._positions[session_id] = len(prompt_ids)
+        return logits
+
     def step(self, session_id: str, token: int) -> Array:
         """Feed one token to a session; return its logits. Marks it most-recently-used."""
         tok = np.asarray([token], dtype=np.int64)  # (1,) — batch=1; backend casts at seam
         logits, new_state = self.model.step(tok, self._states[session_id])
         self._states[session_id] = new_state
         self._states.move_to_end(session_id)
+        pos = self._positions.get(session_id)
+        if pos is not None:
+            self._positions[session_id] = pos + 1
         return logits
 
     # --- snapshot / restore (the bridge to serve.rewind) ---
@@ -125,6 +166,9 @@ class SessionStore:
         """
         self._states[session_id] = self.model.clone_state(state)
         self._states.move_to_end(session_id)
+        # A restored snapshot's token position is unknowable above the seam, so mark it
+        # unknown — `prefill` must refuse it rather than assume a fresh RoPE origin.
+        self._positions[session_id] = None
 
     # --- introspection ---
     def __contains__(self, session_id: str) -> bool:
@@ -144,5 +188,6 @@ class SessionStore:
             return evicted
         while len(self._states) > self.max_concurrent:
             sid, _ = self._states.popitem(last=False)  # LRU front
+            self._positions.pop(sid, None)
             evicted.append(sid)
         return evicted

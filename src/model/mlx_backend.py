@@ -195,7 +195,8 @@ class SelectiveSSM(nn.Module):
         a = -mx.exp(self.A_log)                    # (H,) scalar decay, fp32
         return delta, a, B, C
 
-    def parallel(self, x: Array, seg_ids: Array = None) -> Array:
+    def parallel(self, x: Array, seg_ids: Array = None, *,
+                 return_state: bool = False) -> Array | Tuple[Array, Array]:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Pads L up to a multiple of the chunk length Q (padded steps carry zero
@@ -204,8 +205,22 @@ class SelectiveSSM(nn.Module):
 
         `seg_ids` (B, L) document ids (chunk-aligned boundaries) makes the scan
         packing-aware (#68): the inter-chunk state carry is masked so recurrent state can't
-        bleed across documents. `None` is the original single-segment scan."""
+        bleed across documents. `None` is the original single-segment scan.
+
+        `return_state` (keyword-only, prefill #165) additionally returns the END-OF-SEQUENCE
+        SSM state (B, H, P, N) — `new_states[:, -1]`, the entry this scan normally discards
+        when it slices `S_enter = new_states[:, :-1]`. It is EXACT even when L is padded up
+        to a chunk multiple: a padded step has `delta = 0`, so its log-decay `g = delta * a`
+        is 0 (decay `exp(0) = 1`, identity) and its input `Xin = delta * X` is 0 — padded
+        tail steps neither contribute nor decay. No `[:L]` trim applies to a state."""
         B_, L, d_inner = x.shape
+        if return_state and seg_ids is not None:
+            raise NotImplementedError(
+                "parallel(..., return_state=True) does not support seg_ids: "
+                "_chunk_seg_mask marks the entering-chunk axis's last row with the -2 "
+                "sentinel (no source chunk carries it), so row nc of decay_chunk is masked "
+                "to all zeros — precisely because S_enter drops it. The carry-out would "
+                "silently read as zeros. See ModelInterface.prefill.")
         H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
         Q = self.config.chunk_size or 64
         cd = _DTYPES[self.config.precision]
@@ -257,7 +272,10 @@ class SelectiveSSM(nn.Module):
 
         Y = (Ydiag + Yoff).reshape(B_, Lp, H, P)[:, :L]             # (B,L,H,P)
         Y = Y + X[:, :L] * self.D[None, None, :, None]             # skip
-        return _cast(Y.reshape(B_, L, d_inner), cd)                # back to compute dtype
+        Y = _cast(Y.reshape(B_, L, d_inner), cd)                   # back to compute dtype
+        if return_state:
+            return Y, new_states[:, -1]                            # (B,H,P,N) fp32 carry-out
+        return Y
 
     def mixing_matrix(self, x: Array) -> Array:
         """Materialize the dense (B, H, L, L) 1-semiseparable mixing matrix M such that
@@ -291,6 +309,31 @@ class SelectiveSSM(nn.Module):
         h = dA[:, :, None, None] * state + dBx      # (B,H,P,N) — fp32 state
         y = mx.sum(h * Cm[:, None, None, :], axis=-1) + Xh * self.D[None, :, None]
         return _cast(y.reshape(B_, -1), cd), h
+
+
+def _conv_window(x_main: Array, k: int) -> Array:
+    """The conv state after consuming `x_main` (B, L, d_inner) — prefill's mirror of what
+    `MambaBlock.step` leaves behind (#165).
+
+    `step` keeps `window[:, 1:]` where `window = concat([conv_state, x_main[:, None]])`, so
+    after L tokens the state is the LAST `k-1` rows of `x_main` — post-`in_proj`, PRE-conv,
+    pre-SiLU. Two edge cases, both live footguns:
+      * `L < k-1`: LEFT-zero-pad to (B, k-1, d_inner) — exactly what an initially zeroed
+        window plus L pushes leaves behind.
+      * `k == 1`: `k-1 == 0` and `x_main[:, -0:]` is the WHOLE array in Python, so the
+        empty window must be built explicitly.
+    Emitted in fp32 so it is dtype-identical to a stepped window (`init_state` allocates
+    fp32 and `concat([fp32, cd])` promotes)."""
+    B_, L, di = x_main.shape
+    w = k - 1
+    if w <= 0:
+        return mx.zeros((B_, 0, di), dtype=mx.float32)
+    tail = _f32(x_main[:, max(0, L - w):])                   # (B, min(L,w), di)
+    missing = w - tail.shape[1]
+    if missing:
+        tail = mx.concatenate(
+            [mx.zeros((B_, missing, di), dtype=tail.dtype), tail], axis=1)
+    return tail
 
 
 class MambaBlock(nn.Module):
@@ -363,6 +406,22 @@ class MambaBlock(nn.Module):
         y = self.ssm.parallel(xc, seg_ids)
         y = y * _silu(z)
         return x + _linear(self.out_proj, y, cd)
+
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        """`forward_seq` plus the (conv_state, ssm_state) pair `step` would have left (#165).
+
+        Same math as `forward_seq` — the only additions are the SSD carry-out state and the
+        conv window read off `x_main` (pre-conv), which together are exactly this block's
+        `step` state after L tokens."""
+        L = x.shape[1]
+        cd = _DTYPES[self.config.precision]
+        xn = self.norm(x)
+        x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)   # (B,L,di) each
+        xc = _silu(self._conv_seq(x_main, cd)[:, :L])
+        y, ssm_state = self.ssm.parallel(xc, seg_ids, return_state=True)
+        y = y * _silu(z)
+        out = x + _linear(self.out_proj, y, cd)
+        return out, (_conv_window(x_main, self.config.d_conv), ssm_state)
 
     def mixing_matrix(self, x: Array) -> Array:
         """This block's head-split SSM mixing matrix (B, H, L, L), for distillation
@@ -477,6 +536,26 @@ class AttentionBlock(nn.Module):
         out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
         return x + _linear(self.o_proj, _cast(out, cd), cd)
 
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        """`forward_seq` plus the (k_cache, v_cache) pair `step` would have built (#165).
+
+        The emitted `k` is POST-RoPE — the same tensor that built `scores` here — and `v` is
+        unchanged; both fp32 (B, H, L, Dh), matching what `step` accumulates. RoPE positions
+        run from 0, so this is valid only from a fresh (zero-length) cache; see
+        `ModelInterface.prefill`."""
+        cd = _DTYPES[self.config.precision]
+        L = x.shape[1]
+        xn = self.norm(x)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,L,Dh) fp32
+        cos, sin = _rope_cos_sin(mx.arange(L), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(self.Dh)   # (B,H,L,L)
+        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
+        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        out = _softmax_lastdim(scores) @ v                   # (B,H,L,Dh)
+        out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (k, v)
+
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
         cd = _DTYPES[self.config.precision]
         k_cache, v_cache = state                             # (B,H,T,Dh) each, fp32
@@ -556,6 +635,14 @@ class MoEBlock(nn.Module):
     def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
         return x + self._moe(self.norm(x))                   # pointwise: seg_ids irrelevant
 
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        # Stateless: emit the SAME placeholder pair `init_state` builds for a MoE layer,
+        # so a prefilled state and a stepped state agree element-wise (and clone_state's
+        # 2-tuple unpack stays valid).
+        B_ = x.shape[0]
+        z = mx.zeros((B_, 0))
+        return x + self._moe(self.norm(x)), (z, z)
+
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
         return x + self._moe(self.norm(x)), state            # stateless: pass state through
 
@@ -614,6 +701,28 @@ class MLXMambaModel(ModelInterface, nn.Module):
             for layer_fn in self._layer_fns:
                 h = layer_fn(h, seg)                                  # boundary-aware (#68)
         return self._head(self.norm_f(h))
+
+    def prefill(self, token_batch: Array, seg_ids: Array = None, *,
+                last_only: bool = False) -> Tuple[Array, State]:
+        """One parallel scan over the whole prompt -> (logits, state). See
+        `ModelInterface.prefill` for the contract (fresh-session only, no seg_ids)."""
+        if seg_ids is not None:
+            raise NotImplementedError(
+                "prefill does not support seg_ids (#165): the SSD carry-out row is masked "
+                "to zeros under the packing-aware scan, the conv window can straddle a "
+                "document boundary, and AttentionBlock.step has no per-document masking. "
+                "Use forward(token_batch, seg_ids) for packed training sequences.")
+        h = _cast(self.embedding(mx.array(token_batch)), self._cd)
+        state = []
+        # Raw layers, NOT self._layer_fns: grad checkpointing is a training concern
+        # (prefill is inference) and those closures thread no state.
+        for layer in self.layers:
+            h, st = layer.forward_prefill(h)
+            state.append(st)
+        h = self.norm_f(h)
+        if last_only:
+            h = h[:, -1]                                 # (B, d_model) -> logits (B, V)
+        return self._head(h), state
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
         h = _cast(self.embedding(mx.array(token)), self._cd)

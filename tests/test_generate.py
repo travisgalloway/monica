@@ -36,6 +36,18 @@ class CounterModel:
         logits = np.eye(self.config.vocab_size)[nxt]  # (1, vocab), one-hot
         return logits, state + token  # state = running sum (fresh array)
 
+    def prefill(self, token_batch, seg_ids=None, *, last_only=False):
+        """Seam `prefill` stand-in: an internal step loop, so the counter arithmetic the
+        assertions rely on is unchanged by `generate` switching to prefill (#165)."""
+        assert seg_ids is None
+        token_batch = np.asarray(token_batch)
+        state = self.init_state(token_batch.shape[0])
+        rows = []
+        for t in range(token_batch.shape[1]):
+            logits, state = self.step(token_batch[:, t], state)
+            rows.append(logits)
+        return (rows[-1] if last_only else np.stack(rows, axis=1)), state
+
     def clone_state(self, state):
         return np.array(state, copy=True)
 

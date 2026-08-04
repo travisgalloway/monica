@@ -326,7 +326,8 @@ class SelectiveSSM(nn.Module):
         a = -torch.exp(self.A_log)                   # (H,) scalar decay, fp32
         return delta, a, B, C
 
-    def parallel(self, x: Array, seg_ids: Array = None) -> Array:
+    def parallel(self, x: Array, seg_ids: Array = None, *,
+                 return_state: bool = False) -> Array | Tuple[Array, Array]:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Dispatches to `mamba_chunk_scan_combined` (#40) when the tensor is on CUDA and
@@ -337,8 +338,20 @@ class SelectiveSSM(nn.Module):
 
         `seg_ids` (B, L) document ids (chunk-aligned boundaries) makes the scan
         packing-aware (#68): the inter-chunk state carry is masked so recurrent state can't
-        bleed across documents. `None` is the original single-segment scan."""
+        bleed across documents. `None` is the original single-segment scan.
+
+        `return_state` (keyword-only, prefill #165) additionally returns the end-of-sequence
+        SSM state (B, H, P, N) — the fused kernel's `return_final_states`, or the
+        `new_states[:, -1]` entry the fallback normally discards. Exact under padding:
+        padded steps have `delta = 0`, so they contribute no input and apply identity decay."""
         B_, L, d_inner = x.shape
+        if return_state and seg_ids is not None:
+            raise NotImplementedError(
+                "parallel(..., return_state=True) does not support seg_ids: "
+                "_chunk_seg_mask marks the entering-chunk axis's last row with the -2 "
+                "sentinel, so row nc of decay_chunk is masked to all zeros — precisely "
+                "because S_enter drops it. The carry-out would silently read as zeros. "
+                "See ModelInterface.prefill.")
         H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
         Q = self.config.chunk_size or 64
         cd = _DTYPES[self.config.precision]
@@ -357,6 +370,15 @@ class SelectiveSSM(nn.Module):
             #   seq_idx (B,L) int32   — maps each position to its document id (#68)
             X = _f32(x).reshape(B_, L, H, P)
             si = (seg_ids.to(torch.int32) if seg_ids is not None else None)
+            if return_state:
+                # `return_final_states=True` makes the kernel return (out, final_states)
+                # with final_states (B,H,P,N) — the same carry-out the fallback reads off
+                # new_states[:, -1]. Kept off the no-state call so that shape is unchanged.
+                Y, final = fn(X, delta, a, Bm[:, :, None, :], Cm[:, :, None, :], Q,
+                              D=self.D, seq_idx=si, dt_softplus=False,
+                              return_final_states=True)
+                final = _f32(final).reshape(B_, H, P, N)
+                return _cast(Y.reshape(B_, L, d_inner), cd), final
             Y = fn(X, delta, a, Bm[:, :, None, :], Cm[:, :, None, :], Q,
                    D=self.D, seq_idx=si, dt_softplus=False)    # (B,L,H,P) fp32
             return _cast(Y.reshape(B_, L, d_inner), cd)
@@ -403,7 +425,10 @@ class SelectiveSSM(nn.Module):
 
         Y = (Ydiag + Yoff).reshape(B_, Lp, H, P)[:, :L]      # (B,L,H,P)
         Y = Y + X[:, :L] * self.D[None, None, :, None]       # skip
-        return _cast(Y.reshape(B_, L, d_inner), cd)          # back to compute dtype
+        Y = _cast(Y.reshape(B_, L, d_inner), cd)             # back to compute dtype
+        if return_state:
+            return Y, new_states[:, -1]                      # (B,H,P,N) fp32 carry-out
+        return Y
 
     def mixing_matrix(self, x: Array) -> Array:
         """Materialize the dense (B, H, L, L) 1-semiseparable mixing matrix M such that
@@ -434,6 +459,25 @@ class SelectiveSSM(nn.Module):
         h = dA[:, :, None, None] * state + dBx        # (B,H,P,N) — fp32 state
         y = torch.sum(h * Cm[:, None, None, :], dim=-1) + Xh * self.D[None, :, None]
         return _cast(y.reshape(B_, -1), cd), h
+
+
+def _conv_window(x_main: Array, k: int) -> Array:
+    """The conv state after consuming `x_main` (B, L, d_inner) — torch port of
+    `mlx_backend._conv_window` (#165).
+
+    `step` keeps `window[:, 1:]`, so after L tokens the state is the LAST `k-1` rows of
+    `x_main` — post-`in_proj`, PRE-conv, pre-SiLU. `L < k-1` LEFT-zero-pads (what an
+    initially zeroed window plus L pushes leaves behind); `k == 1` needs an explicit empty
+    window (`x_main[:, -0:]` is the whole array). Emitted fp32 to match a stepped window."""
+    B_, L, di = x_main.shape
+    w = k - 1
+    if w <= 0:
+        return x_main.new_zeros((B_, 0, di), dtype=torch.float32)
+    tail = _f32(x_main[:, max(0, L - w):])                   # (B, min(L,w), di)
+    missing = w - tail.shape[1]
+    if missing:
+        tail = torch.cat([tail.new_zeros((B_, missing, di)), tail], dim=1)
+    return tail
 
 
 class MambaBlock(nn.Module):
@@ -510,6 +554,19 @@ class MambaBlock(nn.Module):
         y = self.ssm.parallel(xc, seg_ids)
         y = y * _silu(z)
         return x + _linear(self.out_proj, y, cd)
+
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        """`forward_seq` plus the (conv_state, ssm_state) pair `step` would have left (#165)
+        — torch port of `mlx_backend.MambaBlock.forward_prefill`."""
+        L = x.shape[1]
+        cd = _DTYPES[self.config.precision]
+        xn = self.norm(x)
+        x_main, z = torch.chunk(_linear(self.in_proj, xn, cd), 2, dim=-1)   # (B,L,di) each
+        xc = _silu(self._conv_seq(x_main, cd)[:, :L])
+        y, ssm_state = self.ssm.parallel(xc, seg_ids, return_state=True)
+        y = y * _silu(z)
+        out = x + _linear(self.out_proj, y, cd)
+        return out, (_conv_window(x_main, self.config.d_conv), ssm_state)
 
     def mixing_matrix(self, x: Array) -> Array:
         """This block's head-split SSM mixing matrix (B, H, L, L), for distillation
@@ -627,6 +684,24 @@ class AttentionBlock(nn.Module):
         out = out.permute(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
         return x + _linear(self.o_proj, _cast(out, cd), cd)
 
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        """`forward_seq` plus the (k_cache, v_cache) pair `step` would have built (#165).
+
+        `k` is captured POST-RoPE but BEFORE the `to(cd)` SDPA cast, and `v` likewise, so
+        both stay fp32 — the dtype `step` keeps its caches in. RoPE positions run from 0,
+        so this is valid only from a fresh cache; see `ModelInterface.prefill`."""
+        cd = _DTYPES[self.config.precision]
+        L = x.shape[1]
+        xn = self.norm(x)
+        q, k, v = self._qkv(xn, cd)                          # (B,H,L,Dh) fp32
+        cos, sin = _rope_cos_sin(torch.arange(L, device=x.device), self.Dh)
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        k_cache, v_cache = k, v                              # fp32 caches, pre-cast
+        out = F.scaled_dot_product_attention(
+            q.to(cd), k.to(cd), v.to(cd), is_causal=True, scale=1.0 / math.sqrt(self.Dh))
+        out = out.permute(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (k_cache, v_cache)
+
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
         cd = _DTYPES[self.config.precision]
         k_cache, v_cache = state                             # (B,H,T,Dh) each, fp32
@@ -733,6 +808,30 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         if seg_ids is not None:                      # (B, L) document ids -> boundary-aware (#68)
             seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
         return self._forward_compute(h, seg)
+
+    def prefill(self, token_batch: Array, seg_ids: Array = None, *,
+                last_only: bool = False) -> Tuple[Array, State]:
+        """One parallel scan over the whole prompt -> (logits, state). See
+        `ModelInterface.prefill` (fresh-session only, no seg_ids)."""
+        if seg_ids is not None:
+            raise NotImplementedError(
+                "prefill does not support seg_ids (#165): the SSD carry-out row is masked "
+                "to zeros under the packing-aware scan, the conv window can straddle a "
+                "document boundary, and AttentionBlock.step has no per-document masking. "
+                "Use forward(token_batch, seg_ids) for packed training sequences.")
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        h = _cast(self.embedding(ids), self._cd)
+        state = []
+        # Raw layers, NOT _forward_compute: that is the torch.compile region and returns
+        # logits only; compiling a state-returning traversal is deliberate follow-up work.
+        # Grad checkpointing is skipped too — prefill is inference.
+        for layer in self.layers:
+            h, st = layer.forward_prefill(h)
+            state.append(st)
+        h = self.norm_f(h)
+        if last_only:
+            h = h[:, -1]                                 # (B, d_model) -> logits (B, V)
+        return self._head(h), state
 
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
         ids = torch.as_tensor(np.asarray(token), dtype=torch.long, device=self._device)

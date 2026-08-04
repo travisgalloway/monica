@@ -66,6 +66,18 @@ class FakeModel:
         succ = (np.asarray(token) + 1) % self.config.vocab_size
         return BIG * np.eye(self.config.vocab_size, dtype=np.float32)[succ], state
 
+    def prefill(self, token_batch, seg_ids=None, *, last_only=False):
+        """Seam `prefill` stand-in (#165): an internal step loop, so the successor
+        logits stay consistent with `step` and `forward`."""
+        assert seg_ids is None
+        token_batch = np.asarray(token_batch)
+        state = self.init_state(token_batch.shape[0])
+        rows = []
+        for t in range(token_batch.shape[1]):
+            logits, state = self.step(token_batch[:, t], state)
+            rows.append(logits)
+        return (rows[-1] if last_only else np.stack(rows, axis=1)), state
+
     def clone_state(self, state):
         return np.array(state, copy=True)
 

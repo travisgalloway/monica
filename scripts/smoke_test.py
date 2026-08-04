@@ -154,6 +154,45 @@ def main() -> None:
                 f"compiled step loss not finite: {out_c['loss']}"
             print(f"[compile] one compiled step OK  loss={float(out_c['loss']):.5f}")
 
+    # --- 6) prefill + a few decode steps (#165) ---------------------------------
+    # Isolated from the resume math above the same way --compile is: this drives model_b
+    # only through prefill/step/init_state, never the optimizer, so the gated comparison
+    # cannot be perturbed. Unconditional (no flag, no hardware need) — it is pure fp32 toy
+    # math on both backends, and a silent prefill/decode divergence is exactly the kind of
+    # bug this gate exists to catch: the prompt's own logits stay right while every token
+    # decoded afterwards is subtly wrong.
+    import contextlib
+
+    from src.conformance.prefill_decode_parity import check_prefill_decode_parity
+
+    guard = contextlib.nullcontext()
+    if backend.name == "cuda":
+        import torch
+        guard = torch.no_grad()
+
+    n_decode = 4
+    prompt_len = 16
+    with guard:
+        prompt = batches[0][0][:2, :prompt_len]           # (2, 16) inputs from the stream
+        par = check_prefill_decode_parity(model_b, prompt, to_numpy=np_to,
+                                          rtol=1e-4, atol=1e-5, n_decode=n_decode)
+        if not par["ok"]:
+            raise SystemExit(f"SMOKE TEST FAILED: prefill/decode parity broken: {par}")
+
+        # ...and end to end: prefill a prompt, then decode greedily off its state.
+        logits, state = model_b.prefill(prompt, last_only=True)
+        rows = [np_to(logits)]
+        for _ in range(n_decode):
+            nxt = rows[-1].argmax(axis=-1)                # (B,) greedy feedback
+            logits, state = model_b.step(nxt, state)
+            rows.append(np_to(logits))
+    import numpy as _np
+    if not all(_np.isfinite(r).all() for r in rows):
+        raise SystemExit("SMOKE TEST FAILED: prefill/decode produced non-finite logits.")
+    print(f"[prefill] L={prompt.shape[1]} + {n_decode} decode steps OK  "
+          f"max|logit diff|={par['max_abs_diff']:.3e}  "
+          f"max|state diff|={par['max_abs_state_diff']:.3e}")
+
     print("\nSMOKE TEST PASSED ✅  resume is exact and eval runs.")
 
 

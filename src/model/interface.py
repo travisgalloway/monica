@@ -56,6 +56,45 @@ class ModelInterface(ABC):
         """
 
     @abstractmethod
+    def prefill(self, token_batch: Array, seg_ids: Array = None, *,
+                last_only: bool = False) -> Tuple[Array, State]:
+        """Consume a whole prompt in ONE parallel scan, returning (logits, state) (#165).
+
+        The recurrence is O(prompt_len) sequential graph evaluations; the SSD chunked
+        scan already consumes a full sequence in one pass AND computes the carry-out
+        state it used to throw away. This surfaces that state, so serving pays one
+        parallel pass for a prompt instead of one `step` per prompt token.
+
+        Shapes. `token_batch` is (batch, seq_len) ids.
+          * `last_only=False` -> logits (batch, seq_len, vocab_size), identical to
+            `forward` on the same input.
+          * `last_only=True`  -> logits (batch, vocab_size), the last position only —
+            the same shape `step` returns, which is what the serving loop wants. It
+            also lets the backend skip the vocab head over the first `L-1` positions
+            (V is 50k+ at poc scale, so this is a real saving).
+
+        The returned `State` is **the state `step` would have produced** after
+        consuming all `L` tokens starting from `init_state(batch)`. That equivalence
+        is the contract, and it is gated element-wise by
+        `src/conformance/prefill_decode_parity.py` in fp32 at ~1e-4.
+
+        **Fresh-session only (v1).** Attention RoPE positions are seeded from absolute
+        position 0 here (as in `forward`), while `step` seeds from the KV cache length.
+        So `prefill` may only be used from a zeroed state — never to extend a session
+        that has already consumed tokens. `SessionStore.prefill` enforces this.
+        Follow-up: thread a position offset through the seam so a prompt can be
+        appended to a live session.
+
+        `seg_ids` is accepted for signature symmetry with `forward` and currently
+        raises `NotImplementedError`. Three things block it: (1) the SSD inter-chunk
+        decay matrix's last row is deliberately masked to zero under `seg_ids`
+        (the `-2` sentinel in `_chunk_seg_mask`), so the carry-out would read as
+        zeros; (2) the conv window's trailing `d_conv-1` rows can straddle a document
+        boundary; (3) `AttentionBlock.step` has no per-document masking, so decode
+        would attend across boundaries in a multi-document KV cache.
+        """
+
+    @abstractmethod
     def init_state(self, batch_size: int) -> State:
         """Fresh, zeroed recurrent state for `batch_size` sequences."""
 
