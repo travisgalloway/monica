@@ -5,6 +5,7 @@
 //   monica-tokenize decode --tokenizer <tokenizer.json> [--in <file>]
 //   monica-tokenize pack   --tokenizer <tokenizer.json> --in <parquet|jsonl|txt|dir> --out <dir>
 //                          [--seq-len 8192] [--shard-size-mb 512] [--chunk-align N]
+//   monica-tokenize stats  --tokenizer <tokenizer.json> --in <jsonl> [--json]
 //
 // `--in` reads stdin when omitted (encode/decode). `train`/`pack` corpus = a `.parquet` file or
 // a directory of `.parquet` shards (reads the `text` column directly, #247 — only
@@ -221,11 +222,125 @@ func cmdPack(_ flags: [String: String]) {
     } catch { fail("pack: \(error)") }
 }
 
+// MARK: - stats
+
+/// One language's accumulated measurement. `bytes` is raw UTF-8 in, `tokens` is what `pack`
+/// would actually write (encode + the appended EOS), so bytes/token is the real packed ratio
+/// rather than an idealized encode.
+struct LangStats {
+    var docs = 0
+    var bytes = 0
+    var tokens = 0
+    var pretokens = 0
+    var maxTokenId = 0
+
+    mutating func add(bytes b: Int, ids: [Int], pretokens p: Int) {
+        docs += 1
+        bytes += b
+        tokens += ids.count + 1        // + EOS, matching cmdPack
+        pretokens += p
+        for id in ids where id > maxTokenId { maxTokenId = id }
+    }
+
+    var json: [String: Any] {
+        ["docs": docs, "bytes": bytes, "tokens": tokens, "pretokens": pretokens,
+         "max_token_id": maxTokenId,
+         "bytes_per_token": tokens > 0 ? Double(bytes) / Double(tokens) : 0]
+    }
+}
+
+/// Read `{"text": ..., "lang": ...}` JSONL for `stats`. Deliberately separate from `readDocs`:
+/// `train`/`pack` depend on that function's exact behavior, and `stats` needs the language tag
+/// it discards. Rows without a `lang` land in "untagged" rather than being dropped silently.
+func readTaggedDocs(_ path: String) -> [(text: String, lang: String)] {
+    guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+        fail("stats: cannot read --in file \(path)")
+    }
+    var docs: [(text: String, lang: String)] = []
+    var skipped = 0
+    for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
+        guard let d = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let text = obj["text"] as? String else { skipped += 1; continue }
+        docs.append((text, (obj["lang"] as? String) ?? "untagged"))
+    }
+    if skipped > 0 { warn("skipped \(skipped) malformed/text-less JSONL line(s) in \(path)") }
+    return docs
+}
+
+/// Pre-token counts, computed with the same bounded-concurrency shape as `batchEncode`.
+/// `Pretokenizer` never sees the merges, so this number must be identical across vocab sizes —
+/// which is exactly why the sweep measures it (a mismatch means something real broke).
+func pretokenCounts(_ docs: [String], digitGroup: Int) async -> [Int] {
+    var out = [Int](repeating: 0, count: docs.count)
+    let limit = max(1, ProcessInfo.processInfo.activeProcessorCount)
+    await withTaskGroup(of: (Int, Int).self) { group in
+        var next = 0
+        while next < docs.count && next < limit {
+            let i = next
+            group.addTask { (i, Pretokenizer.pretokenize(docs[i], digitGroup: digitGroup).count) }
+            next += 1
+        }
+        for await (i, n) in group {
+            out[i] = n
+            if next < docs.count {
+                let j = next
+                group.addTask { (j, Pretokenizer.pretokenize(docs[j], digitGroup: digitGroup).count) }
+                next += 1
+            }
+        }
+    }
+    return out
+}
+
+func cmdStats(_ flags: [String: String]) async {
+    let tok = loadTokenizer(flags)
+    guard let inPath = flags["in"] else { fail("stats: --in <jsonl> is required") }
+    let tagged = readTaggedDocs(inPath)
+    if tagged.isEmpty { fail("stats: no documents read from \(inPath)") }
+
+    let texts = tagged.map { $0.text }
+    let idsPerDoc = await tok.batchEncode(texts)
+    let pretoks = await pretokenCounts(texts, digitGroup: tok.digitGroup)
+
+    var byLang: [String: LangStats] = [:]
+    var overall = LangStats()
+    for (i, doc) in tagged.enumerated() {
+        let b = doc.text.utf8.count
+        byLang[doc.lang, default: LangStats()].add(bytes: b, ids: idsPerDoc[i], pretokens: pretoks[i])
+        overall.add(bytes: b, ids: idsPerDoc[i], pretokens: pretoks[i])
+    }
+
+    if flags["json"] != nil {
+        let payload: [String: Any] = [
+            "vocab_size": tok.vocabSize,
+            "overall": overall.json,
+            "by_lang": byLang.mapValues { $0.json },
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload,
+                                                     options: [.prettyPrinted, .sortedKeys]) else {
+            fail("stats: could not serialize results")
+        }
+        print(String(decoding: data, as: UTF8.self))
+    } else {
+        func line(_ name: String, _ s: LangStats) -> String {
+            let pad = name.padding(toLength: max(12, name.count), withPad: " ", startingAt: 0)
+            let bpt = s.tokens > 0 ? Double(s.bytes) / Double(s.tokens) : 0
+            return "  \(pad) \(s.docs) docs, \(s.bytes) bytes, \(s.tokens) tokens, "
+                + String(format: "%.4f bytes/token", bpt)
+        }
+        print("vocab_size \(tok.vocabSize)")
+        for lang in byLang.keys.sorted() { print(line(lang, byLang[lang]!)) }
+        print(line("overall", overall))
+        print("  max_token_id \(overall.maxTokenId), pretokens \(overall.pretokens)")
+    }
+}
+
 // MARK: - dispatch
 
 let argv = Array(CommandLine.arguments.dropFirst())
 guard let cmd = argv.first else {
-    fail("usage: monica-tokenize <train|encode|decode|pack> [flags]")
+    fail("usage: monica-tokenize <train|encode|decode|pack|stats> [flags]")
 }
 let flags = parseFlags(Array(argv.dropFirst()))
 switch cmd {
@@ -233,5 +348,6 @@ case "train":  cmdTrain(flags)
 case "encode": cmdEncode(flags)
 case "decode": cmdDecode(flags)
 case "pack":   cmdPack(flags)
-default:       fail("unknown subcommand '\(cmd)' (train|encode|decode|pack)")
+case "stats":  await cmdStats(flags)
+default:       fail("unknown subcommand '\(cmd)' (train|encode|decode|pack|stats)")
 }

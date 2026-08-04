@@ -65,13 +65,17 @@ def download_contents(blob_id: str, src_encoding: str, *, s3_client,
     return body.decode(src_encoding)
 
 
-def _row_to_record(row: Dict[str, Any], content: str) -> Record:
+def _row_to_record(row: Dict[str, Any], content: str, *, lang: str = "typescript") -> Record:
     """Map an HF Stack v2 metadata row + its resolved content to the common corpus schema.
 
     ``detected_licenses`` on Stack v2 is a list (a file can carry more than one detected
     license); we keep the first entry as the record's license — good enough for the
     permissive-only gate downstream, which only needs to know the file is *unambiguously*
-    permissive to keep it."""
+    permissive to keep it.
+
+    ``lang`` is keyword-only with the TypeScript default this module was written for: the
+    corpus is multilingual since #198, so a caller passing a non-TypeScript ``config=`` must
+    be able to tag the records correctly (#251) — but existing callers stay unchanged."""
     licenses = row.get("detected_licenses") or row.get("license") or []
     if isinstance(licenses, str):
         license_value = licenses
@@ -82,7 +86,7 @@ def _row_to_record(row: Dict[str, Any], content: str) -> Record:
     return Record(
         text=content,
         source="stack-v2",
-        lang="typescript",
+        lang=lang,
         license=normalize_license(license_value),
         meta={
             "is_code": True,
@@ -95,6 +99,7 @@ def _row_to_record(row: Dict[str, Any], content: str) -> Record:
 
 def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
                       dataset: str = "bigcode/the-stack-v2-dedup", config: str = "TypeScript",
+                      lang: str = "typescript",
                       rows: Optional[Iterable[Dict[str, Any]]] = None) -> Iterator[Record]:
     """Stream permissively-licensed TypeScript ``Record``s from Stack v2.
 
@@ -128,7 +133,7 @@ def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
             break
         content = download_contents(row["blob_id"], row.get("src_encoding") or "utf-8",
                                      s3_client=s3_client)
-        record = _row_to_record(row, content)
+        record = _row_to_record(row, content, lang=lang)
         if not license_ok(record):
             continue
         n += 1

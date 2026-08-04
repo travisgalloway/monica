@@ -45,6 +45,7 @@ PORTABLE_MODULES = [
     "src.data.shard",
     "src.data.pack",
     "src.data.stack_v2",
+    "src.data.vocab_sample",
     "src.data.ts_clean",
     "src.data.split",
     "src.data.download",
