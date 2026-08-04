@@ -52,7 +52,12 @@ class MoEBalancer:
         Invariant to a uniform positive scale on `loads` (only the sign of the deviation
         matters), which is what makes the `grad_checkpoint` double-count harmless — see
         `MoEBlock._moe`'s counting comment (#213 D5).
+
+        Raises on a shape mismatch rather than `zip`-truncating it: a short/long `loads`
+        means the model and the policy disagree about the MoE layout, and silently
+        skipping a layer would mis-steer routing for the rest of the run.
         """
+        self._check_shape(loads, "loads")
         for layer_bias, layer_loads in zip(self.bias, loads):
             if not layer_loads:
                 continue
@@ -61,6 +66,21 @@ class MoEBalancer:
                 diff = mean - load
                 sign = (diff > 0) - (diff < 0)   # -1, 0, or +1 (no numpy dependency)
                 layer_bias[i] += self.rate * sign
+
+    def _check_shape(self, rows: list, what: str) -> None:
+        """Assert `rows` is `[n_layers][n_experts]`, allowing an EMPTY row (a layer with
+        no signal yet, or a router that carries no bias). Shared by `update` and
+        `load_state_dict` so both fail loudly and identically."""
+        if len(rows) != self.n_layers:
+            raise ValueError(
+                f"{what} has {len(rows)} layers, expected n_layers={self.n_layers}."
+            )
+        for i, row in enumerate(rows):
+            if len(row) not in (0, self.n_experts):
+                raise ValueError(
+                    f"{what}[{i}] has {len(row)} entries, expected "
+                    f"n_experts={self.n_experts} (or 0 for no signal)."
+                )
 
     def biases(self) -> list:
         """Current per-layer bias vectors, for the backend to push into its routers."""
@@ -94,14 +114,17 @@ class MoEBalancer:
         Defensive like `DynamicLossScaler.load_state_dict`: a missing/empty/None state,
         or one whose `bias` key is absent or null, is a no-op rather than a `KeyError`
         (an old checkpoint, or a resume into a config that only just turned balancing
-        on).
+        on). A PRESENT but wrong-shaped bias is an error, not a no-op — it means the
+        checkpoint was trained under a different MoE layout, and adopting it would
+        mis-steer every router.
         """
         if not state:
             return
         rows = state.get("bias") or []
         if not rows:
             return
-        self.bias = [list(row) for row in rows]
+        self._check_shape(rows, "bias")
+        self.bias = [list(row) if row else [0.0] * self.n_experts for row in rows]
 
 
 def balancer_for_config(cfg) -> "MoEBalancer | None":

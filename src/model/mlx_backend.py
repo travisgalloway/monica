@@ -638,7 +638,15 @@ class MoEBlock(nn.Module):
     def set_route_bias(self, vec) -> None:
         """Set the per-expert selection bias (Loss-Free-Balancing, #213) — `vec` a
         `list[float]` of length `n_experts` (one `MoEBalancer.biases()` layer entry).
-        Switches `_moe` onto the biased-ranking path."""
+        Switches `_moe` onto the biased-ranking path.
+
+        A wrong-length `vec` raises here rather than broadcasting into a silently wrong
+        ranking downstream (`logits + bias` would broadcast a length-1 vector happily)."""
+        if len(vec) != self.config.n_experts:
+            raise ValueError(
+                f"route bias has {len(vec)} entries, expected "
+                f"n_experts={self.config.n_experts}."
+            )
         self._route_bias = mx.array(vec, dtype=mx.float32)
         self._bias_active = True
 
@@ -880,8 +888,18 @@ class MLXMambaModel(ModelInterface, nn.Module):
 
     def set_moe_biases(self, biases: List[List[float]]) -> None:
         """Push per-layer route-bias vectors (`MoEBalancer.biases()`) into each MoE
-        block, in layer order."""
-        for block, vec in zip(self.moe_blocks(), biases):
+        block, in layer order.
+
+        A layer-count mismatch raises rather than `zip`-truncating: leaving some routers
+        on the old bias while others take the new one is a partially-activated routing
+        state that would be very hard to notice mid-run. Per-vector length is checked by
+        `MoEBlock.set_route_bias`."""
+        blocks = self.moe_blocks()
+        if len(biases) != len(blocks):
+            raise ValueError(
+                f"got {len(biases)} bias vectors for {len(blocks)} MoE layers."
+            )
+        for block, vec in zip(blocks, biases):
             block.set_route_bias(vec)
 
     def moe_biases(self) -> List[List[float]]:
@@ -975,5 +993,15 @@ class MLXMambaModel(ModelInterface, nn.Module):
                 params.append((k, mx.array(v)))
         self.update(tree_unflatten(params))
         for i, vec in biases.items():
+            # Check the key names a real MoE layer before indexing: a balanced checkpoint
+            # loaded into a dense or differently-interleaved config would otherwise die on
+            # an IndexError / AttributeError deep in the load, with nothing pointing at the
+            # actual mismatch. (Per-vector length is checked by `set_route_bias`.)
+            if not (0 <= i < len(self.layers)) or not isinstance(self.layers[i], MoEBlock):
+                raise ValueError(
+                    f"checkpoint has {self._MOE_BIAS_PREFIX}{i}, but layer {i} of this "
+                    "config is not an MoE layer — the weights and the config disagree "
+                    "about the MoE interleave."
+                )
             self.layers[i].set_route_bias(np.asarray(vec).reshape(-1).tolist())
         mx.eval(self.parameters())

@@ -328,6 +328,45 @@ def test_set_moe_biases_and_pop_moe_load_round_trip():
 
 
 @requires_mlx
+def test_set_moe_biases_raises_on_a_shape_mismatch():
+    """Driver-facing API: a wrong layer count or expert count must fail loudly, not
+    leave the model in a partially-activated routing state."""
+    from src.model.mlx_backend import MLXMambaModel
+    cfg = _cfg(moe_balance_rate=0.05)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    with pytest.raises(ValueError, match="1 bias vectors for 2 MoE layers"):
+        model.set_moe_biases([[0.0] * 8])
+    with pytest.raises(ValueError, match="route bias has 3 entries"):
+        model.set_moe_biases([[0.0] * 3, [0.0] * 3])
+    assert all(not b._bias_active for b in model.moe_blocks())
+
+
+@requires_mlx
+def test_loading_a_bias_for_a_non_moe_layer_raises_clearly(tmp_path):
+    """A balanced checkpoint loaded into a config with a different MoE interleave must
+    name the mismatch, not die on an IndexError deep in the load."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.train.checkpoint import load_weights_dict, save_weights
+    cfg = _cfg(moe_balance_rate=0.05)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    model.set_moe_biases([[0.1] * 8, [0.2] * 8])
+    path = str(tmp_path / "weights.safetensors")
+    model.save(path)
+
+    weights = load_weights_dict(path)
+    weights["moe_route_bias.7"] = weights.pop("moe_route_bias.1")   # no layer 7 here
+    bad = str(tmp_path / "bad.safetensors")
+    save_weights(weights, bad, config=cfg)
+
+    mx.random.seed(1)
+    fresh = MLXMambaModel(cfg)
+    with pytest.raises(ValueError, match="layer 7 of this config is not an MoE layer"):
+        fresh.load(bad)
+
+
+@requires_mlx
 def test_pop_moe_load_is_empty_for_a_dense_model():
     from src.model.mlx_backend import MLXMambaModel
     mx.random.seed(0)

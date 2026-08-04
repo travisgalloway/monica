@@ -89,6 +89,36 @@ def test_update_ignores_empty_layer_loads():
     assert b.biases()[1][0] < 0.0
 
 
+def test_update_raises_on_a_shape_mismatch():
+    """A short/long `loads` means the model and the policy disagree about the MoE
+    layout; `zip`-truncating it would silently stop steering some layer."""
+    import pytest
+    b = MoEBalancer(n_layers=2, n_experts=3, rate=0.1)
+    with pytest.raises(ValueError, match="loads has 1 layers"):
+        b.update([[1.0, 2.0, 3.0]])
+    with pytest.raises(ValueError, match=r"loads\[1\] has 2 entries"):
+        b.update([[1.0, 2.0, 3.0], [1.0, 2.0]])
+    assert b.biases() == [[0.0] * 3, [0.0] * 3]        # nothing partially applied
+
+
+def test_load_state_dict_raises_on_a_wrong_shaped_bias():
+    """A PRESENT but wrong-shaped bias is a mismatched checkpoint, not a no-op."""
+    import pytest
+    b = MoEBalancer(n_layers=2, n_experts=3, rate=0.1)
+    with pytest.raises(ValueError, match="bias has 1 layers"):
+        b.load_state_dict({"bias": [[0.1, 0.2, 0.3]]})
+    with pytest.raises(ValueError, match=r"bias\[0\] has 4 entries"):
+        b.load_state_dict({"bias": [[0.1, 0.2, 0.3, 0.4], [0.0, 0.0, 0.0]]})
+
+
+def test_load_state_dict_fills_an_empty_row_with_zeros():
+    """An inactive router reads back as `[]`; adopting it must still leave a usable
+    `[n_layers][n_experts]` bias rather than a ragged one."""
+    b = MoEBalancer(n_layers=2, n_experts=3, rate=0.1)
+    b.load_state_dict({"bias": [[0.1, 0.2, 0.3], []]})
+    assert b.biases() == [[0.1, 0.2, 0.3], [0.0, 0.0, 0.0]]
+
+
 def test_repeated_update_reduces_utilization_variance():
     """A toy closed-loop sanity check of the intended dynamics: if routing load shifts
     toward whichever expert currently holds the larger bias (the effect the router's
