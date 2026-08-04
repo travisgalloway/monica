@@ -68,6 +68,7 @@ PORTABLE_MODULES = [
     "src.train.schedule",
     "src.train.checkpoint",
     "src.train.loss_scale",
+    "src.train.moe_balance",
     "src.train.loop",
     "src.train.logging",
     "src.eval.val_loss",

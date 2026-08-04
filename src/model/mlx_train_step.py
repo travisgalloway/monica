@@ -15,6 +15,8 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+from ..train.moe_balance import MoEBalancer
+
 
 def _global_grad_norm(grads) -> mx.array:
     leaves = [v for _, v in tree_flatten(grads)]
@@ -23,7 +25,7 @@ def _global_grad_norm(grads) -> mx.array:
 
 
 def _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches, lr,
-                         grad_clip, scaler) -> dict:
+                         grad_clip, scaler, balancer=None) -> dict:
     """Shared accumulate -> (unscale) -> clip -> optimizer-step tail.
 
     `loss_and_grad(model, micro_batch) -> (loss, grads)` is the only objective-specific
@@ -32,6 +34,14 @@ def _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches, lr,
     pretraining, SFT, and DPO, so they all funnel through here. Grads are averaged over
     the micro-batches so an effective batch can exceed what fits in memory (one
     micro-batch is live at a time).
+
+    `balancer` (a `MoEBalancer`, #213) is the Loss-Free-Balancing policy: on a successful
+    (non-skipped) step it reads this step's per-expert load counts off the model
+    (`pop_moe_load`), nudges the bias OUTSIDE the gradient (`update` — no aux loss ever
+    touches the objective above), and pushes the new biases back into the model's MoE
+    blocks (`set_moe_biases`) for the next forward. `None` (dense/hybrid models, or MoE
+    without balancing) is a no-op — the default, so every non-MoE-balanced train step is
+    unaffected.
     """
     n = len(micro_batches)
     acc_grads = None
@@ -68,17 +78,28 @@ def _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches, lr,
     if scaler:
         out["loss_scale"] = scaler.scale
         out["skipped"] = False
+    if balancer is not None:
+        # Loss-Free-Balancing (#213): update the bias from this step's routed-token
+        # counts, OUTSIDE the gradient, then push the new biases back into the model for
+        # the next forward. `pop_moe_load` returns `[]` for a model with no MoE layers.
+        loads = model.pop_moe_load()
+        if loads:
+            balancer.update(loads)
+            model.set_moe_biases(balancer.biases())
+            out["moe_util_var"] = max(MoEBalancer.utilization_variance(loads))
     return out
 
 
 def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                    scaler=None) -> Callable:
+                    scaler=None, balancer=None) -> Callable:
     """Build a `train_step(model, micro_batches, lr) -> dict` (pretraining CE).
 
     `micro_batches` is a list of `(inputs, targets)`. `scaler` (a `DynamicLossScaler`,
     fp16 path) scales the loss before backprop and unscales grads after; on a non-finite
     gradient the optimizer step is SKIPPED and the scale is backed off (see
-    `_accumulate_and_step`). Pass None for fp32 (toy/smoke).
+    `_accumulate_and_step`). Pass None for fp32 (toy/smoke). `balancer` (a `MoEBalancer`,
+    #213) is the Loss-Free-Balancing policy; None (the default) for dense/hybrid models
+    and for MoE configs with `moe_balance_rate` unset.
     """
     def loss_fn(model, inputs, targets):
         logits = model.forward(inputs)                      # (B, L, V)
@@ -99,20 +120,20 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
-                                    lr, grad_clip, scaler)
+                                    lr, grad_clip, scaler, balancer)
 
     return train_step
 
 
 def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                        scaler=None) -> Callable:
+                        scaler=None, balancer=None) -> Callable:
     """Build an SFT `train_step(model, micro_batches, lr) -> dict` (masked CE).
 
     `micro_batches` is a list of `(inputs, targets, mask)` (the `SFTLoader` 3-tuple). The
     loss is the per-token cross-entropy averaged over the *response* tokens only:
     `sum(mask * CE) / sum(mask)`, so prompt/padding positions (mask 0) never contribute.
     Accumulation, fp16 scaling/overflow-skip, clipping, and the optimizer step are shared
-    with pretraining via `_accumulate_and_step`.
+    with pretraining via `_accumulate_and_step`. `balancer` (#213) as in `make_train_step`.
     """
     def loss_fn(model, inputs, targets, mask):
         logits = model.forward(inputs)                      # (B, L, V)
@@ -132,7 +153,7 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
-                                    lr, grad_clip, scaler)
+                                    lr, grad_clip, scaler, balancer)
 
     return train_step
 
@@ -161,7 +182,7 @@ def _log_sigmoid(x: mx.array) -> mx.array:
 
 
 def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1,
-                        grad_clip: float = 1.0, scaler=None) -> Callable:
+                        grad_clip: float = 1.0, scaler=None, balancer=None) -> Callable:
     """Build a DPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of the `DPOLoader` 6-tuple `(c_in, c_tgt, c_mask, r_in,
@@ -171,7 +192,7 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
     updates the policy, and the reference forward is wrapped in `mx.stop_gradient` (and
     `ref_model` is a distinct object never handed to the optimizer), so the reference
     stays frozen. Accumulation / fp16 scaling / clipping are shared via
-    `_accumulate_and_step`.
+    `_accumulate_and_step`. `balancer` (#213) as in `make_train_step`.
     """
     def loss_fn(policy, c_in, c_tgt, c_mask, r_in, r_tgt, r_mask):
         lp_c = _masked_seq_logprob(policy, c_in, c_tgt, c_mask)
@@ -189,13 +210,13 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
-                                    lr, grad_clip, scaler)
+                                    lr, grad_clip, scaler, balancer)
 
     return train_step
 
 
 def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                         scaler=None) -> Callable:
+                         scaler=None, balancer=None) -> Callable:
     """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of `(inputs, targets, mask, advantages)`: a batch of sampled
@@ -203,7 +224,8 @@ def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
     advantages (one per sequence, precomputed in the driver via `train.grpo.group_advantages`
     from verifier rewards). The loss is `-mean(advantage * logpθ(completion))` — REINFORCE
     with the GRPO group baseline; gradients flow through the policy only. Accumulation /
-    fp16 scaling / clipping are shared via `_accumulate_and_step`.
+    fp16 scaling / clipping are shared via `_accumulate_and_step`. `balancer` (#213) as in
+    `make_train_step`.
     """
     def loss_fn(model, inputs, targets, mask, advantages):
         logp = _masked_seq_logprob(model, inputs, targets, mask)     # (B,)
@@ -218,7 +240,7 @@ def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
-                                    lr, grad_clip, scaler)
+                                    lr, grad_clip, scaler, balancer)
 
     return train_step
 

@@ -125,6 +125,14 @@ class MambaConfig:
     top_k: int = 2              # experts routed per token (1 <= top_k <= n_experts)
     # Expert FFN hidden width. None => d_inner (the Mamba inner width), a natural scale.
     moe_d_ff: Optional[int] = None
+    # Loss-Free-Balancing (#213, DeepSeek-V3 style) bias-update rate, in LOGIT units.
+    # None = balancing OFF and the router is byte-identical to pre-#213 behavior (every
+    # config in the tree today, including the smoke gate's dense toy.yaml). When set, a
+    # per-expert bias — updated OUTSIDE the gradient from per-expert load counts, never
+    # an aux loss on the objective — steers the router's top-k SELECTION only; the gate
+    # weights stay the unbiased softmax. See `src/train/moe_balance.py` (the portable
+    # policy) and `MoEBlock._moe` (src/model/mlx_backend.py) for the mechanism.
+    moe_balance_rate: Optional[float] = None
     # fp8 expert GEMMs via NVIDIA Transformer Engine (#240), CUDA/Hopper-only. A separate
     # bool rather than a `precision` value: fp8 applies ONLY to the three expert linears
     # (gate/up/down), not the whole model — everything else stays at `precision`. A no-op
@@ -356,6 +364,10 @@ class MambaConfig:
                 raise ValueError(
                     f"moe_every={self.moe_every} selects no layer at n_layers="
                     f"{self.n_layers} (after attention precedence)."
+                )
+            if self.moe_balance_rate is not None and self.moe_balance_rate <= 0:
+                raise ValueError(
+                    f"moe_balance_rate={self.moe_balance_rate} must be > 0, or None (off)."
                 )
         if self.fp8_experts:
             # n_moe_layers==0 also catches moe_every=None (fp8 applies to expert GEMMs

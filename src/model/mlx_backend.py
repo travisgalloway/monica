@@ -612,20 +612,100 @@ class MoEBlock(nn.Module):
         self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
         d_ff = config.moe_d_ff_resolved
         self.experts = [_Expert(config.d_model, d_ff) for _ in range(config.n_experts)]
+        # Loss-Free-Balancing (#213 D1): a per-expert route BIAS and a per-expert LOAD-COUNT
+        # accumulator. Both names start with an underscore ON PURPOSE — DO NOT "clean this
+        # up". `nn.Module.valid_parameter_filter` is
+        #     isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+        # so a leading-underscore attribute holding an mx.array is EXCLUDED from
+        # `parameters()`/`trainable_parameters()`. That is the whole method: the bias must
+        # live outside the gradient, so `nn.value_and_grad` never differentiates it and
+        # `optimizer.update` never steps it. Renaming these without the underscore would
+        # silently turn the bias into a trained parameter and void Loss-Free-Balancing.
+        # (Asserted in tests/test_moe_balance_mlx.py, not merely assumed.)
+        #
+        # `_bias_active` starts False: until `set_route_bias` is called at least once,
+        # `_moe` takes the ORIGINAL pre-#213 ranking path verbatim — byte-identical when
+        # balancing is off, which is every config in the tree today.
+        self._route_bias = mx.zeros((config.n_experts,))
+        self._bias_active = False
+        # `_count_loads` gates the accumulation (#213 D4): without the gate the lazy MLX
+        # graph behind `_load_counts` would grow for an entire un-balanced MoE run (nothing
+        # ever pops it), pinning every step's routing mask alive — a slow memory leak. The
+        # training wiring flips this on exactly when a balancer exists.
+        self._count_loads = False
+        self._load_counts = mx.zeros((config.n_experts,))
+
+    def set_route_bias(self, vec) -> None:
+        """Set the per-expert selection bias (Loss-Free-Balancing, #213) — `vec` a
+        `list[float]` of length `n_experts` (one `MoEBalancer.biases()` layer entry).
+        Switches `_moe` onto the biased-ranking path."""
+        self._route_bias = mx.array(vec, dtype=mx.float32)
+        self._bias_active = True
+
+    def route_bias(self) -> list:
+        """This block's current bias as host floats (`[]` when it was never activated) —
+        the read-back the portable state dict and the drivers' resume seeding use."""
+        return [float(b) for b in self._route_bias.tolist()] if self._bias_active else []
+
+    def set_load_counting(self, flag: bool) -> None:
+        """Enable/disable per-expert load counting in `_moe` (see `_count_loads`)."""
+        self._count_loads = bool(flag)
+
+    def pop_load(self) -> list:
+        """Return this block's accumulated per-expert token counts since the last pop
+        (host `list[float]` — the portable `MoEBalancer` never touches MLX arrays), then
+        reset the accumulator. Reading forces the eval, so the lazy graph never outlives
+        one step."""
+        counts = self._load_counts
+        self._load_counts = mx.zeros_like(counts)
+        return [float(c) for c in counts.tolist()]
 
     def _moe(self, xn: Array) -> Array:
         cd = _DTYPES[self.config.precision]
         E, k = self.config.n_experts, self.config.top_k
         logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
-        probs = mx.softmax(logits, axis=-1)
+        probs = mx.softmax(logits, axis=-1)                  # UNBIASED — always the gate weight
         if k < E:                                            # keep EXACTLY top_k per token
-            # Rank each expert by descending prob (double argsort), keep ranks < k. A plain
-            # `probs >= kth` threshold would keep MORE than k experts on ties (e.g. uniform
-            # routing early in training), breaking the top_k contract and the active-FLOP
-            # count; ranking breaks ties by index so exactly k survive.
-            ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
-            gate = mx.where(ranks < k, probs, mx.zeros_like(probs))
+            # Loss-Free-Balancing (#213 D2): when active, rank by the BIASED selection
+            # score `logits + route_bias`; the gate weight below stays `probs` (unbiased).
+            # The bias steers ROUTING only, never the combination weight — biasing the gate
+            # would be a different (and wrong) algorithm. Bias is added in LOGIT space, and
+            # ranking by logits is order-identical to ranking by probs (softmax is monotone
+            # per row and preserves ties), so a zero bias does not perturb routing.
+            if self._bias_active:
+                sel = logits + self._route_bias
+                ranks = mx.argsort(mx.argsort(-sel, axis=-1), axis=-1)
+            else:
+                # Rank each expert by descending prob (double argsort), keep ranks < k. A
+                # plain `probs >= kth` threshold would keep MORE than k experts on ties
+                # (e.g. uniform routing early in training), breaking the top_k contract and
+                # the active-FLOP count; ranking breaks ties by index so exactly k survive.
+                # (The biased branch above uses the same double argsort for the same
+                # reason.)
+                ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
+            mask = ranks < k
+            gate = mx.where(mask, probs, mx.zeros_like(probs))
             gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
+            if self._count_loads:
+                # Per-expert load bookkeeping for the balancer: how many tokens (summed
+                # over every non-expert axis) this forward routed to each expert, detached
+                # from the graph (`stop_gradient` — the count must never become a training
+                # signal) and accumulated; `pop_load()` reads + resets it after the step.
+                # Counted only here, in the `k < E` branch: with `k == E` every expert takes
+                # every token and balancing is vacuous (no mask exists).
+                # Two known, benign inexactnesses:
+                #  * With `grad_checkpoint: true` each layer's forward is RECOMPUTED in
+                #    backward, so every count doubles (#213 D5). Both consumers are
+                #    invariant to a uniform positive scale — `update` uses
+                #    `sign(mean - load_i)` and `utilization_variance` normalizes to
+                #    fractions — and the recompute uses the same inputs and the same bias,
+                #    so the factor is exactly 2 for every expert of every MoE layer.
+                #  * On an fp16 overflow-skipped step `_accumulate_and_step` returns before
+                #    popping, so those counts carry into the next pop. Harmless: the update
+                #    is sign-based and the routing really did happen.
+                axes = tuple(range(mask.ndim - 1))
+                self._load_counts = self._load_counts + mx.stop_gradient(
+                    mx.sum(mask.astype(mx.float32), axis=axes))
         else:
             gate = probs                                          # softmax already sums to 1
         outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
@@ -787,6 +867,37 @@ class MLXMambaModel(ModelInterface, nn.Module):
             h = layer_fn(h)
         return out
 
+    # --- Loss-Free-Balancing accessors (#213) ---------------------------------
+    def moe_blocks(self) -> List["MoEBlock"]:
+        """This model's MoE layers, in layer order — the accessor the balancer wiring
+        (`src/model/mlx_train_step.py`, the training drivers) uses."""
+        return [l for l in self.layers if isinstance(l, MoEBlock)]
+
+    def set_moe_biases(self, biases: List[List[float]]) -> None:
+        """Push per-layer route-bias vectors (`MoEBalancer.biases()`) into each MoE
+        block, in layer order."""
+        for block, vec in zip(self.moe_blocks(), biases):
+            block.set_route_bias(vec)
+
+    def moe_biases(self) -> List[List[float]]:
+        """Per-MoE-layer route biases as host floats, in layer order (an inactive block
+        reports `[]`). The read-back the drivers use to re-seed the portable `MoEBalancer`
+        from just-loaded weights after a resume (#213 D3) — one copy of the numbers, in
+        the model, with no second checkpoint field to drift from it."""
+        return [block.route_bias() for block in self.moe_blocks()]
+
+    def set_moe_load_counting(self, flag: bool) -> None:
+        """Enable/disable per-expert load counting on every MoE block (#213 D4). Off by
+        default; the training wiring turns it on exactly when a balancer is present."""
+        for block in self.moe_blocks():
+            block.set_load_counting(flag)
+
+    def pop_moe_load(self) -> List[List[float]]:
+        """Per-MoE-layer accumulated expert-load counts since the last pop (in layer
+        order), resetting each block's accumulator. `[]` when the model has no MoE
+        layers (dense / hybrid-only models)."""
+        return [block.pop_load() for block in self.moe_blocks()]
+
     def init_state(self, batch_size: int) -> State:
         c = self.config
         di, k = c.d_inner, c.d_conv
@@ -823,12 +934,41 @@ class MLXMambaModel(ModelInterface, nn.Module):
         from ..train.checkpoint import load_weights
         load_weights(self, path)
 
+    # `moe_route_bias.{layer_index}` — the MoE route bias's key prefix in the portable
+    # weights (#213 D3). Not a parameter (see MoEBlock.__init__), so it is added/popped
+    # explicitly around the `tree_flatten(self.parameters())` path rather than riding it.
+    _MOE_BIAS_PREFIX = "moe_route_bias."
+
     def _portable_state_dict(self) -> dict:
         # Flatten MLX params to {name: numpy array} for safetensors. With tied
         # embeddings there is no separate head param, so nothing to drop.
-        return {k: np.array(v) for k, v in tree_flatten(self.parameters())}
+        out = {k: np.array(v) for k, v in tree_flatten(self.parameters())}
+        # Loss-Free-Balancing bias (#213 D3): it rides in the PORTABLE weights, not the
+        # resume bundle. It is routing state that changes the model's function at
+        # inference — a model served or evaluated from weights.safetensors must route the
+        # way it was trained, and #214 must be able to load an MLX-trained MoE checkpoint
+        # into CUDA and route identically. `src/train/checkpoint.py`'s split is explicit:
+        # weights port across backends, optimizer state does not need to.
+        # The key is emitted ONLY for a block whose bias is active — an unconditional key
+        # would break `sum(v.size) == cfg.num_parameters()` (tests/test_moe.py,
+        # tests/test_sizing_mlx.py), and the bias genuinely is not a parameter, so it does
+        # not belong in num_parameters() either way.
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, MoEBlock) and layer._bias_active:
+                out[f"{self._MOE_BIAS_PREFIX}{i}"] = np.array(layer._route_bias)
+        return out
 
     def _load_portable(self, weights: dict) -> None:
-        params = [(k, mx.array(v)) for k, v in weights.items()]
+        # Pop the non-parameter route-bias keys first — they must never reach
+        # `Module.update`, which only knows about the parameter tree. Absent keys (an old
+        # checkpoint, balancing off, a dense model) simply leave every block inactive.
+        biases, params = {}, []
+        for k, v in weights.items():
+            if k.startswith(self._MOE_BIAS_PREFIX):
+                biases[int(k[len(self._MOE_BIAS_PREFIX):])] = v
+            else:
+                params.append((k, mx.array(v)))
         self.update(tree_unflatten(params))
+        for i, vec in biases.items():
+            self.layers[i].set_route_bias(np.asarray(vec).reshape(-1).tolist())
         mx.eval(self.parameters())
