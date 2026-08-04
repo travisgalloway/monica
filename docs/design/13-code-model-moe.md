@@ -10,15 +10,19 @@ from-scratch code model, described below.
 
 ## What this is
 
-> **Read this section as the target design, not as shipped state.** As of 2026-07-25 the only
-> MHM component that is **built** is the tokenizer (MHM-P1b, #191/#245). `MambaConfig` carries the
-> MoE and hybrid-attention knobs (`moe_every`, `n_experts`, `top_k`, `attn_every`, `fp8_experts`)
-> and the MLX backend has a **toy** `MoEBlock` — a plain softmax top-k router with **no shared
-> expert and no load balancing**, which collapses at the target 64×top-6 shape. The CUDA backend
-> still raises `NotImplementedError` for MoE (#214). The shared expert, aux-loss-free balancing,
-> FIM, the Essential-Web + Stack-v2 mixture, and repo-context packing described below are **designed,
-> not implemented**. Per-item status is in the MHM-P# list that follows; when the two disagree,
-> the P# list wins.
+> **Read this section as the target design, not as shipped state.** As of 2026-08-03 the MHM
+> components that are **built** are the tokenizer (MHM-P1b, #191/#245) and aux-loss-free load
+> balancing on MLX (MHM-P2-T0, #213). `MambaConfig` carries the MoE and hybrid-attention knobs
+> (`moe_every`, `n_experts`, `top_k`, `attn_every`, `fp8_experts`, `moe_balance_rate`) and the MLX
+> backend's `MoEBlock` now has a DeepSeek-V3 Loss-Free-Balancing router: a per-expert bias steers
+> top-k **selection** only, updated outside the gradient from per-expert load counts, with no aux
+> loss on the objective (portable policy in `src/train/moe_balance.py`; `moe_balance_rate: null`
+> keeps the pre-#213 router byte-identical). It still has **no shared expert**, and it densely
+> evaluates every expert (sparse *combination*, not sparse compute) — a capacity experiment, not a
+> production kernel. The CUDA backend still raises `NotImplementedError` for MoE (#214), which will
+> reuse `src/train/moe_balance.py` unchanged. The shared expert, FIM, the Essential-Web + Stack-v2
+> mixture, and repo-context packing described below are **designed, not implemented**. Per-item
+> status is in the MHM-P# list that follows; when the two disagree, the P# list wins.
 
 A from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code model**. The
 backbone is mostly Mamba-2/SSD state-space layers with a **minority (~12.5%) of full-attention
@@ -73,7 +77,9 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   written `compression="snappy"` (`src/data/corpus.py --compression snappy`) for the Swift
   packer to read them.
 - **MHM-P2 — Architecture & harness build** (the large net-new engineering): aux-loss-free
-  balancing router (#213, *land first*) → CUDA MoE backend (#214: dropless routing, shared expert,
+  balancing router (#213, **done on MLX** — portable `MoEBalancer` policy above the seam +
+  selection-only route bias in `MoEBlock`; the bias rides in the portable safetensors so a served
+  or ported checkpoint routes as trained) → CUDA MoE backend (#214: dropless routing, shared expert,
   FSDP, sparse-upcycle init) → FIM collator (#215 — consumes the Swift-packed shards; the FIM
   insertion transform may live in the Swift `pack` path), length curriculum + dataloader-state resume
   (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).

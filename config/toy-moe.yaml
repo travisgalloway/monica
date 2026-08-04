@@ -14,6 +14,12 @@ moe_every: 2           # layers 1 and 3 (0-indexed (i+1)%2==0) are MoE
 n_experts: 4           # route each token to top_k of these
 top_k: 2               # 2/4 experts active per token (sparse)
 moe_d_ff: null         # expert hidden width (null -> d_inner = 128)
+# Loss-Free-Balancing (#213) bias-update rate, in logit units. null = OFF (the default
+# here) — the router takes the pre-#213 probs-ranked path verbatim, so this config's
+# existing parity/sizing tests stay byte-identical. Set a small positive rate (e.g. 1e-3;
+# tests/test_moe_balance_mlx.py uses 0.05 on a deliberately collapse-prone 8-expert toy)
+# to steer top-k SELECTION toward under-used experts. See src/train/moe_balance.py.
+moe_balance_rate: null
 
 vocab_size: 256        # byte-fallback tokenizer for offline tests
 seq_len: 64

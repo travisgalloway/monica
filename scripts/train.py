@@ -76,6 +76,7 @@ def main() -> None:
     from src.model.blocks import load_config
     from src.data.loader import PackedLoader
     from src.train.loss_scale import scaler_for_precision
+    from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
     from src.train.checkpoint import CheckpointStore
@@ -98,7 +99,15 @@ def main() -> None:
     if scaler is None and cfg.precision != "fp32":
         print(f"[info] precision={cfg.precision!r}: training unscaled "
               "(loss scaling is fp16-only; expected for bf16)")
-    train_step = backend.make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler)
+    # Loss-Free-Balancing (#213): None for dense/hybrid configs and for MoE configs with
+    # moe_balance_rate unset (the default) — balancer_for_config is the single source of
+    # truth for the off-switch. Passed as a kwarg only when set, so the CUDA backend's
+    # make_train_step (which has no balancer param; CUDA rejects MoE entirely, #214) is
+    # untouched.
+    balancer = balancer_for_config(cfg)
+    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
+    train_step = backend.make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler,
+                                         **balancer_kwargs)
 
     # --- data ------------------------------------------------------------------
     train_loader = PackedLoader(args.data / "train.bin", cfg.seq_len,
@@ -125,6 +134,11 @@ def main() -> None:
         if scaler is not None:
             scaler.load_state_dict(meta.get("loss_scale_state") or {})
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
+    # Loss-Free-Balancing (#213): seed the policy from the just-loaded weights (the bias
+    # rides in the portable safetensors, D3), push it into the routers, and enable load
+    # counting. No-op when balancing is off. `CheckpointStore.save` is unchanged — there
+    # is deliberately no second copy of the bias in the resume bundle.
+    attach_balancer(balancer, model)
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 

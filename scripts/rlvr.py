@@ -80,6 +80,7 @@ def main() -> None:
     from src.serve.sessions import SessionStore
     from src.serve.sampling import sample
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
+    from src.train.moe_balance import attach_balancer, balancer_for_config
 
     backend = get_backend()
     cfg = load_config(str(args.config))
@@ -90,7 +91,14 @@ def main() -> None:
     store = SessionStore(model)
     np_to = backend.to_numpy
     opt = backend.make_optimizer(model, args.lr)
-    grpo_step = backend.make_grpo_train_step(model, opt)
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
+    # kwarg is conditional (CUDA's make_grpo_train_step has no balancer param). The bias
+    # arrives with `--init`'s portable weights (D3); attach_balancer adopts it, pushes it
+    # into the routers, and enables load counting. No-op when balancing is off.
+    balancer = balancer_for_config(cfg)
+    grpo_step = backend.make_grpo_train_step(
+        model, opt, **({"balancer": balancer} if balancer is not None else {}))
+    attach_balancer(balancer, model)
     reward_fn = math_reward if args.reward == "math" else exact_match_reward
 
     problems = [json.loads(ln) for ln in args.problems.read_text(encoding="utf-8").splitlines()

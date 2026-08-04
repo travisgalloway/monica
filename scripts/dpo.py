@@ -69,6 +69,7 @@ def main() -> None:
     from src.model.blocks import load_config
     from src.data.dpo_loader import DPOLoader
     from src.train.loss_scale import scaler_for_precision
+    from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
     from src.train.checkpoint import CheckpointStore
@@ -93,8 +94,13 @@ def main() -> None:
     ref.load(str(args.init))                             # frozen reference (never updated)
     opt = backend.make_optimizer(policy, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
+    # kwarg is conditional (CUDA's make_dpo_train_step has no balancer param).
+    balancer = balancer_for_config(cfg)
+    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
     train_step = backend.make_dpo_train_step(policy, ref, opt, beta=args.beta,
-                                             grad_clip=args.grad_clip, scaler=scaler)
+                                             grad_clip=args.grad_clip, scaler=scaler,
+                                             **balancer_kwargs)
 
     np_to = backend.to_numpy
     max_b = args.eval_batches or None
@@ -120,6 +126,10 @@ def main() -> None:
     else:
         policy.load(str(args.init))                      # init policy from SFT weights
         print(f"[init] policy + reference from {args.init}")
+    # Loss-Free-Balancing (#213): adopt the bias that came in with the policy weights
+    # (D3), push it into the routers, enable load counting. The frozen reference is left
+    # alone — it never trains, so it keeps whatever bias its checkpoint carried.
+    attach_balancer(balancer, policy)
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 

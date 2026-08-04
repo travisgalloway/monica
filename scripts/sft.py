@@ -70,6 +70,7 @@ def main() -> None:
     from src.model.blocks import load_config
     from src.data.sft_loader import SFTLoader
     from src.train.loss_scale import scaler_for_precision
+    from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
     from src.train.checkpoint import CheckpointStore
@@ -93,8 +94,12 @@ def main() -> None:
     model = backend.model_cls(cfg)
     opt = backend.make_optimizer(model, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
+    # kwarg is conditional (CUDA's make_sft_train_step has no balancer param).
+    balancer = balancer_for_config(cfg)
+    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
     train_step = backend.make_sft_train_step(model, opt, grad_clip=args.grad_clip,
-                                             scaler=scaler)
+                                             scaler=scaler, **balancer_kwargs)
 
     np_to = backend.to_numpy
     max_b = args.eval_batches or None
@@ -119,6 +124,9 @@ def main() -> None:
     else:
         model.load(str(args.init))                       # initialize from pretrained base
         print(f"[init] from pretrained base {args.init}")
+    # Loss-Free-Balancing (#213): adopt the bias that came in with the weights (D3), push
+    # it into the routers, enable load counting. No-op when balancing is off.
+    attach_balancer(balancer, model)
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 
