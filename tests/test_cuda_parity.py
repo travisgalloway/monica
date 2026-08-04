@@ -17,6 +17,7 @@ torch = pytest.importorskip("torch")
 from src.model.blocks import load_config
 from src.model.cuda_backend import CUDAMambaModel, SelectiveSSM
 from src.conformance.forward_step_parity import check_forward_step_parity
+from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 
 
 def _np(a):
@@ -163,6 +164,111 @@ def test_forward_step_parity_mps():
     with torch.no_grad():
         result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
     assert result["ok"], result
+
+
+# --- prefill/decode parity (#165) -----------------------------------------------------
+
+def _tokens(cfg, B, L, seed=0):
+    return np.random.default_rng(seed).integers(
+        0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+
+
+def test_prefill_decode_parity_toy():
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    with torch.no_grad():
+        result = check_prefill_decode_parity(model, _tokens(cfg, 2, 32), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_decode_parity_multichunk():
+    """THE load-bearing case: L = 2Q+1 forces three chunks, so the state parity check
+    actually reads the SSD inter-chunk carry-out (`new_states[:, -1]`, the entry the
+    scan normally discards). At L < Q the scan is a single degenerate chunk."""
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    Q = cfg.chunk_size or 64
+    with torch.no_grad():
+        result = check_prefill_decode_parity(model, _tokens(cfg, 2, 2 * Q + 1), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_decode_parity_hybrid():
+    """Attention layers: the prefilled KV cache (post-RoPE k, v, captured before the SDPA
+    compute-dtype cast) must equal what `step` accumulates. No MoE case here — the CUDA
+    constructor refuses MoE configs outright."""
+    torch.manual_seed(0)
+    cfg = load_config("config/toy-hybrid.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    assert any(type(l).__name__ == "AttentionBlock" for l in model.layers)
+    with torch.no_grad():
+        result = check_prefill_decode_parity(model, _tokens(cfg, 2, 40), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_short_sequence_conv_window():
+    """L < d_conv-1: the conv window must be LEFT-zero-padded to (B, k-1, d_inner)."""
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    B, L = 2, 2
+    tokens = _tokens(cfg, B, L)
+    with torch.no_grad():
+        _, state = model.prefill(tokens)
+        conv, _ = state[0]
+        assert conv.shape == (B, cfg.d_conv - 1, cfg.d_inner)
+        assert float(conv[:, 0].abs().max()) == 0.0          # the left pad row is zero
+        result = check_prefill_decode_parity(model, tokens, to_numpy=_np, n_decode=1)
+    assert result["ok"], result
+
+
+def test_prefill_seg_ids_raises():
+    torch.manual_seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = CUDAMambaModel(cfg)
+    model.eval()
+    tokens = _tokens(cfg, 1, 8)
+    with pytest.raises(NotImplementedError):
+        model.prefill(tokens, np.zeros_like(tokens))
+
+
+def test_fused_prefill_state_matches_vanilla():
+    """Fused `mamba_chunk_scan_combined(..., return_final_states=True)` state agrees with
+    the pure-PyTorch carry-out (#165).
+
+    Skipped when CUDA is unavailable or mamba-ssm is not installed — which is the case on
+    an Apple Silicon dev box, so this branch gets NO local coverage; it is verifiable only
+    on a CUDA host with `.[cuda-fast]`. Modelled on `test_fused_scan_matches_vanilla`."""
+    from src.model.cuda_backend import _fused_scan
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    if _fused_scan() is None:
+        pytest.skip("mamba-ssm fused kernel not available")
+
+    torch.manual_seed(42)
+    cfg = load_config("config/toy.yaml")
+    dev = torch.device("cuda")
+    ssm = SelectiveSSM(cfg).to(dev)
+    B, L, di = 2, cfg.seq_len, cfg.d_inner
+    x_cpu = torch.randn(B, L, di) * 0.1
+
+    with torch.no_grad():
+        _, s_fused = ssm.parallel(x_cpu.to(dev), return_state=True)      # fused kernel
+        _, s_vanilla = ssm.to("cpu").parallel(x_cpu, return_state=True)  # pure-torch
+        ssm.to(dev)   # restore
+    s_fused = s_fused.cpu().numpy()
+    s_vanilla = s_vanilla.numpy()
+
+    assert s_fused.shape == s_vanilla.shape, (s_fused.shape, s_vanilla.shape)
+    max_abs = float(np.abs(s_fused.astype(np.float64) - s_vanilla.astype(np.float64)).max())
+    assert np.allclose(s_fused, s_vanilla, rtol=1e-4, atol=1e-5), (
+        f"fused carry-out state differs from vanilla: max|diff|={max_abs:.3e}")
 
 
 def test_fused_scan_matches_vanilla():

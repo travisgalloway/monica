@@ -19,6 +19,7 @@ mx = pytest.importorskip("mlx.core")
 from src.model.blocks import load_config
 from src.model.mlx_backend import MLXMambaModel, SelectiveSSM
 from src.conformance.forward_step_parity import check_forward_step_parity
+from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 
 
 def _np(a):
@@ -158,3 +159,81 @@ def test_forward_step_parity_hybrid():
     tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, size=(B, L)).astype(np.int32)
     result = check_forward_step_parity(model, tokens, to_numpy=_np, rtol=1e-4, atol=1e-5)
     assert result["ok"], result
+
+
+# --- prefill/decode parity (#165) -----------------------------------------------------
+
+def _tokens(cfg, B, L, seed=0):
+    return np.random.default_rng(seed).integers(
+        0, cfg.vocab_size, size=(B, L)).astype(np.int32)
+
+
+def test_prefill_decode_parity_toy():
+    mx.random.seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = MLXMambaModel(cfg)
+    result = check_prefill_decode_parity(model, _tokens(cfg, 2, 32), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_decode_parity_multichunk():
+    """THE load-bearing case: L = 2Q+1 forces three chunks, so the SSD inter-chunk
+    carry-out (`new_states[:, -1]`, the entry the scan normally discards) is what the
+    state parity check actually reads. At L < Q the scan is one degenerate chunk and a
+    broken carry-out would still pass."""
+    mx.random.seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = MLXMambaModel(cfg)
+    Q = cfg.chunk_size or 64
+    result = check_prefill_decode_parity(model, _tokens(cfg, 2, 2 * Q + 1), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_decode_parity_hybrid():
+    """Attention layers: the prefilled KV cache (post-RoPE k, v) must equal the one
+    `step` accumulates — including RoPE positions, which prefill seeds from 0."""
+    mx.random.seed(0)
+    cfg = load_config("config/toy-hybrid.yaml")
+    model = MLXMambaModel(cfg)
+    assert any(type(l).__name__ == "AttentionBlock" for l in model.layers)
+    result = check_prefill_decode_parity(model, _tokens(cfg, 2, 40), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_decode_parity_moe():
+    """MoE layers are stateless; prefill must emit the SAME zero-sized placeholder pair
+    `init_state` does, or the state walk sees a structure mismatch."""
+    mx.random.seed(0)
+    cfg = load_config("config/toy-moe.yaml")
+    model = MLXMambaModel(cfg)
+    assert any(type(l).__name__ == "MoEBlock" for l in model.layers)
+    result = check_prefill_decode_parity(model, _tokens(cfg, 2, 32), to_numpy=_np)
+    assert result["ok"], result
+
+
+def test_prefill_short_sequence_conv_window():
+    """L < d_conv-1: the conv window must be LEFT-zero-padded to (B, k-1, d_inner) —
+    what an initially zeroed window plus L pushes leaves behind. A right-pad or a bare
+    slice would change both the shape and the tap alignment."""
+    mx.random.seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = MLXMambaModel(cfg)
+    assert cfg.d_conv - 1 == 3
+    B, L = 2, 2
+    tokens = _tokens(cfg, B, L)
+    _, state = model.prefill(tokens)
+    conv, _ = state[0]
+    assert conv.shape == (B, cfg.d_conv - 1, cfg.d_inner)
+    assert float(mx.abs(conv[:, 0]).max()) == 0.0            # the left pad row is zero
+
+    result = check_prefill_decode_parity(model, tokens, to_numpy=_np, n_decode=1)
+    assert result["ok"], result
+
+
+def test_prefill_seg_ids_raises():
+    mx.random.seed(0)
+    cfg = load_config("config/toy.yaml")
+    model = MLXMambaModel(cfg)
+    tokens = _tokens(cfg, 1, 8)
+    with pytest.raises(NotImplementedError):
+        model.prefill(tokens, np.zeros_like(tokens))

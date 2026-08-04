@@ -94,6 +94,7 @@ PORTABLE_MODULES = [
     "src.conformance.forward_step_parity",
     "src.conformance.backend_parity",
     "src.conformance.doc_boundary_parity",
+    "src.conformance.prefill_decode_parity",
     "src.serve.sessions",
     "src.serve.rewind",
     "src.serve.sampling",
