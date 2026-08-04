@@ -1,6 +1,6 @@
 // monica-tokenize — native CLI for the Monica code tokenizer.
 //
-//   monica-tokenize train  --in <corpus> --out <tokenizer.json> [--vocab-size 16384]
+//   monica-tokenize train  --in <corpus> --out <tokenizer.json> [--vocab-size 49152]
 //   monica-tokenize encode --tokenizer <tokenizer.json> [--in <file>] [--json]
 //   monica-tokenize decode --tokenizer <tokenizer.json> [--in <file>]
 //   monica-tokenize pack   --tokenizer <tokenizer.json> --in <parquet|jsonl|txt|dir> --out <dir>
@@ -21,7 +21,10 @@ let SPECIAL_TOKENS = [
     "<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>",
     "<|fim_suffix|>", "<|fim_pad|>", "<mask>",
 ]
-let DEFAULT_VOCAB_SIZE = 16384
+// Ratified 2026-08-04 by the #251 sweep (see docs/design/13-code-model-moe.md). 16384 was sized
+// when #193 was scoped TypeScript-only; on the #198 multilingual corpus it costs 7.6% of overall
+// compression and 11.4% on Markdown against 49152. Still under the 65536 uint16 packing cap.
+let DEFAULT_VOCAB_SIZE = 49152
 let DEFAULT_DIGIT_GROUP = 3
 
 func fail(_ msg: String) -> Never {

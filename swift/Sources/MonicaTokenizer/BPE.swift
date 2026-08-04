@@ -16,7 +16,7 @@ public final class BPE: @unchecked Sendable {   // immutable after init → safe
     public let vocabSize: Int
 
     /// Pack an ordered id pair into one `UInt64` key. Token ids must fit in `UInt32`; the code
-    /// tokenizer's vocab is ≤ 16384 (uint16-packable, #191) — far within that bound.
+    /// tokenizer's vocab is ≤ 65536 (the uint16 packing cap, #191/#251) — far within that bound.
     @inline(__always)
     public static func key(_ a: Int, _ b: Int) -> UInt64 {
         (UInt64(UInt32(a)) << 32) | UInt64(UInt32(b))

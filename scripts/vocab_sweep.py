@@ -119,7 +119,7 @@ def format_table(stats: Dict[int, Dict], sizes: List[int]) -> str:
     """Markdown bytes/token table: rows = languages then `overall`, columns = vocab sizes."""
     base = sizes[0]
     langs = sorted(stats[base]["by_lang"].keys())
-    cols = "".join(f" {s} |" for s in sizes) + "".join(f" Δ vs {base} |" for s in sizes[1:])
+    cols = "".join(f" {s} |" for s in sizes) + "".join(f" Δ {s} vs {base} |" for s in sizes[1:])
     lines = [f"| Language | bytes |{cols}",
              "|---|---:|" + "---:|" * (2 * len(sizes) - 1)]
 
