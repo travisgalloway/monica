@@ -201,6 +201,19 @@ def test_fetch_contents_is_a_no_op_for_a_zero_target():
     assert client.calls == []
 
 
+def test_fetch_contents_cancels_unstarted_work_once_target_is_reached_mid_chunk():
+    # With the old `pool.map`, crossing the target early still pays for the rest of the
+    # chunk (the bug this fixes). A single worker makes the savings observable: once the
+    # first result crosses the target, the rest of the chunk is still queued (not yet
+    # running) and gets cancelled, so far fewer than the full chunk is ever fetched.
+    texts = {f"b{i}": gzip.compress(b"z" * 300) for i in range(20)}
+    client = _FakeS3Client(texts)
+    rows = [_row(f"b{i}") for i in range(20)]
+    out = list(fetch_contents(rows, 100, s3_client=client, threads=1, chunk=20))
+    assert len(out) == 1
+    assert len(client.calls) < len(rows)
+
+
 # --- mixture + manifest --------------------------------------------------------------
 def test_default_mixture_covers_prose_and_the_code_languages():
     langs = {s.lang for s in DEFAULT_MIXTURE}
@@ -223,9 +236,30 @@ def test_scale_mixture_rejects_a_non_positive_scale():
 
 def test_manifest_matches_only_the_same_langs_and_targets():
     mixture = [SliceSpec("en", "essential_web", 100)]
-    assert _manifest_matches({"slices": {"en": {"target_bytes": 100}}}, mixture)
-    assert not _manifest_matches({"slices": {"en": {"target_bytes": 200}}}, mixture)
+    assert _manifest_matches(
+        {"slices": {"en": {"kind": "essential_web", "source": "", "target_bytes": 100}}},
+        mixture)
+    assert not _manifest_matches(
+        {"slices": {"en": {"kind": "essential_web", "source": "", "target_bytes": 200}}},
+        mixture)
     assert not _manifest_matches({"slices": {}}, mixture)
+
+
+def test_manifest_matches_rejects_a_different_kind_at_the_same_target_bytes():
+    # A stack_v2 slice re-tagged "en" at the same byte budget as a cached essential_web
+    # slice must NOT be treated as a cache hit -- same lang/target, different source data.
+    mixture = [SliceSpec("en", "stack_v2", 100, "Python")]
+    cached = {"slices": {"en": {"kind": "essential_web", "source": "", "target_bytes": 100}}}
+    assert not _manifest_matches(cached, mixture)
+
+
+def test_manifest_matches_rejects_a_different_stack_v2_source_at_the_same_target_bytes():
+    # Same lang tag, same kind, same byte budget, but a different Stack-v2 language
+    # directory -- reusing this cache would silently swap the corpus content.
+    mixture = [SliceSpec("code", "stack_v2", 100, "Python")]
+    cached = {"slices": {"code": {"kind": "stack_v2", "source": "JavaScript",
+                                  "target_bytes": 100}}}
+    assert not _manifest_matches(cached, mixture)
 
 
 # --- build_sample (end to end, offline) ----------------------------------------------
@@ -261,7 +295,8 @@ def test_build_sample_reuses_a_cached_sample_without_touching_the_network(tmp_pa
     sample_dir.mkdir(parents=True)
     (sample_dir / "sample.jsonl").write_text('{"text": "x", "lang": "en"}\n')
     (sample_dir / "manifest.json").write_text(json.dumps(
-        {"slices": {"en": {"target_bytes": 200}}, "total_bytes": 1, "total_docs": 1}))
+        {"slices": {"en": {"kind": "essential_web", "source": "", "target_bytes": 200}},
+         "total_bytes": 1, "total_docs": 1}))
 
     # No parquet opener patched and no S3 client: any network work would raise.
     out = build_sample(tmp_path, mixture=[SliceSpec("en", "essential_web", 200)],

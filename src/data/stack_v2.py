@@ -101,7 +101,13 @@ def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
                       dataset: str = "bigcode/the-stack-v2-dedup", config: str = "TypeScript",
                       lang: str = "typescript",
                       rows: Optional[Iterable[Dict[str, Any]]] = None) -> Iterator[Record]:
-    """Stream permissively-licensed TypeScript ``Record``s from Stack v2.
+    """Stream permissively-licensed ``Record``s from one Stack v2 language config.
+
+    Despite the ``_ts`` name (its original TypeScript-only scope), ``config`` (the HF
+    language config, e.g. ``"Python"``) and ``lang`` (the tag stamped onto emitted
+    ``Record``s, see #251's rescope to multilingual Essential-Web + Stack-v2) make this
+    multilingual — the defaults (``config="TypeScript"``, ``lang="typescript"``) just
+    keep the historical TypeScript behavior for callers that pass neither.
 
     Resolves each metadata row's file content from Software Heritage via ``s3_client``
     (defaulting to ``resolve_swh_s3()`` when not given) and applies the corpus's
@@ -114,7 +120,16 @@ def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
     is omitted, ``datasets.load_dataset(dataset, config, split="train",
     streaming=streaming)`` supplies the metadata rows and a resolvable ``s3_client`` (real
     creds) is required.
+
+    Raises ``ValueError`` when ``config`` is overridden to a non-TypeScript language but
+    ``lang`` is left at its ``"typescript"`` default — that combination would silently
+    mislabel every emitted ``Record`` with the wrong language tag.
     """
+    if config != "TypeScript" and lang == "typescript":
+        raise ValueError(
+            f"config={config!r} but lang is still the \"typescript\" default — pass "
+            f"lang= explicitly (e.g. lang={config.lower()!r}) so records aren't mislabeled")
+
     if rows is None:
         from datasets import load_dataset
 

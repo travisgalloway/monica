@@ -226,8 +226,16 @@ def fetch_contents(rows: Iterable[Dict[str, Any]], target_bytes: int, *, s3_clie
     with ThreadPoolExecutor(max_workers=threads) as pool:
 
         def _drain(batch: List[Dict[str, Any]]) -> Iterator[str]:
-            """Fetch one chunk in parallel, yielding in submission order (determinism)."""
-            for text, src in zip(pool.map(_one, batch), batch):
+            """Fetch one chunk in parallel, yielding in submission order (determinism).
+
+            Rows are submitted as individual futures (not ``pool.map``, which blocks until
+            every future in the chunk is done) so that once ``target_bytes`` is crossed
+            mid-chunk, futures that haven't started running yet can be cancelled instead of
+            paying for the rest of the chunk (up to ``chunk`` wasted S3 fetches otherwise).
+            """
+            futures = [pool.submit(_one, row) for row in batch]
+            for future, src in zip(futures, batch):
+                text = future.result()
                 path = src.get("_parquet")
                 if path and path not in seen_files:
                     seen_files.add(path)
@@ -239,6 +247,8 @@ def fetch_contents(rows: Iterable[Dict[str, Any]], target_bytes: int, *, s3_clie
                 st.bytes += len(text.encode("utf-8"))
                 yield text
                 if st.bytes >= target_bytes:
+                    for f in futures:
+                        f.cancel()
                     return
 
         batch: List[Dict[str, Any]] = []
@@ -258,9 +268,18 @@ def fetch_contents(rows: Iterable[Dict[str, Any]], target_bytes: int, *, s3_clie
 
 
 def _manifest_matches(manifest: Dict[str, Any], mixture: Sequence[SliceSpec]) -> bool:
-    """True when a cached manifest was built from exactly this mixture (same langs + targets)."""
-    want = {s.lang: s.target_bytes for s in mixture}
-    got = {k: v.get("target_bytes") for k, v in (manifest.get("slices") or {}).items()}
+    """True when a cached manifest was built from exactly this mixture.
+
+    Compares ``(kind, source, target_bytes)`` per language, not just the byte target —
+    two slices can share a language tag and byte budget while reading different sources
+    (e.g. a `stack_v2` slice re-tagged from a different language directory, or a slice
+    whose `kind` changed between `essential_web` and `stack_v2`), and reusing that cache
+    would silently invalidate a sweep rerun. ``build_sample`` already writes `kind` and
+    `source` into each manifest slice, so no manifest format change is needed here.
+    """
+    want = {s.lang: (s.kind, s.source, s.target_bytes) for s in mixture}
+    got = {k: (v.get("kind"), v.get("source"), v.get("target_bytes"))
+           for k, v in (manifest.get("slices") or {}).items()}
     return want == got
 
 
