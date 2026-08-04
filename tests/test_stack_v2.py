@@ -9,6 +9,8 @@ from __future__ import annotations
 import gzip
 import io
 
+import pytest
+
 from src.data.corpus import Record
 from src.data.stack_v2 import _row_to_record, download_contents, iter_stack_v2_ts
 
@@ -135,3 +137,17 @@ def test_iter_stack_v2_ts_defaults_src_encoding_to_utf8():
 
 def test_iter_stack_v2_ts_yields_nothing_for_empty_rows():
     assert list(iter_stack_v2_ts(rows=[], s3_client=_FakeS3Client({}))) == []
+
+
+def test_iter_stack_v2_ts_rejects_a_non_typescript_config_with_the_default_lang():
+    # config overridden but lang left at its "typescript" default would silently
+    # mislabel every emitted Record — fail fast instead (#251 review comment).
+    with pytest.raises(ValueError):
+        list(iter_stack_v2_ts(rows=_rows(), s3_client=_client_for(_rows()), config="Python"))
+
+
+def test_iter_stack_v2_ts_allows_a_non_typescript_config_when_lang_is_also_given():
+    rows = _rows()
+    client = _client_for(rows)
+    out = list(iter_stack_v2_ts(rows=rows, s3_client=client, config="Python", lang="python"))
+    assert all(r.lang == "python" for r in out)

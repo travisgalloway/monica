@@ -44,17 +44,69 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   tokenizer, not Python/MLX — see MHM-P1b), RunPod (CUDA) + M1 (MLX) dev. Carried decisions:
   D4 Jamba-vs-Routing-Mamba, D5 Large A vs Large B.
 
-  > **Vocab size — provisionally 16384, must be re-derived before the corpus is packed.**
-  > 16k is the Swift trainer's `DEFAULT_VOCAB_SIZE` and what #193/#200 assume, so it is decided in
-  > practice. But that number was chosen when #193 was scoped as *"TS LSP-clean pipeline (Stack v2
-  > **TS subset**)"* — 16k is reasonable for TypeScript alone. #198 then **rescoped the corpus to
-  > general multilingual Essential-Web + Stack-v2 and the vocab never moved.** On multilingual
-  > prose + multi-language code, 16k compresses poorly, and that costs twice: worse **BPB** (the
-  > program's primary metric) and fewer characters per token, which directly undercuts the
-  > context-length half of the local-hardware win. 32k still fits the uint16 ceiling with room.
-  > Re-derive by training candidate vocabs (16k/32k/48k) on a corpus sample and comparing
-  > bytes/token — hours of work with `monica-tokenize train --vocab-size`, and it must happen
-  > **before** the corpus is packed, since redoing it after is a full re-tokenize.
+  > **Vocab size — 49152, ratified 2026-08-04 (#251).** `DEFAULT_VOCAB_SIZE` was 16384, sized when
+  > #193 was scoped as *"TS LSP-clean pipeline (Stack v2 **TS subset**)"* — reasonable for
+  > TypeScript alone. #198 rescoped the corpus to general multilingual Essential-Web + Stack-v2 and
+  > the vocab never moved. Measured on the rescoped distribution, 16384 costs **7.6% of overall
+  > compression** and **11.4% on Markdown**; 49152 is the best of the three candidates swept and is
+  > under the 65536 uint16 packing cap.
+  >
+  > **bytes/token** (higher is better — more raw bytes carried per token):
+  >
+  > | Language | sample bytes | 16384 | 32768 | 49152 | Δ 32768 | Δ 49152 |
+  > |---|---:|---:|---:|---:|---:|---:|
+  > | cpp | 1.05 MB | 2.9998 | 3.2195 | 3.3177 | +7.33% | +10.60% |
+  > | en | 10.58 MB | 3.4368 | 3.7451 | 3.8893 | +8.97% | +13.17% |
+  > | go | 1.05 MB | 3.0427 | 3.2193 | 3.3134 | +5.80% | +8.90% |
+  > | java | 1.58 MB | 3.6480 | 3.9145 | 4.0703 | +7.31% | +11.58% |
+  > | javascript | 2.10 MB | 3.3452 | 3.5518 | 3.6518 | +6.18% | +9.17% |
+  > | markdown | 1.05 MB | 2.8511 | 3.1751 | 3.3509 | +11.37% | +17.53% |
+  > | python | 2.12 MB | 3.5047 | 3.7173 | 3.8233 | +6.07% | +9.09% |
+  > | rust | 1.06 MB | 3.5151 | 3.6811 | 3.7628 | +4.72% | +7.05% |
+  > | typescript | 4.26 MB | 3.5703 | 3.7943 | 3.9201 | +6.28% | +9.80% |
+  > | **overall** | 24.85 MB | 3.4029 | 3.6630 | 3.7920 | +7.64% | +11.43% |
+  >
+  > **Per-language rows are blend-independent** — a language's bytes/token is computed only over
+  > its own documents. **Only the "overall" row is blend-weighted**, so the decision does not
+  > silently depend on mixture weights nobody ratified.
+  >
+  > **Two limitations, so this is not read as better-founded than it is:**
+  > 1. **The tested range did not bracket the knee.** bytes/token is monotonic non-decreasing in
+  >    vocab size, and 32768→49152 was still yielding a lot (+3.5% overall, +5.25% Markdown).
+  >    Returns never flattened inside 16k–49k, so the rule returned the **largest candidate
+  >    tested** — which is not the same claim as "49152 is optimal". The honest statement is
+  >    **≥49152 on this evidence; the ceiling was not located.** The uint16 packing cap (65536)
+  >    bounds where it can be, leaving roughly **49k–64k unexplored**.
+  > 2. **The rule prices the benefit, not the cost.** Since bytes/token improves monotonically,
+  >    this metric alone has no interior optimum. The counterweight is the **tied-embedding
+  >    parameter cost** — at `d_model 768` each token costs 768 params in the embedding *and* the
+  >    output head, and 16384→49152 roughly triples that matrix (for scale: `config/poc.yaml`'s
+  >    tied embedding is ~38M of ~127M params, and M12-small is ~120M-active). The sweep measured
+  >    **compression only**; the parameter-cost side was **not** evaluated. Revisit if the small
+  >    rung turns out embedding-heavy.
+  >
+  > **Sample.** 24.85 MB / 5,420 docs, built by `src/data/vocab_sample.py`: 10.58 MB Essential-Web
+  > prose + 14.27 MB Stack-v2 code across 8 languages (TypeScript over-weighted at 4.26 MB — the
+  > program is TypeScript-first). Filters, applied to Stack-v2 *metadata columns before* any S3
+  > fetch: permissive license (`filters.is_permissive`; ~67% of rows carry an empty
+  > `detected_licenses`), not vendored, not generated, 1 KiB ≤ `length_bytes` ≤ 128 KiB. Carries
+  > **240,073 unique pre-tokens (122,111 appearing ≥2×)** — 4.9× / 2.5× the 49,152 merges
+  > requested, so the tail merges come from real repeated structure, not the exhaustion regime that
+  > caps an undersized sample. The run produced all 48,890 requested merges without exhausting.
+  >
+  > **Method.** One 49,152 train (2,035 s), with 32,768 / 16,384 derived by **truncating `merges`**
+  > — `Trainer.train` is greedy with no lookahead, so a k-vocab merge list is a strict prefix of
+  > any larger run's. That invariant is now guarded by `monica-selfcheck`, not assumed. `tokens`
+  > counts the EOS `pack` appends, so bytes/token is the real packed ratio. Reproduce with
+  > `scripts/vocab_sweep.py`.
+  >
+  > **Invariants that held:** FIM sentinel ids identical across all three sizes; pre-token counts
+  > identical (5,884,475 — the pre-tokenizer never sees the merges); `max_token_id` 49,151 < 65,536,
+  > and `monica-tokenize pack` confirmed the uint16 shard path.
+  >
+  > **BPB is unaffected by this choice.** BPB is byte-normalized, so a larger vocab does not
+  > "cheat" it the way it deflates raw perplexity — the table measures genuine compression, and
+  > BPB remains a fair primary metric across vocab sizes.
 - **MHM-P1 — Corpus** (#193): general multilingual Essential-Web + Stack-v2 mixture, repo-context
   packing, decontamination blocklist. (Rescopes the earlier FineWeb-Edu + Stack-v1 corpus.)
 - **MHM-P1b — Tokenizer** (#191, **done** — PR #245): own byte-level BPE, shipped as a **native

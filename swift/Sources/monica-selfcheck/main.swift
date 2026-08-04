@@ -43,6 +43,53 @@ do {
     check(vocab <= 65536, "vocab is uint16-packable (\(vocab) <= 65536)")
 }
 
+// MARK: vocab-size invariants (#251)
+//
+// The vocab sweep trains ONCE at the largest size and derives the smaller ones by truncating
+// `merges`. That is only sound because `Trainer.train` is greedy with no lookahead, which makes
+// a k-vocab merge list a strict prefix of any larger run's. Without a guard that is an
+// undocumented assumption a future trainer optimization could silently break, invalidating the
+// ratified vocab size.
+
+do {
+    // Calibrate off what this corpus can actually produce: `Trainer.train` stops early once no
+    // pair repeats, so a hard-coded small size could silently become vacuous (both runs
+    // exhausting at the same merge count would make the prefix check trivially true). Asking
+    // for exactly half of the big run's merges keeps the check non-vacuous by construction.
+    let big = trained(2000)
+    let half = big.merges.count / 2
+    check(half > 0, "corpus produces enough merges to test the prefix invariant")
+    let small = trained(SPECIALS.count + 256 + half)
+    eq(small.merges.count, half, "smaller run produces exactly the requested merge count")
+    eq(small.merges, Array(big.merges.prefix(half)),
+       "merges of a smaller vocab are a strict prefix of a larger one's")
+
+    // A truncated artifact must still be a *valid* artifact — merge m's parents are all
+    // < baseOffset + m, so prefixes are self-contained. The sweep writes these to disk.
+    let truncated = TokenizerFormat(specialTokens: big.specialTokens, digitGroup: big.digitGroup,
+                                    merges: Array(big.merges.prefix(half)))
+    do { try truncated.validate() } catch { failures.append("truncated format rejected: \(error)") }
+
+    // Special-token layout is vocab-independent: `baseOffset = specialCount + 256`, so the
+    // FIM sentinels keep their ids at every vocab size. True by construction — verified, not
+    // assumed, because the sweep compares token streams across sizes.
+    eq(small.specialTokens, big.specialTokens, "special tokens identical across vocab sizes")
+    let fimProbe = "<|fim_prefix|>x<|fim_suffix|>y<|fim_middle|>"
+    let smallIds = Tokenizer(format: small).encode(fimProbe)
+    let bigIds = Tokenizer(format: big).encode(fimProbe)
+    eq(smallIds.filter { $0 < SPECIALS.count }, [1, 3, 2], "FIM sentinel ids are 1,3,2")
+    eq(smallIds.filter { $0 < SPECIALS.count }, bigIds.filter { $0 < SPECIALS.count },
+       "FIM sentinel ids identical across vocab sizes")
+
+    // Pretokenization never sees the merges, so pre-token counts are a vocab-independent
+    // control in the sweep's per-language table.
+    for s in ["const x = 1234567;", "  indented\tline", "function f(a: number) {}"] {
+        eq(Pretokenizer.pretokenize(s, digitGroup: small.digitGroup).count,
+           Pretokenizer.pretokenize(s, digitGroup: big.digitGroup).count,
+           "pre-token count is vocab-independent")
+    }
+}
+
 // MARK: format validation (a corrupt artifact must fail with an actionable error, not crash)
 
 do {

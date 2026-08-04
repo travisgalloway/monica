@@ -65,13 +65,17 @@ def download_contents(blob_id: str, src_encoding: str, *, s3_client,
     return body.decode(src_encoding)
 
 
-def _row_to_record(row: Dict[str, Any], content: str) -> Record:
+def _row_to_record(row: Dict[str, Any], content: str, *, lang: str = "typescript") -> Record:
     """Map an HF Stack v2 metadata row + its resolved content to the common corpus schema.
 
     ``detected_licenses`` on Stack v2 is a list (a file can carry more than one detected
     license); we keep the first entry as the record's license — good enough for the
     permissive-only gate downstream, which only needs to know the file is *unambiguously*
-    permissive to keep it."""
+    permissive to keep it.
+
+    ``lang`` is keyword-only with the TypeScript default this module was written for: the
+    corpus is multilingual since #198, so a caller passing a non-TypeScript ``config=`` must
+    be able to tag the records correctly (#251) — but existing callers stay unchanged."""
     licenses = row.get("detected_licenses") or row.get("license") or []
     if isinstance(licenses, str):
         license_value = licenses
@@ -82,7 +86,7 @@ def _row_to_record(row: Dict[str, Any], content: str) -> Record:
     return Record(
         text=content,
         source="stack-v2",
-        lang="typescript",
+        lang=lang,
         license=normalize_license(license_value),
         meta={
             "is_code": True,
@@ -95,8 +99,15 @@ def _row_to_record(row: Dict[str, Any], content: str) -> Record:
 
 def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
                       dataset: str = "bigcode/the-stack-v2-dedup", config: str = "TypeScript",
+                      lang: str = "typescript",
                       rows: Optional[Iterable[Dict[str, Any]]] = None) -> Iterator[Record]:
-    """Stream permissively-licensed TypeScript ``Record``s from Stack v2.
+    """Stream permissively-licensed ``Record``s from one Stack v2 language config.
+
+    Despite the ``_ts`` name (its original TypeScript-only scope), ``config`` (the HF
+    language config, e.g. ``"Python"``) and ``lang`` (the tag stamped onto emitted
+    ``Record``s, see #251's rescope to multilingual Essential-Web + Stack-v2) make this
+    multilingual — the defaults (``config="TypeScript"``, ``lang="typescript"``) just
+    keep the historical TypeScript behavior for callers that pass neither.
 
     Resolves each metadata row's file content from Software Heritage via ``s3_client``
     (defaulting to ``resolve_swh_s3()`` when not given) and applies the corpus's
@@ -109,7 +120,16 @@ def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
     is omitted, ``datasets.load_dataset(dataset, config, split="train",
     streaming=streaming)`` supplies the metadata rows and a resolvable ``s3_client`` (real
     creds) is required.
+
+    Raises ``ValueError`` when ``config`` is overridden to a non-TypeScript language but
+    ``lang`` is left at its ``"typescript"`` default — that combination would silently
+    mislabel every emitted ``Record`` with the wrong language tag.
     """
+    if config != "TypeScript" and lang == "typescript":
+        raise ValueError(
+            f"config={config!r} but lang is still the \"typescript\" default — pass "
+            f"lang= explicitly (e.g. lang={config.lower()!r}) so records aren't mislabeled")
+
     if rows is None:
         from datasets import load_dataset
 
@@ -128,7 +148,7 @@ def iter_stack_v2_ts(*, limit: int = -1, streaming: bool = True, s3_client=None,
             break
         content = download_contents(row["blob_id"], row.get("src_encoding") or "utf-8",
                                      s3_client=s3_client)
-        record = _row_to_record(row, content)
+        record = _row_to_record(row, content, lang=lang)
         if not license_ok(record):
             continue
         n += 1
