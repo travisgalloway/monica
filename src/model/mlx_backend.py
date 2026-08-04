@@ -644,7 +644,12 @@ class MoEBlock(nn.Module):
 
     def route_bias(self) -> list:
         """This block's current bias as host floats (`[]` when it was never activated) —
-        the read-back the portable state dict and the drivers' resume seeding use."""
+        the read-back the portable state dict and the drivers' resume seeding use.
+
+        The router holds the bias in fp32, so a policy -> model -> policy round-trip
+        (what a resume does, D3) quantizes it to fp32. Immaterial: the bias is a coarse
+        steering signal accumulated in units of `rate`, and fp32 resolves that ~7 decimal
+        digits deep."""
         return [float(b) for b in self._route_bias.tolist()] if self._bias_active else []
 
     def set_load_counting(self, flag: bool) -> None:
