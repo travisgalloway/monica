@@ -2,9 +2,10 @@
 
 One generation loop, two consumers: the CLI (`scripts/generate.py`) streams the
 decoded tokens to a user, and the lm-eval adapter (`src/eval/olmes_adapter.py`)
-collects them for generative tasks. It drives the model purely through
-`SessionStore.step(session_id, token) -> logits` — the proven seam primitive — so it
-adds no new state handling.
+collects them for generative tasks. It drives the model through two `SessionStore`
+primitives only — `prefill(session_id, prompt_ids)` for the prompt (#165) and
+`step(session_id, token)` for each decoded token — so it adds no state handling of its
+own.
 
 Above the seam: only numpy + the `SessionStore` API. Backend logits are converted to
 numpy via the injected `to_numpy` (as in `src/eval/val_loss.py`); the `sampler`
@@ -34,11 +35,15 @@ def generate(
 ) -> List[int]:
     """Generate up to `max_new_tokens` continuation ids for `session_id`.
 
-    Prefill: feed every prompt id through `store.step` (the last one's logits seed the
-    first sample). Then loop: sample the next id, record/stream it, feed it back, and
-    stop on `eos_id`, on reaching `max_new_tokens`, or when `stop_fn(generated)` is
-    True. `prompt_ids` must be non-empty (the recurrence needs a token to advance on).
-    Returns only the generated ids (not the prompt).
+    Prefill: `store.prefill` consumes the whole prompt in ONE parallel scan and returns
+    the last position's logits, which seed the first sample (#165) — replacing the old
+    one-`step`-per-prompt-token loop. That makes `session_id` a **fresh** session's id:
+    prefill seeds attention RoPE from position 0, so it may not extend a session that has
+    already consumed tokens (every caller in the tree already does `store.create(sid)`
+    immediately before). Then loop: sample the next id, record/stream it, feed it back
+    through `store.step`, and stop on `eos_id`, on reaching `max_new_tokens`, or when
+    `stop_fn(generated)` is True. `prompt_ids` must be non-empty (the recurrence needs a
+    token to advance on). Returns only the generated ids (not the prompt).
 
     `pass_context=True` calls `sampler(logits, previous_tokens=prompt + generated)` so a
     repetition-aware sampler can penalize already-emitted tokens; the default keeps the
@@ -48,9 +53,7 @@ def generate(
         raise ValueError("prompt_ids must be non-empty")
 
     prompt = [int(t) for t in prompt_ids]
-    logits = None
-    for tok in prompt:
-        logits = store.step(session_id, tok)
+    logits = store.prefill(session_id, prompt)
 
     generated: List[int] = []
     for _ in range(max_new_tokens):
