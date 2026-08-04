@@ -3,7 +3,7 @@
 
     .venv/bin/python scripts/vocab_sweep.py [--work-dir ~/monica-data/vocab-sweep-251]
         [--vocab-sizes 16384,32768,49152] [--threads 64] [--mixture-scale 1.0]
-        [--rebuild-sample] [--no-truncate] [--sample-only] [--tokenize-bin PATH]
+        [--rebuild-sample] [--retrain] [--no-truncate] [--sample-only] [--tokenize-bin PATH]
 
 Flow: build (or reuse) the tagged sample -> train the BPE **once** at the largest size ->
 derive the smaller sizes by truncating `merges` -> `monica-tokenize stats` per size ->
@@ -15,8 +15,9 @@ base bytes) — verified empirically on a 2.46 MB corpus and now guarded by `mon
 Training once is ~2.5x cheaper than three independent runs on the dominant cost.
 `--no-truncate` trains each size independently and is kept as the audit path.
 
-The sample lives outside the repo (default `~/monica-data/vocab-sweep-251/`) and is cached:
-a re-run costs zero network time.
+The sample lives outside the repo (default `~/monica-data/vocab-sweep-251/`) and is cached, as
+are the trained tokenizers: a re-run costs zero network time and no retraining, so re-emitting
+the table is cheap. `--rebuild-sample` / `--retrain` force each half.
 """
 
 from __future__ import annotations
@@ -57,6 +58,21 @@ def resolve_tokenize_bin(explicit: str | None) -> Path:
     if not binary.exists():
         raise SystemExit(f"monica-tokenize not found at {binary}")
     return binary
+
+
+def tokenizer_is_usable(path: Path, vocab: int) -> bool:
+    """True when `path` is already a trained artifact of exactly `vocab` tokens.
+
+    Training at 49,152 on a ~50 MB sample is the long pole of the whole sweep, so a re-run
+    (after a `stats` fix, or to re-emit the table) must not pay for it twice. Rebuild with
+    `--retrain`.
+    """
+    if not path.exists():
+        return False
+    try:
+        return len(json.loads(path.read_text())["merges"]) == vocab - BASE_OFFSET
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def train_tokenizer(binary: Path, corpus: Path, out: Path, vocab: int) -> None:
@@ -196,16 +212,20 @@ def decide(stats: Dict[int, Dict], sizes: List[int]) -> Tuple[str, int]:
     pool = within or survivors or sizes
     winner = min(pool)
 
-    lines.append("**Rule 3 — TypeScript tie-break (>3% better on the TS row):**")
-    ts_best = max(stats[s]["by_lang"]["typescript"]["bytes_per_token"] for s in pool)
-    bumped = [s for s in pool if s > winner
-              and (ts_best - stats[winner]["by_lang"]["typescript"]["bytes_per_token"]) / ts_best > 0.03
-              and stats[s]["by_lang"]["typescript"]["bytes_per_token"] >= ts_best * 0.999]
-    if bumped:
-        lines.append(f"  {winner} is >3% off the best TS row -> promote to {min(bumped)}")
-        winner = min(bumped)
+    lines.append("**Rule 3 — TypeScript tie-break (a larger survivor >3% better on the TS row wins):**")
+    win_ts = stats[winner]["by_lang"]["typescript"]["bytes_per_token"]
+    better = [s for s in pool if s > winner
+              and (stats[s]["by_lang"]["typescript"]["bytes_per_token"] - win_ts) / win_ts > 0.03]
+    for s in pool:
+        if s == winner:
+            continue
+        gain = (stats[s]["by_lang"]["typescript"]["bytes_per_token"] - win_ts) / win_ts
+        lines.append(f"  {s} vs {winner} on TypeScript: {gain * 100:+.2f}%")
+    if better:
+        lines.append(f"  -> promote {winner} to {min(better)} (TypeScript-first program)")
+        winner = min(better)
     else:
-        lines.append(f"  no candidate is >3% better than {winner} on TypeScript -> no change")
+        lines.append(f"  -> no candidate is >3% better than {winner} on TypeScript; no change")
 
     lines.append(f"\n**WINNER: {winner}** "
                  f"(overall {stats[winner]['overall']['bytes_per_token']:.4f} bytes/token)")
@@ -221,6 +241,8 @@ def main() -> int:
     ap.add_argument("--mixture-scale", type=float, default=1.0,
                     help="scale every slice's byte target (keeps all languages)")
     ap.add_argument("--rebuild-sample", action="store_true")
+    ap.add_argument("--retrain", action="store_true",
+                    help="retrain even when a matching tokenizer artifact is cached")
     ap.add_argument("--no-truncate", action="store_true",
                     help="train each vocab size independently (audit path; much slower)")
     ap.add_argument("--sample-only", action="store_true",
@@ -246,12 +268,18 @@ def main() -> int:
     tok_dir.mkdir(parents=True, exist_ok=True)
     tokenizers: Dict[int, Path] = {s: tok_dir / f"vocab-{s}.json" for s in sizes}
 
+    def ensure_trained(size: int) -> None:
+        if not args.retrain and tokenizer_is_usable(tokenizers[size], size):
+            log(f"reusing cached tokenizer {tokenizers[size].name}")
+            return
+        train_tokenizer(binary, corpus, tokenizers[size], size)
+
     if args.no_truncate:
         for s in sizes:
-            train_tokenizer(binary, corpus, tokenizers[s], s)
+            ensure_trained(s)
     else:
         biggest = sizes[-1]
-        train_tokenizer(binary, corpus, tokenizers[biggest], biggest)
+        ensure_trained(biggest)
         for s in sizes[:-1]:
             truncate_tokenizer(tokenizers[biggest], tokenizers[s], s)
 
