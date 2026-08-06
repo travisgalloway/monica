@@ -134,7 +134,10 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   or ported checkpoint routes as trained) → CUDA MoE backend (#214: dropless routing, shared expert,
   FSDP, sparse-upcycle init) → FIM (#215, **done** — see the resolved note below), length
   curriculum + dataloader-state resume
-  (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
+  (#216, **done** — `--curriculum "0.25:2048,0.5:4096,1.0:16384"` on `scripts/train.py`, plus
+  explicit `MicroBatchStream` state committed inside the checkpoint slot; see
+  [05-training.md](05-training.md#length-curriculum--dataloader-state-resume-216)),
+  routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
   **Training-efficiency levers** (folded 2026-07-20 from the efficiency-survey review): hybrid
   Muon+AdamW optimizer at the `make_optimizer` seam (#237, **done** — `3b02e6b`), WSD
   warmup-stable-decay LR schedule (#238, **done** — `8fe62f7`), and `torch.compile` default-on for

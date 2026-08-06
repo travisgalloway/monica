@@ -139,9 +139,19 @@ class CheckpointStore:
     survives until the next one is durably committed.
 
     Each slot holds the FULL checkpoint: portable weights (the cross-backend bridge) AND
-    the within-backend resume bundle (optimizer + step + fp16 loss-scale state). Note the
-    loss-scale state is NOT an RNG state — the data order on resume is reconstructed
-    deterministically from (seed, step, grad_accum) and the model has no train-time RNG.
+    the within-backend resume bundle (optimizer + step + fp16 loss-scale state + the
+    dataloader position). Note the loss-scale state is NOT an RNG state, and the model has
+    no train-time RNG.
+
+    Dataloader position (#216). Historically the data order on resume was *reconstructed*
+    from (seed, step, grad_accum), which is only valid while `tokens_per_step` — and hence
+    `len(loader)` — is constant for the whole run. A length curriculum breaks that, so
+    `save(data_state=...)` now persists the stream's **explicit** position inside
+    `resume_meta.json`. It deliberately lives in the existing meta file, INSIDE the slot,
+    so it is committed by the very same `LATEST` flip that commits the step and the
+    weights — a data state that could disagree with the weights it ships with would be
+    worse than none at all. `data_state` is optional: pre-#216 bundles read back as
+    `meta.get("data_state") is None` and fall back to the legacy reconstruction.
     """
 
     _SLOTS = ("slot-a", "slot-b")
@@ -169,12 +179,16 @@ class CheckpointStore:
     # -- write/read -------------------------------------------------------------
     def save(self, *, step: int, loss_scale_state: Any,
              weights_serializer: Callable[[str], None],
-             optimizer_serializer: Callable[[str], None]) -> str:
+             optimizer_serializer: Callable[[str], None],
+             data_state: Any = None) -> str:
         """Write a full checkpoint to the inactive slot, then atomically make it live.
 
         `weights_serializer(path)` writes portable weights (e.g. `model.save`) and
         `optimizer_serializer(path)` the backend optimizer state — both supplied by the
-        caller so this stays backend-free. Returns the slot that was committed.
+        caller so this stays backend-free. `data_state` is the dataloader position
+        (`MicroBatchStream.state_dict()`, #216); it rides in `resume_meta.json` rather
+        than a file of its own, so it adds no entry to the slot and inherits the slot's
+        crash-atomicity for free. Returns the slot that was committed.
         """
         slot = self._inactive_slot()
         slot_dir = self.root / slot
@@ -186,7 +200,8 @@ class CheckpointStore:
 
         weights_serializer(str(slot_dir / "weights.safetensors"))   # + .config.json sidecar
         optimizer_serializer(str(slot_dir / "optimizer.state"))     # backend owns the extension
-        meta = {"step": int(step), "loss_scale_state": _jsonable(loss_scale_state)}
+        meta = {"step": int(step), "loss_scale_state": _jsonable(loss_scale_state),
+                "data_state": _jsonable(data_state)}
         _atomic_write_text(slot_dir / "resume_meta.json", json.dumps(meta))
 
         # Durably flush every file's DATA (the backend optimizer dump may not fsync
@@ -203,7 +218,9 @@ class CheckpointStore:
     def load(self, *, weights_deserializer: Callable[[str], None],
              optimizer_deserializer: Callable[[str], Any]) -> dict:
         """Load the live checkpoint into the model + optimizer. Returns
-        {step, loss_scale_state, optimizer, slot}. Raises if no checkpoint is committed."""
+        {step, loss_scale_state, data_state, optimizer, slot}. Raises if no checkpoint is
+        committed. Read `data_state` with `meta.get("data_state")` — it is absent in
+        pre-#216 bundles, and `None` for runs that persisted no dataloader position."""
         slot = self.latest_slot()
         if slot is None:
             raise RuntimeError(f"no committed checkpoint under {str(self.root)!r}")

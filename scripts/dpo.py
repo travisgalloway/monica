@@ -133,7 +133,10 @@ def main() -> None:
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 
-    def on_checkpoint(step: int) -> None:
+    # `data_state` is accepted and IGNORED: DPO resume stays step-based, and the #216
+    # length curriculum applies to pretraining only. Persisting a position nothing reads
+    # back would be worse than not persisting one.
+    def on_checkpoint(step: int, data_state=None) -> None:
         store.save(step=step,
                    loss_scale_state=(scaler.state_dict() if scaler else None),
                    weights_serializer=lambda p: policy.save(p),  # checkpoint the POLICY

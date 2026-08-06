@@ -40,6 +40,12 @@ def main() -> None:
                     help="also run ONE torch.compile'd training step (CUDA + .[cuda-fast] "
                          "pod) and assert it does not hard-error; the main resume-exactness "
                          "run stays eager. Verifies the Triton graph-break path on hardware.")
+    ap.add_argument("--curriculum", type=str, default=None,
+                    help="phase 7 length curriculum (#216), "
+                         "'until_frac:seq_len[:batch_size],...'. Default: a two-stage "
+                         "ramp derived from the config (seq_len//2 -> seq_len).")
+    ap.add_argument("--curriculum-steps", type=int, default=20,
+                    help="phase 7: optimizer steps for the curriculum kill/resume gate")
     args = ap.parse_args()
 
     # Backend selection stays behind the seam factory; only portable modules are
@@ -192,6 +198,125 @@ def main() -> None:
     print(f"[prefill] L={prompt.shape[1]} + {n_decode} decode steps OK  "
           f"max|logit diff|={par['max_abs_diff']:.3e}  "
           f"max|state diff|={par['max_abs_state_diff']:.3e}")
+
+    # --- 7) curriculum kill/resume gate (#216) ----------------------------------
+    # Phases 1-6 drive `step_fn` directly over a PRE-MATERIALIZED batch list, which is
+    # exactly what makes them insensitive to data ordering — and therefore blind to the
+    # thing #216 changes. So this phase drives the REAL `train()` + `MicroBatchStream` +
+    # `CheckpointStore` instead: the wiring between them is the new surface, and a
+    # curriculum that silently failed to engage, or a resume that silently resampled,
+    # would leave every other phase green.
+    from src.train.curriculum import build_curriculum
+    from src.train.loop import TrainConfig, train
+
+    spec = args.curriculum or (f"0.5:{max(1, cfg.seq_len // 2)}:{2 * args.batch_size},"
+                               f"1.0:{cfg.seq_len}:{args.batch_size}")
+    curriculum = build_curriculum(spec, base_seq_len=cfg.seq_len,
+                                  base_batch_size=args.batch_size, grad_accum=1,
+                                  total_steps=args.curriculum_steps)
+    cN = curriculum.total_steps
+    boundary = curriculum.first_steps[1] if len(curriculum.stages) > 1 else cN // 2
+    # Kill strictly AFTER the boundary so the resume starts INSIDE the later stage, with
+    # a partial epoch — the case a boundary-aligned kill would not exercise.
+    cK = min(cN - 1, boundary + 2)
+    if cK <= 0 or cK >= cN:
+        raise SystemExit(f"SMOKE TEST FAILED: phase 7 needs 0 < kill({cK}) < steps({cN}); "
+                         "raise --curriculum-steps.")
+
+    def curric_factory(seq_len, batch_size):
+        return PackedLoader(args.data / "train.bin", seq_len, batch_size,
+                            shuffle=True, seed=args.seed)
+
+    ctcfg = TrainConfig(total_steps=cN, base_lr=3e-4, warmup_steps=max(1, cN // 6),
+                        grad_accum=1, grad_clip=1.0, log_every=1, eval_every=10 ** 9,
+                        ckpt_every=cK, out_dir=str(out), seed=args.seed)
+
+    def curric_run(model, step_fn, logs, **kw):
+        return train(model, None, ctcfg, step_fn, logger=logs.append,
+                     curriculum=curriculum, loader_factory=curric_factory, **kw)
+
+    # 7a) reference: one uninterrupted curriculum run.
+    ref_logs = []
+    cmodel, _, cstep = fresh_model_opt()
+    curric_run(cmodel, cstep, ref_logs)
+    ref_steps = [p for p in ref_logs if "event" not in p]
+
+    # 7b) interrupted: kill AT the checkpoint (as a preempted pod does — the budget is
+    # unchanged), tear down model/optimizer/stream, rebuild from the store, finish.
+    class _Killed(Exception):
+        pass
+
+    cstore = CheckpointStore(str(out / "resume-curriculum"))
+    saved = {}
+    res_logs = []
+    cmodel_a, copt_a, cstep_a = fresh_model_opt()
+
+    def curric_ckpt(step, data_state):
+        cstore.save(step=step, loss_scale_state=None, data_state=data_state,
+                    weights_serializer=lambda p: cmodel_a.save(p),
+                    optimizer_serializer=lambda p: backend.save_optimizer(copt_a, p))
+        saved["step"] = step
+        raise _Killed
+
+    try:
+        curric_run(cmodel_a, cstep_a, res_logs, on_checkpoint=curric_ckpt)
+    except _Killed:
+        pass
+    if saved.get("step") != cK:
+        raise SystemExit(f"SMOKE TEST FAILED: phase 7 checkpoint fired at "
+                         f"{saved.get('step')}, expected {cK}.")
+    del cmodel_a, copt_a, cstep_a                    # "kill" the process state
+
+    backend.seed(args.seed + 999)                    # different RNG: weights from disk
+    cmodel_b = backend.model_cls(cfg)
+    copt_b = backend.make_optimizer(cmodel_b, 3e-4)
+    cmeta = cstore.load(weights_deserializer=lambda p: cmodel_b.load(p),
+                        optimizer_deserializer=lambda p: backend.load_optimizer(copt_b, p))
+    if cmeta.get("data_state") is None:
+        raise SystemExit("SMOKE TEST FAILED: phase 7 resume bundle carries no "
+                         "data_state — the dataloader position was not committed.")
+    curric_run(cmodel_b, backend.make_train_step(cmodel_b, copt_b, grad_clip=1.0),
+               res_logs, start_step=int(cmeta["step"]),
+               start_data_state=cmeta["data_state"])
+    res_steps = [p for p in res_logs if "event" not in p]
+
+    # 7c) the trajectory over the resumed window must match the reference. A resume that
+    # resampled data would diverge here even though every counter looked healthy.
+    ref_loss = {p["step"]: float(p["loss"]) for p in ref_steps}
+    res_loss = {p["step"]: float(p["loss"]) for p in res_steps}
+    missing = [s for s in range(cN) if s not in ref_loss or s not in res_loss]
+    if missing:
+        raise SystemExit(f"SMOKE TEST FAILED: phase 7 missing steps {missing[:5]}...")
+    cdiffs = [abs(ref_loss[s] - res_loss[s]) for s in range(cK, cN)]
+    cmax = max(cdiffs)
+    print(f"[curriculum] {spec}  steps={cN}  boundary={boundary}  kill={cK}  "
+          f"post-resume max|loss diff| over steps {cK}..{cN-1} = {cmax:.3e}")
+    if cmax > args.atol:
+        raise SystemExit(f"SMOKE TEST FAILED: curriculum resume not exact "
+                         f"(max|diff|={cmax:.3e} > {args.atol}).")
+
+    # 7d) ...and the curriculum actually ENGAGED. Without this a curriculum that silently
+    # collapsed to one shape would sail through 7c, since a fixed-shape run resumes fine.
+    for label, steps in (("reference", ref_steps), ("resumed", res_steps)):
+        seq_lens = [p["seq_len"] for p in sorted(steps, key=lambda p: p["step"])]
+        want = [curriculum.stage_at(s).seq_len for s in range(cN)]
+        if seq_lens != want:
+            raise SystemExit(f"SMOKE TEST FAILED: phase 7 {label} seq_len sequence "
+                             f"{seq_lens} != expected {want} — the curriculum did not "
+                             "engage.")
+        if len(set(seq_lens)) < 2:
+            raise SystemExit(f"SMOKE TEST FAILED: phase 7 {label} never changed seq_len; "
+                             "the gate would be vacuous.")
+
+    # 7e) ...and token accounting survived the kill (it is cumulative across stages, and
+    # the resumed run must pick it up rather than restart from zero).
+    want_tokens = sum(curriculum.tokens_at(s) for s in range(cN))
+    got_tokens = max(p["tokens"] for p in res_steps)
+    if got_tokens != want_tokens:
+        raise SystemExit(f"SMOKE TEST FAILED: phase 7 cumulative tokens {got_tokens} != "
+                         f"{want_tokens}.")
+    print(f"[curriculum] stages engaged in both runs; tokens={got_tokens} "
+          f"(cumulative across {len(curriculum.stages)} stages) OK")
 
     print("\nSMOKE TEST PASSED ✅  resume is exact and eval runs.")
 
