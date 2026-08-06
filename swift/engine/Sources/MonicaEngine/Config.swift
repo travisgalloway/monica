@@ -123,6 +123,11 @@ public struct MambaConfig: Decodable, Sendable {
         return (i + 1) % e == 0 && !isAttentionLayer(i)
     }
 
+    /// Count of layers `isMoELayer` selects (`blocks.py:212-213`'s `n_moe_layers`).
+    public var nMoeLayers: Int {
+        (0..<nLayers).filter(isMoELayer).count
+    }
+
     /// Compute dtype for the heavy GEMMs (`mlx_backend.py:_DTYPES`).
     public var cd: DType {
         switch precision {
@@ -151,19 +156,29 @@ public struct MambaConfig: Decodable, Sendable {
         if longCtxFactor < 1.0 {
             throw ConfigError.invalid("long_ctx_factor must be >= 1.0 (1.0 = off)")
         }
-        if attnEvery != nil {
+        if let ae = attnEvery {
+            if ae <= 0 { throw ConfigError.invalid("attn_every must be a positive int or null") }
             let nah = nAttnHeadsResolved
             if nah <= 0 || dModel % nah != 0 {
                 throw ConfigError.invalid(
                     "n_attn_heads=\(nah) must divide d_model=\(dModel)")
             }
+            if attnHeadDim % 2 != 0 {
+                throw ConfigError.invalid(
+                    "attn_head_dim=\(attnHeadDim) must be even (RoPE splits it in half)")
+            }
         }
-        if moeEvery != nil {
+        if let me = moeEvery {
+            if me <= 0 { throw ConfigError.invalid("moe_every must be a positive int or null") }
             if nExperts < 2 { throw ConfigError.invalid("n_experts must be >= 2 when moe_every is set") }
             if !(1 <= topK && topK <= nExperts) {
                 throw ConfigError.invalid("top_k=\(topK) must be in [1, n_experts=\(nExperts)]")
             }
             if moeDFFResolved <= 0 { throw ConfigError.invalid("moe_d_ff must be positive or null") }
+            if nMoeLayers == 0 {
+                throw ConfigError.invalid(
+                    "moe_every=\(me) selects no layer at n_layers=\(nLayers) (after attention precedence)")
+            }
         }
     }
 
