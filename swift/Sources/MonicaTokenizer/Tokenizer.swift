@@ -41,6 +41,29 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
 
     public func decode(_ ids: [Int]) -> String { bpe.decode(ids) }
 
+    /// Append `text`'s ids to `ids`. Public (it was `private`) so `FIM.transform` (#215) can
+    /// assemble a PSM stream â€” sentinel, piece, sentinel, piece â€” without three throwaway arrays,
+    /// and so it goes through exactly this encoder rather than a second copy of it.
+    public func encode(_ text: String, into ids: inout [Int]) {
+        if specials.isEmpty { encodeSegment(text, into: &ids); return }
+        var idx = text.startIndex
+        var segStart = idx
+        let end = text.endIndex
+        while idx < end {
+            var hit: (text: String, id: Int)? = nil
+            for sp in specials where text[idx...].hasPrefix(sp.text) { hit = sp; break }
+            if let m = hit {
+                if segStart < idx { encodeSegment(String(text[segStart..<idx]), into: &ids) }
+                ids.append(m.id)
+                idx = text.index(idx, offsetBy: m.text.count)
+                segStart = idx
+            } else {
+                idx = text.index(after: idx)
+            }
+        }
+        if segStart < end { encodeSegment(String(text[segStart..<end]), into: &ids) }
+    }
+
     /// Encode many documents concurrently (data-parallel across docs; identical on Mac/Linux).
     /// Concurrency is **bounded** to `maxConcurrency` in-flight tasks (default = core count):
     /// a large corpus would otherwise spawn one task per document and pile up memory. Output
@@ -65,26 +88,6 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
     }
 
     // MARK: - internals
-
-    private func encode(_ text: String, into ids: inout [Int]) {
-        if specials.isEmpty { encodeSegment(text, into: &ids); return }
-        var idx = text.startIndex
-        var segStart = idx
-        let end = text.endIndex
-        while idx < end {
-            var hit: (text: String, id: Int)? = nil
-            for sp in specials where text[idx...].hasPrefix(sp.text) { hit = sp; break }
-            if let m = hit {
-                if segStart < idx { encodeSegment(String(text[segStart..<idx]), into: &ids) }
-                ids.append(m.id)
-                idx = text.index(idx, offsetBy: m.text.count)
-                segStart = idx
-            } else {
-                idx = text.index(after: idx)
-            }
-        }
-        if segStart < end { encodeSegment(String(text[segStart..<end]), into: &ids) }
-    }
 
     private func encodeSegment(_ segment: String, into ids: inout [Int]) {
         for pretoken in Pretokenizer.pretokenize(segment, digitGroup: digitGroup) {

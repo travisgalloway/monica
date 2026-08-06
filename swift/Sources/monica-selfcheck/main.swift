@@ -191,6 +191,225 @@ do {
           "pack throws on overflowing shardSizeMB")
 }
 
+// MARK: FIM (#215)
+//
+// StarCoder2 shipped a silent FIM bug — a malformed frame trains fine and only shows up as a
+// model that cannot infill. The reassembly assertion below is the guard: it must pass before any
+// compute is spent. It extends the tokenizer-level sentinel check above (ids 1,3,2) to the actual
+// pack path: transform → decode the three spans → get the original document back.
+
+/// Split a PSM stream into its (prefix, suffix, middle) id runs. `nil` if the frame is malformed,
+/// which the caller must report as a failure — never as "no FIM here".
+func psmSpans(_ ids: [Int], _ o: FIMOptions) -> (p: [Int], s: [Int], m: [Int])? {
+    guard let pi = ids.firstIndex(of: o.prefixId),
+          let si = ids.firstIndex(of: o.suffixId),
+          let mi = ids.firstIndex(of: o.middleId),
+          pi == 0, pi < si, si < mi else { return nil }
+    return (Array(ids[1..<si]), Array(ids[(si + 1)..<mi]), Array(ids[(mi + 1)...]))
+}
+
+do {
+    // --- 1. RNG determinism and a known-answer vector -----------------------------------------
+    // The known answers are the *published* SplitMix64 outputs for seed 0, not values harvested
+    // from this implementation — an externally-anchored vector is what catches a toolchain or
+    // refactor silently altering the stream (which would break the macOS-vs-Linux shard cmp).
+    do {
+        var r1 = SplitMix64(seed: 42)
+        var r2 = SplitMix64(seed: 42)
+        var a: [UInt64] = [], b: [UInt64] = []
+        for _ in 0..<16 { a.append(r1.next()); b.append(r2.next()) }
+        eq(a, b, "SplitMix64 is reproducible from a seed")
+        check(Set(a).count > 8, "SplitMix64 stream is not a constant")
+
+        var ref = SplitMix64(seed: 0)
+        eq(ref.next(), 0xE220_A839_7B1D_CDAF, "SplitMix64 reference vector, seed 0, draw 1")
+        eq(ref.next(), 0x6E78_9E6A_A1B9_65F4, "SplitMix64 reference vector, seed 0, draw 2")
+        eq(ref.next(), 0x06C4_5D18_8009_454F, "SplitMix64 reference vector, seed 0, draw 3")
+
+        var bounded = SplitMix64(seed: 7)
+        var maxDraw: UInt64 = 0
+        for _ in 0..<20000 { maxDraw = max(maxDraw, bounded.next(upperBound: 10000)) }
+        check(maxDraw < 10000, "next(upperBound: 10000) stays in range (max \(maxDraw))")
+        check(maxDraw > 9000, "next(upperBound: 10000) covers the range (max \(maxDraw))")
+        var degenerate = SplitMix64(seed: 7)
+        eq(degenerate.next(upperBound: 1), 0, "next(upperBound: 1) is always 0")
+        eq(degenerate.next(upperBound: 0), 0, "next(upperBound: 0) is 0, not a division trap")
+    }
+
+    let tok = Tokenizer(format: trained())
+    let forceAll = FIMOptions(rateBasisPoints: 10000, seed: 1234)
+
+    let fimDocs = [
+        "function add(a: number, b: number): number { return a + b; }",
+        "const greet = (name: string): string => `hello ${name}`;",
+        "export class Vec {\n  constructor(public x: number, public y: number) {}\n}\n",
+        "const s = 'π≈3.14'; // 数字 🚀 mixed-width unicode",
+        "\t\tif (x) {\n\t\t\treturn 0;\n\t\t}",
+        "abc",                                   // exactly the 3-byte minimum
+        String(repeating: "let z = 0;\n", count: 40),
+    ]
+
+    // --- 2. Round trip: the headline check ----------------------------------------------------
+    do {
+        var stats = FIMStats()
+        for (i, doc) in fimDocs.enumerated() {
+            let ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                    options: forceAll, stats: &stats)
+            eq(ids.first, forceAll.prefixId, "FIM stream starts with <|fim_prefix|> (doc \(i))")
+            for sentinel in FIM.sentinels(forceAll) {
+                eq(ids.filter { $0 == sentinel }.count, 1,
+                   "sentinel \(sentinel) appears exactly once (doc \(i))")
+            }
+            guard let spans = psmSpans(ids, forceAll) else {
+                failures.append("malformed PSM frame for doc \(i)")
+                continue
+            }
+            eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), doc,
+               "prefix+middle+suffix reassembles the original document (doc \(i))")
+            let specialsInSpans = (spans.p + spans.m + spans.s).filter { $0 < SPECIALS.count }
+            eq(specialsInSpans, [], "no sentinel id leaks inside a span (doc \(i))")
+        }
+        eq(stats.transformed, fimDocs.count, "rate 1.0 transforms every eligible doc")
+        eq(stats.skippedShort, 0, "no fixture doc was skipped as short")
+        eq(stats.skippedSentinel, 0, "no fixture doc was skipped as sentinel-bearing")
+    }
+
+    // --- 3. The rate is actually honoured -----------------------------------------------------
+    // A deliberately loose band: this is a wiring check (is the roll connected to the flag?),
+    // not a statistics test, and it must never flake.
+    do {
+        var stats = FIMStats()
+        let synthetic = (0..<200).map { "const value\($0) = compute(\($0)) + offset;" }
+        for (i, doc) in synthetic.enumerated() {
+            _ = FIM.transform(document: doc, index: i, tokenizer: tok,
+                              options: FIMOptions(rateBasisPoints: 5000, seed: 99), stats: &stats)
+        }
+        eq(stats.eligible, synthetic.count, "every synthetic doc is FIM-eligible")
+        check(stats.transformed >= 70 && stats.transformed <= 130,
+              "rate 0.5 transforms roughly half (\(stats.transformed)/200)")
+    }
+
+    // --- 4. Determinism at the pack level, plus the anti-vacuity guard ------------------------
+    // Same seed -> byte-identical shards; different seed -> different tokens. Without the second
+    // half, a transform that silently did nothing would pass the identity check vacuously.
+    do {
+        func packWith(_ options: FIMOptions, into dir: URL) -> Bool {
+            var stats = FIMStats()
+            var tokenized: [[Int]] = []
+            for (i, doc) in SAMPLE.enumerated() {
+                var ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                        options: options, stats: &stats)
+                ids.append(tok.eosTokenId)
+                tokenized.append(ids)
+            }
+            // `try?` rather than do/catch: in top-level code the compiler already treats thrown
+            // errors as handled, so a `catch` here warns as unreachable. A nil result is the
+            // failure signal, and it is reported — never swallowed.
+            guard (try? Packing.pack(docs: tokenized, outDir: dir, seqLen: 16, shardSizeMB: 1)) != nil else {
+                failures.append("FIM pack failed for seed \(options.seed)")
+                return false
+            }
+            return true
+        }
+
+        func artifacts(_ dir: URL) -> [String: Data] {
+            var out: [String: Data] = [:]
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+            for name in names.sorted() {
+                out[name] = (try? Data(contentsOf: dir.appendingPathComponent(name))) ?? Data()
+            }
+            return out
+        }
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("monica-fim-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dirA = root.appendingPathComponent("a")
+        let dirB = root.appendingPathComponent("b")
+        let dirC = root.appendingPathComponent("c")
+        let seeded = FIMOptions(rateBasisPoints: 5000, seed: 1234)
+        let reseeded = FIMOptions(rateBasisPoints: 5000, seed: 4321)
+
+        if packWith(seeded, into: dirA), packWith(seeded, into: dirB), packWith(reseeded, into: dirC) {
+            let a = artifacts(dirA), b = artifacts(dirB), c = artifacts(dirC)
+            check(!a.isEmpty, "FIM pack produced artifacts (an empty compare would be vacuous)")
+            eq(a.keys.sorted(), b.keys.sorted(), "same-seed packs write the same file set")
+            for name in a.keys.sorted() {
+                eq(a[name], b[name], "same-seed pack is byte-identical: \(name)")
+            }
+            check(a["part-00000.bin"] != c["part-00000.bin"],
+                  "a different --fim-seed produces different tokens (anti-vacuity)")
+        }
+    }
+
+    // --- 5. Rate 0 is a true no-op (this is what keeps the pre-#215 pipeline byte-identical) --
+    do {
+        var stats = FIMStats()
+        let off = FIMOptions(rateBasisPoints: 0, seed: 1234)
+        for (i, doc) in fimDocs.enumerated() {
+            eq(FIM.transform(document: doc, index: i, tokenizer: tok, options: off, stats: &stats),
+               tok.encode(doc), "rate 0 returns a plain encode (doc \(i))")
+        }
+        eq(stats.transformed, 0, "rate 0 transforms nothing")
+    }
+
+    // --- 6. Edge cases ------------------------------------------------------------------------
+    do {
+        var stats = FIMStats()
+        eq(FIM.transform(document: "", index: 0, tokenizer: tok, options: forceAll, stats: &stats),
+           [], "empty doc yields no tokens and no sentinels")
+
+        for short in ["a", "ab"] {
+            let ids = FIM.transform(document: short, index: 1, tokenizer: tok,
+                                    options: forceAll, stats: &stats)
+            eq(ids, tok.encode(short), "sub-3-byte doc is left unchanged")
+        }
+        eq(stats.skippedShort, 2, "short docs are counted, not silently dropped")
+
+        // A doc that literally contains a sentinel string would otherwise get a real sentinel id
+        // mid-span from `Tokenizer.encode`, corrupting the frame. It must be skipped and counted.
+        let hostile = "before <|fim_prefix|> after the sentinel string"
+        let ids = FIM.transform(document: hostile, index: 2, tokenizer: tok,
+                                options: forceAll, stats: &stats)
+        eq(ids, tok.encode(hostile), "sentinel-bearing doc is left unchanged")
+        eq(stats.skippedSentinel, 1, "sentinel-bearing docs are counted")
+
+        // Empty prefix / middle / suffix are legitimate draws and must round-trip too.
+        for (a, b) in [(0, 0), (0, 3), (3, 3)] {
+            let doc = "abc"
+            let bytes = Array(doc.utf8)
+            var frame: [Int] = [forceAll.prefixId]
+            tok.encode(String(decoding: bytes[0..<a], as: UTF8.self), into: &frame)
+            frame.append(forceAll.suffixId)
+            tok.encode(String(decoding: bytes[b...], as: UTF8.self), into: &frame)
+            frame.append(forceAll.middleId)
+            tok.encode(String(decoding: bytes[a..<b], as: UTF8.self), into: &frame)
+            guard let spans = psmSpans(frame, forceAll) else {
+                failures.append("degenerate PSM frame (\(a),\(b)) did not parse")
+                continue
+            }
+            eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), doc,
+               "degenerate split (\(a),\(b)) still reassembles")
+        }
+
+        // Cut points never land inside a UTF-8 scalar: snapping forward is idempotent and
+        // monotonic, so every transformed multi-byte-scalar doc must decode losslessly.
+        let unicodeDoc = "π≈3.14 数字 🚀 πππ 数数数 🚀🚀🚀 tail"
+        for seed in UInt64(0)..<64 {
+            var s = FIMStats()
+            let out = FIM.transform(document: unicodeDoc, index: 0, tokenizer: tok,
+                                    options: FIMOptions(rateBasisPoints: 10000, seed: seed),
+                                    stats: &s)
+            guard let spans = psmSpans(out, forceAll) else {
+                failures.append("unicode doc produced a malformed frame at seed \(seed)")
+                continue
+            }
+            eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), unicodeDoc,
+               "unicode doc reassembles at seed \(seed)")
+        }
+    }
+}
+
 // MARK: parquet
 //
 // Covers the pure-Swift Parquet reader (swift/Sources/MonicaTokenizer/Parquet/, #247) on both
