@@ -1,0 +1,10 @@
+{
+  "config": "toy-moe.yaml",
+  "batch": 2,
+  "seq": 40,
+  "seed": 0,
+  "precision": "fp32",
+  "mlx_version": "0.31.2",
+  "moe_bias": false,
+  "forward_step_max_abs_diff": 1.430511474609375e-06
+}

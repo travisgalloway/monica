@@ -219,3 +219,34 @@ jobs:
         run: |
           sha256sum macos/tokenizer.json linux/tokenizer.json
           cmp macos/tokenizer.json linux/tokenizer.json
+
+  # ── Job 7: the Swift/MLX model port's logit parity gate (#166) ────────────
+  # Apple-only: swift/engine/ is a SEPARATE SwiftPM package that depends on
+  # mlx-swift, deliberately kept OUT of swift/Package.swift so the tokenizer
+  # package stays dependency-free and swift-linux keeps needing no network for
+  # dependencies (platform conditions gate build edges, not RESOLUTION — SwiftPM
+  # would still clone mlx-swift's vendored C++ tree on Linux). Jobs 4/5/6 are
+  # untouched by design. See docs/design/14-inference-engine.md.
+  #
+  # `swift run monica-parity` compares the Swift model's forward AND stacked-step
+  # logits against checked-in Python/MLX references at fp32 rtol=1e-4/atol=1e-5.
+  swift-engine:
+    name: swift model parity (macOS, mlx-swift)
+    runs-on: macos-latest
+    # mlx-swift builds the vendored `mlx` C++ tree from source; a COLD runner
+    # build is plausibly 20-40 min, hence the generous timeout and the cache.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - uses: actions/cache@v4
+        with:
+          path: swift/engine/.build
+          key: swift-engine-${{ runner.os }}-${{ hashFiles('swift/engine/Package.resolved') }}
+      - name: Build
+        working-directory: swift/engine
+        run: swift build
+      - name: Logit parity vs the Python MLX oracle
+        working-directory: swift/engine
+        run: swift run monica-parity
