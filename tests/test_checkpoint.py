@@ -1,11 +1,13 @@
 """Unit tests for portable weight save/load and the double-buffered CheckpointStore.
 
 Backend-free: uses numpy weight dicts and dummy weight/optimizer (de)serializers, so it
-runs anywhere. The resume metadata persists `step` + the fp16 `loss_scale_state` (NOT an
-RNG state — the data order on resume is reconstructed deterministically); these tests
-guard `_jsonable` against a realistic nested NumPy structure (nested dict + np.ndarray +
-np scalars — the worst case it handles), which a shallow JSON conversion breaks, plus the
-crash-safety contract (the previous checkpoint survives a write interrupted mid-flight).
+runs anywhere. The resume metadata persists `step`, the fp16 `loss_scale_state`, and —
+since #216 — the dataloader position (`data_state`). These tests guard `_jsonable`
+against a realistic nested NumPy structure (nested dict + np.ndarray + np scalars — the
+worst case it handles), which a shallow JSON conversion breaks; the crash-safety contract
+(the previous checkpoint survives a write interrupted mid-flight); and that `data_state`
+lives INSIDE the slot's existing meta file, so it is committed by the same atomic LATEST
+flip as the weights rather than drifting out of sync with them.
 """
 
 import json
@@ -90,6 +92,74 @@ def test_store_roundtrips_loss_scale_state(tmp_path):
                optimizer_serializer=o_ser)
     meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
     assert meta["loss_scale_state"] == state
+
+
+def test_store_roundtrips_data_state(tmp_path):
+    """#216: the dataloader position rides inside resume_meta.json, so it is committed by
+    the same atomic LATEST flip as the weights and the step. It contains a nested numpy
+    RNG state (the stream's tripwire), which only survives via `_jsonable`."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    data_state = {
+        "version": 1, "stage_idx": 1, "micro_in_stage": 4, "global_micro": 22,
+        "epoch_idx": 3, "batches_into_epoch": 2,
+        "rng_state": np.random.default_rng(7).bit_generator.state,
+        "stages_at_save": [[2048, 32, 100], [16384, 4, 50]],
+        "fingerprint": {"seed": 0, "grad_accum": 4,
+                        "stage_shapes": [[2048, 32], [16384, 4]]},
+    }
+    _, w_ser, o_ser, w_deser, o_deser = _dummy_io()
+    store.save(step=150, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser, data_state=data_state)
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
+
+    assert meta["data_state"] == _jsonable(data_state)
+    assert meta["data_state"]["global_micro"] == 22
+    assert meta["data_state"]["fingerprint"]["stage_shapes"] == [[2048, 32], [16384, 4]]
+
+
+def test_store_without_data_state_reads_back_as_none(tmp_path):
+    """Backward compatibility: a bundle saved with no dataloader position (SFT/DPO, or a
+    pre-#216 run) must read back as None so callers fall back to reconstruction."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    _, w_ser, o_ser, w_deser, o_deser = _dummy_io()
+    store.save(step=7, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
+    assert meta.get("data_state") is None
+
+
+def test_legacy_bundle_missing_the_key_entirely_reads_back_as_none(tmp_path):
+    """A bundle written BEFORE #216 has no `data_state` key at all, not a null one."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    _, w_ser, o_ser, w_deser, o_deser = _dummy_io()
+    store.save(step=7, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+    slot_meta = tmp_path / "resume" / "slot-a" / "resume_meta.json"
+    legacy = json.loads(slot_meta.read_text())
+    del legacy["data_state"]
+    slot_meta.write_text(json.dumps(legacy))
+
+    meta = store.load(weights_deserializer=w_deser, optimizer_deserializer=o_deser)
+    assert "data_state" not in meta and meta.get("data_state") is None
+    assert meta["step"] == 7
+
+
+def test_data_state_adds_no_file_to_the_slot(tmp_path):
+    """It must live in the EXISTING meta file, never next to LATEST and never as a new
+    slot entry — anything outside the slot would lose the commit protocol's atomicity."""
+    store = CheckpointStore(str(tmp_path / "resume"))
+    _, w_ser, o_ser, _, _ = _dummy_io()
+    store.save(step=1, loss_scale_state=None, weights_serializer=w_ser,
+               optimizer_serializer=o_ser)
+    without = sorted(p.name for p in (tmp_path / "resume" / "slot-a").iterdir())
+
+    store2 = CheckpointStore(str(tmp_path / "resume2"))
+    store2.save(step=1, loss_scale_state=None, weights_serializer=w_ser,
+                optimizer_serializer=o_ser, data_state={"version": 1, "x": 2})
+    with_state = sorted(p.name for p in (tmp_path / "resume2" / "slot-a").iterdir())
+
+    assert without == with_state
+    assert sorted(p.name for p in (tmp_path / "resume2").iterdir()) == ["LATEST", "slot-a"]
 
 
 def test_store_alternates_slots(tmp_path):

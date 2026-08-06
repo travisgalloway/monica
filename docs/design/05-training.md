@@ -112,14 +112,22 @@ This separation is the crux of the migration story:
 - **`save_weights`** writes safetensors + a `<path>.config.json` sidecar — portable,
   the bridge between backends.
 - **`CheckpointStore`** writes the same-backend resume bundle (portable weights +
-  optimizer state + step + fp16 loss-scale state) via a backend-supplied serializer —
-  optimizer-state layout *is* backend-specific, and you never need to resume a
-  half-finished MLX run on CUDA. It is **double-buffered and crash-safe**: two slots plus
-  an atomically-flipped `LATEST` pointer, so a checkpoint interrupted mid-write (a spot
-  preemption on a multi-week run) leaves the *previous* checkpoint fully intact. The data
-  order on resume is reconstructed deterministically from `(seed, step, grad_accum)` — no
-  RNG is persisted, because the model has no train-time randomness (dropout-free; weight
-  init is overwritten by the loaded weights).
+  optimizer state + step + fp16 loss-scale state + the dataloader position) via a
+  backend-supplied serializer — optimizer-state layout *is* backend-specific, and you
+  never need to resume a half-finished MLX run on CUDA. It is **double-buffered and
+  crash-safe**: two slots plus an atomically-flipped `LATEST` pointer, so a checkpoint
+  interrupted mid-write (a spot preemption on a multi-week run) leaves the *previous*
+  checkpoint fully intact. No model RNG is persisted, because the model has no train-time
+  randomness (dropout-free; weight init is overwritten by the loaded weights).
+- **The data position used to be *reconstructed*, and since #216 it is *recorded*.** The
+  old rule — "data order on resume is derived deterministically from `(seed, step,
+  grad_accum)`" — holds only while `seq_len`, and therefore `len(loader)`, is constant for
+  the whole run. The length curriculum below breaks that, so `save(data_state=...)`
+  persists the stream's explicit position. It rides **inside the slot's existing
+  `resume_meta.json`**, so it is committed by the same atomic `LATEST` flip as the weights
+  and the step: a checkpoint can never ship weights that disagree with the data position
+  they were trained to. `data_state` is optional and read with `meta.get("data_state")`,
+  so pre-#216 bundles still resume via the old reconstruction.
 
 `safetensors` is imported lazily so the module loads without the dependency present.
 
@@ -144,6 +152,72 @@ Success is read straight off `<out>/metrics.jsonl`: a smoothly decreasing
 on ~1M repetitive bytes — it is fine for short smoke/validation runs but will eventually
 destabilize in fp32 if pushed far past that regime; the poc run (100M params, fp16 +
 dynamic scaling, ~3B diverse tokens) is the regime M5 actually targets.
+
+## Length curriculum + dataloader-state resume (#216)
+
+Two changes that the issue deliberately pairs, because **the first invalidates the
+invariant the second replaces**.
+
+**The curriculum.** `--curriculum "0.25:2048,0.5:4096,1.0:16384"` on `scripts/train.py`
+ramps `seq_len` across the run — short contexts through the early, high-LR steps, long
+context only in the second half. SSMs extend gracefully, and extending late is far
+cheaper than training long throughout. The spec is `until_frac:seq_len[:batch_size]`,
+comma separated, where **`until_frac` is cumulative** (the fraction of the run *ending* at
+that stage) and the last must be `1.0`; it is validated hard, because misreading it as
+"share of the run" would silently produce a plausible-but-wrong allocation. An omitted
+`batch_size` is derived as `max(1, base_batch*base_seq // seq_len_i)` — a **floor**, so a
+derived stage can only ever get cheaper than the reference, never surprise-OOM at 16k.
+Like every other run param, it is a **CLI flag, not model config**.
+
+Two things it deliberately does not do. **Val loss stays pinned at `cfg.seq_len`** — a
+val curve measured at a changing context length is not comparable across the run, which
+would make the POC's primary signal unreadable. And **holding tokens/step constant does
+not hold *cost* constant**: attention is O(L²), so 8× the length at ⅛ the batch is ~8× the
+attention FLOPs and activation memory for the ~12.5% attention layers. `grad_checkpoint:
+true` stays mandatory, and the explicit per-stage `batch_size` field exists precisely so
+an operator can shrink further at 16k.
+
+**Why explicit dataloader state became necessary.** Chunking is `seq_len`-dependent
+(`stride = seq_len + 1`, so `n_chunks` and `len(loader)` both move), which is exactly what
+the old step→position reconstruction assumed was fixed. On an interruptible pod the
+failure would have been *silent*: the run resumes, resamples data it has already seen, and
+its epoch accounting is quietly wrong while every log line looks healthy. So
+[`src/train/stream.py`](../../src/train/stream.py)'s `MicroBatchStream` carries the
+position as five counters — `stage_idx`, `micro_in_stage`, `global_micro`, `epoch_idx`,
+`batches_into_epoch` — and `state_dict()`/`load_state_dict()` round-trip them through the
+checkpoint. **Every failure path raises**; none degrades to "start a fresh epoch".
+`load_state_dict` checks a fingerprint (`seed`, `grad_accum`, per-stage shapes, corpus
+path + size) and an RNG tripwire, and names `--ignore-data-state` as the escape hatch.
+`steps` is deliberately *outside* the fingerprint, so extending a run with a bigger
+`--total-tokens` stays legal.
+
+Details worth carrying:
+
+- **Stage lengths are in optimizer steps**, so a boundary always lands on a step boundary
+  and no single step ever mixes shapes.
+- **`epoch_idx` is global, not per-stage.** The per-epoch shuffle reseeds with
+  `seed + epoch_idx`, so a global counter makes the one-stage case bit-identical to the
+  pre-#216 stream — which is what keeps SFT/DPO and the smoke gate unchanged. `train()`
+  synthesizes that one-stage curriculum when none is passed, so there is a single code
+  path.
+- **`torch.compile` recompiles at each boundary** (CUDA only). Bounded — at most
+  `n_stages - 1` events, and inductor promotes to dynamic shapes after the second distinct
+  `(B, L)` — so the mitigation is *visibility*, not a code change: the startup banner sizes
+  the cost explicitly and the loop emits an `{"event": "stage", ...}` line before each
+  boundary, so a stall there is attributable rather than mysterious. `dynamic=True`,
+  `mark_dynamic`, and CUDA graphs are out of scope.
+- **Acceptance is "kill-and-resume reproduces the exact data stream"**, checked at three
+  levels: `tests/test_stream.py` (pure numpy, kill points mid-epoch / on an epoch boundary
+  / on and after a stage boundary), `tests/test_train_loop.py::test_resume_across_curriculum_boundary`
+  (through the real loop), and the smoke gate's **phase 7**, which drives the real
+  `train()` + `MicroBatchStream` + `CheckpointStore` across a boundary and asserts both
+  that the post-resume loss trajectory matches *and* that the `seq_len` sequence really
+  changed — a curriculum that silently failed to engage must not pass.
+
+The guarantee is exact stream *reproduction*, not "no token is seen twice": `PackedLoader`
+cuts windows from one flat `train.bin` with no document structure, so chunking at a
+different `seq_len` is a different partition of the same corpus and later stages
+necessarily re-cover earlier tokens at a different alignment.
 
 ## Efficiency levers (M12, landed 2026-07-20/21)
 

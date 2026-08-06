@@ -71,6 +71,8 @@ PORTABLE_MODULES = [
     "src.train.loss_scale",
     "src.train.moe_balance",
     "src.train.loop",
+    "src.train.curriculum",
+    "src.train.stream",
     "src.train.logging",
     "src.eval.val_loss",
     "src.eval.quantize",

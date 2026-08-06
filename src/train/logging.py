@@ -23,7 +23,11 @@ class JsonlLogger:
         self._f.write(json.dumps(payload) + "\n")
         self._f.flush()
         if self.echo:
-            keys = ("step", "lr", "loss", "grad_norm", "val_loss", "val_perplexity")
+            # `event`/`seq_len` make a #216 length-curriculum stage change visible in the
+            # terminal — otherwise a boundary (and the CUDA recompile that follows it)
+            # looks like an unexplained stall.
+            keys = ("event", "step", "seq_len", "lr", "loss", "grad_norm",
+                    "val_loss", "val_perplexity")
             parts = [f"{k}={payload[k]:.4g}" if isinstance(payload.get(k), float)
                      else f"{k}={payload[k]}" for k in keys if k in payload]
             print("  ".join(parts))
