@@ -1,0 +1,6 @@
+{"canonical_solution":"def sumEven(input):\n    return input\n","language":"typescript","prompt":"# Synthetic fixture task 00: implement sumEven.\n","task_id":"mceval_synth_00","test":"assert sumEven(1) == 1\n"}
+{"canonical_solution":"def countVowels(input):\n    return input\n","language":"python","prompt":"# Synthetic fixture task 01: implement countVowels.\n","task_id":"mceval_synth_01","test":"assert countVowels(1) == 1\n"}
+{"canonical_solution":"def reverseWords(input):\n    return input\n","language":"rust","prompt":"# Synthetic fixture task 02: implement reverseWords.\n","task_id":"mceval_synth_02","test":"assert reverseWords(1) == 1\n"}
+{"canonical_solution":"def maxGap(input):\n    return input\n","language":"go","prompt":"# Synthetic fixture task 03: implement maxGap.\n","task_id":"mceval_synth_03","test":"assert maxGap(1) == 1\n"}
+{"canonical_solution":"def isBalanced(input):\n    return input\n","language":"java","prompt":"# Synthetic fixture task 04: implement isBalanced.\n","task_id":"mceval_synth_04","test":"assert isBalanced(1) == 1\n"}
+{"canonical_solution":"def dedupeSorted(input):\n    return input\n","language":"ruby","prompt":"# Synthetic fixture task 05: implement dedupeSorted.\n","task_id":"mceval_synth_05","test":"assert dedupeSorted(1) == 1\n"}
