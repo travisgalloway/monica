@@ -266,8 +266,14 @@ jobs:
       - name: Build (xcodebuild, so mlx-swift's Metal kernels actually get compiled)
         working-directory: swift/engine
         run: |
+          # mlx-swift's own Cmlx target carries a build-tool plugin (CudaBuild, a
+          # no-op on macOS). xcodebuild requires interactively trusting package
+          # plugins before first use; -skipPackagePluginValidation is the
+          # documented non-interactive-CI bypass (there is no prompt to answer
+          # in a headless runner, so without it xcodebuild hard-fails on
+          # "Validate plug-in \"CudaBuild\" in package \"mlx-swift\"").
           xcodebuild build -scheme MonicaEngine-Package -destination 'platform=macOS' \
-            -derivedDataPath .build-xcode
+            -derivedDataPath .build-xcode -skipPackagePluginValidation
       - name: Logit parity vs the Python MLX oracle
         working-directory: swift/engine
         run: |
