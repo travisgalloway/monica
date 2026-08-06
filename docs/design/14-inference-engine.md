@@ -236,10 +236,13 @@ DPO/GRPO step factories.
   M12 **small rung** (~120M active) backward fit *without* it on the target Mac? Note the Swift
   training target is that rung, **not** poc-24-layers-on-32 GB, so the answer may well be yes —
   but it is unmeasured.
-- **MoE in Swift.** MoE is MLX-Python-only today: `src/model/cuda_backend.py:665` raises
-  `NotImplementedError`, and the MLX `MoEBlock` (`src/model/mlx_backend.py:512`) is a toy softmax top-k
-  router with no shared expert and no load balancing. Porting an unfinished router to a third
-  implementation is premature — **sequence Swift MoE behind #213/#214**.
+- **MoE in Swift — RESOLVED (#166).** The concern was porting an *unfinished* router to a third
+  implementation. #213 settled it (`15d699b`: the aux-loss-free load-balancing policy plus the MLX
+  router), so #166 ported `MoEBlock` in full — the top-k double-argsort ranking, the biased-ranking
+  branch, and the `moe_route_bias.*` load path — gated by the `toy-moe` and `toy-moe-biased`
+  fixtures. Still Swift-side out of scope, as *training* surfaces with no effect on logits: load
+  counting (`_count_loads`/`pop_load`) and the `set_route_bias` write path, both for #195.
+  `src/model/cuda_backend.py:665` still raises `NotImplementedError` — that is #214.
 - **`SessionStore`'s budget math ignores the attention KV cache.** `per_session_state_floats`
   (`src/serve/sessions.py:40`) charges every layer a conv window plus an SSM state and has **no
   attention term**. That is exact for a pure-Mamba config, but the M12 hybrid's ~12.5% attention
@@ -258,12 +261,18 @@ DPO/GRPO step factories.
 - **Two engines is two maintenance surfaces.** Every seam change — #165's `prefill`, a promoted
   `verify_block` — now lands twice. The parity gates are the mitigation, and they are the reason
   the gates are non-negotiable rather than nice-to-have.
-- **Where the Swift engine lives — open.** Extend the existing `swift/` package with new targets
-  alongside `MonicaTokenizer`, or start a sibling package? #166 leaves it as "e.g. `swift/` or a
-  sibling repo". The pull toward reusing `swift/` is real — the tokenizer is already there and the
-  engine needs it. The cost is equally real: `swift/Package.swift` today has **zero** external
-  dependencies, which is precisely what makes its Linux CI cheap and its bit-exactness credible
-  (#246); adding mlx-swift changes that for the tokenizer too.
+- **Where the Swift engine lives — RESOLVED (#166): a sibling package at `swift/engine/`.**
+  `swift/Package.swift` is not touched. The rejected alternative was adding mlx-swift to it with
+  `condition: .when(platforms: [.macOS])` on the target dependency — which does not work, because
+  **platform conditions apply to build *edges*, not to *resolution***: SwiftPM would still clone
+  mlx-swift (which vendors the whole `mlx` C++ tree) on Linux, putting a large network fetch and a
+  new upstream-outage failure mode into `swift-linux`, a job that today needs zero network for
+  dependencies. It would also drag `swift/Package.swift` from `swift-tools-version: 5.9` /
+  `.macOS(.v13)` up to `6.0` / `.macOS("14.0")` **for the tokenizer too**. A sibling package keeps
+  `swift/`'s zero-dependency, cross-platform property intact — the property that makes the #246
+  bit-identity gate cheap and credible. `swift/engine/` is not inside any target path declared by
+  `swift/Package.swift`, so `cd swift && swift build` ignores it exactly the way it already ignores
+  `Fixtures/`. CI gains one job, `swift-engine` (macOS only); jobs 4/5/6 are unchanged.
 
 ## See also
 

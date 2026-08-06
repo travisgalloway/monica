@@ -219,3 +219,72 @@ jobs:
         run: |
           sha256sum macos/tokenizer.json linux/tokenizer.json
           cmp macos/tokenizer.json linux/tokenizer.json
+
+  # ── Job 7: the Swift/MLX model port's logit parity gate (#166) ────────────
+  # Apple-only: swift/engine/ is a SEPARATE SwiftPM package that depends on
+  # mlx-swift, deliberately kept OUT of swift/Package.swift so the tokenizer
+  # package stays dependency-free and swift-linux keeps needing no network for
+  # dependencies (platform conditions gate build edges, not RESOLUTION — SwiftPM
+  # would still clone mlx-swift's vendored C++ tree on Linux). Jobs 4/5/6 are
+  # untouched by design. See docs/design/14-inference-engine.md.
+  #
+  # `swift run monica-parity` compares the Swift model's forward AND stacked-step
+  # logits against checked-in Python/MLX references at fp32 rtol=1e-4/atol=1e-5.
+  swift-engine:
+    name: swift model parity (macOS, mlx-swift)
+    runs-on: macos-latest
+    # mlx-swift builds the vendored `mlx` C++ tree from source; a COLD runner
+    # build is plausibly 20-40 min, hence the generous timeout and the cache.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        # Piped to a file (in addition to stdout) so the cache key below can
+        # hashFiles() it — restoring a .build-xcode built by a different
+        # Swift/Xcode toolchain (macos-latest images roll forward) risks a
+        # flaky build, so the toolchain identity must be part of the key.
+        run: swift --version | tee .swift-toolchain-version
+      # mlx-swift's Cmlx target links a `default.metallib` (its Metal shader
+      # kernels) that plain `swift build`/`swift run` never compiles — SwiftPM
+      # CLI builds only produce the C++/Swift object code. `default.metallib`
+      # is an Xcode-only build product (see ml-explore/mlx-swift Package.swift's
+      # "PrepareMetalShaders" comment, and ml-explore/mlx-swift#345, which
+      # documents the same gap for downstream SPM consumers). Confirmed by
+      # trial: `swift build` succeeds and `swift run monica-parity` still fails
+      # with "Failed to load the default metallib. library not found" even
+      # with the MetalToolchain component present — no `.metal` compile step
+      # ever appears in `swift build`'s log. The fix is to build with
+      # `xcodebuild` (which mlx-swift's own CI does, via its aggregate
+      # `-Package` scheme) instead of `swift build`, then run the executable
+      # xcodebuild produced in DerivedData.
+      - name: Ensure Metal toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -downloadComponent MetalToolchain || true
+          xcodebuild -showComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: actions/cache@v4
+        with:
+          path: swift/engine/.build-xcode
+          key: swift-engine-${{ runner.os }}-${{ hashFiles('swift/engine/Package.resolved') }}-${{ hashFiles('.swift-toolchain-version') }}
+      - name: Build (xcodebuild, so mlx-swift's Metal kernels actually get compiled)
+        working-directory: swift/engine
+        run: |
+          # mlx-swift's own Cmlx target carries a build-tool plugin (CudaBuild, a
+          # no-op on macOS). xcodebuild requires interactively trusting package
+          # plugins before first use; -skipPackagePluginValidation is the
+          # documented non-interactive-CI bypass (there is no prompt to answer
+          # in a headless runner, so without it xcodebuild hard-fails on
+          # "Validate plug-in \"CudaBuild\" in package \"mlx-swift\"").
+          xcodebuild build -scheme MonicaEngine-Package -destination 'platform=macOS' \
+            -derivedDataPath .build-xcode -skipPackagePluginValidation
+      - name: Logit parity vs the Python MLX oracle
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-parity binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          "$BIN"
