@@ -191,6 +191,46 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   Distance-bucketed FIM eval ships with #215 as `src/eval/fim_eval.py` (portable, pure numpy,
   teacher-forced loss over the middle span with per-instance records); **#215 owns that module and
   #221 extends it** rather than writing a second one.
+
+> **What #221 shipped.** Instrumentation, not numbers — there is no trained MHM checkpoint yet
+> (#200/#222 are downstream), so every acceptance check is a fixture/determinism check. All of it
+> is above the seam (numpy + stdlib, in `tests/test_import_guard.py`'s `PORTABLE_MODULES`) and all
+> of it is **teacher-forced — no pass@1 gating anywhere**, because at the small rung a generative
+> gate is noise (the LSP-in-the-loop assessment: functional pass@1 flat at 0.503 while clean-rate
+> moved 0.887 → 0.962).
+>
+> | Module | Probe |
+> |---|---|
+> | `src/eval/code_suite.py` | shared per-instance record schema, canonical JSONL writer, bucketed aggregator, the batched causal span scorer, `StubCausalModel` |
+> | `src/eval/code_recall.py` | cross-file TS symbol resolution by token distance — CE **plus a discriminative rank** against near-miss exports (the actual recall signal) |
+> | `src/eval/code_needle.py` | RULER-over-code on a `context_len × depth` grid, `single` + `multikey` |
+> | `src/eval/fim_eval.py` | `evaluate_fim_multi_key` — prefix-length **and** recall-distance keyings from one forward pass |
+> | `src/eval/domain_bpb.py` | held-out BPB per domain, byte-weighted overall |
+> | `src/eval/external_sets.py` | pinned loaders + normalizing adapters for the seven named suites |
+> | `scripts/eval_code_suite.py` | the driver: shared-schema JSONL transcript + results JSON, `--stub-model` for offline runs |
+> | `scripts/build_domain_val_sets.py`, `scripts/build_decontam_blocklist.py` | the two artifacts the above consume |
+>
+> Type-aware completion (`tsc`) was **not** rebuilt — `TscRunner`/`CompositeOracle` already
+> implement it, and `--suites tsc` only surfaces their verdicts in the shared schema.
+>
+> **Two gaps stated rather than papered over.**
+>
+> 1. **The seven external revisions are unpinned.** An HF commit SHA cannot be resolved without
+>    network access, and inventing one is worse than not having one — a wrong pin silently loads a
+>    different revision or errors far from its cause. So the table ships `revision=None` with a
+>    `# TODO(pin):` per entry, a live pull **raises** while unpinned, and every `None` is echoed
+>    into the driver's results JSON. Only the MultiPL-E repo identifiers were confirmable offline
+>    (`repo_verified`); the rest must be checked at pin time. Fixtures are synthetic,
+>    schema-shaped rows — **no third-party benchmark data is checked in**.
+> 2. **Packed shards carry no domain/language field**, so per-domain BPB comes from purpose-built
+>    per-domain val sets (`scripts/build_domain_val_sets.py`, reading the cleaned Parquet where
+>    `source`/`lang`/`meta` still exist) rather than from the training corpus. That is a different
+>    measurement from "BPB per domain over the actual training mix", and the module docstring says
+>    so. **Follow-up:** a `.domains` uint8 sidecar written next to `.bounds` by both
+>    `src/data/shard.py` and `swift/Sources/MonicaTokenizer/Packing.swift` would let the number be
+>    read off the training corpus directly — a data-pipeline change requiring a re-pack, out of
+>    scope for an eval issue. `src/data/split.py` writing `n_bytes` (it currently does not, so
+>    `val_bpb` is silently omitted on the shard path) belongs with it.
 - **MHM-P3 — Small-model ablation sweep** (#219, ~$80–120 each): attention ratio 8/12/16%,
   d_state 128 vs 256, Jamba vs Routing-Mamba.
 - **MHM-P4 — Small-model full run** (#222, 50–70B tokens): the small **MoE** rung
