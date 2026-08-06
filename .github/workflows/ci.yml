@@ -268,13 +268,17 @@ jobs:
         # The cross-platform determinism gate for FIM insertion. A divergent RNG
         # (or any float creeping into the transform) shows up here and nowhere
         # else. manifest.json holds only ints and fixed strings — no paths, no
-        # floats — so it is safely byte-comparable.
+        # floats — so it is safely byte-comparable. Diff the full file lists
+        # (not a hardcoded part-00000.* set) so a future fixture that packs to
+        # multiple shard parts still gets every part compared, not silently
+        # skipped past the first.
         run: |
-          test -s fim-macos/part-00000.bin   # non-empty, or the cmp below is vacuous
-          for f in part-00000.bin part-00000.bounds manifest.json; do
+          test -s fim-macos/part-00000.bin   # non-empty, or the diff below is vacuous
+          diff <(cd fim-macos && find . -type f | sort) <(cd fim-linux && find . -type f | sort)
+          while IFS= read -r f; do
             sha256sum "fim-macos/$f" "fim-linux/$f"
             cmp "fim-macos/$f" "fim-linux/$f"
-          done
+          done < <(cd fim-macos && find . -type f | sort)
 
   # ── Job 7: the Swift/MLX model port's logit parity gate (#166) ────────────
   # Apple-only: swift/engine/ is a SEPARATE SwiftPM package that depends on
