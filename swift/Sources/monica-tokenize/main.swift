@@ -5,6 +5,7 @@
 //   monica-tokenize decode --tokenizer <tokenizer.json> [--in <file>]
 //   monica-tokenize pack   --tokenizer <tokenizer.json> --in <parquet|jsonl|txt|dir> --out <dir>
 //                          [--seq-len 8192] [--shard-size-mb 512] [--chunk-align N]
+//                          [--fim-rate 0.0] [--fim-seed 0]
 //   monica-tokenize stats  --tokenizer <tokenizer.json> --in <jsonl> [--json]
 //
 // `--in` reads stdin when omitted (encode/decode). `train`/`pack` corpus = a `.parquet` file or
@@ -63,6 +64,33 @@ func intFlag(_ flags: [String: String], _ name: String, default def: Int) -> Int
     guard let raw = flags[name], !raw.isEmpty else { return def }
     guard let v = Int(raw) else { fail("--\(name) must be an integer, got '\(raw)'") }
     return v
+}
+
+/// A `UInt64` flag, or `def` when absent. Separate from `intFlag` so a FIM seed can span the
+/// full 64-bit space (the RNG's seed type) instead of being clamped to `Int`'s signed range.
+func uint64Flag(_ flags: [String: String], _ name: String, default def: UInt64) -> UInt64 {
+    guard let raw = flags[name], !raw.isEmpty else { return def }
+    guard let v = UInt64(raw) else {
+        fail("--\(name) must be a non-negative integer in [0, \(UInt64.max)], got '\(raw)'")
+    }
+    return v
+}
+
+/// `--fim-rate 0.45` → 4500 basis points. The **only** floating-point step in the whole FIM path:
+/// rounding happens once, here, so the transform itself is integer-only and cannot drift between
+/// the macOS and Linux FP paths (which would break the `swift-parity` shard `cmp`). Absent → 0,
+/// i.e. FIM off, which keeps `pack` output byte-identical to the pre-#215 pipeline.
+func rateBasisPoints(_ flags: [String: String], _ name: String) -> Int {
+    guard let raw = flags[name], !raw.isEmpty else { return 0 }
+    guard let v = Double(raw) else { fail("--\(name) must be a number in [0, 1], got '\(raw)'") }
+    guard v >= 0 && v <= 1 else { fail("--\(name) must be in [0, 1], got '\(raw)'") }
+    let bp = Int((v * 10000).rounded())
+    // #215 pins the intended band at 0.4–0.5 (explicitly NOT the 0.5–0.9 reported elsewhere).
+    // Warn rather than fail: hard-failing would block a deliberate ablation sweep.
+    if bp > 0 && (bp < 4000 || bp > 5000) {
+        warn("--\(name) \(raw) is outside the intended 0.4–0.5 FIM band (#215); proceeding")
+    }
+    return bp
 }
 
 /// Text from `--in <file>` (failing fast if it can't be read — never a silent empty
@@ -212,16 +240,38 @@ func cmdPack(_ flags: [String: String]) {
         chunkAlign = nil
     }
 
+    // FIM insertion (#215) happens here, at pack time, because this is the only place documents
+    // still exist as whole objects — `src/data/split.py` drops the `.bounds` sidecars, so the
+    // Python trainer never sees doc structure. Trade-off, accepted and recorded in FIM.swift:
+    // changing the rate means re-packing the corpus, not editing a config.
+    let fimOptions = FIMOptions(rateBasisPoints: rateBasisPoints(flags, "fim-rate"),
+                                seed: uint64Flag(flags, "fim-seed", default: 0))
+    var fimStats = FIMStats()
+
     let docs = readDocs(inPath)
     let eos = tok.eosTokenId
-    let tokenized = docs.map { doc -> [Int] in
-        var ids = tok.encode(doc); ids.append(eos); return ids
+    var tokenized: [[Int]] = []
+    tokenized.reserveCapacity(docs.count)
+    for (i, doc) in docs.enumerated() {
+        // The index is `readDocs`'s, which is stable regardless of which docs `pack` later drops
+        // as empty — so a document's FIM outcome never depends on its neighbours.
+        var ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                options: fimOptions, stats: &fimStats)
+        ids.append(eos)
+        tokenized.append(ids)
     }
     do {
         let m = try Packing.pack(docs: tokenized, outDir: URL(fileURLWithPath: outPath),
                                  seqLen: seqLen, shardSizeMB: shardMB,
                                  tokenizer: "code", chunkAlign: chunkAlign)
         print("packed \(m.n_sequences) seq x \(seqLen) (\(m.n_tokens) tokens, \(m.shards.count) shard(s)) -> \(outPath)")
+        if fimOptions.isEnabled {
+            let rate = String(format: "%.4f", Double(fimOptions.rateBasisPoints) / 10000.0)
+            print("fim: \(fimStats.transformed)/\(docs.count) docs transformed "
+                  + "(rate \(rate), seed \(fimOptions.seed); \(fimStats.eligible) eligible, "
+                  + "skipped \(fimStats.skippedShort) short, "
+                  + "\(fimStats.skippedSentinel) sentinel-bearing)")
+        }
     } catch { fail("pack: \(error)") }
 }
 

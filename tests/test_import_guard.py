@@ -75,6 +75,7 @@ PORTABLE_MODULES = [
     "src.eval.val_loss",
     "src.eval.quantize",
     "src.eval.long_context",
+    "src.eval.fim_eval",
     "src.eval.olmes_adapter",
     "src.eval.bfcl_adapter",
     "src.eval.retrieval_probe",

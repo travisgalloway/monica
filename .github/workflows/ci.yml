@@ -157,6 +157,28 @@ jobs:
           name: tokenizer-macos
           path: ${{ runner.temp }}/tokenizer.json
           retention-days: 7
+      - name: Pack the parity corpus with FIM (#215)
+        # FIM insertion is seeded (SplitMix64, integer-only, no stdlib random
+        # conveniences) precisely so this output is bit-identical to the Linux
+        # job's. An in-process "pack twice, same bytes" check runs on ONE machine
+        # and therefore cannot catch a platform-divergent RNG; only the cmp in
+        # swift-parity can. `--fim-rate 0.5` sits at the top of #215's intended
+        # 0.4-0.5 band, so this exercises the transform on most documents.
+        working-directory: swift
+        run: |
+          swift run monica-tokenize pack \
+            --tokenizer "$RUNNER_TEMP/tokenizer.json" \
+            --in Fixtures/parity-corpus.jsonl --out "$RUNNER_TEMP/fim-shards" \
+            --seq-len 64 --shard-size-mb 1 --fim-rate 0.5 --fim-seed 1234 | tee "$RUNNER_TEMP/fim.log"
+          # An empty pack would leave swift-parity cmp-ing two nonexistent files
+          # and reading as a pass. A check that cannot observe its target is BLIND.
+          grep -qE '^packed [1-9][0-9]* seq' "$RUNNER_TEMP/fim.log"
+          grep -qE '^fim: [1-9][0-9]*/' "$RUNNER_TEMP/fim.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fim-shards-macos
+          path: ${{ runner.temp }}/fim-shards
+          retention-days: 7
 
   # ── Job 5: native Swift toolchain, Linux (#246) ───────────────────────────
   # The official swift image (Ubuntu 24.04, glibc 2.39) — the same toolchain the
@@ -194,6 +216,21 @@ jobs:
           name: tokenizer-linux
           path: ${{ runner.temp }}/tokenizer.json
           retention-days: 7
+      - name: Pack the parity corpus with FIM (#215)
+        # Must match the macOS job's flags exactly — swift-parity cmp's the two.
+        working-directory: swift
+        run: |
+          swift run monica-tokenize pack \
+            --tokenizer "$RUNNER_TEMP/tokenizer.json" \
+            --in Fixtures/parity-corpus.jsonl --out "$RUNNER_TEMP/fim-shards" \
+            --seq-len 64 --shard-size-mb 1 --fim-rate 0.5 --fim-seed 1234 | tee "$RUNNER_TEMP/fim.log"
+          grep -qE '^packed [1-9][0-9]* seq' "$RUNNER_TEMP/fim.log"
+          grep -qE '^fim: [1-9][0-9]*/' "$RUNNER_TEMP/fim.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fim-shards-linux
+          path: ${{ runner.temp }}/fim-shards
+          retention-days: 7
 
   # ── Job 6: the bit-identical guarantee itself (#246) ──────────────────────
   # #191/#245's whole premise is that the Swift tokenizer produces identical
@@ -219,6 +256,29 @@ jobs:
         run: |
           sha256sum macos/tokenizer.json linux/tokenizer.json
           cmp macos/tokenizer.json linux/tokenizer.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: fim-shards-macos
+          path: fim-macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: fim-shards-linux
+          path: fim-linux
+      - name: Diff the two FIM-packed shard sets (#215)
+        # The cross-platform determinism gate for FIM insertion. A divergent RNG
+        # (or any float creeping into the transform) shows up here and nowhere
+        # else. manifest.json holds only ints and fixed strings — no paths, no
+        # floats — so it is safely byte-comparable. Diff the full file lists
+        # (not a hardcoded part-00000.* set) so a future fixture that packs to
+        # multiple shard parts still gets every part compared, not silently
+        # skipped past the first.
+        run: |
+          test -s fim-macos/part-00000.bin   # non-empty, or the diff below is vacuous
+          diff <(cd fim-macos && find . -type f | sort) <(cd fim-linux && find . -type f | sort)
+          while IFS= read -r f; do
+            sha256sum "fim-macos/$f" "fim-linux/$f"
+            cmp "fim-macos/$f" "fim-linux/$f"
+          done < <(cd fim-macos && find . -type f | sort)
 
   # ── Job 7: the Swift/MLX model port's logit parity gate (#166) ────────────
   # Apple-only: swift/engine/ is a SEPARATE SwiftPM package that depends on
