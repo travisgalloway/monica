@@ -1,0 +1,86 @@
+{
+  "allow_network": false,
+  "blocklist": "blocklist.txt",
+  "min_words": 13,
+  "n_lines": 447,
+  "sha256": "01223d5cd5a1d207f9be2a78d4e9be3b5618f6a530870af4384e1b4d5ea2f52c",
+  "sources": {
+    "code_needle": {
+      "fixture_only": true,
+      "n_lines": 12,
+      "n_records": 12,
+      "revision": null,
+      "source": "eval_sets/code_needle/haystack.jsonl"
+    },
+    "code_recall": {
+      "fixture_only": true,
+      "n_lines": 12,
+      "n_records": 14,
+      "revision": null,
+      "source": "eval_sets/code_recall/fixture_repo.jsonl"
+    },
+    "external:crosscodeeval": {
+      "fixture_only": true,
+      "n_lines": 12,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/crosscodeeval/fixture.jsonl"
+    },
+    "external:mceval": {
+      "fixture_only": true,
+      "n_lines": 0,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/mceval/fixture.jsonl"
+    },
+    "external:multipl-e-humaneval-ts": {
+      "fixture_only": true,
+      "n_lines": 6,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/multipl-e-humaneval-ts/fixture.jsonl"
+    },
+    "external:multipl-e-mbpp-ts": {
+      "fixture_only": true,
+      "n_lines": 6,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/multipl-e-mbpp-ts/fixture.jsonl"
+    },
+    "external:real-fim-eval": {
+      "fixture_only": true,
+      "n_lines": 0,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/real-fim-eval/fixture.jsonl"
+    },
+    "external:repobench": {
+      "fixture_only": true,
+      "n_lines": 0,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/repobench/fixture.jsonl"
+    },
+    "external:safim": {
+      "fixture_only": true,
+      "n_lines": 0,
+      "n_records": 6,
+      "revision": null,
+      "source": "eval_sets/external/safim/fixture.jsonl"
+    },
+    "humaneval_ts": {
+      "fixture_only": true,
+      "n_lines": 318,
+      "n_records": 159,
+      "revision": null,
+      "source": "eval_sets/humaneval_ts/humaneval_ts.jsonl"
+    },
+    "ts_error_injection": {
+      "fixture_only": true,
+      "n_lines": 96,
+      "n_records": 96,
+      "revision": null,
+      "source": "eval_sets/ts_error_injection/eval.jsonl"
+    }
+  }
+}
