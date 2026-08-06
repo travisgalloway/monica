@@ -132,8 +132,8 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   balancing router (#213, **done on MLX** — portable `MoEBalancer` policy above the seam +
   selection-only route bias in `MoEBlock`; the bias rides in the portable safetensors so a served
   or ported checkpoint routes as trained) → CUDA MoE backend (#214: dropless routing, shared expert,
-  FSDP, sparse-upcycle init) → FIM collator (#215 — consumes the Swift-packed shards; the FIM
-  insertion transform may live in the Swift `pack` path), length curriculum + dataloader-state resume
+  FSDP, sparse-upcycle init) → FIM (#215, **done** — see the resolved note below), length
+  curriculum + dataloader-state resume
   (#216), routing instrumentation (#217), pure-PyTorch Mamba-2 reference for laptop parity (#218).
   **Training-efficiency levers** (folded 2026-07-20 from the efficiency-survey review): hybrid
   Muon+AdamW optimizer at the `make_optimizer` seam (#237, **done** — `3b02e6b`), WSD
@@ -146,7 +146,48 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   is already mature on the survey's biggest axes — data dedup/filtering, fused AdamW, SDPA, the
   mamba-ssm kernels, grad-checkpoint — so these four are the net-new levers; #216 is the
   length-curriculum lever.)
+> **Resolved 2026-08-06 (#215) — FIM insertion is in the Swift `pack` path, not a Python
+> collator.** An earlier draft left this open ("*may* live in the Swift pack path"). It is settled:
+> the transform is `swift/Sources/MonicaTokenizer/FIM.swift`, driven by `monica-tokenize pack
+> --fim-rate <0..1> --fim-seed <n>`.
+>
+> *Why.* FIM needs **document boundaries**, and pack time is the only place they still exist as
+> objects. `src/data/split.py` drops the `.bounds` sidecars, so the trainer reads a flat
+> `train.bin` through `PackedLoader`, which cuts fixed `seq_len` windows and cannot see doc
+> structure. Reconstructing boundaries in the loader to feed a collator is a far larger change
+> than doing the transform where the documents are still whole.
+>
+> *Trade-offs, accepted.* Changing the FIM rate requires a **re-pack** of the corpus, not a config
+> edit. The transform sits outside the pytest gate because it is Swift — `monica-selfcheck` is its
+> test runner (the package declares no `.testTarget`), backed by `tests/test_swift_fim.py`, which
+> shells out to the built binary.
+>
+> *Shape.* PSM only (SPM is out of scope): `[fim_prefix] prefix [fim_suffix] suffix [fim_middle]
+> middle`. The **rate band is 0.4–0.5** — explicitly *not* the 0.5–0.9 reported elsewhere; a rate
+> outside the band warns rather than fails so an ablation is not blocked. Cuts are on UTF-8 **byte**
+> offsets of the document text, not on token ids: slicing ids would make every middle begin exactly
+> on a token boundary, the classic silent FIM distribution bug (StarCoder2 shipped one).
+>
+> *Determinism is a CI gate.* Insertion is seeded per document with SplitMix64 (integer-only, no
+> stdlib random conveniences, no floats, no hashed-collection iteration, no grapheme indexing), and
+> `.github/workflows/ci.yml`'s `swift-parity` job now `cmp`s macOS-packed FIM shards against
+> Linux-packed ones. `--fim-rate` defaults to 0, so pre-#215 pack output is byte-identical.
+>
+> *Architectural consequence — configuration guidance, not a validator rule.* In PSM the suffix is
+> consumed **before** the middle is generated, so every middle token depends on recalling the suffix
+> out of state — the fixed-width-state bottleneck the hybrid exists to patch. Therefore **the final
+> block should be an attention block**: `n_layers % attn_every == 0`, from `layer i is attention iff
+> (i+1) % attn_every == 0` (`src/model/blocks.py:192`). `config/toy-hybrid.yaml` satisfies it
+> (4 layers, `attn_every 2` → `[Mamba, Attn, Mamba, Attn]`); `config/student-1b.yaml` (28 layers,
+> `attn_every 8` → attention at 7/15/23, top block Mamba) does **not**, so a future MHM config must
+> not copy that shape. This is deliberately *not* a `MambaConfig.validate()` rule — that validator
+> is shared with reserve configs that legitimately violate it. `src/eval/fim_eval.py`'s
+> `attention_after_suffix()` is the advisory check.
+
 - **MHM-P2e — Evals** (build first): code eval suite (#221), BPB (#192, primary).
+  Distance-bucketed FIM eval ships with #215 as `src/eval/fim_eval.py` (portable, pure numpy,
+  teacher-forced loss over the middle span with per-instance records); **#215 owns that module and
+  #221 extends it** rather than writing a second one.
 - **MHM-P3 — Small-model ablation sweep** (#219, ~$80–120 each): attention ratio 8/12/16%,
   d_state 128 vs 256, Jamba vs Routing-Mamba.
 - **MHM-P4 — Small-model full run** (#222, 50–70B tokens): the small **MoE** rung
