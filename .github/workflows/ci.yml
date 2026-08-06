@@ -240,14 +240,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: swift --version
-      # mlx-swift's Cmlx target links a `default.metallib` that ships as an
-      # Xcode-only build product (no SwiftPM build-tool plugin builds it — see
-      # ml-explore/mlx-swift Package.swift's "PrepareMetalShaders" comment).
-      # It's produced at runtime via `xcrun -sdk macosx metal`, which since
-      # Xcode 16 needs the (separately downloadable) MetalToolchain component;
-      # GitHub-hosted macOS runner images don't document it as preinstalled.
-      # Without it, `swift run` fails with "Failed to load the default
-      # metallib. library not found" even though `swift build` succeeds.
+      # mlx-swift's Cmlx target links a `default.metallib` (its Metal shader
+      # kernels) that plain `swift build`/`swift run` never compiles — SwiftPM
+      # CLI builds only produce the C++/Swift object code. `default.metallib`
+      # is an Xcode-only build product (see ml-explore/mlx-swift Package.swift's
+      # "PrepareMetalShaders" comment, and ml-explore/mlx-swift#345, which
+      # documents the same gap for downstream SPM consumers). Confirmed by
+      # trial: `swift build` succeeds and `swift run monica-parity` still fails
+      # with "Failed to load the default metallib. library not found" even
+      # with the MetalToolchain component present — no `.metal` compile step
+      # ever appears in `swift build`'s log. The fix is to build with
+      # `xcodebuild` (which mlx-swift's own CI does, via its aggregate
+      # `-Package` scheme) instead of `swift build`, then run the executable
+      # xcodebuild produced in DerivedData.
       - name: Ensure Metal toolchain
         run: |
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -256,11 +261,20 @@ jobs:
           xcrun -sdk macosx metal --version
       - uses: actions/cache@v4
         with:
-          path: swift/engine/.build
+          path: swift/engine/.build-xcode
           key: swift-engine-${{ runner.os }}-${{ hashFiles('swift/engine/Package.resolved') }}
-      - name: Build
+      - name: Build (xcodebuild, so mlx-swift's Metal kernels actually get compiled)
         working-directory: swift/engine
-        run: swift build
+        run: |
+          xcodebuild build -scheme MonicaEngine-Package -destination 'platform=macOS' \
+            -derivedDataPath .build-xcode
       - name: Logit parity vs the Python MLX oracle
         working-directory: swift/engine
-        run: swift run monica-parity
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-parity binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          "$BIN"
