@@ -82,6 +82,10 @@ and asserts no backend leaked into `sys.modules`. **When adding code above the s
 do not import a backend — and add new portable modules to that test's
 `PORTABLE_MODULES` list.** Keep MLX-only imports local (inside functions), as
 `scripts/smoke_test.py` does, when a portable-ish entry point needs the backend.
+`src/train/upcycle.py` (#214's sparse-upcycle transform — dense checkpoint to MoE init)
+is a recent example: numpy-only, no backend import, lives above the seam in
+`PORTABLE_MODULES` despite reading/writing the same safetensors weights the two
+below-seam backends produce.
 
 **A third category — the `swift/` native toolchain (the repo's first Swift package).** The
 code tokenizer (#191, PR #245) is a native, cross-platform Swift package (`swift/MonicaTokenizer`
@@ -195,12 +199,18 @@ The smoke gate stresses exactly this round-trip.
 - The **active program is M12 — the from-scratch Mamba-2 hybrid MoE code model** (**GitHub issue
   #198**, the live tracker; design record `docs/design/13-code-model-moe.md`): the "MHM" spine
   (own BPE #191 **— done: native Swift, PR #245** → Essential-Web + Stack-v2 corpus #193 →
-  aux-loss-free MoE router #213 → CUDA MoE backend #214 → FIM/curriculum/eval build → ablation
-  sweep #219 → small full run #222 → sparse-upcycled large run #223), with **SSI**
+  aux-loss-free MoE router #213 **— done** → CUDA MoE backend #214 **— done: dropless
+  grouped-gather routing, shared expert, `src/train/upcycle.py` sparse-upcycle init; fp8
+  expert GEMMs (#240) and 8-bit AdamW moments wired but hardware-unverified; FSDP/ZeRO-2 +
+  expert parallel split into a follow-up issue that blocks #223, not #222** →
+  FIM/curriculum/eval build → ablation sweep #219 → small full run #222 → sparse-upcycled
+  large run #223), with **SSI**
   (structural-signal integration) as a secondary
   measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
   #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
-  gate). The bulk of the net-new work is the MoE build (#213/#214) — MoE is MLX-toy-only today.
+  gate). The MoE build (#213/#214) is done on both backends; remaining net-new work ahead of
+  the #222/#223 runs is FSDP/ZeRO-2 + expert parallel and resolving #223's `d_model`
+  conflict with #200 (see `docs/design/13-code-model-moe.md`'s "Open (#223)" note).
 - **Reserve/history — M10 distillation (#65) was dropped 2026-07-19; its code was removed from the
   tree (#189).** The teacher/student/distill modules, `scripts/distill.py`/`sweep.py`/
   `precompute_teacher.py`, `distill_manifest`, and the corpus tooling are gone (recoverable via git

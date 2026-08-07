@@ -324,7 +324,10 @@ pip install -e ".[dev,data,cuda-fast]"
 
 # 2. CUDA smoke gate — prove the torch backend resumes bit-exactly through the
 #    double-buffered CheckpointStore. Build a tiny toy split on the pod, then:
-python scripts/smoke_test.py --backend cuda --data <toy-split>     # use config/toy.yaml (dense; MoE is MLX-only)
+python scripts/smoke_test.py --backend cuda --data <toy-split>     # config/toy.yaml (dense)
+#    Or exercise the CUDA MoE path (#214 — MoE is no longer MLX-only) the same way:
+python scripts/smoke_test.py --backend cuda --config config/toy-moe.yaml --moe-impl gather \
+    --data <toy-split>
 
 # 3. Train-step bench — s/step, tokens/s, and PEAK GPU MEMORY for the real path,
 #    BEFORE paying for big cards:
@@ -338,6 +341,54 @@ python scripts/train.py --backend cuda --config config/<student-or-poc>.yaml \
 Bring the pod up **in that order** so a config or throughput problem surfaces *before* the long
 run. The CUDA backend is already done and A40-verified (the full suite is green on a rented
 A40); the fused kernels auto-detect at runtime and degrade gracefully when absent.
+
+### Manual verification: 8-bit optimizer + fp8 experts (#214)
+
+Both levers are real code paths, not stubs, but neither is CI-testable: `cuda-cpu` runs on CPU
+torch with no `bitsandbytes`/`transformer-engine` installed at all, and `full-macos`/`portable`
+have no CUDA. What CI DOES cover (`tests/test_cuda_8bit_optimizer.py`, `tests/test_cuda_fp8.py`):
+config surface, `optimizer_sizing_key`, the `SystemExit`/`NotImplementedError` seam guards, and
+the lazy-import guarantee (`tests/test_import_guard.py`'s `FORBIDDEN_ROOTS`). Everything below
+needs real hardware and is a merge-adjacent checklist item, not a blocking gate.
+
+**8-bit AdamW (`optimizer_8bit: true`, any Ampere+ card):**
+
+```bash
+pip install -e ".[dev,data,cuda-8bit]"     # bitsandbytes — CUDA-only wheels, no macOS build
+python scripts/smoke_test.py --backend cuda --config config/toy-moe-8bit.yaml --data <toy-split>
+```
+- [ ] Model builds and trains without the `SystemExit`/`ImportError` path firing.
+- [ ] `nvidia-smi`/`torch.cuda.max_memory_allocated()` shows a lower optimizer-state footprint
+      than the same config with `optimizer_8bit: false` (the whole point of the lever).
+- [ ] The resume-exactness phase of the smoke gate still passes — a bitsandbytes state-dict
+      round trip through `CheckpointStore` must not silently drop or requantize state.
+- [ ] Confirm the tied embedding's optimizer state actually stayed 32-bit: inspect
+      `bnb.optim.GlobalOptimManager.get_instance().pid2config` for `id(model.embedding.weight)`,
+      or diff its per-param memory footprint against a non-embedding AdamW8bit param of similar
+      size.
+- [ ] `muon` + `optimizer_8bit` stacked: confirm the memory savings are small relative to plain
+      `adamw` + `optimizer_8bit` — Muon already owns the expert matrices and the embedding is
+      forced to 32-bit either way, so this is a sanity check, not a real lever.
+
+**fp8 MoE experts (`fp8_experts: true`, Hopper+/sm_90 only — H100, H200, etc.):**
+
+```bash
+pip install -e ".[dev,data,cuda-fp8]"      # transformer-engine — Hopper-only prebuilt wheels
+pytest -q tests/test_cuda_fp8.py           # un-skips the two Hopper-gated acceptance tests here
+python scripts/smoke_test.py --backend cuda --config config/toy-moe.yaml --moe-impl gather \
+    --data <toy-split>   # then repeat with fp8_experts: true set in the config
+```
+- [ ] `[cuda] fp8 MoE experts ACTIVE (Transformer Engine, Hopper+).` printed at model build
+      (`_report_fp8_status_once`) — a silent bf16 fallback here is a throughput trap, not a
+      correctness bug, so it is easy to miss without checking this line.
+- [ ] `tests/test_cuda_fp8.py::test_fp8_expert_forward_matches_bf16` and
+      `::test_fp8_expert_checkpoint_backward_finite_grads` pass (both skip everywhere else).
+- [ ] A real training step under `grad_checkpoint: true` + `fp8_experts: true` runs several
+      hundred steps without the fp8 amax history diverging into non-finite loss — the `te.
+      checkpoint` vs plain-checkpoint distinction this PR wires in is exactly the failure mode
+      a short smoke run would not catch (amax drift compounds over many steps).
+- [ ] `torch.compile` (`--compile` on `smoke_test.py`, or `torch_compile: true`) still graph-breaks
+      cleanly around `te.Linear`/`te.checkpoint` rather than hard-erroring.
 
 ---
 

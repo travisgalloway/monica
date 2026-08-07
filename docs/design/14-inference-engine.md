@@ -242,7 +242,11 @@ DPO/GRPO step factories.
   branch, and the `moe_route_bias.*` load path — gated by the `toy-moe` and `toy-moe-biased`
   fixtures. Still Swift-side out of scope, as *training* surfaces with no effect on logits: load
   counting (`_count_loads`/`pop_load`) and the `set_route_bias` write path, both for #195.
-  `src/model/cuda_backend.py:665` still raises `NotImplementedError` — that is #214.
+  `src/model/cuda_backend.py`'s CUDA `MoEBlock`/`_Expert` landed with #214 (dropless
+  grouped-gather routing, shared expert) — the `NotImplementedError` this line used to cite
+  is gone. Swift porting the CUDA-specific gather dispatch remains out of scope for #166
+  (Swift is inference-only and evaluates every expert the same way the MLX/dense reference
+  does; gather is a training-throughput optimization with no logit effect to port).
 - **`SessionStore`'s budget math ignores the attention KV cache.** `per_session_state_floats`
   (`src/serve/sessions.py:40`) charges every layer a conv window plus an SSM state and has **no
   attention term**. That is exact for a pure-Mamba config, but the M12 hybrid's ~12.5% attention

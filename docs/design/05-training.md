@@ -60,7 +60,13 @@ sparse-upcycle branch, #223), which cosine cannot give you without re-running th
 Both schedules are indexed by `step` over `total_steps` and WSD's decay window is a
 *fraction* (`decay_frac`) of it, so nothing here depends on `total_steps` being fixed —
 which is what keeps it compatible with the length curriculum (#216), where tokens/step
-varies.
+varies. `scripts/train.py --init <path>` (#214) is the missing half of this lever: it
+loads foreign PORTABLE weights (via `check_weight_keys`, `strict=True`-equivalent) as a
+fresh step-0 start with a NEW LR schedule/optimizer state, which is exactly what a WSD
+re-decay branch needs — `--resume` (same-backend, same schedule, same optimizer state)
+answers a different question and always wins if both are passed (see
+[Sparse-upcycle init (#214)](#sparse-upcycle-init-214) below for `--init`'s other
+consumer).
 
 ## The backend step: clipping + loss scaling
 
@@ -153,6 +159,39 @@ on ~1M repetitive bytes — it is fine for short smoke/validation runs but will 
 destabilize in fp32 if pushed far past that regime; the poc run (100M params, fp16 +
 dynamic scaling, ~3B diverse tokens) is the regime M5 actually targets.
 
+## Sparse-upcycle init (#214)
+
+`scripts/train.py --init <path>` starts a FRESH step-0 run from a foreign checkpoint's
+PORTABLE weights (safetensors + config sidecar), rather than resuming its optimizer
+state/step/schedule the way `--resume` does. `--resume` **wins unconditionally** if both
+are passed, and the ignore is printed, never silent — a mistyped `--init` on an
+already-resumable run must not silently do the wrong thing. `check_weight_keys`
+(`src/train/checkpoint.py`) enforces `strict=True`-equivalent key matching on load: CUDA's
+`load_state_dict(strict=True)` already refuses a missing/extra/wrong-shaped key, but MLX's
+`_load_portable` (`mlx_backend.py:1006`) ends in a plain `self.update(...)`, which is
+*silently lenient* — a missing key leaves that param at random init and a wrong-shaped
+tensor is silently rebound. `check_weight_keys` closes that gap so `--init` is equally safe
+on both backends.
+
+`src/train/upcycle.py` (portable, numpy-only) is the actual sparse-upcycle transform this
+flag is built for: `upcycle_dense_to_moe(...)` takes a **dense** checkpoint — specifically
+a degenerate `n_experts: 1, top_k: 1` "MoE" block, which validate() permits and which IS a
+plain SwiGLU FFN (softmax over one logit is exactly 1.0) — and replicates its
+`experts.0.{gate,up,down}` into every expert slot of a real MoE target, re-initializes the
+router (`U(±1/sqrt(d_model))`, matching what both backends' `nn.Linear` already produces —
+no new magic constant), and zeros the shared expert's `down` projection so the combined
+block reproduces the dense forward exactly at step 0 regardless of the combination
+formula. `check_upcycle_compatible(src_cfg, dst_cfg)` reports **every** dimension mismatch
+at once (not one-at-a-time raises, which is how a run ends up mis-dimensioned) and hard-
+`UpcycleError`s on any `d_model` mismatch — expert replication can copy a tensor, not widen
+it; see [13-code-model-moe.md](13-code-model-moe.md#the-ssi-fold-structural-signal-integration--secondary)'s
+"Open (#223)" note for why that is a live constraint, not a hypothetical one.
+`scripts/upcycle.py` runs this offline as an explicit, one-shot CLI (never implicitly
+inside `train.py` — a mistyped `--init` reshaping instead of erroring would burn a whole
+run on a wrong init that still produces a plausible-looking loss curve), writing one
+weights artifact plus a `.upcycle.json` manifest (source sha256, seed, both configs) next
+to it.
+
 ## Length curriculum + dataloader-state resume (#216)
 
 Two changes that the issue deliberately pairs, because **the first invalidates the
@@ -231,7 +270,8 @@ mamba-ssm kernels, grad checkpointing), so these are the net-new ones.
 | Hybrid **Muon + AdamW** optimizer | #237 / `3b02e6b` | `src/model/cuda_muon.py`, selected at the `make_optimizer` seam in `src/model/backend.py` | **landed** |
 | **WSD** LR schedule | #238 / `8fe62f7` | `src/train/schedule.py` (`WSDSchedule`) — see above | **landed** |
 | **`torch.compile`** default-on for real CUDA runs | #239 / `7a71073` | `src/model/cuda_backend.py` | **landed** |
-| **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240 / `c57a8e6` | `src/model/cuda_backend.py` (`_te_linear_cls`, `fp8_status`) | **design-only**, gated on #214 |
+| **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240, landed with #214 | `src/model/cuda_backend.py` (`_te_linear_cls`, `MoEBlock._fp8_ctx`, `_layer_forward`'s TE-checkpoint branch) | **wired**, hardware-unverified (no Hopper CI runner) |
+| **8-bit AdamW moments** (bitsandbytes) | #214 | `src/model/backend.py` (`_cuda_backend._make_optimizer`'s `_adamw` helper) | **wired**, hardware-unverified (no CUDA CI runner) |
 
 Two details worth carrying:
 
@@ -245,9 +285,41 @@ Two details worth carrying:
   eager. fp8's `te.Linear` graph-breaks `torch.compile` the same way `mamba-ssm` does —
   safe, but it is why the fp8 path is opaque to inductor.
 
-The fp8 code is **defined but never called** until the CUDA MoE backend (#214) lands, since
-there are no CUDA expert linears to attach it to yet. Do not read `fp8_experts: bool` in
-`MambaConfig` as a working switch.
+The fp8 code is now live: `_Expert`'s linears are built by `_expert_linear` (a `te.Linear`
+when `fp8_experts` resolves TE on a Hopper+ device, else the bf16/fp16 `nn.Linear`
+fallback), and `MoEBlock._fp8_ctx` wraps the expert-compute region — dense/gather
+dispatch plus the shared-expert sum, but deliberately NOT the router (a plain `nn.Linear`
+that always routes in fp32) — in `transformer_engine.pytorch.fp8_autocast(...)`, since a
+`te.Linear` called outside that context silently runs in bf16. Grad-checkpointed MoE
+layers under `fp8_experts` route through `transformer_engine.pytorch.checkpoint` instead
+of the plain `torch.utils.checkpoint` call every other layer uses — plain checkpoint's
+recompute pass would double-update the fp8 amax history TE calibrates its scale from.
+None of this is CI-verified (no Hopper runner); see `tests/test_cuda_fp8.py`'s two
+Hopper-gated acceptance tests and docs/infrastructure.md's manual-verification checklist.
+
+### 8-bit AdamW moments (#214)
+
+`optimizer_8bit: bool` on `MambaConfig` is an axis **orthogonal to** `optimizer`
+(`adamw`/`muon`), not a third enum value, so it composes with the Muon hybrid: Muon
+already routes 2D hidden weight matrices (including MoE expert gate/up/down) through
+Newton-Schulz orthogonalization with its own (non-Adam) state, so `optimizer_8bit` only
+changes how the **AdamW-routed remainder** stores its moments — embeddings, norms,
+biases, the router, `dt_proj` under `muon`, or literally everything under plain `adamw`.
+`backend.py::_cuda_backend._make_optimizer`'s `_adamw(params)` helper is the ONE place
+the 8-bit switch appears, shared by both branches: it builds `bnb.optim.AdamW8bit`
+(`bitsandbytes`, imported lazily — a missing `[cuda-8bit]` install surfaces as a legible
+`SystemExit` naming the extra, not a bare `ImportError`) and then forces the tied
+embedding's optimizer state back to 32-bit via `bnb.optim.GlobalOptimManager`, since it
+is the single largest AdamW-routed tensor and is touched every step regardless of batch
+content. **`muon` + `optimizer_8bit` saves almost nothing** — Muon already owns the
+memory-heavy expert matrices, and the embedding is forced back to 32-bit either way — so
+the lever's real payoff is plain `adamw` + `optimizer_8bit`, not the stacked combination.
+`bnb.optim.AdamW8bit` has no `fused` kwarg (a `TypeError` at run start if one is passed,
+unlike stock `torch.optim.AdamW`). The MLX backend raises `NotImplementedError` on
+`optimizer_8bit`, mirroring the existing Muon raise — bitsandbytes has no MLX/Metal port,
+and a silent 32-bit fallback would make a Mac memory measurement quietly wrong.
+Hardware-unverified like fp8, above; see `config/toy-moe-8bit.yaml` (a config-surface
+fixture only) and docs/infrastructure.md's manual-verification checklist.
 
 ## Related
 

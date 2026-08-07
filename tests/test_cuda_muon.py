@@ -165,10 +165,17 @@ def test_hybrid_optimizer_tolerates_empty_side():
     hybrid.load_state_dict(sd)                       # no-op on the muon side, must not raise
 
 
-def test_backend_partitions_real_model_params_via_is_muon_param():
+@pytest.mark.parametrize("cfg_path", [
+    TOY_MUON_CFG,
+    "config/toy-moe-muon.yaml",   # #214: covers MoE expert gate/up/down (Muon) + router (AdamW)
+])
+def test_backend_partitions_real_model_params_via_is_muon_param(cfg_path):
     """End-to-end: `get_backend("cuda").make_optimizer` on a `optimizer: muon` config
-    partitions the real CUDA model's named_parameters() exactly per `is_muon_param`."""
-    cfg = load_config(TOY_MUON_CFG)
+    partitions the real CUDA model's named_parameters() exactly per `is_muon_param`.
+    Parametrized over a plain hybrid config and an MoE one (#214) — the MoE case
+    additionally proves expert gate/up/down matrices land on Muon while the router
+    (also 2D, but excluded by `is_muon_param`'s router carve-out) stays on AdamW."""
+    cfg = load_config(cfg_path)
     assert cfg.optimizer == "muon"
     torch.manual_seed(0)
     model = CUDAMambaModel(cfg)

@@ -113,7 +113,7 @@ PORTABLE_MODULES = [
     "src.serve.spec_decode",
 ]
 
-FORBIDDEN_ROOTS = ("mlx", "torch")
+FORBIDDEN_ROOTS = ("mlx", "torch", "bitsandbytes")
 
 
 def _run_guard(modules):

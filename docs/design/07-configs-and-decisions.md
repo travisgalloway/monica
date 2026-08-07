@@ -15,6 +15,10 @@ scale run) — but they are no longer the whole surface.
 | `toy.yaml` | milestone-1..4 smoke test; tiny + fp32 so fixed-seed resume is exactly reproducible | **live** (the gate) |
 | `toy-hybrid.yaml` | tiny Mamba-2 with config-gated attention layers (#67) — parity + sizing tests exercise both block types | live |
 | `toy-moe.yaml` | tiny Mamba-2 with config-gated sparse-MoE FFN layers (#53) — parity + sizing tests exercise the MoE block | live |
+| `toy-moe-dense.yaml` | degenerate `n_experts: 1, top_k: 1` MoE block (IS a plain dense SwiGLU FFN) — the sparse-upcycle SOURCE fixture (#214) | live |
+| `toy-moe-fine.yaml` | 64 x top-6, `moe_d_ff = d_inner/8`, balancing ON — the sparse-upcycle TARGET fixture, pairs with `toy-moe-dense.yaml` (#214) | live |
+| `toy-moe-muon.yaml` | `toy-moe.yaml` + `optimizer: muon` — covers expert gate/up/down (Muon) and the router (AdamW) in one real model (#214) | live |
+| `toy-moe-8bit.yaml` | `toy-moe.yaml` + `optimizer_8bit: true` — config-surface fixture ONLY, not runnable without `bitsandbytes`/a CUDA host (#214) | live (surface-only) |
 | `toy-muon.yaml` | toy.yaml's shape with `optimizer: muon` (#237) — exercises the hybrid optimizer | live |
 | `small.yaml` | ~2.6M params, byte vocab — fast local iteration | live |
 | `poc.yaml` | ~127M OLMo-vocab from-scratch scale run | reserve (validated foundation, #75) |
@@ -32,7 +36,12 @@ scale run) — but they are no longer the whole surface.
 
 The M12 code model's own configs (small ~120M-active/700M-total, "Large A"
 ~700M-active/3.5B-total) do **not** exist yet — they arrive with #200/#219. See
-[13-code-model-moe.md](13-code-model-moe.md).
+[13-code-model-moe.md](13-code-model-moe.md). **Note (#200):** whatever `d_model` #200
+lands at, Large A's sparse-upcycle source must match it exactly — `src/train/upcycle.py`
+hard-raises `UpcycleError` on any `d_model` mismatch (expert replication copies a tensor,
+it cannot widen one). #200's currently-assumed `d_model 768` does not match Large A's
+current default of `d_model 1536`; see [13-code-model-moe.md](13-code-model-moe.md)'s
+"Open (#223)" note and its follow-up issue before dimensioning #200.
 
 ## `config/toy.yaml`
 

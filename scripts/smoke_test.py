@@ -22,6 +22,7 @@ ordering. The portable loop (train.loop) is exercised separately.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 
@@ -46,6 +47,9 @@ def main() -> None:
                          "ramp derived from the config (seq_len//2 -> seq_len).")
     ap.add_argument("--curriculum-steps", type=int, default=20,
                     help="phase 7: optimizer steps for the curriculum kill/resume gate")
+    ap.add_argument("--moe-impl", choices=("auto", "dense", "gather"), default=None,
+                    help="#214: override config.moe_impl (the MoE compute strategy) "
+                         "without editing the YAML; no-op on a config with no MoE layers")
     args = ap.parse_args()
 
     # Backend selection stays behind the seam factory; only portable modules are
@@ -59,15 +63,17 @@ def main() -> None:
 
     backend = get_backend(args.backend)
     cfg = load_config(str(args.config))
+    if args.moe_impl is not None:
+        cfg = dataclasses.replace(cfg, moe_impl=args.moe_impl)
+        cfg.validate()
     assert cfg.precision == "fp32", "smoke test requires fp32 for exact resume"
-    # Pin the CUDA gate to a DENSE config (e.g. config/toy.yaml). MoE-Mamba (#53) is
-    # MLX-only, so CUDAMambaModel refuses to build it — fail here with that reason
-    # rather than deep inside model construction. (toy-moe.yaml is also fp32, so the
-    # precision assert above would not catch it.)
-    if backend.name == "cuda":
-        assert cfg.n_moe_layers == 0, (
-            f"CUDA smoke gate needs a dense config (got {args.config} with "
-            f"{cfg.n_moe_layers} MoE layers); MoE is MLX-only. Use config/toy.yaml.")
+    # A dense-config-only restriction used to sit here ("MoE is MLX-only"). That is now
+    # false (#214): the CUDA backend builds and trains MoE, and its grouped-gather
+    # dispatch was deliberately built on a deterministic `index_select` backward (never
+    # an atomic `index_add_`) SPECIFICALLY so discrete top-k routing stays inside this
+    # gate's bit-exact-fp32-resume contract rather than needing a carve-out from it —
+    # see the determinism note in `cuda_backend.py::MoEBlock._moe_gather`. A MoE config
+    # now runs this gate exactly like a dense one, `--moe-impl gather` included.
     N = args.steps
     half = N // 2
     np_to = backend.to_numpy
@@ -146,7 +152,6 @@ def main() -> None:
         if backend.name != "cuda":
             print("[compile] skipped (only meaningful on the CUDA backend)")
         else:
-            import dataclasses
             import math as _math
 
             ccfg = dataclasses.replace(cfg, torch_compile=True)

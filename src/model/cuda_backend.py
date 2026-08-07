@@ -17,6 +17,7 @@ it stays out of `tests/test_import_guard.py`'s portable set.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import List, Tuple
 
@@ -110,14 +111,14 @@ def _report_fast_path_once(device: "torch.device") -> None:
 
 
 # --------------------------------------------------------------------------- #
-# fp8 MoE-expert linears (#240, DESIGN-ONLY still — the probe below is complete and
-# tested, but nothing calls `_report_fp8_status_once` yet, since no config sets
-# `fp8_experts=True`): NVIDIA Transformer Engine (TE) `te.Linear` on Hopper+ (sm_90) for
-# the expert gate/up/down GEMMs only. Mirrors the `_fused_scan()` /
-# `_report_fast_path_once()` lazy-probe + warn-once pattern above. `_Expert`/`MoEBlock`
-# (#214, below) already build their linears via `_expert_linear`, so this probe DOES
-# have a live caller now — just not yet an active fp8 one (that GEMM/amax wiring is
-# #240's job).
+# fp8 MoE-expert linears (#214/#240, live): NVIDIA Transformer Engine (TE) `te.Linear`
+# on Hopper+ (sm_90) for the expert gate/up/down GEMMs only. Mirrors the
+# `_fused_scan()` / `_report_fast_path_once()` lazy-probe + warn-once pattern above.
+# `_Expert`/`MoEBlock` (below) build their linears via `_expert_linear` AND wrap the
+# expert-compute region in `MoEBlock._fp8_ctx`'s `fp8_autocast`, so a config that sets
+# `fp8_experts: true` on a Hopper+ box now actually runs the GEMMs in fp8 — not just
+# reachable code. Un-verified without Hopper hardware (see `tests/test_cuda_fp8.py`'s
+# GPU-gated acceptance tests and `docs/infrastructure.md`'s manual checklist).
 # --------------------------------------------------------------------------- #
 _TE_LINEAR_CLS = None      # sentinel: None = untried, False = unavailable/pre-Hopper
 
@@ -149,10 +150,10 @@ _FP8_STATUS_REPORTED = False
 
 
 def _report_fp8_status_once(device: "torch.device") -> None:
-    """On the first CUDA model built with `fp8_experts=True`, log whether TE fp8 is
-    active. Like `_report_fast_path_once`, a silent bf16 fallback on a GPU is a
-    throughput trap during a sweep — make it loud. Not called yet: no CUDA model
-    build path sets `fp8_experts` until #214 adds the CUDA MoE experts."""
+    """On the first CUDA model built with `fp8_experts=True` and at least one MoE
+    layer, log whether TE fp8 is active. Like `_report_fast_path_once`, a silent bf16
+    fallback on a GPU is a throughput trap during a sweep — make it loud. Called from
+    `CUDAMambaModel.__init__` (#214)."""
     global _FP8_STATUS_REPORTED
     if _FP8_STATUS_REPORTED or device.type != "cuda":
         return
@@ -169,25 +170,22 @@ def _report_fp8_status_once(device: "torch.device") -> None:
             RuntimeWarning, stacklevel=2)
 
 
-# === expert linear construction (#214 live; full fp8 wiring is #240, still LATER) ====
+# === expert linear construction (#214, fully wired) =======================
 # `_Expert.__init__` (below) builds its three linears (gate/up/down) via this helper:
 # `te.Linear` when fp8 is available (TE keeps fp32 master weights and casts to fp8 at
 # the GEMM, analogous to `_linear`'s cast-at-matmul above), else a plain bf16/fp16
-# `nn.Linear`. Today `config.fp8_experts` is always False in every shipped config, so
-# this always resolves to the `nn.Linear` fallback — the TE branch is reachable code,
-# not yet a live path. Remaining work for #240 to light it up:
-#   MoE grad-checkpoint wraps in `transformer_engine.pytorch.checkpoint`, NOT
-#     `torch.utils.checkpoint` — plain checkpoint double-updates the fp8 amax history
-#     on the recompute pass (it has no `use_reentrant` kwarg either).
-#   The expert-compute region needs an `fp8_autocast()` context (`nullcontext()` when
-#     off) — a `te.Linear` called outside one runs in bf16, not fp8.
-#   model build calls `_report_fp8_status_once(device)` once fp8_experts is wired.
-# `te.Linear` graph-breaks `torch.compile` like `mamba-ssm` (safe/opaque, same as the
-# fused scan above).
+# `nn.Linear`. `device`/`params_dtype=torch.float32` are passed through explicitly so
+# TE builds the weight directly on the right device, in fp32 — the same
+# fp32-master-weights invariant `_linear`'s cast-at-matmul documents everywhere else in
+# this module (mixed precision never stores a low-precision master copy). A `te.Linear`
+# called OUTSIDE an `fp8_autocast()` context still runs — but silently in bf16, not
+# fp8 — so `MoEBlock._fp8_ctx` (below) must wrap every call site. `te.Linear` also
+# graph-breaks `torch.compile` like `mamba-ssm` (safe/opaque, same as the fused scan
+# above).
 def _expert_linear(d_in: int, d_out: int, config: MambaConfig, device):
     cls = _te_linear_cls() if getattr(config, "fp8_experts", False) else None
     if cls is not None:
-        return cls(d_in, d_out, bias=False)        # TE fp8 GEMM, fp32 master weights
+        return cls(d_in, d_out, bias=False, device=device, params_dtype=torch.float32)
     return nn.Linear(d_in, d_out, bias=False)       # bf16/fp16 fallback (no TE / pre-Hopper)
 # ===========================================================================
 
@@ -728,9 +726,11 @@ class AttentionBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 class _Expert(nn.Module):
     """A SwiGLU FFN expert: down(silu(gate(x)) * up(x)). Bias-free. Torch port of
-    `mlx_backend._Expert`, built via `_expert_linear` (the `# BLOCKED-ON-#214` scaffolding
-    above, now live): a plain `nn.Linear` unless `config.fp8_experts` resolves a
-    Transformer Engine `te.Linear` (the fp8 GEMM wiring itself is a later dispatch, #240).
+    `mlx_backend._Expert`, built via `_expert_linear`: a plain `nn.Linear` unless
+    `config.fp8_experts` resolves a Transformer Engine `te.Linear` (fp32 master
+    weights, fp8 GEMM). The fp8_autocast context that actually makes a `te.Linear` run
+    in fp8 (rather than silently in bf16) is entered by the CALLER — see
+    `MoEBlock._fp8_ctx` — not here, so this class stays agnostic to it.
 
     `_linear` (this module's helper) reaches into `layer.weight` directly to cast
     operands to the compute dtype at the matmul site — correct for `nn.Linear`, but it
@@ -837,6 +837,22 @@ class MoEBlock(nn.Module):
         self._load_counts.zero_()
         return [float(c) for c in counts.tolist()]
 
+    def _fp8_ctx(self):
+        """Context manager for the expert-compute region (#214/#240). A `te.Linear`
+        called OUTSIDE an `fp8_autocast` context silently runs in bf16, not fp8, so
+        `_expert_linear` alone does not turn fp8 on — every expert GEMM call site in
+        `_moe` must be wrapped in this. `contextlib.nullcontext()` when fp8 is off or
+        unavailable, so the non-fp8 path is untouched byte-for-byte (no TE import even
+        attempted). The router's logits/probs are computed by the CALLER, above this
+        context — the router is a plain `nn.Linear` and always routes in fp32, and
+        must stay bit-identical between fp8 and bf16 runs regardless (see the
+        zero-tolerance routing-identity test in `tests/test_cuda_fp8.py`)."""
+        if not (self.config.fp8_experts and fp8_status()):
+            return contextlib.nullcontext()
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import DelayedScaling
+        return te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling())
+
     def _moe_dense(self, xn: Array, cd, gate: Array) -> Array:
         outs = torch.stack([e(xn, cd) for e in self.experts], dim=-2)   # (...,E,d_model)
         return torch.sum(gate.unsqueeze(-1) * _f32(outs), dim=-2)       # combine in fp32
@@ -923,23 +939,26 @@ class MoEBlock(nn.Module):
                     topk_ids.reshape(-1), minlength=E).to(self._load_counts.dtype)
                 self._load_counts += counts
 
-            if self._use_gather:
-                gate_kept = torch.gather(probs, -1, topk_ids)
-                gate_kept = gate_kept / gate_kept.sum(-1, keepdim=True)
-                y = self._moe_gather(xn, cd, topk_ids, gate_kept)
-            else:
-                mask = torch.zeros_like(probs, dtype=torch.bool)
-                mask.scatter_(-1, topk_ids, True)
-                gate = torch.where(mask, probs, torch.zeros_like(probs))
-                gate = gate / gate.sum(-1, keepdim=True)      # renormalize the kept gates
-                y = self._moe_dense(xn, cd, gate)
+            with self._fp8_ctx():                          # expert GEMMs only (#214/#240)
+                if self._use_gather:
+                    gate_kept = torch.gather(probs, -1, topk_ids)
+                    gate_kept = gate_kept / gate_kept.sum(-1, keepdim=True)
+                    y = self._moe_gather(xn, cd, topk_ids, gate_kept)
+                else:
+                    mask = torch.zeros_like(probs, dtype=torch.bool)
+                    mask.scatter_(-1, topk_ids, True)
+                    gate = torch.where(mask, probs, torch.zeros_like(probs))
+                    gate = gate / gate.sum(-1, keepdim=True)   # renormalize the kept gates
+                    y = self._moe_dense(xn, cd, gate)
         else:
-            y = self._moe_dense(xn, cd, probs)                # softmax already sums to 1
+            with self._fp8_ctx():
+                y = self._moe_dense(xn, cd, probs)            # softmax already sums to 1
 
         if len(self.shared_experts):
             # Additive, OUTSIDE the router softmax/top-k renormalization (DeepSeek-V2/V3
             # form). Guarded so n_shared_experts=0 takes the exact pre-#214 path.
-            y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
+            with self._fp8_ctx():
+                y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
         return _cast(y, cd)
 
     def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
@@ -989,6 +1008,8 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self._state = None
         self.to(self._device)
         _report_fast_path_once(self._device)
+        if config.fp8_experts and config.n_moe_layers:
+            _report_fp8_status_once(self._device)
         # torch.compile (#145, #239): fuse the pure-tensor forward (layer loop + head) via
         # inductor. Tri-state config.torch_compile: None = AUTO (compile only on a real CUDA
         # device with torch>=2.1 — the real-run path), True/False = explicit override honored
@@ -1031,6 +1052,17 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         # retaining its activations. Only meaningful under autograd; use_reentrant=False
         # runs normally in no-grad (eval/parity) contexts.
         if self.config.grad_checkpoint and torch.is_grad_enabled():
+            if self.config.fp8_experts and isinstance(layer, MoEBlock):
+                # `transformer_engine.pytorch.checkpoint`, NOT `torch.utils.checkpoint`
+                # (#214/#240): plain checkpoint's recompute pass re-runs the fp8_autocast
+                # region and double-updates the amax history TE uses to calibrate the fp8
+                # scale, which `te.checkpoint` knows to skip. It has NO `use_reentrant`
+                # kwarg — passing one is a TypeError, unlike the plain-checkpoint call
+                # below.
+                import transformer_engine.pytorch as te
+                if seg_ids is None:
+                    return te.checkpoint(layer.forward_seq, h)
+                return te.checkpoint(layer.forward_seq, h, seg_ids)
             if seg_ids is None:
                 return _checkpoint(layer.forward_seq, h, use_reentrant=False)
             return _checkpoint(layer.forward_seq, h, seg_ids, use_reentrant=False)

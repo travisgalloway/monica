@@ -103,6 +103,13 @@ def _mlx_backend() -> Backend:
                 "Muon is CUDA-only (#237); the MLX Newton-Schulz port is a scoped "
                 "follow-up."
             )
+        if model.config.optimizer_8bit:
+            # bitsandbytes ships CUDA-only wheels — there is no MLX/Metal port to fall
+            # back to. Raise loudly rather than silently training in 32-bit moments: a
+            # silent downgrade would make a Mac memory measurement quietly wrong (#214).
+            raise NotImplementedError(
+                "optimizer_8bit is CUDA-only (bitsandbytes has no MLX/Metal port)."
+            )
         return optim.AdamW(learning_rate=base_lr)
 
     return Backend(
@@ -175,20 +182,60 @@ def _cuda_backend() -> Backend:
         # CUDA device, so gate on it; on CPU (torch-CPU parity runs) fall back to the default.
         fused = _dev.startswith("cuda")
         cfg = model.config
+
+        def _adamw(params):
+            """AdamW for a non-Muon parameter group, with `optimizer_8bit` (#214) as an
+            orthogonal switch — the ONE place that switch appears, shared by the `adamw`
+            branch below AND the `muon` branch's AdamW remainder side. `bitsandbytes` is
+            imported lazily so a missing `[cuda-8bit]` install only surfaces when 8-bit is
+            actually requested, as a legible SystemExit (not an ImportError at plain module
+            import, which would defeat the seam guard's lazy-import contract)."""
+            params = list(params)
+            if not cfg.optimizer_8bit:
+                return torch.optim.AdamW(params, lr=base_lr, fused=fused)
+            try:
+                import bitsandbytes as bnb
+            except ModuleNotFoundError as e:
+                if e.name != "bitsandbytes":
+                    raise
+                raise SystemExit(
+                    "bitsandbytes not found — optimizer_8bit requires the '[cuda-8bit]' "
+                    "extra on a CUDA host:\n"
+                    "    pip install -e '.[cuda-8bit]'\n"
+                    "(bitsandbytes ships CUDA-only prebuilt wheels; it does not install "
+                    "on macOS, so this is a GPU-pod-only path — see "
+                    "docs/infrastructure.md's manual-verification section.)"
+                ) from e
+            # `bnb.optim.AdamW8bit` has NO `fused` kwarg — passing one is a TypeError at
+            # run start on the pod (not a slow no-op), so it is deliberately omitted here.
+            opt = bnb.optim.AdamW8bit(params, lr=base_lr)
+            if getattr(model, "_tie_embeddings", False):
+                # Force the tied embedding's optimizer state back to 32-bit: it is the
+                # single largest AdamW-routed tensor (vocab_size x d_model), read/written
+                # on every step regardless of batch content, so 8-bit quantization noise
+                # there is the highest-leverage place it could hurt convergence.
+                bnb.optim.GlobalOptimManager.get_instance().register_module_override(
+                    model.embedding, "weight", {"optim_bits": 32})
+            return opt
+
         if cfg.optimizer == "adamw":
-            return torch.optim.AdamW(model.parameters(), lr=base_lr, fused=fused)
+            return _adamw(model.parameters())
         if cfg.optimizer == "muon":
             # Hybrid optimizer (#237): 2D hidden weight matrices go through Newton-Schulz
             # orthogonalization (Muon); everything else stays on AdamW. `is_muon_param` is
             # portable (src.model.blocks); the Muon/HybridOptimizer classes are torch-only
             # and stay lazily imported here, matching this module's lazy-import style.
+            # NOTE: `muon` + `optimizer_8bit` saves almost nothing — Muon already owns the
+            # expert matrices (the memory-heavy MoE params) and the embedding is forced
+            # back to 32-bit above, so the AdamW remainder 8-bit can shrink is small. The
+            # real payoff of `optimizer_8bit` is on plain `adamw`, not stacked with Muon.
             from .blocks import is_muon_param
             from .cuda_muon import Muon, HybridOptimizer
             muon_params, adam_params = [], []
             for name, p in model.named_parameters():
                 (muon_params if is_muon_param(name, p.ndim) else adam_params).append(p)
             muon_lr = cfg.muon_lr if cfg.muon_lr is not None else base_lr
-            adam = torch.optim.AdamW(adam_params, lr=base_lr, fused=fused) if adam_params else None
+            adam = _adamw(adam_params) if adam_params else None
             muon = Muon(muon_params, lr=base_lr, lr_scale=muon_lr / base_lr,
                        momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps) if muon_params else None
             return HybridOptimizer(adam, muon)
