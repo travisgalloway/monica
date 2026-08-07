@@ -121,6 +121,18 @@ def test_grad_checkpoint_cuts_activations():
     assert a_on < a_off
 
 
+def test_optimizer_sizing_key_covers_every_config():
+    # #214: every config's `optimizer_sizing_key` must resolve to a real
+    # `OPTIMIZER_BYTES_PER_PARAM` entry, so `sizing.training_bytes` never KeyErrors on a
+    # real config even though its default caller-facing `optimizer=` param is different.
+    for path in sorted(CONFIG_DIR.glob("*.yaml")):
+        cfg = load_config(path)
+        assert cfg.optimizer_sizing_key in sizing.OPTIMIZER_BYTES_PER_PARAM, (
+            f"{path.name}: optimizer_sizing_key={cfg.optimizer_sizing_key!r} not in "
+            f"{list(sizing.OPTIMIZER_BYTES_PER_PARAM)}"
+        )
+
+
 def test_family_table_renders_all_tiers():
     table = sizing.format_family_table(sizing.load_family(CONFIG_DIR))
     for name, _ in FAMILY:

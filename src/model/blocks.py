@@ -78,6 +78,13 @@ class MambaConfig:
     muon_lr: Optional[float] = None
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # 8-bit Adam moments (#214), an ORTHOGONAL axis to `optimizer` (not a third enum
+    # value) so it composes with the Muon hybrid: Muon already owns the 2D hidden
+    # matrices, and `optimizer_8bit` only changes how the AdamW-routed remainder
+    # (embeddings/norms/biases/router/dt_proj, or everything under plain "adamw")
+    # stores its moments. CUDA-only; MLX raises NotImplementedError, mirroring Muon.
+    # See `optimizer_sizing_key` below for the sizing-table consequence.
+    optimizer_8bit: bool = False
 
     # SSD chunk length Q. None => the backend default (64). The chunked-matmul scan
     # processes the sequence in chunks of Q; the sequence is padded up to a multiple
@@ -133,6 +140,18 @@ class MambaConfig:
     # weights stay the unbiased softmax. See `src/train/moe_balance.py` (the portable
     # policy) and `MoEBlock._moe` (src/model/mlx_backend.py) for the mechanism.
     moe_balance_rate: Optional[float] = None
+    # Extra experts run on EVERY token (DeepSeek-V2/V3 form), additive to the routed
+    # top_k combination: output = shared(x) + sum_{i in top_k}(gate_i * expert_i(x)),
+    # OUTSIDE the router softmax/renormalization so the routed gates still sum to 1.
+    # 0 (default) = OFF, byte-identical to pre-#214 (no shared_experts params exist).
+    n_shared_experts: int = 0
+    # Expert-compute strategy: "auto" (default) picks dense when top_k >= n_experts or
+    # n_experts == 1, else a grouped-gather kernel (CUDA-only, #214); "dense" forces the
+    # evaluate-every-expert-then-mask path (both backends; the MLX/Swift reference
+    # implementation, so it stays available as the oracle gather is checked against);
+    # "gather" forces the grouped-gather kernel explicitly (CUDA-only — the MLX backend
+    # raises NotImplementedError rather than silently downgrading to dense).
+    moe_impl: str = "auto"
     # fp8 expert GEMMs via NVIDIA Transformer Engine (#240), CUDA/Hopper-only. A separate
     # bool rather than a `precision` value: fp8 applies ONLY to the three expert linears
     # (gate/up/down), not the whole model — everything else stays at `precision`. A no-op
@@ -274,12 +293,16 @@ class MambaConfig:
         return bd
 
     def _moe_layer_params(self, n_active_experts: int) -> int:
-        """Params of one MoE block counting `n_active_experts` experts: pre-norm + router
-        + experts (SwiGLU gate+up+down, bias-free). Used both for total capacity
-        (n_active_experts = n_experts) and active compute (= top_k)."""
+        """Params of one MoE block counting `n_active_experts` routed experts plus every
+        shared expert (SwiGLU gate+up+down, bias-free — shared experts run on EVERY
+        token, so they count in full regardless of whether this call is for total
+        capacity (n_active_experts = n_experts) or active compute (= top_k)), plus the
+        pre-norm + router. Default `n_shared_experts=0` leaves this arithmetic
+        unchanged from pre-#214."""
         d_model, d_ff = self.d_model, self.moe_d_ff_resolved
         expert = 3 * d_model * d_ff
-        return d_model + self.n_experts * d_model + n_active_experts * expert
+        return (d_model + self.n_experts * d_model
+                + (n_active_experts + self.n_shared_experts) * expert)
 
     def num_parameters(self) -> int:
         """Total trainable parameters (sum of `parameter_breakdown()`)."""
@@ -303,6 +326,16 @@ class MambaConfig:
     def packing_dtype(self) -> str:
         """The token packing dtype implied by the vocab: 'uint16' (< 65536) or 'uint32'."""
         return "uint16" if self.vocab_size < 65536 else "uint32"
+
+    @property
+    def optimizer_sizing_key(self) -> str:
+        """Which `sizing.OPTIMIZER_BYTES_PER_PARAM` key models THIS config's real
+        training memory. This repo trains with fp32 master weights, cast to the
+        compute dtype at the matmul site (see `cuda_backend.py`'s `_f32`/`_cast`), never
+        the lean all-bf16 regime `sizing.py`'s plain "adamw"/"adam8bit" keys model — so
+        the fp32-master variant is always the honest pick here, selected by whether
+        `optimizer_8bit` (#214's orthogonal 8-bit-moments axis) is set."""
+        return "adam8bit_fp32" if self.optimizer_8bit else "adamw_fp32"
 
     def validate(self) -> None:
         if self.n_layers <= 0:
@@ -346,18 +379,45 @@ class MambaConfig:
                     f"n_attn_heads={nah} must divide d_model={self.d_model} "
                     "(attn_head_dim = d_model // n_attn_heads)."
                 )
+        if self.moe_impl not in ("auto", "dense", "gather"):
+            raise ValueError(
+                f"unknown moe_impl {self.moe_impl!r} (expected one of auto, dense, gather)"
+            )
+        if self.n_shared_experts < 0:
+            raise ValueError(f"n_shared_experts={self.n_shared_experts} must be >= 0")
+        if self.n_shared_experts > 0 and self.n_moe_layers == 0:
+            raise ValueError(
+                f"n_shared_experts={self.n_shared_experts} requires an MoE model "
+                "(set moe_every so at least one layer is MoE); a shared expert with no "
+                "routed MoE block to attach it to is meaningless."
+            )
         if self.moe_every is not None:
             if self.moe_every <= 0:
                 raise ValueError("moe_every must be a positive int or None")
-            if self.n_experts < 2:
+            if self.n_experts < 1:
                 raise ValueError(
-                    f"n_experts={self.n_experts} must be >= 2 when moe_every is set "
-                    "(a sparse MoE needs at least two experts to route between)."
+                    f"n_experts={self.n_experts} must be >= 1 when moe_every is set."
                 )
             if not (1 <= self.top_k <= self.n_experts):
                 raise ValueError(
                     f"top_k={self.top_k} must be in [1, n_experts={self.n_experts}]."
                 )
+            if self.n_experts == 1:
+                # The degenerate E=1 block IS a plain SwiGLU FFN (softmax over one logit
+                # is exactly 1.0, `_moe` takes the k==E branch) — the dense-upcycle source
+                # (#214). top_k must be 1 (already implied by the range check above, but
+                # spelled out here) and balancing one expert is a provable no-op
+                # (sign(mean - load) == sign(0) == 0 forever), so reject it rather than
+                # silently accepting a rate that can never do anything.
+                if self.top_k != 1:
+                    raise ValueError(
+                        f"n_experts=1 requires top_k=1 (got top_k={self.top_k})."
+                    )
+                if self.moe_balance_rate is not None:
+                    raise ValueError(
+                        "moe_balance_rate must be None when n_experts=1 (balancing a "
+                        "single expert is a no-op: there is nothing to route between)."
+                    )
             if self.moe_d_ff_resolved <= 0:
                 raise ValueError("moe_d_ff must be positive or None")
             if self.n_moe_layers == 0:

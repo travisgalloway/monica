@@ -607,11 +607,26 @@ class MoEBlock(nn.Module):
 
     def __init__(self, config: MambaConfig):
         super().__init__()
+        if config.moe_impl == "gather":
+            # Grouped-gather routing is a real dispatch-kernel change (CUDA-only, #214) —
+            # not something the dense MLX path can silently approximate. Fail loudly at
+            # construction rather than quietly falling back to dense under an explicit
+            # request for a different compute strategy.
+            raise NotImplementedError(
+                "moe_impl='gather' is CUDA-only (grouped-gather routing, #214); the MLX "
+                "backend only implements the dense (auto/dense) path."
+            )
         self.config = config
         self.norm = RMSNorm(config.d_model)
         self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
         d_ff = config.moe_d_ff_resolved
         self.experts = [_Expert(config.d_model, d_ff) for _ in range(config.n_experts)]
+        # Shared experts (#214, DeepSeek-V2/V3 form): plain Python list exactly like
+        # `self.experts`, so `tree_flatten` gives `layers.{i}.shared_experts.{j}.*` for
+        # free. Combined ADDITIVELY in `_moe`, outside the router softmax/top-k
+        # renormalization — every token goes through every shared expert, unconditionally.
+        self.shared_experts = [_Expert(config.d_model, d_ff)
+                                for _ in range(config.n_shared_experts)]
         # Loss-Free-Balancing (#213 D1): a per-expert route BIAS and a per-expert LOAD-COUNT
         # accumulator. Both names start with an underscore ON PURPOSE — DO NOT "clean this
         # up". `nn.Module.valid_parameter_filter` is
@@ -723,6 +738,12 @@ class MoEBlock(nn.Module):
             gate = probs                                          # softmax already sums to 1
         outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
         y = mx.sum(gate[..., None] * _f32(outs), axis=-2)    # combine in fp32
+        if self.shared_experts:
+            # Additive, OUTSIDE the router softmax/top-k renormalization (DeepSeek-V2/V3
+            # form): shared experts see every token and are never gated. Guarded by the
+            # `if` (never `sum()` an empty generator) so `n_shared_experts=0` takes the
+            # exact same path as before #214 — byte-identical.
+            y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
         return _cast(y, cd)
 
     def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:

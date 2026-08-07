@@ -64,13 +64,54 @@ def test_active_params_below_total_and_matches_top_k():
 
 
 def test_moe_validation():
-    with pytest.raises(ValueError, match="n_experts"):
-        _cfg(moe_every=2, n_experts=1, top_k=1).validate()
     with pytest.raises(ValueError, match="top_k"):
         _cfg(moe_every=2, n_experts=4, top_k=5).validate()
     with pytest.raises(ValueError, match="moe_every"):
         _cfg(moe_every=0, n_experts=4, top_k=2).validate()
     _cfg(moe_every=2, n_experts=4, top_k=2).validate()           # valid: no raise
+
+
+def test_moe_degenerate_single_expert_valid():
+    # #214: n_experts=1 is now valid (the dense-upcycle source) provided top_k=1 and
+    # balancing is off — the degenerate block IS a plain SwiGLU FFN.
+    _cfg(moe_every=2, n_experts=1, top_k=1).validate()           # no raise
+
+
+def test_moe_single_expert_requires_top_k_one():
+    with pytest.raises(ValueError, match="top_k"):
+        _cfg(moe_every=2, n_experts=1, top_k=2).validate()
+
+
+def test_moe_single_expert_rejects_balance_rate():
+    with pytest.raises(ValueError, match="moe_balance_rate"):
+        _cfg(moe_every=2, n_experts=1, top_k=1, moe_balance_rate=0.01).validate()
+
+
+def test_moe_bad_moe_impl_rejected():
+    with pytest.raises(ValueError, match="moe_impl"):
+        _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl="bogus").validate()
+    for ok in ("auto", "dense", "gather"):
+        _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl=ok).validate()   # no raise
+
+
+def test_moe_shared_experts_negative_rejected():
+    with pytest.raises(ValueError, match="n_shared_experts"):
+        _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=-1).validate()
+
+
+def test_moe_shared_experts_require_moe():
+    with pytest.raises(ValueError, match="n_shared_experts"):
+        _cfg(n_shared_experts=1).validate()                      # moe_every unset
+
+
+def test_moe_shared_experts_add_capacity():
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=1)
+    bd = cfg.parameter_breakdown()
+    assert cfg.num_parameters() == sum(bd.values())
+    plain = _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=0)
+    assert cfg.num_parameters() > plain.num_parameters()
+    # Shared experts are always fully active (every token), so active params grow too.
+    assert cfg.active_num_parameters() > plain.active_num_parameters()
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +193,103 @@ def test_router_selects_top_k():
     expert_outs = np.stack([np.array(e(xn, cd)) for e in block.experts], axis=1)  # (5,E,d)
     for i, e in enumerate(chosen):
         assert np.allclose(combined[i], expert_outs[i, e], atol=1e-5)
+
+
+@requires_mlx
+def test_shared_expert_param_count_exact():
+    """n_shared_experts=1: the closed-form param count must exactly match the built
+    model's real tensors, same invariant as the no-shared-expert case above."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=1)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    assert len(block.shared_experts) == 1
+    actual = sum(int(v.size) for v in model._portable_state_dict().values())
+    assert cfg.num_parameters() == actual
+
+
+@requires_mlx
+def test_shared_expert_forward_step_parity():
+    """Shared-expert MoE is still pointwise -> forward/step must agree."""
+    from src.model.mlx_backend import MLXMambaModel
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=1)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    tokens = np.arange(32).reshape(1, 32) % 256
+
+    seq = np.array(model.forward(mx.array(tokens)))[0]
+    state = model.init_state(1)
+    step = []
+    for t in range(tokens.shape[1]):
+        logit, state = model.step(mx.array(tokens[:, t]), state)
+        step.append(np.array(logit)[0])
+    step = np.stack(step)
+    rel = np.abs(seq - step).max() / (np.abs(seq).max() + 1e-6)
+    assert rel < 1e-4
+
+
+@requires_mlx
+def test_shared_expert_output_equals_shared_plus_routed():
+    """The block output must equal shared(xn) + the routed top_k combination, computed
+    by hand — additive, outside the router softmax/renormalization."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, n_shared_experts=2)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    xn = mx.random.normal((5, cfg.d_model))
+    cd = mx.float32
+
+    combined = np.array(block._moe(xn))
+
+    logits = np.array(block.router(xn))
+    probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = probs / probs.sum(axis=-1, keepdims=True)
+    ranks = (-probs).argsort(axis=-1).argsort(axis=-1)
+    mask = ranks < cfg.top_k
+    gate = np.where(mask, probs, 0.0)
+    gate = gate / gate.sum(axis=-1, keepdims=True)
+    expert_outs = np.stack([np.array(e(xn, cd)) for e in block.experts], axis=1)  # (5,E,d)
+    routed = (gate[..., None] * expert_outs).sum(axis=1)
+    shared = sum(np.array(se(xn, cd)) for se in block.shared_experts)
+    expected = routed + shared
+    assert np.allclose(combined, expected, atol=1e-4)
+
+
+@requires_mlx
+def test_shared_experts_zero_is_byte_identical():
+    """n_shared_experts=0 must take the exact pre-#214 path (empty-generator guard)."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
+    assert cfg.n_shared_experts == 0
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    assert block.shared_experts == []
+    xn = mx.random.normal((3, cfg.d_model))
+    y = np.array(block._moe(xn))
+    assert np.all(np.isfinite(y))
+
+
+@requires_mlx
+def test_moe_impl_gather_raises_on_mlx():
+    from src.model.mlx_backend import MLXMambaModel
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl="gather")
+    with pytest.raises(NotImplementedError):
+        MLXMambaModel(cfg)
+
+
+@requires_mlx
+def test_moe_impl_auto_and_dense_unchanged():
+    from src.model.mlx_backend import MLXMambaModel
+    for impl in ("auto", "dense"):
+        cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl=impl)
+        mx.random.seed(0)
+        model = MLXMambaModel(cfg)
+        tokens = mx.array(np.arange(32).reshape(1, 32) % 256)
+        y = np.array(model.forward(tokens))
+        assert np.all(np.isfinite(y))
 
 
 @requires_mlx
