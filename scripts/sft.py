@@ -73,7 +73,7 @@ def main() -> None:
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import CheckpointStore
+    from src.train.checkpoint import CheckpointStore, check_weight_keys, load_weights_dict
     from src.eval.val_loss import evaluate_masked
 
     backend = get_backend(args.backend)
@@ -121,6 +121,10 @@ def main() -> None:
             scaler.load_state_dict(meta.get("loss_scale_state") or {})
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
     else:
+        # #214: MLX's load is silently lenient (missing key -> stays at random init,
+        # wrong shape -> silently rebound), so check explicitly before loading.
+        check_weight_keys(load_weights_dict(str(args.init)), model._portable_state_dict(),
+                          where=f"--init {args.init}")
         model.load(str(args.init))                       # initialize from pretrained base
         print(f"[init] from pretrained base {args.init}")
     # Loss-Free-Balancing (#213): adopt the bias that came in with the weights (D3), push

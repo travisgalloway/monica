@@ -61,6 +61,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--init-loss-scale", type=float, default=2.0 ** 13)
     ap.add_argument("--resume", type=Path, default=None,
                     help="resume bundle dir; if omitted, auto-detects <out>/resume")
+    ap.add_argument("--init", type=Path, default=None,
+                    help="portable base weights to initialize from (e.g. a "
+                         "sparse-upcycled checkpoint from scripts/upcycle.py) — NOT a "
+                         "resume bundle: optimizer/step/loss-scale all start fresh. "
+                         "IGNORED (with a printed note) when --resume is active; "
+                         "--resume always wins.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--curriculum", type=str, default=None,
                     help="length curriculum (#216): 'until_frac:seq_len[:batch_size],...' "
@@ -91,7 +97,7 @@ def main() -> None:
     from src.train.curriculum import build_curriculum
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import CheckpointStore
+    from src.train.checkpoint import CheckpointStore, check_weight_keys, load_weights_dict
     from src.eval.val_loss import evaluate
 
     backend = get_backend(args.backend)
@@ -195,6 +201,19 @@ def main() -> None:
             data_state_note = "present"
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})  "
               f"data_state={data_state_note}")
+        if args.init is not None:
+            # --resume always wins (a resume bundle is the authoritative, in-progress
+            # state of THIS run); printed, not silently dropped, so a stale --init left
+            # on the command line after the first successful resume doesn't read as
+            # "it did something."
+            print(f"[init] IGNORED — --resume is active (from step {start_step}); "
+                  f"--init={args.init} has no effect. --resume always wins over --init.")
+    elif args.init is not None:
+        init_weights = load_weights_dict(str(args.init))
+        check_weight_keys(init_weights, model._portable_state_dict(),
+                          where=f"--init {args.init}")
+        model._load_portable(init_weights)
+        print(f"[init] from {args.init}")
     # Loss-Free-Balancing (#213): seed the policy from the just-loaded weights (the bias
     # rides in the portable safetensors, D3), push it into the routers, and enable load
     # counting. No-op when balancing is off. `CheckpointStore.save` is unchanged — there

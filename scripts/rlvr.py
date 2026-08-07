@@ -81,10 +81,15 @@ def main() -> None:
     from src.serve.sampling import sample
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
     from src.train.moe_balance import attach_balancer, balancer_for_config
+    from src.train.checkpoint import check_weight_keys, load_weights_dict
 
     backend = get_backend()
     cfg = load_config(str(args.config))
     model = backend.model_cls(cfg)
+    # #214: MLX's load is silently lenient (missing key -> stays at random init, wrong
+    # shape -> silently rebound), so check explicitly before loading.
+    check_weight_keys(load_weights_dict(str(args.init)), model._portable_state_dict(),
+                      where=f"--init {args.init}")
     model.load(str(args.init))
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
     eos = getattr(tok, "eos_token_id", None)

@@ -1,0 +1,42 @@
+# Sparse-upcycle TARGET fixture (#214): the real fine-grained MoE (64 experts, top-6)
+# that `scripts/upcycle.py` upcycles toy-moe-dense.yaml's single dense expert into.
+# "Fine-grained" (many narrow experts, DeepSeekMoE style) rather than few wide ones: at
+# Large A's real scale (#223), 64 FULL-WIDTH experts (moe_d_ff == d_inner) per MoE layer
+# would run ~906M params per layer — so each expert is narrowed to d_inner/8 instead,
+# trading width for count at ~constant total capacity per layer.
+#
+# IDENTICAL to toy-moe-dense.yaml in EVERY dimension `check_upcycle_compatible` requires
+# to match (d_model, n_layers, d_state, expand, d_conv, head_dim, dt_rank, vocab_size,
+# tie_embeddings, attn_every, moe_every, moe_d_ff) — ONLY n_experts, top_k, and
+# moe_balance_rate differ. Do not change one of the pair without the other; the upcycle
+# test fixture (tests/test_upcycle.py) and `scripts/upcycle.py --dry-run` both fail loudly
+# if they drift apart.
+d_model: 64
+n_layers: 4
+d_state: 16            # SSM state width N (per head)
+expand: 2               # d_inner = 128
+d_conv: 4
+head_dim: 16            # Mamba-2/SSD: 128/16 = 8 SSM heads (scalar A per head)
+dt_rank: auto
+
+moe_every: 2             # layers 1 and 3 — same interleave as toy-moe-dense.yaml
+n_experts: 64             # the real fine-grained expert count
+top_k: 6                  # ~6/64 active per token (sparse)
+moe_d_ff: 16              # MUST match toy-moe-dense.yaml's moe_d_ff (see its comment)
+# Loss-Free-Balancing (#213) ON: 64 experts is exactly the regime that collapses without
+# it (a handful of experts absorb most tokens early and never recover). A small positive
+# rate in logit units; see src/train/moe_balance.py for the update rule.
+moe_balance_rate: 0.001
+
+vocab_size: 256          # byte-fallback tokenizer for offline tests
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32           # correctness first; fp32 makes step-0 upcycle-exactness exact
+chunk_size: null          # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false    # tiny; keep tests cheap
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

@@ -72,7 +72,7 @@ def main() -> None:
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import CheckpointStore
+    from src.train.checkpoint import CheckpointStore, check_weight_keys, load_weights_dict
     from src.train.dpo_math import evaluate_dpo
 
     backend = get_backend(args.backend)
@@ -91,6 +91,11 @@ def main() -> None:
     backend.seed(args.seed)
     policy = backend.model_cls(cfg)
     ref = backend.model_cls(cfg)
+    # #214: MLX's load is silently lenient (missing key -> stays at random init, wrong
+    # shape -> silently rebound), so check explicitly before loading. ref/policy share
+    # the same cfg, so one check against a fresh model's expected keys covers both.
+    check_weight_keys(load_weights_dict(str(args.init)), ref._portable_state_dict(),
+                      where=f"--init {args.init}")
     ref.load(str(args.init))                             # frozen reference (never updated)
     opt = backend.make_optimizer(policy, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
