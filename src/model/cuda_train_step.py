@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..train.moe_balance import MoEBalancer
+
 
 def _global_grad_norm(params) -> torch.Tensor:
     leaves = [p.grad for p in params if p.grad is not None]
@@ -27,8 +29,8 @@ def _global_grad_norm(params) -> torch.Tensor:
     return torch.sqrt(sq)
 
 
-def _accumulate_and_step(optimizer, params, loss_fn, micro_batches, lr,
-                         grad_clip, scaler) -> dict:
+def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
+                         grad_clip, scaler, balancer=None) -> dict:
     """Shared accumulate -> (unscale) -> clip -> optimizer-step tail.
 
     `loss_fn(micro_batch) -> scalar torch loss` is the only objective-specific piece;
@@ -36,6 +38,15 @@ def _accumulate_and_step(optimizer, params, loss_fn, micro_batches, lr,
     clipping, the optimizer update, and the returned metrics dict) is identical for
     pretraining, SFT, DPO, and GRPO, so they all funnel through here — the torch mirror of
     `mlx_train_step._accumulate_and_step`.
+
+    `model` is the model whose MoE routers the `balancer` hook (below) reads/writes — for
+    DPO this MUST be the policy model, never the frozen reference (see
+    `make_dpo_train_step`). `balancer` (a `MoEBalancer`, #213/#214) is the Loss-Free-
+    Balancing policy: on a successful (non-skipped) step it reads this step's per-expert
+    load counts off the model (`pop_moe_load`), nudges the bias OUTSIDE the gradient
+    (`update` — no aux loss ever touches the objective above), and pushes the new biases
+    back into the model's MoE blocks (`set_moe_biases`) for the next forward. `None`
+    (dense/hybrid models, or MoE without balancing) is a no-op.
     """
     n = len(micro_batches)
     s = scaler.scale if scaler else 1.0
@@ -77,11 +88,23 @@ def _accumulate_and_step(optimizer, params, loss_fn, micro_batches, lr,
     if scaler:
         out["loss_scale"] = scaler.scale
         out["skipped"] = False
+    if balancer is not None:
+        # Loss-Free-Balancing (#213/#214): update the bias from this step's routed-token
+        # counts, OUTSIDE the gradient, then push the new biases back into the model for
+        # the next forward. `pop_moe_load` returns `[]` for a model with no MoE layers.
+        # Placed at the VERY END, after `out` is assembled — i.e. AFTER the fp16 overflow
+        # early-return above, so a skipped step does NOT pop the counters (intentional,
+        # mirrors `mlx_backend.py:717-720` — do not "fix" with a `finally`).
+        loads = model.pop_moe_load()
+        if loads:
+            balancer.update(loads)
+            model.set_moe_biases(balancer.biases())
+            out["moe_util_var"] = max(MoEBalancer.utilization_variance(loads))
     return out
 
 
 def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                    scaler=None) -> Callable:
+                    scaler=None, balancer=None) -> Callable:
     """Build a `train_step(model, micro_batches, lr) -> dict` (pretraining CE).
 
     `micro_batches` is a list of `(inputs, targets)` numpy pairs; the step averages
@@ -92,6 +115,8 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
     grads are unscaled before the optimizer step. On a non-finite gradient the step is
     SKIPPED and the scale is backed off; the returned dict carries `loss_scale`/`skipped`.
     Pass None for fp32 (toy/smoke) — numerically identical to a plain unscaled step.
+    `balancer` (a `MoEBalancer`, #213/#214) is the Loss-Free-Balancing policy; None (the
+    default) for dense/hybrid models and for MoE configs with `moe_balance_rate` unset.
     """
     params = list(model.parameters())
 
@@ -105,8 +130,8 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
         return F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="mean")
 
     def train_step(model, micro_batches, lr: float) -> dict:
-        return _accumulate_and_step(optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler)
+        return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
+                                    grad_clip, scaler, balancer)
 
     return train_step
 
@@ -119,12 +144,13 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
 # against. All four objectives share `_accumulate_and_step`.
 # --------------------------------------------------------------------------- #
 def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                        scaler=None) -> Callable:
+                        scaler=None, balancer=None) -> Callable:
     """Build an SFT `train_step(model, micro_batches, lr) -> dict` (masked CE).
 
     `micro_batches` is a list of `(inputs, targets, mask)` (the `SFTLoader` 3-tuple). The
     loss is the per-token cross-entropy averaged over the *response* tokens only:
     `sum(mask * CE) / sum(mask)`, so prompt/padding positions (mask 0) never contribute.
+    `balancer` (#213/#214) as in `make_train_step`.
     """
     params = list(model.parameters())
 
@@ -139,8 +165,8 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
         return (ce * m).sum() / torch.clamp(m.sum(), min=1.0)    # response-token mean
 
     def train_step(model, micro_batches, lr: float) -> dict:
-        return _accumulate_and_step(optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler)
+        return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
+                                    grad_clip, scaler, balancer)
 
     return train_step
 
@@ -161,14 +187,17 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> torch.Tensor:
 
 
 def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1,
-                        grad_clip: float = 1.0, scaler=None) -> Callable:
+                        grad_clip: float = 1.0, scaler=None, balancer=None) -> Callable:
     """Build a DPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of the `DPOLoader` 6-tuple `(c_in, c_tgt, c_mask, r_in,
     r_tgt, r_mask)`. The loss is `-mean(log sigmoid(beta * (pi_logratio - ref_logratio)))`.
     Gradients flow through `policy_model` only: the optimizer holds the policy params and
     the reference forward runs under `torch.no_grad()` (and `ref_model` is a distinct
-    object never handed to the optimizer), so the reference stays frozen.
+    object never handed to the optimizer), so the reference stays frozen. `balancer`
+    (#213/#214) as in `make_train_step` — its `pop_moe_load`/`set_moe_biases` calls MUST
+    target `policy_model`, never `ref_model`: the reference is frozen and keeps whatever
+    bias its checkpoint carried (see `src/train/moe_balance.py`'s driver-wiring note).
     """
     params = list(policy_model.parameters())
 
@@ -183,20 +212,21 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
         return -F.logsigmoid(margin).mean()
 
     def train_step(model, micro_batches, lr: float) -> dict:
-        return _accumulate_and_step(optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler)
+        return _accumulate_and_step(policy_model, optimizer, params, _loss, micro_batches,
+                                    lr, grad_clip, scaler, balancer)
 
     return train_step
 
 
 def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                         scaler=None) -> Callable:
+                         scaler=None, balancer=None) -> Callable:
     """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of `(inputs, targets, mask, advantages)`: sampled rollouts
     (mask = 1 on the completion tokens) and their group-standardized advantages (one per
     sequence, precomputed via `train.grpo.group_advantages`). The loss is
     `-mean(advantage * logpθ(completion))` — REINFORCE with the GRPO group baseline.
+    `balancer` (#213/#214) as in `make_train_step`.
     """
     params = list(model.parameters())
 
@@ -208,8 +238,8 @@ def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
         return -(adv * logp).mean()
 
     def train_step(model, micro_batches, lr: float) -> dict:
-        return _accumulate_and_step(optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler)
+        return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
+                                    grad_clip, scaler, balancer)
 
     return train_step
 

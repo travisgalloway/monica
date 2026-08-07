@@ -91,13 +91,12 @@ def main() -> None:
     store = SessionStore(model)
     np_to = backend.to_numpy
     opt = backend.make_optimizer(model, args.lr)
-    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
-    # kwarg is conditional (CUDA's make_grpo_train_step has no balancer param). The bias
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch. The bias
     # arrives with `--init`'s portable weights (D3); attach_balancer adopts it, pushes it
-    # into the routers, and enables load counting. No-op when balancing is off.
+    # into the routers, and enables load counting. `balancer=None` is a no-op on either
+    # backend's make_grpo_train_step (#214).
     balancer = balancer_for_config(cfg)
-    grpo_step = backend.make_grpo_train_step(
-        model, opt, **({"balancer": balancer} if balancer is not None else {}))
+    grpo_step = backend.make_grpo_train_step(model, opt, balancer=balancer)
     attach_balancer(balancer, model)
     reward_fn = math_reward if args.reward == "math" else exact_match_reward
 

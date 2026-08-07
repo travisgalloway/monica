@@ -124,13 +124,11 @@ def main() -> None:
               "(loss scaling is fp16-only; expected for bf16)")
     # Loss-Free-Balancing (#213): None for dense/hybrid configs and for MoE configs with
     # moe_balance_rate unset (the default) — balancer_for_config is the single source of
-    # truth for the off-switch. Passed as a kwarg only when set, so the CUDA backend's
-    # make_train_step (which has no balancer param; CUDA rejects MoE entirely, #214) is
-    # untouched.
+    # truth for the off-switch. Both backends' make_train_step accept `balancer=` (#214);
+    # None is a no-op on either.
     balancer = balancer_for_config(cfg)
-    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
     train_step = backend.make_train_step(model, opt, grad_clip=args.grad_clip, scaler=scaler,
-                                         **balancer_kwargs)
+                                         balancer=balancer)
 
     # --- data ------------------------------------------------------------------
     # ONE construction path for every stage, including stage 0 (`open_packed` returns a

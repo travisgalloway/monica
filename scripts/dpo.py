@@ -94,13 +94,12 @@ def main() -> None:
     ref.load(str(args.init))                             # frozen reference (never updated)
     opt = backend.make_optimizer(policy, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
-    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
-    # kwarg is conditional (CUDA's make_dpo_train_step has no balancer param).
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch. Both backends'
+    # make_dpo_train_step accept `balancer=` (#214); None is a no-op on either.
     balancer = balancer_for_config(cfg)
-    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
     train_step = backend.make_dpo_train_step(policy, ref, opt, beta=args.beta,
                                              grad_clip=args.grad_clip, scaler=scaler,
-                                             **balancer_kwargs)
+                                             balancer=balancer)
 
     np_to = backend.to_numpy
     max_b = args.eval_batches or None

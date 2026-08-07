@@ -110,12 +110,14 @@ def _report_fast_path_once(device: "torch.device") -> None:
 
 
 # --------------------------------------------------------------------------- #
-# fp8 MoE-expert linears (#240, DESIGN-ONLY, blocked on #214): NVIDIA Transformer
-# Engine (TE) `te.Linear` on Hopper+ (sm_90) for the expert gate/up/down GEMMs only.
-# Mirrors the `_fused_scan()` / `_report_fast_path_once()` lazy-probe + warn-once
-# pattern above. TE is not wired to any expert module yet — #214 has not built the
-# CUDA MoE `_Expert`/`MoEBlock` (that lives only in `mlx_backend.py:499-560` today) —
-# so this probe is complete and tested, but has no live caller besides its own tests.
+# fp8 MoE-expert linears (#240, DESIGN-ONLY still — the probe below is complete and
+# tested, but nothing calls `_report_fp8_status_once` yet, since no config sets
+# `fp8_experts=True`): NVIDIA Transformer Engine (TE) `te.Linear` on Hopper+ (sm_90) for
+# the expert gate/up/down GEMMs only. Mirrors the `_fused_scan()` /
+# `_report_fast_path_once()` lazy-probe + warn-once pattern above. `_Expert`/`MoEBlock`
+# (#214, below) already build their linears via `_expert_linear`, so this probe DOES
+# have a live caller now — just not yet an active fp8 one (that GEMM/amax wiring is
+# #240's job).
 # --------------------------------------------------------------------------- #
 _TE_LINEAR_CLS = None      # sentinel: None = untried, False = unavailable/pre-Hopper
 
@@ -167,17 +169,18 @@ def _report_fp8_status_once(device: "torch.device") -> None:
             RuntimeWarning, stacklevel=2)
 
 
-# === BLOCKED-ON-#214: CUDA MoE experts do not exist yet ======================
-# When #214 adds the CUDA `_Expert`/`MoEBlock` (mirroring `mlx_backend.py:499-560`),
-# its three expert linears (gate/up/down) build via this helper: `te.Linear` when fp8
-# is available (TE keeps fp32 master weights and casts to fp8 at the GEMM, analogous
-# to `_linear`'s cast-at-matmul above), else a plain bf16/fp16 `nn.Linear`. This
-# function is DEFINED BUT NEVER CALLED until #214 lands — no CUDA `_Expert` exists to
-# call it. Un-dormanting is mechanical:
-#   _Expert.__init__: self.gate/up/down = _expert_linear(d_in, d_out, config, device)
+# === expert linear construction (#214 live; full fp8 wiring is #240, still LATER) ====
+# `_Expert.__init__` (below) builds its three linears (gate/up/down) via this helper:
+# `te.Linear` when fp8 is available (TE keeps fp32 master weights and casts to fp8 at
+# the GEMM, analogous to `_linear`'s cast-at-matmul above), else a plain bf16/fp16
+# `nn.Linear`. Today `config.fp8_experts` is always False in every shipped config, so
+# this always resolves to the `nn.Linear` fallback — the TE branch is reachable code,
+# not yet a live path. Remaining work for #240 to light it up:
 #   MoE grad-checkpoint wraps in `transformer_engine.pytorch.checkpoint`, NOT
 #     `torch.utils.checkpoint` — plain checkpoint double-updates the fp8 amax history
-#     on the recompute pass.
+#     on the recompute pass (it has no `use_reentrant` kwarg either).
+#   The expert-compute region needs an `fp8_autocast()` context (`nullcontext()` when
+#     off) — a `te.Linear` called outside one runs in bf16, not fp8.
 #   model build calls `_report_fp8_status_once(device)` once fp8_experts is wired.
 # `te.Linear` graph-breaks `torch.compile` like `mamba-ssm` (safe/opaque, same as the
 # fused scan above).
@@ -718,6 +721,240 @@ class AttentionBlock(nn.Module):
         return x + _linear(self.o_proj, _cast(out, cd), cd), (k_cache, v_cache)
 
 
+# --------------------------------------------------------------------------- #
+# Sparse Mixture-of-Experts FFN block (#53, CUDA grouped-gather routing #214) — torch
+# port of mlx_backend's MoE block, now with a real gathered-dispatch kernel alongside
+# the dense evaluate-every-expert reference.
+# --------------------------------------------------------------------------- #
+class _Expert(nn.Module):
+    """A SwiGLU FFN expert: down(silu(gate(x)) * up(x)). Bias-free. Torch port of
+    `mlx_backend._Expert`, built via `_expert_linear` (the `# BLOCKED-ON-#214` scaffolding
+    above, now live): a plain `nn.Linear` unless `config.fp8_experts` resolves a
+    Transformer Engine `te.Linear` (the fp8 GEMM wiring itself is a later dispatch, #240).
+
+    `_linear` (this module's helper) reaches into `layer.weight` directly to cast
+    operands to the compute dtype at the matmul site — correct for `nn.Linear`, but it
+    would silently bypass a `te.Linear`'s own fp8 GEMM/amax bookkeeping entirely. `self._te`
+    is cached at construction so `forward` can branch: a TE linear is always called
+    directly (module `__call__`), never routed through `_linear`.
+    """
+
+    def __init__(self, d_model: int, d_ff: int, config: MambaConfig, device):
+        super().__init__()
+        cls = _te_linear_cls() if getattr(config, "fp8_experts", False) else None
+        self._te = cls is not None
+        self.gate = _expert_linear(d_model, d_ff, config, device)
+        self.up = _expert_linear(d_model, d_ff, config, device)
+        self.down = _expert_linear(d_ff, d_model, config, device)
+
+    def forward(self, xn: Array, cd) -> Array:
+        if self._te:
+            # TE linears own their GEMM (fp8 under an fp8_autocast context — not yet
+            # wired, #240 — or bf16/fp16 outside one); call the modules directly.
+            return self.down(_silu(self.gate(xn)) * self.up(xn))
+        return _linear(self.down,
+                       _silu(_linear(self.gate, xn, cd)) * _linear(self.up, xn, cd), cd)
+
+
+class MoEBlock(nn.Module):
+    """Sparse Mixture-of-Experts FFN block (#53), interleaved like `AttentionBlock` —
+    torch port of `mlx_backend.MoEBlock`, plus a real grouped-gather dispatch kernel
+    (#214) alongside the dense evaluate-every-expert reference. Same `forward_seq(x)->x`
+    / `step(x, state)->(x, state)` contract as the other blocks; stateless (pointwise
+    over the sequence), so forward and step compute the same function by construction.
+
+    `moe_impl` picks the compute strategy, resolved once at construction:
+      * "dense"  — evaluate every expert, mask+renormalize the top_k gates. Exact and
+        FLOP-accountable but not wall-clock-sparse. This is the MLX/Swift reference — the
+        oracle every gather test below is checked against, so it must never be deleted.
+      * "gather" — dispatch each token only to its top_k chosen experts.
+      * "auto"   — dense when top_k >= n_experts or n_experts == 1 (gather buys nothing
+        there), else gather.
+    """
+
+    _MOE_BIAS_PREFIX = "moe_route_bias."   # kept for symmetry with the model-level prefix
+
+    def __init__(self, config: MambaConfig, device):
+        super().__init__()
+        self.config = config
+        self.norm = RMSNorm(config.d_model)
+        self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
+        d_ff = config.moe_d_ff_resolved
+        self.experts = nn.ModuleList(
+            [_Expert(config.d_model, d_ff, config, device) for _ in range(config.n_experts)])
+        # Shared experts (#214, DeepSeek-V2/V3 form): every token goes through every
+        # shared expert unconditionally; combined ADDITIVELY in `_moe`, outside the
+        # router softmax/top-k renormalization. Empty ModuleList for n_shared_experts=0.
+        self.shared_experts = nn.ModuleList(
+            [_Expert(config.d_model, d_ff, config, device)
+             for _ in range(config.n_shared_experts)])
+
+        E = config.n_experts
+        if config.moe_impl == "dense":
+            self._use_gather = False
+        elif config.moe_impl == "gather":
+            self._use_gather = True
+        else:                                          # "auto"
+            self._use_gather = not (config.top_k >= E or E == 1)
+
+        # Loss-Free-Balancing (#213 D1), torch port. MLX excludes the bias/counts from
+        # the parameter tree via a leading-underscore-attribute convention baked into
+        # `nn.Module.valid_parameter_filter`; torch has no such convention, so
+        # `register_buffer(..., persistent=False)` does the ACTUAL work here — verified:
+        # absent from `named_parameters()` AND `state_dict()`, `load_state_dict(strict=
+        # True)` does not demand it, and — unlike a plain attribute — it IS moved by
+        # `.to()` (a plain attribute would silently stay on the wrong device the first
+        # time a bias activates on GPU; `persistent=True` would make every load raise on
+        # a missing key). The leading underscore on these names is therefore load-bearing
+        # in MLX but purely COSMETIC here — kept only for cross-backend name parity.
+        self.register_buffer("_route_bias", torch.zeros(E), persistent=False)
+        self._bias_active = False
+        self._count_loads = False
+        self.register_buffer("_load_counts", torch.zeros(E), persistent=False)
+
+    def set_route_bias(self, vec) -> None:
+        """Set the per-expert selection bias (#213) — `vec` a `list[float]` of length
+        `n_experts`. Mutates the buffer IN PLACE (`copy_`), never rebinds it, so it stays
+        the exact object `.to()` already placed on the right device."""
+        if len(vec) != self.config.n_experts:
+            raise ValueError(
+                f"route bias has {len(vec)} entries, expected "
+                f"n_experts={self.config.n_experts}."
+            )
+        self._route_bias.copy_(
+            torch.as_tensor(vec, dtype=torch.float32, device=self._route_bias.device))
+        self._bias_active = True
+
+    def route_bias(self) -> list:
+        return [float(b) for b in self._route_bias.tolist()] if self._bias_active else []
+
+    def set_load_counting(self, flag: bool) -> None:
+        self._count_loads = bool(flag)
+
+    def pop_load(self) -> list:
+        """Per-expert token counts accumulated since the last pop, then reset."""
+        counts = self._load_counts.clone()
+        self._load_counts.zero_()
+        return [float(c) for c in counts.tolist()]
+
+    def _moe_dense(self, xn: Array, cd, gate: Array) -> Array:
+        outs = torch.stack([e(xn, cd) for e in self.experts], dim=-2)   # (...,E,d_model)
+        return torch.sum(gate.unsqueeze(-1) * _f32(outs), dim=-2)       # combine in fp32
+
+    def _moe_gather(self, xn: Array, cd, topk_ids: Array, gate_kept: Array) -> Array:
+        """Grouped-gather routing (#214): dispatch each token only to its top_k chosen
+        experts, instead of `_moe_dense`'s evaluate-every-expert-then-mask.
+
+        Two-step gather — `expand` then `index_select` — is DELIBERATELY NOT the
+        one-shot `flat.index_select(0, perm // k)`: that form's backward is `index_add_`
+        with repeated indices, a CUDA atomic reduction whose summation order varies run
+        to run and would break the bit-exact resume the smoke gate asserts (see the
+        determinism note at `cuda_muon.py:25-27`). This form's backward is a
+        deterministic `sum` (from the `expand`) composed with a permutation
+        `index_select` — at the cost of one extra `(N*k, D)` buffer, noted for the FSDP
+        follow-up.
+
+        Loops over ALL E experts, deliberately with no `if count == 0: continue`: a
+        zero-row GEMM still yields a real, exactly-zero, finite `weight.grad` (matching
+        the dense path), whereas skipping the call leaves that expert's `.grad` as
+        `None` and `Muon.step` (`cuda_muon.py:65-67`) then skips its momentum decay
+        while the dense path decays it — a silent, impl-dependent training divergence.
+        """
+        E, k = self.config.n_experts, self.config.top_k
+        D = xn.shape[-1]
+        lead_shape = xn.shape[:-1]
+        flat_x = xn.reshape(-1, D)
+        N = flat_x.shape[0]
+        flat_ids = topk_ids.reshape(N, k)
+        flat_gate = gate_kept.reshape(N, k)
+
+        # (N,D) -> (N,k,D) -> (N*k,D): each token's row repeated once per chosen expert
+        # (its own dispatch copy), so the backward through this step is a deterministic
+        # sum over the k repeats — never an atomic scatter-add.
+        dispatch = flat_x.unsqueeze(1).expand(N, k, D).reshape(N * k, D)
+        dispatch_expert = flat_ids.reshape(-1)              # (N*k,) expert id per slot
+
+        perm = torch.argsort(dispatch_expert, stable=True)  # group dispatch slots by expert
+        sorted_expert = dispatch_expert[perm]
+        sorted_x = dispatch.index_select(0, perm)            # deterministic gather
+
+        counts = torch.bincount(sorted_expert, minlength=E).tolist()   # one host sync
+        chunks = []
+        offset = 0
+        for e in range(E):                     # ALL experts — see the no-`continue` note above
+            c = counts[e]
+            chunks.append(self.experts[e](sorted_x[offset:offset + c], cd))
+            offset += c
+        out_sorted = torch.cat(chunks, dim=0)                 # (N*k, D)
+
+        inv_perm = torch.argsort(perm)                        # undo the grouping sort
+        out_dispatch = out_sorted.index_select(0, inv_perm).reshape(N, k, D)
+        combined = torch.sum(_f32(out_dispatch) * flat_gate.unsqueeze(-1), dim=1)   # (N,D)
+        return combined.reshape(*lead_shape, D)
+
+    def _moe(self, xn: Array) -> Array:
+        cd = _DTYPES[self.config.precision]
+        E, k = self.config.n_experts, self.config.top_k
+        logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
+        probs = F.softmax(logits, dim=-1)                    # UNBIASED — always the gate weight
+
+        if k < E:                                             # keep EXACTLY top_k per token
+            # Loss-Free-Balancing (#213 D2): when active, rank by the BIASED selection
+            # score `logits + route_bias` (LOGIT space); the gate weight below stays
+            # `probs` (unbiased) regardless. Unbiased: rank by `probs`, NOT `logits` —
+            # softmax can collide two distinct fp32 logits into one prob, so the two
+            # tie-break differently; this must mirror `mlx_backend.py:694` literally.
+            sel = (logits + self._route_bias) if self._bias_active else probs
+            # `stable=True` is the WHOLE tie-break contract: verified to match MLX's
+            # `argsort(argsort(-x)) < k` double-argsort on every tested tie pattern.
+            # `torch.topk` is DISQUALIFIED — it diverges from that on ties (see the
+            # explicit negative test in tests/test_cuda_moe.py).
+            order = torch.argsort(-sel, dim=-1, stable=True)       # descending rank
+            topk_ids, _ = torch.sort(order[..., :k], dim=-1)       # ascending: dense-order sum
+
+            if self._count_loads:
+                # Per-expert load bookkeeping for the balancer (#213), detached from the
+                # graph (topk_ids already carries no grad) and accumulated; `pop_load()`
+                # reads + resets it. Counted only here (k < E): with k == E every expert
+                # takes every token and balancing is vacuous. Shared between dense/gather
+                # (both derive from the same topk_ids), so `pop_moe_load()` agrees exactly
+                # between impls.
+                counts = torch.bincount(
+                    topk_ids.reshape(-1), minlength=E).to(self._load_counts.dtype)
+                self._load_counts += counts
+
+            if self._use_gather:
+                gate_kept = torch.gather(probs, -1, topk_ids)
+                gate_kept = gate_kept / gate_kept.sum(-1, keepdim=True)
+                y = self._moe_gather(xn, cd, topk_ids, gate_kept)
+            else:
+                mask = torch.zeros_like(probs, dtype=torch.bool)
+                mask.scatter_(-1, topk_ids, True)
+                gate = torch.where(mask, probs, torch.zeros_like(probs))
+                gate = gate / gate.sum(-1, keepdim=True)      # renormalize the kept gates
+                y = self._moe_dense(xn, cd, gate)
+        else:
+            y = self._moe_dense(xn, cd, probs)                # softmax already sums to 1
+
+        if len(self.shared_experts):
+            # Additive, OUTSIDE the router softmax/top-k renormalization (DeepSeek-V2/V3
+            # form). Guarded so n_shared_experts=0 takes the exact pre-#214 path.
+            y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
+        return _cast(y, cd)
+
+    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+        return x + self._moe(self.norm(x))                   # pointwise: seg_ids irrelevant
+
+    def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        # Stateless: emit the SAME placeholder pair `init_state` builds for a MoE layer.
+        B_ = x.shape[0]
+        z = x.new_zeros((B_, 0))
+        return x + self._moe(self.norm(x)), (z, z)
+
+    def step(self, x: Array, state: State) -> Tuple[Array, State]:
+        return x + self._moe(self.norm(x)), state            # stateless: pass state through
+
+
 def _torch_ge_21() -> bool:
     # "2.3.1+cu121" -> (2, 3); robust to the +cuXXX / +cpu local suffix.
     parts = torch.__version__.split("+")[0].split(".")
@@ -729,26 +966,22 @@ def _torch_ge_21() -> bool:
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class CUDAMambaModel(ModelInterface, nn.Module):
+    # `moe_route_bias.{layer_index}` — the MoE route bias's key prefix in the portable
+    # weights (#213 D3). Not a parameter (see MoEBlock.__init__), so it is added/popped
+    # explicitly around the state_dict path rather than riding it.
+    _MOE_BIAS_PREFIX = "moe_route_bias."
+
     def __init__(self, config: MambaConfig, device: str = "cpu"):
         nn.Module.__init__(self)
         config.validate()
-        # Fail fast rather than silently build a DENSE model: the sparse-MoE block (#53) is
-        # MLX-only for now, but MambaConfig.num_parameters()/parameter_breakdown() already
-        # account for MoE capacity — so a `moe_every` config here would disagree with the
-        # formula and skew any cross-backend sizing/comparison.
-        if config.n_moe_layers > 0:
-            raise NotImplementedError(
-                "MoE-Mamba (#53) is not implemented in the CUDA backend; "
-                "build a config without `moe_every` (it is an MLX-only experiment)."
-            )
         self.config = config
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self._device = torch.device(device)
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions.
-        self.layers = nn.ModuleList(
-            [AttentionBlock(config) if config.is_attention_layer(i) else MambaBlock(config)
-             for i in range(config.n_layers)])
+        # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions;
+        # MoE (#53/#214): sparse-FFN blocks replace Mamba blocks at their gated positions
+        # (attention takes precedence on a collision, matching `is_moe_layer`).
+        self.layers = nn.ModuleList([self._make_layer(i) for i in range(config.n_layers)])
         self.norm_f = RMSNorm(config.d_model)
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
@@ -773,6 +1006,16 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             self._compiled = bool(config.torch_compile)
         if self._compiled:
             self._forward_compute = torch.compile(self._forward_compute)
+
+    def _make_layer(self, i: int):
+        """Attention -> MoE -> Mamba precedence, mirroring `mlx_backend.MLXMambaModel.
+        _make_layer` (and `MambaConfig.is_moe_layer`'s own attention-takes-precedence
+        rule)."""
+        if self.config.is_attention_layer(i):
+            return AttentionBlock(self.config)
+        if self.config.is_moe_layer(i):
+            return MoEBlock(self.config, self._device)
+        return MambaBlock(self.config)
 
     def _head(self, h: Array) -> Array:
         # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is upcast
@@ -858,16 +1101,40 @@ class CUDAMambaModel(ModelInterface, nn.Module):
 
     def mixing_matrices(self, token_batch: Array) -> List[Tuple[int, Array]]:
         """For the `mixing-match` stage: each Mamba layer's head-averaged mixing matrix
-        `(B, L, L)` paired with its layer index. Attention layers are skipped. Torch port of
+        `(B, L, L)` paired with its layer index. Attention AND MoE layers are skipped
+        (`MoEBlock` has no `mixing_matrix` — it is pointwise, not a mixer). Torch port of
         `mlx_backend.MLXMambaModel.mixing_matrices`."""
         ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
         h = _cast(self.embedding(ids), self._cd)
         out: List[Tuple[int, Array]] = []
         for i, layer in enumerate(self.layers):
-            if not self.config.is_attention_layer(i):
+            if not self.config.is_attention_layer(i) and not self.config.is_moe_layer(i):
                 out.append((i, layer.mixing_matrix(h).mean(dim=1)))     # head-average -> (B,L,L)
             h = self._layer_forward(layer, h)
         return out
+
+    # --- Loss-Free-Balancing accessors (#213/#214), torch mirrors of the MLX ones ----
+    def moe_blocks(self) -> List["MoEBlock"]:
+        return [l for l in self.layers if isinstance(l, MoEBlock)]
+
+    def set_moe_biases(self, biases: List[List[float]]) -> None:
+        blocks = self.moe_blocks()
+        if len(biases) != len(blocks):
+            raise ValueError(
+                f"got {len(biases)} bias vectors for {len(blocks)} MoE layers."
+            )
+        for block, vec in zip(blocks, biases):
+            block.set_route_bias(vec)
+
+    def moe_biases(self) -> List[List[float]]:
+        return [block.route_bias() for block in self.moe_blocks()]
+
+    def set_moe_load_counting(self, flag: bool) -> None:
+        for block in self.moe_blocks():
+            block.set_load_counting(flag)
+
+    def pop_moe_load(self) -> List[List[float]]:
+        return [block.pop_load() for block in self.moe_blocks()]
 
     def init_state(self, batch_size: int) -> State:
         c = self.config
@@ -877,10 +1144,14 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         dev = self._device
         # Per Mamba layer: (conv window (B,k-1,di), SSM state (B,H,P,N)), fp32.
         # Per attention layer: a zero-length KV cache (k,v), each (B,Ha,0,Dh), grown by step.
+        # Per MoE layer: a zero-length placeholder pair (stateless FFN).
         def layer_state(i):
             if c.is_attention_layer(i):
                 z = torch.zeros((batch_size, Ha, 0, Dh), device=dev)
                 return (z, z)
+            if c.is_moe_layer(i):
+                z = torch.zeros((batch_size, 0), device=dev)
+                return (z, z)                     # keeps clone_state's (a, b) unpack valid
             return (torch.zeros((batch_size, k - 1, di), device=dev),
                     torch.zeros((batch_size, H, P, N), device=dev))
         return [layer_state(i) for i in range(self.config.n_layers)]
@@ -914,14 +1185,44 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             if k.endswith(".conv.weight"):
                 arr = arr.transpose(1, 2)            # (out,1,k) -> (out,k,1)
             out[k] = arr.numpy()
+        # Loss-Free-Balancing bias (#213 D3): rides in the PORTABLE weights, not the
+        # resume bundle — it is routing state that changes the model's function at
+        # inference. `_route_bias` is a non-persistent buffer (see MoEBlock.__init__),
+        # so it never appears in `named_parameters()` above; emitted explicitly, and only
+        # for a block whose bias is ACTIVE — an unconditional key would break
+        # `sum(v.size) == cfg.num_parameters()` (tests/test_moe.py / test_sizing.py), and
+        # the bias genuinely is not a parameter, so it does not belong in
+        # `num_parameters()` either way. Mirrors `mlx_backend.py:986-1003`.
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, MoEBlock) and layer._bias_active:
+                out[f"{self._MOE_BIAS_PREFIX}{i}"] = layer._route_bias.detach().cpu().numpy()
         return out
 
     def _load_portable(self, weights: dict) -> None:
-        tensors = {}
+        # Pop the non-parameter route-bias keys FIRST — they must never reach
+        # `load_state_dict`, which only knows about the real parameter/buffer tree and
+        # would raise (strict=True) on an unexpected key. Absent keys (an old checkpoint,
+        # balancing off, a dense model) simply leave every block inactive. Mirrors
+        # `mlx_backend.py:1005-1028`.
+        biases, tensors = {}, {}
         for k, v in weights.items():
+            if k.startswith(self._MOE_BIAS_PREFIX):
+                biases[int(k[len(self._MOE_BIAS_PREFIX):])] = v
+                continue
             t = torch.as_tensor(np.asarray(v))
             if k.endswith(".conv.weight"):
                 t = t.transpose(1, 2)                # (out,k,1) -> (out,1,k)
             tensors[k] = t
         self.load_state_dict(tensors, strict=True)
         self.to(self._device)
+        for i, vec in biases.items():
+            # Check the key names a real MoE layer before indexing: a balanced checkpoint
+            # loaded into a dense or differently-interleaved config would otherwise die on
+            # an IndexError deep in the load, with nothing pointing at the real mismatch.
+            if not (0 <= i < len(self.layers)) or not isinstance(self.layers[i], MoEBlock):
+                raise ValueError(
+                    f"checkpoint has {self._MOE_BIAS_PREFIX}{i}, but layer {i} of this "
+                    "config is not an MoE layer — the weights and the config disagree "
+                    "about the MoE interleave."
+                )
+            self.layers[i].set_route_bias(np.asarray(vec).reshape(-1).tolist())
