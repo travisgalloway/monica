@@ -286,28 +286,102 @@ def evaluate_fim(model, examples: Sequence[FIMExample], *, batch_size: int = 8,
             "example has an empty middle span"
         )
 
-    def aggregate(rows: List[dict]) -> dict:
-        n_tokens = sum(r["n_middle_tokens"] for r in rows)
-        ce = sum(r["ce_nats"] * r["n_middle_tokens"] for r in rows) / n_tokens
-        acc = sum(r["token_accuracy"] * r["n_middle_tokens"] for r in rows) / n_tokens
-        return {
-            "ce": float(ce),
-            "perplexity": perplexity(float(ce)),
-            "token_accuracy": float(acc),
-            "exact_match_rate": float(np.mean([r["exact_match"] for r in rows])),
-            "n_examples": len(rows),
-            "n_tokens": int(n_tokens),
-        }
-
     by_bucket: dict = {}
     for name, _lo, _hi in buckets:
         rows = [r for r in scored_records if r["bucket"] == name]
-        by_bucket[name] = aggregate(rows) if rows else None
+        by_bucket[name] = aggregate_rows(rows) if rows else None
 
     return {
         "records": records,
         "by_bucket": by_bucket,
-        "overall": aggregate(scored_records),
+        "overall": aggregate_rows(scored_records),
+        "advisory": _architecture_advisory(model),
+    }
+
+
+def aggregate_rows(rows: List[dict]) -> dict:
+    """Token-weighted aggregate of scored FIM records (was `evaluate_fim`'s inner closure;
+    lifted to module level so #221's multi-key re-aggregation can reuse it verbatim).
+
+    CE and token accuracy are weighted by `n_middle_tokens` so a long middle does not count
+    the same as a one-token middle; exact match is a per-example rate.
+    """
+    n_tokens = sum(r["n_middle_tokens"] for r in rows)
+    ce = sum(r["ce_nats"] * r["n_middle_tokens"] for r in rows) / n_tokens
+    acc = sum(r["token_accuracy"] * r["n_middle_tokens"] for r in rows) / n_tokens
+    return {
+        "ce": float(ce),
+        "perplexity": perplexity(float(ce)),
+        "token_accuracy": float(acc),
+        "exact_match_rate": float(np.mean([r["exact_match"] for r in rows])),
+        "n_examples": len(rows),
+        "n_tokens": int(n_tokens),
+    }
+
+
+def aggregate_by(scored_records: Sequence[dict], *, key_field: str,
+                 buckets: Sequence[Tuple[str, int, Optional[int]]] = DEFAULT_BUCKETS) -> dict:
+    """Re-bucket already-scored records on `key_field` (`"prefix_len"` or
+    `"recall_distance"`) and aggregate each bucket.
+
+    Pure re-aggregation — no model call. An empty bucket is `None`, not a zero row.
+    """
+    rows_by_bucket: dict = {name: [] for name, _lo, _hi in buckets}
+    for r in scored_records:
+        if not r.get("n_middle_tokens"):
+            continue
+        rows_by_bucket[bucket_of(int(r[key_field]), buckets)].append(r)
+    return {name: (aggregate_rows(rows) if rows else None)
+            for name, rows in rows_by_bucket.items()}
+
+
+def evaluate_fim_multi_key(model, examples: Sequence[FIMExample], *, batch_size: int = 8,
+                           buckets: Sequence[Tuple[str, int, Optional[int]]] = DEFAULT_BUCKETS,
+                           keys: Sequence[str] = ("prefix_len", "recall_distance"),
+                           sentinels: FIMSentinels = FIMSentinels(),
+                           to_numpy=np.asarray) -> dict:
+    """#221's FIM probe: **both** keyings from a single forward pass.
+
+    `evaluate_fim` buckets on one key at a time, so getting FIM-by-prefix-distance *and*
+    FIM-by-recall-distance meant scoring the same examples twice — the forward pass is the
+    expensive part and it is identical in both. Records already carry both distances
+    (`fim_eval` scores once, buckets later), so this scores once and re-aggregates.
+
+    Returns `{"records", "by_key": {key: {bucket: agg | None}}, "overall", "advisory"}`.
+    Each `by_key[k]` is byte-identical to `evaluate_fim(..., key=lambda ex: getattr(ex, k))`'s
+    `by_bucket`, which `tests/test_fim_eval.py` pins down.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    for key in keys:
+        if key not in ("prefix_len", "recall_distance", "middle_len", "suffix_len"):
+            raise ValueError(f"unknown FIM bucket key {key!r}")
+
+    records: List[dict] = []
+    for start in range(0, len(examples), batch_size):
+        batch = list(examples[start:start + batch_size])
+        for ex, scored in zip(batch, _score_batch(model, batch, sentinels, to_numpy)):
+            records.append({
+                "doc_index": ex.doc_index,
+                "prefix_len": ex.prefix_len,
+                "middle_len": ex.middle_len,
+                "suffix_len": ex.suffix_len,
+                "recall_distance": ex.recall_distance,
+                **scored,
+            })
+
+    scored_records = [r for r in records if r["n_middle_tokens"] > 0]
+    if not scored_records:
+        raise ValueError(
+            "evaluate_fim_multi_key(): no middle tokens scored — the example set is empty "
+            "or every example has an empty middle span"
+        )
+
+    return {
+        "records": records,
+        "by_key": {key: aggregate_by(scored_records, key_field=key, buckets=buckets)
+                   for key in keys},
+        "overall": aggregate_rows(scored_records),
         "advisory": _architecture_advisory(model),
     }
 
@@ -346,3 +420,19 @@ def format_fim_table(results: dict) -> str:
     if results.get("advisory"):
         lines.append(f"  advisory: {results['advisory']}")
     return "\n".join(lines)
+
+
+def format_fim_multi_table(results: dict) -> str:
+    """`evaluate_fim_multi_key` results as one `format_fim_table` block per key."""
+    blocks = []
+    for key, by_bucket in results["by_key"].items():
+        blocks.append(format_fim_table({
+            "by_bucket": by_bucket,
+            "overall": results["overall"],
+            # The advisory is a property of the model, not of the keying — print it once,
+            # on the last block, rather than repeating it per key.
+            "advisory": None,
+        }).replace("FIM loss by distance bucket:", f"FIM loss by {key}:", 1))
+    if results.get("advisory"):
+        blocks.append(f"  advisory: {results['advisory']}")
+    return "\n".join(blocks)

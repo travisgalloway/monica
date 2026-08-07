@@ -11,11 +11,15 @@ from src.eval.fim_eval import (
     DEFAULT_BUCKETS,
     FIMExample,
     FIMSentinels,
+    aggregate_by,
+    aggregate_rows,
     attention_after_suffix,
     bucket_of,
     build_fim_examples,
     documents_from_shards,
     evaluate_fim,
+    evaluate_fim_multi_key,
+    format_fim_multi_table,
     format_fim_table,
     make_fim_example,
 )
@@ -327,6 +331,108 @@ def test_documents_from_shards_honours_max_docs(tmp_path):
     docs = [[6, 7, 8, 9] for _ in range(6)]
     pack_sequences(iter(docs), tmp_path, seq_len=4, shard_size_mb=1)
     assert len(documents_from_shards(tmp_path, max_docs=2)) == 2
+
+
+# --------------------------------------------------------------------------------------- #
+# Multi-key aggregation (#221's additive extension)
+# --------------------------------------------------------------------------------------- #
+
+class _CountingModel(_FakeModel):
+    """Counts `forward` calls, so 'one forward pass, both keyings' is an assertion rather
+    than a comment."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.n_forward = 0
+
+    def forward(self, inputs):
+        self.n_forward += 1
+        return super().forward(inputs)
+
+
+def _multi_key_examples():
+    # prefix_len and recall_distance land in DIFFERENT buckets for these, which is the only
+    # way the two keyings can be told apart.
+    return [
+        make_fim_example(_doc(700), 100, 200, doc_index=0),    # prefix 100 (short), recall 602
+        make_fim_example(_doc(2600, start=7), 200, 400, doc_index=1),  # prefix 200, recall 2402
+        make_fim_example(_doc(60, start=9), 10, 30, doc_index=2),      # both short
+    ]
+
+
+def test_aggregate_rows_is_the_token_weighted_mean():
+    rows = [{"n_middle_tokens": 10, "ce_nats": 1.0, "token_accuracy": 1.0, "exact_match": 1.0},
+            {"n_middle_tokens": 30, "ce_nats": 3.0, "token_accuracy": 0.0, "exact_match": 0.0}]
+    agg = aggregate_rows(rows)
+    assert agg["ce"] == pytest.approx((1.0 * 10 + 3.0 * 30) / 40)
+    assert agg["token_accuracy"] == pytest.approx(10 / 40)
+    assert agg["exact_match_rate"] == pytest.approx(0.5)      # per-example, not token-weighted
+
+
+def test_aggregate_by_rebuckets_without_touching_the_model():
+    records = evaluate_fim(_FakeModel(), _multi_key_examples(), batch_size=2)["records"]
+    by_prefix = aggregate_by(records, key_field="prefix_len")
+    by_recall = aggregate_by(records, key_field="recall_distance")
+    assert by_prefix["short"] is not None and by_prefix["long"] is None
+    assert by_recall["long"] is not None                       # 2402 tokens of recall distance
+    assert by_prefix != by_recall
+
+
+def test_multi_key_matches_two_separate_single_key_runs():
+    examples = _multi_key_examples()
+    model = _FakeModel()
+    multi = evaluate_fim_multi_key(model, examples, batch_size=2)
+    by_prefix = evaluate_fim(model, examples, batch_size=2,
+                             key=lambda e: e.prefix_len)["by_bucket"]
+    by_recall = evaluate_fim(model, examples, batch_size=2,
+                             key=lambda e: e.recall_distance)["by_bucket"]
+    assert multi["by_key"]["prefix_len"] == by_prefix
+    assert multi["by_key"]["recall_distance"] == by_recall
+    assert multi["overall"] == evaluate_fim(model, examples, batch_size=2)["overall"]
+
+
+def test_multi_key_scores_once_not_once_per_key():
+    examples = _multi_key_examples()
+    multi_model = _CountingModel()
+    evaluate_fim_multi_key(multi_model, examples, batch_size=2)
+    single_model = _CountingModel()
+    evaluate_fim(single_model, examples, batch_size=2)
+    # Same number of forward calls as ONE evaluate_fim — the point of the extension.
+    assert multi_model.n_forward == single_model.n_forward
+
+
+def test_multi_key_records_carry_both_distances():
+    res = evaluate_fim_multi_key(_FakeModel(), _multi_key_examples(), batch_size=2)
+    for rec in res["records"]:
+        assert "prefix_len" in rec and "recall_distance" in rec
+
+
+def test_multi_key_rejects_an_unknown_key():
+    with pytest.raises(ValueError, match="unknown FIM bucket key"):
+        evaluate_fim_multi_key(_FakeModel(), _multi_key_examples(), keys=("nonsense",))
+
+
+def test_multi_key_raises_on_an_empty_set():
+    with pytest.raises(ValueError, match="no middle tokens scored"):
+        evaluate_fim_multi_key(_FakeModel(), [], batch_size=2)
+
+
+def test_multi_key_table_labels_each_keying():
+    res = evaluate_fim_multi_key(_FakeModel(n_layers=28, attn_every=8), _multi_key_examples(),
+                                 batch_size=2)
+    table = format_fim_multi_table(res)
+    assert "FIM loss by prefix_len:" in table and "FIM loss by recall_distance:" in table
+    assert "advisory:" in table and table.count("advisory:") == 1
+
+
+def test_evaluate_fim_output_is_unchanged_by_the_refactor():
+    """#215 owns `evaluate_fim`; #221's extension is additive only."""
+    examples = _multi_key_examples()
+    res = evaluate_fim(_FakeModel(), examples, batch_size=2)
+    assert sorted(res) == ["advisory", "by_bucket", "overall", "records"]
+    assert sorted(res["overall"]) == ["ce", "exact_match_rate", "n_examples", "n_tokens",
+                                      "perplexity", "token_accuracy"]
+    assert res["records"][0]["bucket"] == "short"
 
 
 def test_fim_example_is_frozen():

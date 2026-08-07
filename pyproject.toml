@@ -60,6 +60,14 @@ logging = ["wandb>=0.16"]
 # Tier-2 OLMES/lm-eval benchmark harness. A heavy optional dependency (some
 # versions pull in torch) — install only where benchmarks run; above the seam
 # it may only ever be imported lazily (inside functions), never at module level.
+#
+# The M12 code eval suite (#221 — `src/eval/code_{suite,recall,needle}.py`,
+# `domain_bpb.py`, `external_sets.py`) deliberately adds **no** hard dependency: it is
+# numpy + stdlib. Its two optional paths reuse extras that already exist —
+# `tree_sitter`/`tree-sitter-typescript` (an advisory cross-check in `code_recall`, which
+# degrades to regex when absent) and `datasets` from the `data` extra (only for a LIVE
+# external-suite pull, which is off by default and requires a pinned revision). Both are
+# imported inside functions, never at module level, so the seam guard needs nothing extra.
 eval = ["lm-eval>=0.4.5,<0.5"]
 dev = ["pytest>=8.0"]
 

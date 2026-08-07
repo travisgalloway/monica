@@ -1,0 +1,6 @@
+{"id":"realfim_synth_00","lang":"typescript","middle":"return input as unknown as number;","prefix":"export function sumEven(input: number[]): number {\n  ","repo":"synthetic/fixture-repo-00","suffix":"\n}\n"}
+{"id":"realfim_synth_01","lang":"typescript","middle":"return input as unknown as number;","prefix":"export function countVowels(input: string): number {\n  ","repo":"synthetic/fixture-repo-01","suffix":"\n}\n"}
+{"id":"realfim_synth_02","lang":"typescript","middle":"return input as unknown as string;","prefix":"export function reverseWords(input: string): string {\n  ","repo":"synthetic/fixture-repo-02","suffix":"\n}\n"}
+{"id":"realfim_synth_03","lang":"typescript","middle":"return input as unknown as number;","prefix":"export function maxGap(input: number[]): number {\n  ","repo":"synthetic/fixture-repo-03","suffix":"\n}\n"}
+{"id":"realfim_synth_04","lang":"typescript","middle":"return input as unknown as boolean;","prefix":"export function isBalanced(input: string): boolean {\n  ","repo":"synthetic/fixture-repo-04","suffix":"\n}\n"}
+{"id":"realfim_synth_05","lang":"typescript","middle":"return input as unknown as number[];","prefix":"export function dedupeSorted(input: number[]): number[] {\n  ","repo":"synthetic/fixture-repo-05","suffix":"\n}\n"}

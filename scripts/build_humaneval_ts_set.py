@@ -37,12 +37,35 @@ def main() -> int:
                     default=Path("eval_sets/humaneval_ts/humaneval_ts.jsonl"))
     ap.add_argument("--config", default="humaneval-ts",
                     help="MultiPL-E config (default: humaneval-ts; mbpp-ts also valid)")
+    ap.add_argument("--revision", default=None,
+                    help="HF commit SHA to pin the pull to. Defaults to the pin recorded in "
+                         "src/eval/external_sets.py; the build fails if neither is set "
+                         "(#221 — an unpinned pull is not a reproducible measurement).")
     args = ap.parse_args()
+
+    # #221: the revision pin lives in one place, next to the other external suites.
+    from src.eval.external_sets import EXTERNAL_SETS, revision_for
+
+    set_name = f"multipl-e-{args.config}"
+    revision = args.revision
+    if revision is None:
+        if set_name not in EXTERNAL_SETS:
+            raise SystemExit(
+                f"no external-set entry for MultiPL-E config {args.config!r} "
+                f"(known: {sorted(EXTERNAL_SETS)}), so no pin can be looked up — pass "
+                "--revision <sha> explicitly.")
+        revision = revision_for(set_name)
+    if revision is None:
+        raise SystemExit(
+            f"{set_name!r} has no pinned revision. A MultiPL-E pull without a commit SHA is "
+            "not reproducible: the set this eval reports against could change under it "
+            "silently. Fix by either passing --revision <sha>, or filling `revision=` for "
+            f"{set_name!r} in src/eval/external_sets.py (see eval_sets/external/README.md).")
 
     from datasets import load_dataset
 
-    print(f"loading nuprl/MultiPL-E {args.config} ...")
-    ds = load_dataset("nuprl/MultiPL-E", args.config, split="test")
+    print(f"loading nuprl/MultiPL-E {args.config} @ {revision} ...")
+    ds = load_dataset("nuprl/MultiPL-E", args.config, split="test", revision=revision)
 
     records = []
     for row in ds:
@@ -55,7 +78,8 @@ def main() -> int:
             "gold_completion": "\n",               # placeholder — no gold body ships; clean-rate
                                                     # + pass@1 are the metrics, not gold-match
             "error_completion": "",
-            "notes": f"MultiPL-E {args.config} {row['name']}; self-contained, real generation",
+            "notes": (f"MultiPL-E {args.config} @ {revision} {row['name']}; "
+                      "self-contained, real generation"),
             # F1 extras (ignored by the scorer, used by the driver)
             "name": row["name"],
             "tests": row["tests"],
