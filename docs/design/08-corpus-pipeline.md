@@ -153,8 +153,9 @@ Dedup/decontam produce `cleaned/` once; the tokenized views are cheap to regener
   2. **CUDA smoke gate** — build a tiny toy split on the pod and run
      `scripts/smoke_test.py --backend cuda --data <toy split>`. This proves the torch
      backend resumes bit-exactly through the [double-buffered `CheckpointStore`](05-training.md)
-     end to end. Use `config/toy.yaml` (a dense config) — the gate refuses a MoE config,
-     since MoE-Mamba (#53) is MLX-only.
+     end to end. `config/toy.yaml` (dense) is the standard fixture; `config/toy-moe.yaml
+     --moe-impl gather` exercises the CUDA MoE path the same way (#214 — MoE is no longer
+     MLX-only).
   3. **Train-step bench** — `scripts/bench_cuda_train_step.py --config config/poc.yaml
      --batch 32 --grad-accum 4` reports s/step, tokens/s, and **peak GPU memory** for the
      production path (`CUDAMambaModel` + AdamW + `make_train_step`, wired exactly as

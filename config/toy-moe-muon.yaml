@@ -1,0 +1,39 @@
+# Toy MoE config + Muon (#214/#237): identical to toy-moe.yaml, plus `optimizer: muon`.
+# Exists so tests/test_cuda_muon.py's real-model partition test covers an MoE model too
+# — expert gate/up/down matrices (2D) go to Muon, the router (2D but excluded by
+# `is_muon_param`'s router carve-out) and everything else stays on AdamW. CUDA backend
+# only; runs on CPU on the Mac dev box like every other toy-*.yaml.
+d_model: 64
+n_layers: 4
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
+d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 SSM heads (scalar A per head)
+dt_rank: auto
+
+# Sparse MoE: every 2nd block is a SwiGLU MoE FFN instead of a Mamba block.
+moe_every: 2           # layers 1 and 3 (0-indexed (i+1)%2==0) are MoE
+n_experts: 4           # route each token to top_k of these
+top_k: 2               # 2/4 experts active per token (sparse)
+moe_d_ff: null         # expert hidden width (null -> d_inner = 128)
+moe_balance_rate: null # balancing OFF — this config is for the optimizer partition, not balance
+
+vocab_size: 256        # byte-fallback tokenizer for offline tests
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32        # correctness first; fp32 makes forward/step parity exact
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny; keep tests cheap
+
+# --- optimizer (#237) ---
+optimizer: muon
+# muon_lr omitted on purpose: derives to base_lr at optimizer-build time (lr_scale ==
+# 1.0), the simplest/most-deterministic path. NOT a tuned value.
+muon_momentum: 0.95
+muon_ns_steps: 5
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

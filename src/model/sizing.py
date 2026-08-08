@@ -24,14 +24,36 @@ GIB = 1024 ** 3
 # Bytes per element for the weight/activation dtype.
 BYTES_PER_DTYPE = {"fp32": 4, "fp16": 2, "bf16": 2}
 
-# Training memory ~ (weights + grads + optimizer state) per parameter. Both options
-# below are the epic's "VRAM-tight" levers vs the classic ~16 B/param fp32 AdamW:
-#   adamw    ~8 B/param : lean all-bf16 Adam — bf16 weight(2) + bf16 grad(2)
-#                         + bf16 Adam m,v(2+2), no fp32 master copy.
-#   adam8bit ~10 B/param: 8-bit Adam moments + an fp32 master weight copy for
-#                         stability — fp32 master(4) + bf16 weight(2) + bf16 grad(2)
-#                         + 8-bit m,v(1+1). The VRAM-tight lever called out in #65.
-OPTIMIZER_BYTES_PER_PARAM = {"adamw": 8, "adam8bit": 10}
+# Training memory ~ (weights + grads + optimizer state) per parameter, keyed by regime.
+# Four keys, two REGIMES (all-bf16 vs fp32-master), each with a plain/8-bit variant:
+#   adamw         ~8 B/param : lean ALL-BF16 Adam — bf16 weight(2) + bf16 grad(2) +
+#                              bf16 Adam m,v(2+2), no fp32 master copy. A real,
+#                              intentionally different regime from what this repo trains
+#                              (kept as a planning option; pinned on purpose at
+#                              `tests/test_sizing.py:109-110` — do not "fix" it to match
+#                              adam8bit).
+#   adam8bit      ~10 B/param: 8-bit Adam moments + an fp32 master weight copy for
+#                              stability — fp32 master(4) + bf16 weight(2) + bf16 grad(2)
+#                              + 8-bit m,v(1+1). The VRAM-tight lever called out in #65.
+#   adamw_fp32    ~16 B/param: classic FP32-MASTER AdamW — fp32 weight(4) + fp32 grad(4)
+#                              + fp32 Adam m,v(4+4). This is the regime THIS REPO
+#                              actually trains in: params stay fp32, cast to the
+#                              backend's compute dtype only at the matmul site (see
+#                              `cuda_backend.py`'s `_f32`/`_cast`, ~:202-221; mirrored on
+#                              MLX). `MambaConfig.optimizer_sizing_key` (#214) resolves
+#                              to this key when `optimizer_8bit` is False.
+#   adam8bit_fp32 ~10 B/param: 8-bit Adam moments on top of the same fp32-master weights
+#                              — numerically identical to `adam8bit` above (that key
+#                              already models an fp32 master copy), kept as a distinct
+#                              name so `optimizer_sizing_key` always names the regime
+#                              this repo is actually in rather than borrowing a key whose
+#                              docstring describes a different one.
+OPTIMIZER_BYTES_PER_PARAM = {
+    "adamw": 8,
+    "adam8bit": 10,
+    "adamw_fp32": 16,
+    "adam8bit_fp32": 10,
+}
 
 # Crude per-token activation footprint: a handful of (batch, seq, d_model) tensors
 # live per layer in the block (in_proj output ~2*d_inner, conv, ssm y, ...). We fold
@@ -108,7 +130,7 @@ def family_row(name: str, cfg: MambaConfig) -> dict:
         "tier": name,
         "params": n,
         "weights_gb": inference_bytes(cfg, "bf16") / GIB,   # bf16 weights == inference footprint
-        "train_gb": training_bytes(cfg)["total"] / GIB,
+        "train_gb": training_bytes(cfg, optimizer=cfg.optimizer_sizing_key)["total"] / GIB,
         "gpu_train": gpu,
         "ram_infer": ram,
     }

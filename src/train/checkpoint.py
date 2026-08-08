@@ -19,7 +19,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -115,6 +115,91 @@ def load_weights(model: Any, path: str) -> None:
             "Backend must implement `_load_portable(dict)` to map portable weights."
         )
     model._load_portable(weights)
+
+
+def load_config_sidecar(weights_path: str) -> Optional[Any]:
+    """Read `<weights_path>.config.json` and reconstruct a `MambaConfig` — the first
+    READER of the sidecar `save_weights` has been writing since day one (#214). Fields
+    in the JSON that are unknown to the CURRENT `MambaConfig` dataclass (e.g. a sidecar
+    written before a config field existed) are dropped, with a printed note, rather than
+    raising a `TypeError` from an unexpected kwarg. Returns `None` if no sidecar exists
+    (a legacy weights-only file, or one written without `config=`) — the caller decides
+    whether that is fatal (e.g. `scripts/upcycle.py` requires either a sidecar or an
+    explicit `--src-config`).
+    """
+    from dataclasses import fields
+    from ..model.blocks import MambaConfig     # local: keeps this module import-light
+
+    p = Path(str(weights_path) + ".config.json")
+    if not p.exists():
+        return None
+    raw = json.loads(p.read_text())
+    known = {f.name for f in fields(MambaConfig)}
+    dropped = sorted(set(raw) - known)
+    if dropped:
+        print(f"[load_config_sidecar] {p}: dropping fields unknown to this "
+              f"MambaConfig: {dropped}")
+    cfg = MambaConfig(**{k: v for k, v in raw.items() if k in known})
+    cfg.validate()
+    return cfg
+
+
+def check_weight_keys(weights: Dict[str, Any], expected: Dict[str, Any], *,
+                      where: str, cap: int = 10) -> None:
+    """Raise `ValueError` unless `weights` (a portable weight dict, or anything
+    `{name: array-like}`) matches `expected` (`{name: array-like}` OR `{name: shape
+    tuple}` — both accepted so callers can pass either a freshly-built model's
+    `_portable_state_dict()` or a precomputed shape table) EXACTLY: same key set, same
+    shapes. Missing, unexpected, AND mis-shaped keys are collected and reported TOGETHER
+    (each category capped at `cap` entries) rather than one raise per problem — a
+    `--init` from a slightly-wrong checkpoint should fail with the whole picture, not a
+    whack-a-mole loop of fix-one-rerun.
+
+    `moe_route_bias.*` keys are ignored on BOTH sides: they are non-parameter routing
+    state (see `MoEBlock.__init__` in either backend) that `_load_portable` pops before
+    the strict `load_state_dict` call this helper exists to guard, and an `expected`
+    built from a freshly-constructed (bias-inactive) model never contains them either —
+    treating them as ordinary keys would flag every balanced checkpoint's `--init` as
+    broken for a reason that isn't real.
+
+    Exists because MLX's `Module.update` (what `_load_portable` uses on that backend) is
+    silently lenient: a missing key leaves that parameter at random init, and a
+    wrong-shaped tensor is silently REBOUND rather than raising. CUDA's `strict=True`
+    catches both automatically; this makes the same guarantee available — and, per the
+    call sites in `scripts/{train,sft,dpo,rlvr}.py`, MANDATORY — on MLX too, so `--init`
+    is safe on either backend.
+    """
+    def _shapes(d: Dict[str, Any]) -> Dict[str, Tuple[int, ...]]:
+        out = {}
+        for k, v in d.items():
+            if k.startswith("moe_route_bias."):
+                continue
+            out[k] = tuple(int(x) for x in v) if isinstance(v, (tuple, list)) \
+                else tuple(np.asarray(v).shape)
+        return out
+
+    w, exp = _shapes(weights), _shapes(expected)
+    missing = sorted(set(exp) - set(w))
+    unexpected = sorted(set(w) - set(exp))
+    mismatched = sorted(k for k in (set(exp) & set(w)) if w[k] != exp[k])
+    if not (missing or unexpected or mismatched):
+        return
+
+    def _fmt(names):
+        shown = list(names[:cap])
+        more = f" (+{len(names) - cap} more)" if len(names) > cap else ""
+        return "[" + ", ".join(shown) + more + "]"
+
+    parts = []
+    if missing:
+        parts.append(f"missing {len(missing)}: {_fmt(missing)}")
+    if unexpected:
+        parts.append(f"unexpected {len(unexpected)}: {_fmt(unexpected)}")
+    if mismatched:
+        want = {k: exp[k] for k in mismatched[:cap]}
+        got = {k: w[k] for k in mismatched[:cap]}
+        parts.append(f"mis-shaped {len(mismatched)}: {_fmt(mismatched)} want={want} got={got}")
+    raise ValueError(f"weight-key check failed for {where}: " + "; ".join(parts))
 
 
 # --- within-backend resume: double-buffered, crash-safe ---------------------

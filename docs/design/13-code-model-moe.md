@@ -10,19 +10,27 @@ from-scratch code model, described below.
 
 ## What this is
 
-> **Read this section as the target design, not as shipped state.** As of 2026-08-03 the MHM
-> components that are **built** are the tokenizer (MHM-P1b, #191/#245) and aux-loss-free load
-> balancing on MLX (MHM-P2-T0, #213). `MambaConfig` carries the MoE and hybrid-attention knobs
-> (`moe_every`, `n_experts`, `top_k`, `attn_every`, `fp8_experts`, `moe_balance_rate`) and the MLX
-> backend's `MoEBlock` now has a DeepSeek-V3 Loss-Free-Balancing router: a per-expert bias steers
-> top-k **selection** only, updated outside the gradient from per-expert load counts, with no aux
-> loss on the objective (portable policy in `src/train/moe_balance.py`; `moe_balance_rate: null`
-> keeps the pre-#213 router byte-identical). It still has **no shared expert**, and it densely
-> evaluates every expert (sparse *combination*, not sparse compute) — a capacity experiment, not a
-> production kernel. The CUDA backend still raises `NotImplementedError` for MoE (#214), which will
-> reuse `src/train/moe_balance.py` unchanged. The shared expert, FIM, the Essential-Web + Stack-v2
-> mixture, and repo-context packing described below are **designed, not implemented**. Per-item
-> status is in the MHM-P# list that follows; when the two disagree, the P# list wins.
+> **Read this section as the target design, not as shipped state.** As of 2026-08-07 the MHM
+> components that are **built** are the tokenizer (MHM-P1b, #191/#245), aux-loss-free load
+> balancing (MHM-P2-T0, #213, portable — shared by both backends), and the **CUDA MoE backend**
+> (MHM-P2-T1, #214). `MambaConfig` carries the MoE and hybrid-attention knobs (`moe_every`,
+> `n_experts`, `top_k`, `n_shared_experts`, `moe_impl`, `attn_every`, `fp8_experts`,
+> `optimizer_8bit`, `moe_balance_rate`). Both the MLX and CUDA `MoEBlock`s now have a shared
+> expert (DeepSeek-V2/V3 form, additive, outside the router softmax/top-k renormalization) and
+> the Loss-Free-Balancing router: a per-expert bias steers top-k **selection** only, updated
+> outside the gradient from per-expert load counts, with no aux loss on the objective (portable
+> policy in `src/train/moe_balance.py`; `moe_balance_rate: null` keeps the pre-#213 router
+> byte-identical). MLX still densely evaluates every expert (sparse *combination*, not sparse
+> compute — a capacity experiment, not a production kernel); the CUDA backend adds a real
+> **grouped-gather dispatch** (`moe_impl: gather`, dispatch-only-to-chosen-experts, with a
+> deterministic backward so it stays inside the bit-exact-fp32-resume smoke gate), alongside the
+> dense path as its always-kept oracle. fp8 expert GEMMs (Transformer Engine, Hopper+) and an
+> 8-bit AdamW-moments switch (bitsandbytes) are wired but **hardware-unverified** — see
+> docs/infrastructure.md's manual-verification checklist. `src/train/upcycle.py` +
+> `scripts/upcycle.py` (#214) turn a dense (degenerate `n_experts: 1`) checkpoint into a sparse-MoE
+> init that matches the dense forward at step 0. FIM, the Essential-Web + Stack-v2 mixture, and
+> repo-context packing described below are **designed, not implemented**. Per-item status is in
+> the MHM-P# list that follows; when the two disagree, the P# list wins.
 
 A from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code model**. The
 backbone is mostly Mamba-2/SSD state-space layers with a **minority (~12.5%) of full-attention
@@ -131,9 +139,11 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 - **MHM-P2 — Architecture & harness build** (the large net-new engineering): aux-loss-free
   balancing router (#213, **done on MLX** — portable `MoEBalancer` policy above the seam +
   selection-only route bias in `MoEBlock`; the bias rides in the portable safetensors so a served
-  or ported checkpoint routes as trained) → CUDA MoE backend (#214: dropless routing, shared expert,
-  FSDP, sparse-upcycle init) → FIM (#215, **done** — see the resolved note below), length
-  curriculum + dataloader-state resume
+  or ported checkpoint routes as trained) → CUDA MoE backend (#214, **done** — dropless
+  grouped-gather routing, shared expert, `src/train/upcycle.py` sparse-upcycle init, 8-bit AdamW
+  moments and fp8 expert GEMMs wired but hardware-unverified; **FSDP/ZeRO-2 + expert parallel
+  split out to #271, blocking #223 but not #222) → FIM (#215, **done** — see the
+  resolved note below), length curriculum + dataloader-state resume
   (#216, **done** — `--curriculum "0.25:2048,0.5:4096,1.0:16384"` on `scripts/train.py`, plus
   explicit `MicroBatchStream` state committed inside the checkpoint slot; see
   [05-training.md](05-training.md#length-curriculum--dataloader-state-resume-216)),
@@ -143,8 +153,10 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   warmup-stable-decay LR schedule (#238, **done** — `8fe62f7`), and `torch.compile` default-on for
   real CUDA runs (#239, **done** — `7a71073`) — all three landed ahead of the #219 sweep, so it
   and the #222/#223 runs carry them; plus fp8 MoE-expert linears
-  (Transformer Engine / Hopper, #240 — **design-only**, `c57a8e6`: the probe landed but the code is
-  never called), *gated on #214* and ahead of the #223 large run. See
+  (Transformer Engine / Hopper, #240 — **wired, hardware-unverified**: `_expert_linear` builds
+  `te.Linear` on Hopper+, `MoEBlock._fp8_ctx` wraps the expert-compute region in `fp8_autocast`,
+  and `_layer_forward` selects `transformer_engine.pytorch.checkpoint` for MoE layers — landed with
+  #214 since it shares `_Expert`/`MoEBlock`), *ahead of the #223 large run*. See
   [05-training.md](05-training.md#efficiency-levers-m12-landed-2026-07-2021). (The repo
   is already mature on the survey's biggest axes — data dedup/filtering, fused AdamW, SDPA, the
   mamba-ssm kernels, grad-checkpoint — so these four are the net-new levers; #216 is the
@@ -253,12 +265,32 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > ~$100s rather than first being exercised on the ~$1.2k large run. It also means **#200 must be
 > re-dimensioned** off `poc-small.yaml`'s 97M shape to match the small rung's non-expert backbone
 > — otherwise the upcycle won't line up.
+
+> **Open (#223) — #200's `d_model` doesn't match Large A.** The table above names #200
+> (`d_model 768`, the small rung) as *the single upcycle source for both MoE runs*, but Large A's
+> current default dims are `d_model 1536` — and `src/train/upcycle.py::check_upcycle_compatible`
+> hard-**raises `UpcycleError`** on any `d_model` mismatch between source and target (#214, by
+> design: expert replication can copy a dense FFN into E expert slots, but it cannot *widen* a
+> tensor). #200-at-768 is therefore NOT a valid upcycle source for Large A as currently dimensioned.
+> Four exits, tracked in #272 (blocks #223's budget):
+>  1. A **second dense run at `d_model 1536`** — the simplest fix, at the cost of a second (larger)
+>     dense pretrain before Large A can start.
+>  2. **Width-expansion upcycling** (Net2Net / bert2BERT-style tensor widening) as its own
+>     from-scratch mechanism — reuses #200-at-768, but is real new research/engineering, not a
+>     config change.
+>  3. **Large A from scratch** — abandons sparse-upcycle entirely for the large run, giving up the
+>     "upcycled init matches dense at step 0" cost savings this PR (#214) built.
+>  4. **Re-shape Large A to `d_model 768`** — keeps the single-source plan intact by changing the
+>     large-model target instead of the source, at the cost of Large A's stated ~700M-active/
+>     3.5B-total budget (more experts / more layers would need to make up the difference).
+
 - **Cross-cutting:** rented-pod ops runbook (#224). **Parked:** post-training SFT (#101) / RLVR
   (#103).
 
-Today the MoE is **MLX-only** (the MLX router is a toy dense softmax-top-k; the CUDA backend
-explicitly rejects MoE), so scaling on RunPod requires the #213/#214 build — this is the bulk of
-the net-new work.
+The MoE backend build (#213/#214, **done**) scales on both MLX and CUDA now — the CUDA backend
+builds dropless grouped-gather MoE with a shared expert and a sparse-upcycle init path. What
+remains before a real RunPod run is FSDP/ZeRO-2 + expert parallel (#271, blocking #223 but not
+#222) and resolving the `d_model` conflict above (#272).
 
 ## The SSI fold (structural signal integration — secondary)
 

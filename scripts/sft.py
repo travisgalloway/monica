@@ -73,7 +73,7 @@ def main() -> None:
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.loop import TrainConfig, train
     from src.train.logging import JsonlLogger
-    from src.train.checkpoint import CheckpointStore
+    from src.train.checkpoint import CheckpointStore, check_weight_keys, load_weights_dict
     from src.eval.val_loss import evaluate_masked
 
     backend = get_backend(args.backend)
@@ -94,12 +94,11 @@ def main() -> None:
     model = backend.model_cls(cfg)
     opt = backend.make_optimizer(model, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
-    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
-    # kwarg is conditional (CUDA's make_sft_train_step has no balancer param).
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch. Both backends'
+    # make_sft_train_step accept `balancer=` (#214); None is a no-op on either.
     balancer = balancer_for_config(cfg)
-    balancer_kwargs = {"balancer": balancer} if balancer is not None else {}
     train_step = backend.make_sft_train_step(model, opt, grad_clip=args.grad_clip,
-                                             scaler=scaler, **balancer_kwargs)
+                                             scaler=scaler, balancer=balancer)
 
     np_to = backend.to_numpy
     max_b = args.eval_batches or None
@@ -122,7 +121,14 @@ def main() -> None:
             scaler.load_state_dict(meta.get("loss_scale_state") or {})
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
     else:
-        model.load(str(args.init))                       # initialize from pretrained base
+        # #214: MLX's load is silently lenient (missing key -> stays at random init,
+        # wrong shape -> silently rebound), so check explicitly before loading. Load the
+        # safetensors once and reuse the dict for both the check and the load itself
+        # (matches scripts/train.py's --init path) rather than reading it twice.
+        init_weights = load_weights_dict(str(args.init))
+        check_weight_keys(init_weights, model._portable_state_dict(),
+                          where=f"--init {args.init}")
+        model._load_portable(init_weights)                # initialize from pretrained base
         print(f"[init] from pretrained base {args.init}")
     # Loss-Free-Balancing (#213): adopt the bias that came in with the weights (D3), push
     # it into the routers, enable load counting. No-op when balancing is off.

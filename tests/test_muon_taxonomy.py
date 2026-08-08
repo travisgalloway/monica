@@ -22,6 +22,10 @@ MUON_TRUE = [
     ("layers.1.experts.0.gate.weight", 2),
     ("layers.1.experts.0.up.weight", 2),
     ("layers.1.experts.0.down.weight", 2),
+    # Shared experts (#214): 2D, unexcluded -> Muon, same as routed experts.
+    ("layers.1.shared_experts.0.gate.weight", 2),
+    ("layers.1.shared_experts.0.up.weight", 2),
+    ("layers.1.shared_experts.0.down.weight", 2),
 ]
 
 MUON_FALSE = [

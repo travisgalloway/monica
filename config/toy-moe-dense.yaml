@@ -1,0 +1,53 @@
+# Sparse-upcycle SOURCE fixture (#214): a degenerate n_experts=1 "MoE" block, which IS a
+# plain dense SwiGLU FFN (softmax over one logit is exactly 1.0, MoEBlock._moe takes the
+# k==E branch — see MambaConfig.validate()'s n_experts==1 carve-out). This is the shape
+# #200's real dense checkpoint is trained at: NOT a plain non-MoE config, because
+# `scripts/upcycle.py` needs `experts.0.{gate,up,down}` keys to replicate into the real
+# target's expert slots, and only an n_experts=1 MoE block has them.
+#
+# Pairs with toy-moe-fine.yaml (the upcycle TARGET) below. `check_upcycle_compatible`
+# requires the pair to agree on every NON-expert dimension (d_model, n_layers, d_state,
+# expand, d_conv, head_dim, dt_rank, vocab_size, tie_embeddings, attn_every, moe_every,
+# and moe_d_ff itself) — only n_experts/top_k/moe_balance_rate may differ. Matching the
+# non-expert backbone is NECESSARY but NOT SUFFICIENT to make a real dense checkpoint a
+# valid upcycle source for a real MoE target: moe_d_ff also has to be sized the way the
+# fine-grained target wants it (see toy-moe-fine.yaml's comment) — that extra constraint
+# is not written down anywhere else in the design docs, and this fixture pair is where it
+# first becomes visible in the tree.
+d_model: 64
+n_layers: 4
+d_state: 16            # SSM state width N (per head)
+expand: 2               # d_inner = 128
+d_conv: 4
+head_dim: 16            # Mamba-2/SSD: 128/16 = 8 SSM heads (scalar A per head)
+dt_rank: auto
+
+# Sparse MoE: every 2nd block is a SwiGLU MoE FFN instead of a Mamba block, matching
+# toy-moe-fine.yaml's interleave exactly (both are required to for the upcycle).
+moe_every: 2            # layers 1 and 3 (0-indexed (i+1)%2==0) are MoE
+n_experts: 1             # degenerate: ONE expert == a plain dense SwiGLU FFN (#214)
+top_k: 1                 # validate() REQUIRES top_k==1 whenever n_experts==1
+# Fine-grained width (d_inner/8 = 128/8 = 16), NOT the usual d_inner default. At Large
+# A's real scale (#223), 64 full-width (moe_d_ff == d_inner) experts per MoE layer would
+# cost ~906M params PER LAYER — far past budget. The fine-grained target
+# (toy-moe-fine.yaml) therefore sizes each expert at d_inner/8, and #200's real dense
+# checkpoint must be dimensioned THE SAME WAY (moe_d_ff: 16 here, matching this toy's
+# d_inner/8) so a single dense expert is upcycle-compatible with 64 narrow ones later —
+# not the usual null (-> d_inner) default a non-upcycle dense config would use.
+moe_d_ff: 16
+# A single expert can never be balanced (sign(mean - load) == sign(0) == 0 forever, since
+# the one expert's load IS the mean); validate() REJECTS a non-null rate here.
+moe_balance_rate: null
+
+vocab_size: 256          # byte-fallback tokenizer for offline tests
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32           # correctness first; fp32 makes forward/step parity exact
+chunk_size: null          # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false    # tiny; keep tests cheap
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

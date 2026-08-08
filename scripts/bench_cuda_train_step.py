@@ -88,10 +88,11 @@ def main() -> None:
     if args.chunk_size is not None:
         cfg = dataclasses.replace(cfg, chunk_size=args.chunk_size)
         cfg.validate()
-    if cfg.n_moe_layers > 0:
-        raise SystemExit(
-            "MoE-Mamba (#53) is MLX-only; the CUDA backend can't build it. Bench a dense "
-            "config (e.g. config/poc.yaml / config/toy.yaml).")
+    # A dense-config-only restriction used to sit here ("MoE is MLX-only"). That is now
+    # false (#214) — the CUDA backend builds and trains MoE — so an MoE config now
+    # benchmarks like a dense one; the timing includes its grouped-gather dispatch's
+    # `counts.tolist()` host sync when `moe_impl` resolves to "gather", which is real
+    # (not benchmark-artifact) overhead worth seeing in the s/step number.
 
     # Fail fast on the one request the backend cannot satisfy.
     if args.device == "cuda" and not torch.cuda.is_available():

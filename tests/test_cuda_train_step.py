@@ -13,12 +13,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.model.blocks import load_config
+from src.model.blocks import MambaConfig, load_config
 from src.model.cuda_backend import CUDAMambaModel
-from src.model.cuda_train_step import make_train_step, save_optimizer, load_optimizer
+from src.model.cuda_train_step import (make_train_step, make_sft_train_step,
+                                       make_dpo_train_step, make_grpo_train_step,
+                                       save_optimizer, load_optimizer)
 from src.train.loss_scale import DynamicLossScaler
 from src.train.loop import TrainConfig, train
 from src.train.checkpoint import CheckpointStore
+from src.train.moe_balance import balancer_for_config, attach_balancer
 from src.data.pack import pack_ids
 from src.data.loader import PackedLoader
 
@@ -165,3 +168,143 @@ def test_save_kill_resume_exact(tmp_path):
 
     max_diff = max(abs(ref[s] - res[s]) for s in range(half, N))
     assert max_diff < 1e-4, f"resume not exact: max|diff|={max_diff:.3e}"
+
+
+# --------------------------------------------------------------------------- #
+# Loss-Free-Balancing threading (#213/#214): all four factories accept `balancer=`,
+# the overflow-skip/pop ordering, and grad-accum count accumulation.
+# --------------------------------------------------------------------------- #
+def _moe_cfg(**over):
+    base = dict(d_model=32, n_layers=2, head_dim=8, d_state=8, vocab_size=32,
+                seq_len=16, precision="fp32", moe_every=1, n_experts=8, top_k=2,
+                moe_d_ff=32, moe_balance_rate=0.05)
+    base.update(over)
+    return MambaConfig(**base)
+
+
+def _pretrain_mb(cfg, B=4, L=16, seed=0):
+    rng = np.random.default_rng(seed)
+    tokens = rng.integers(0, cfg.vocab_size, size=(B, L + 1))
+    return tokens[:, :-1], tokens[:, 1:]
+
+
+def _masked_mb(cfg, B=4, L=16, seed=0):
+    rng = np.random.default_rng(seed)
+    inp = rng.integers(0, cfg.vocab_size, size=(B, L))
+    tgt = rng.integers(0, cfg.vocab_size, size=(B, L))
+    mask = np.ones((B, L), dtype=np.float32)
+    return inp, tgt, mask
+
+
+def test_make_train_step_accepts_balancer_and_emits_util_var():
+    cfg = _moe_cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    balancer = balancer_for_config(cfg)
+    step = make_train_step(model, _adam(model), grad_clip=1.0, scaler=None, balancer=balancer)
+    attach_balancer(balancer, model)
+
+    inp, tgt = _pretrain_mb(cfg)
+    out = step(model, [(inp, tgt)], 1e-3)
+    assert "moe_util_var" in out
+
+
+def test_make_sft_train_step_accepts_balancer_and_emits_util_var():
+    cfg = _moe_cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    balancer = balancer_for_config(cfg)
+    step = make_sft_train_step(model, _adam(model), grad_clip=1.0, scaler=None,
+                               balancer=balancer)
+    attach_balancer(balancer, model)
+
+    mb = _masked_mb(cfg)
+    out = step(model, [mb], 1e-3)
+    assert "moe_util_var" in out
+
+
+def test_make_dpo_train_step_accepts_balancer_and_targets_policy_not_ref():
+    cfg = _moe_cfg()
+    torch.manual_seed(0)
+    policy = CUDAMambaModel(cfg)
+    torch.manual_seed(1)
+    ref = CUDAMambaModel(cfg)
+    balancer = balancer_for_config(cfg)
+    step = make_dpo_train_step(policy, ref, _adam(policy), grad_clip=1.0, scaler=None,
+                               balancer=balancer)
+    attach_balancer(balancer, policy)
+
+    c_in, c_tgt, c_mask = _masked_mb(cfg, seed=0)
+    r_in, r_tgt, r_mask = _masked_mb(cfg, seed=1)
+    out = step(policy, [(c_in, c_tgt, c_mask, r_in, r_tgt, r_mask)], 1e-3)
+    assert "moe_util_var" in out
+    # The balancer's pop/push must target the POLICY only -- the frozen reference is
+    # never wired to it, so its bias stays exactly whatever it started with (inactive).
+    assert ref.moe_biases() == [[], []]
+    assert policy.moe_biases() != [[], []]
+
+
+def test_make_grpo_train_step_accepts_balancer_and_emits_util_var():
+    cfg = _moe_cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    balancer = balancer_for_config(cfg)
+    step = make_grpo_train_step(model, _adam(model), grad_clip=1.0, scaler=None,
+                                balancer=balancer)
+    attach_balancer(balancer, model)
+
+    inp, tgt, mask = _masked_mb(cfg)
+    adv = np.random.default_rng(0).normal(size=(inp.shape[0],)).astype(np.float32)
+    out = step(model, [(inp, tgt, mask, adv)], 1e-3)
+    assert "moe_util_var" in out
+
+
+def test_overflow_skip_does_not_pop_moe_load_counts():
+    """The balancer hook runs AFTER the fp16 overflow early-return, so a skipped step's
+    routed-token counts are NOT popped -- they must survive into the next pop
+    (mirrors `mlx_backend.py:717-720`'s documented, intentional behavior)."""
+    cfg = _moe_cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    balancer = balancer_for_config(cfg)
+    # A scale above fp32-max forces loss*scale -> inf -> non-finite grads (robust trigger,
+    # same recipe as test_fp16_overflow_skips_update_and_backs_off above).
+    scaler = DynamicLossScaler(init_scale=1e40, backoff=0.5, min_scale=1.0)
+    step = make_train_step(model, _adam(model), grad_clip=1.0, scaler=scaler,
+                           balancer=balancer)
+    attach_balancer(balancer, model)          # turns load counting ON
+
+    inp, tgt = _pretrain_mb(cfg)
+    out = step(model, [(inp, tgt)], 1e-3)
+    assert out["skipped"] is True
+    assert "moe_util_var" not in out
+
+    # The forward pass ran (and counted) before overflow was detected in backward; since
+    # the balancer hook never ran, those counts were never popped -- a fresh pop must
+    # still see them.
+    survived = model.pop_moe_load()
+    assert sum(sum(layer) for layer in survived) > 0
+
+
+def test_grad_accum_two_microbatches_accumulates_moe_load_counts():
+    """Grad accumulation sums counts across BOTH micro-batches, not just the last one."""
+    cfg = _moe_cfg(moe_balance_rate=None)     # counting only, no balancer consuming it
+    inp, tgt = _pretrain_mb(cfg)
+
+    torch.manual_seed(0)
+    model1 = CUDAMambaModel(cfg)
+    step1 = make_train_step(model1, _adam(model1), grad_clip=1.0, scaler=None, balancer=None)
+    model1.set_moe_load_counting(True)
+    step1(model1, [(inp, tgt)], 1e-3)
+    single = model1.pop_moe_load()
+
+    torch.manual_seed(0)                      # identical fresh weights, pre-optimizer-step
+    model2 = CUDAMambaModel(cfg)
+    step2 = make_train_step(model2, _adam(model2), grad_clip=1.0, scaler=None, balancer=None)
+    model2.set_moe_load_counting(True)
+    step2(model2, [(inp, tgt), (inp, tgt)], 1e-3)
+    double = model2.pop_moe_load()
+
+    assert sum(sum(l) for l in single) > 0     # sanity: routing actually happened
+    for s_layer, d_layer in zip(single, double):
+        assert d_layer == [2 * c for c in s_layer]

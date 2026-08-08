@@ -1,0 +1,48 @@
+# Toy MoE config + 8-bit AdamW moments (#214). CONFIG-SURFACE FIXTURE ONLY — this is
+# NOT runnable in CI or on the Mac dev box: `optimizer_8bit: true` requires
+# `bitsandbytes`, which ships CUDA-only prebuilt wheels (the `[cuda-8bit]` extra), and
+# there is no CPU/macOS fallback path (unlike `torch` itself, which runs the CUDA
+# backend on CPU for parity). What IS covered by the test suite without a GPU: this
+# file loads and `validate()`s cleanly, `optimizer_sizing_key` resolves to
+# `adam8bit_fp32`, `backend.py::_mlx_backend` raises `NotImplementedError` on it, and
+# the `bitsandbytes` import stays lazy (tests/test_import_guard.py's FORBIDDEN_ROOTS).
+# The actual 8-bit numerics — moment quantization error, resume fidelity through a
+# bitsandbytes state-dict round trip, the tied-embedding 32-bit override actually
+# taking effect — are UNVERIFIABLE here and go on the manual pod checklist in
+# docs/infrastructure.md alongside the fp8 lever.
+#
+# `optimizer: adamw` (NOT muon) is deliberate: `optimizer_8bit` composes with Muon,
+# but Muon already owns the expert gate/up/down matrices and the tied embedding is
+# forced back to 32-bit regardless (see backend.py's `_adamw` helper), so stacking
+# `muon` + 8-bit saves almost nothing — the real payoff is plain `adamw` + 8-bit,
+# which is what this fixture exercises.
+d_model: 64
+n_layers: 4
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
+d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 SSM heads (scalar A per head)
+dt_rank: auto
+
+moe_every: 2
+n_experts: 4
+top_k: 2
+moe_d_ff: null
+moe_balance_rate: null
+
+vocab_size: 256        # byte-fallback tokenizer for offline tests
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32        # correctness first; fp32 makes forward/step parity exact
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny; keep tests cheap
+
+# --- optimizer (#214) ---
+optimizer: adamw
+optimizer_8bit: true
+
+# dt-projection bias init (load-bearing — identical across all configs by design)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

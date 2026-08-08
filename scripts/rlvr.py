@@ -81,23 +81,30 @@ def main() -> None:
     from src.serve.sampling import sample
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
     from src.train.moe_balance import attach_balancer, balancer_for_config
+    from src.train.checkpoint import check_weight_keys, load_weights_dict
 
     backend = get_backend()
     cfg = load_config(str(args.config))
     model = backend.model_cls(cfg)
-    model.load(str(args.init))
+    # #214: MLX's load is silently lenient (missing key -> stays at random init, wrong
+    # shape -> silently rebound), so check explicitly before loading. Load the
+    # safetensors once and reuse the dict for both the check and the load itself
+    # (matches scripts/train.py's --init path) rather than reading it twice.
+    init_weights = load_weights_dict(str(args.init))
+    check_weight_keys(init_weights, model._portable_state_dict(),
+                      where=f"--init {args.init}")
+    model._load_portable(init_weights)
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
     eos = getattr(tok, "eos_token_id", None)
     store = SessionStore(model)
     np_to = backend.to_numpy
     opt = backend.make_optimizer(model, args.lr)
-    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch and why the
-    # kwarg is conditional (CUDA's make_grpo_train_step has no balancer param). The bias
+    # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch. The bias
     # arrives with `--init`'s portable weights (D3); attach_balancer adopts it, pushes it
-    # into the routers, and enables load counting. No-op when balancing is off.
+    # into the routers, and enables load counting. `balancer=None` is a no-op on either
+    # backend's make_grpo_train_step (#214).
     balancer = balancer_for_config(cfg)
-    grpo_step = backend.make_grpo_train_step(
-        model, opt, **({"balancer": balancer} if balancer is not None else {}))
+    grpo_step = backend.make_grpo_train_step(model, opt, balancer=balancer)
     attach_balancer(balancer, model)
     reward_fn = math_reward if args.reward == "math" else exact_match_reward
 
