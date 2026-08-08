@@ -161,9 +161,10 @@ class MambaConfig:
     # `cuda_backend._expert_linear` builds the TE linears, `MoEBlock._fp8_ctx` wraps the
     # expert-compute region in `fp8_autocast`, and `_layer_forward` routes MoE layers
     # through `transformer_engine.pytorch.checkpoint` (plain checkpoint double-updates the
-    # fp8 amax history). The acceptance tests at `tests/test_cuda_fp8.py:77-93` are
-    # un-skipped but gated on sm_90+, so they have never executed — #240 stays open until
-    # they run green on a Hopper pod.
+    # fp8 amax history). The acceptance tests — `test_fp8_expert_forward_matches_bf16` and
+    # `test_fp8_expert_checkpoint_backward_finite_grads` in `tests/test_cuda_fp8.py` — are
+    # un-skipped but gated on the `_hopper` fixture (sm_90+), so they have never executed —
+    # #240 stays open until they run green on a Hopper pod.
     fp8_experts: bool = False
 
     # --- training-free long-context extension (#54) ---

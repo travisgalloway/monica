@@ -197,8 +197,9 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > *Architectural consequence — configuration guidance, not a validator rule.* In PSM the suffix is
 > consumed **before** the middle is generated, so every middle token depends on recalling the suffix
 > out of state — the fixed-width-state bottleneck the hybrid exists to patch. Therefore **the final
-> block should be an attention block**: `n_layers % attn_every == 0`, from `layer i is attention iff
-> (i+1) % attn_every == 0` (`src/model/blocks.py:211`). `config/toy-hybrid.yaml` satisfies it
+> block should be an attention block**: `n_layers % attn_every == 0`, from
+> `MambaConfig.is_attention_layer` (`src/model/blocks.py`) — `(i + 1) % attn_every == 0`.
+> `config/toy-hybrid.yaml` satisfies it
 > (4 layers, `attn_every 2` → `[Mamba, Attn, Mamba, Attn]`); `config/student-1b.yaml` (28 layers,
 > `attn_every 8` → attention at 7/15/23, top block Mamba) does **not**, so a future MHM config must
 > not copy that shape. This is deliberately *not* a `MambaConfig.validate()` rule — that validator
