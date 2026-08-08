@@ -87,10 +87,13 @@ def main() -> None:
     cfg = load_config(str(args.config))
     model = backend.model_cls(cfg)
     # #214: MLX's load is silently lenient (missing key -> stays at random init, wrong
-    # shape -> silently rebound), so check explicitly before loading.
-    check_weight_keys(load_weights_dict(str(args.init)), model._portable_state_dict(),
+    # shape -> silently rebound), so check explicitly before loading. Load the
+    # safetensors once and reuse the dict for both the check and the load itself
+    # (matches scripts/train.py's --init path) rather than reading it twice.
+    init_weights = load_weights_dict(str(args.init))
+    check_weight_keys(init_weights, model._portable_state_dict(),
                       where=f"--init {args.init}")
-    model.load(str(args.init))
+    model._load_portable(init_weights)
     tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
     eos = getattr(tok, "eos_token_id", None)
     store = SessionStore(model)

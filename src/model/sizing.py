@@ -130,7 +130,7 @@ def family_row(name: str, cfg: MambaConfig) -> dict:
         "tier": name,
         "params": n,
         "weights_gb": inference_bytes(cfg, "bf16") / GIB,   # bf16 weights == inference footprint
-        "train_gb": training_bytes(cfg)["total"] / GIB,
+        "train_gb": training_bytes(cfg, optimizer=cfg.optimizer_sizing_key)["total"] / GIB,
         "gpu_train": gpu,
         "ram_infer": ram,
     }

@@ -93,10 +93,13 @@ def main() -> None:
     ref = backend.model_cls(cfg)
     # #214: MLX's load is silently lenient (missing key -> stays at random init, wrong
     # shape -> silently rebound), so check explicitly before loading. ref/policy share
-    # the same cfg, so one check against a fresh model's expected keys covers both.
-    check_weight_keys(load_weights_dict(str(args.init)), ref._portable_state_dict(),
+    # the same cfg, so one check against a fresh model's expected keys covers both. Load
+    # the safetensors once and reuse the dict for ref here and policy below (init path
+    # only) instead of re-reading it for each of ref/policy.
+    init_weights = load_weights_dict(str(args.init))
+    check_weight_keys(init_weights, ref._portable_state_dict(),
                       where=f"--init {args.init}")
-    ref.load(str(args.init))                             # frozen reference (never updated)
+    ref._load_portable(init_weights)                     # frozen reference (never updated)
     opt = backend.make_optimizer(policy, args.base_lr)
     scaler = scaler_for_precision(cfg.precision, args.init_loss_scale)
     # Loss-Free-Balancing (#213): see scripts/train.py for the off-switch. Both backends'
@@ -128,7 +131,7 @@ def main() -> None:
             scaler.load_state_dict(meta.get("loss_scale_state") or {})
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
     else:
-        policy.load(str(args.init))                      # init policy from SFT weights
+        policy._load_portable(init_weights)               # init policy from SFT weights
         print(f"[init] policy + reference from {args.init}")
     # Loss-Free-Balancing (#213): adopt the bias that came in with the policy weights
     # (D3), push it into the routers, enable load counting. The frozen reference is left

@@ -122,10 +122,13 @@ def main() -> None:
         print(f"[resume] from step {start_step} slot={meta['slot']} (out={out})")
     else:
         # #214: MLX's load is silently lenient (missing key -> stays at random init,
-        # wrong shape -> silently rebound), so check explicitly before loading.
-        check_weight_keys(load_weights_dict(str(args.init)), model._portable_state_dict(),
+        # wrong shape -> silently rebound), so check explicitly before loading. Load the
+        # safetensors once and reuse the dict for both the check and the load itself
+        # (matches scripts/train.py's --init path) rather than reading it twice.
+        init_weights = load_weights_dict(str(args.init))
+        check_weight_keys(init_weights, model._portable_state_dict(),
                           where=f"--init {args.init}")
-        model.load(str(args.init))                       # initialize from pretrained base
+        model._load_portable(init_weights)                # initialize from pretrained base
         print(f"[init] from pretrained base {args.init}")
     # Loss-Free-Balancing (#213): adopt the bias that came in with the weights (D3), push
     # it into the routers, enable load counting. No-op when balancing is off.
