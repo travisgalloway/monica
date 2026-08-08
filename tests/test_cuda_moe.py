@@ -194,19 +194,48 @@ def test_moe_degenerate_single_expert_equals_hand_computed_swiglu():
 
 
 # --------------------------------------------------------------------------- #
-# torch.topk is DISQUALIFIED (plan finding #1) -- a permanent negative test so a future
-# "optimization" can't silently swap the selection primitive back in.
+# Tie-break contract (#214).
+#
+# MLX, Swift and this backend all rank with `argsort(argsort(-sel))`, whose ties break by
+# ASCENDING EXPERT INDEX. `MoEBlock._moe` deliberately does not use `torch.topk`, whose
+# tie order torch does not specify and which is observably platform-dependent: on the tie
+# vector below, torch 2.12.0 returns {2,5,6} on macOS/arm64 but {0,5,6} on Linux/x86_64.
+# That is WHY topk is avoided -- but it is rationale, not an invariant, and asserting
+# `topk != reference` asserts on behaviour torch never promised (it fails whenever topk
+# happens to coincide, which says nothing about this code). So the assertions below pin
+# the two things that ARE contractual: the reference semantics, and the block obeying them.
 # --------------------------------------------------------------------------- #
-def test_torch_topk_diverges_from_double_argsort_on_ties():
+def test_double_argsort_breaks_ties_by_ascending_index():
+    """The primitive MLX/Swift/CUDA all agree on. Ties -> lowest expert index wins."""
     sel = torch.tensor([1., 1., 1., 0., 0., 2., 2., 0.])
-    k = 3
-    topk_ids = set(torch.topk(sel, k).indices.tolist())
     order = torch.argsort(-sel, stable=True)
-    double_argsort_ids = set(order[:k].tolist())
-    assert double_argsort_ids == {0, 5, 6}
-    assert topk_ids != double_argsort_ids, (
-        "torch.topk must NOT match the double-argsort tie-break MLX/the CUDA block use "
-        "-- if this now passes, topk's tie-break semantics changed and MoEBlock._moe's "
-        "selection code (which deliberately avoids topk) should be revisited, not this "
-        "test loosened."
-    )
+    assert set(order[:3].tolist()) == {0, 5, 6}
+    # stable=True is the whole contract; without it the tie order is unspecified.
+    assert order[:3].tolist() == [5, 6, 0]
+
+
+@pytest.mark.parametrize("impl", ["dense", "gather"])
+def test_moe_block_selection_obeys_double_argsort_tie_break(impl):
+    """The real routing path, on a deliberate all-ties fixture.
+
+    A zeroed router makes every logit 0, so `sel` is exactly the route bias and the
+    top-k choice is decided purely by the tie-break. Both impls must land on {0,5,6}
+    -- ascending index among equals -- for every token.
+    """
+    cfg = _cfg(n_experts=8, top_k=3, moe_impl=impl)
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    with torch.no_grad():
+        block.router.weight.zero_()
+    block.set_route_bias([1., 1., 1., 0., 0., 2., 2., 0.])
+    block.set_load_counting(True)
+
+    x = torch.randn(2, 5, cfg.d_model)
+    with torch.no_grad():
+        block.forward_seq(x)
+
+    loads = block.pop_load()
+    n_tokens = 2 * 5
+    assert [i for i, c in enumerate(loads) if c > 0] == [0, 5, 6]
+    assert all(loads[i] == n_tokens for i in (0, 5, 6))
