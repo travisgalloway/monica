@@ -157,9 +157,14 @@ class MambaConfig:
     # (gate/up/down), not the whole model — everything else stays at `precision`. A no-op
     # on MLX and on non-Hopper CUDA (the `cuda_backend._te_linear_cls()` probe falls back
     # to a plain bf16/fp16 `nn.Linear` when TE is absent or the device is pre-sm_90).
-    # DESIGN-ONLY today: #240 is blocked on #214 (no CUDA MoE experts exist yet to attach
-    # fp8 to) — this field and its validate() rule land now so #214 can wire fp8 in
-    # mechanically. See `cuda_backend.py`'s `# BLOCKED-ON-#214` block.
+    # WIRED but HARDWARE-UNVERIFIED (#214 landed the CUDA experts this attaches to):
+    # `cuda_backend._expert_linear` builds the TE linears, `MoEBlock._fp8_ctx` wraps the
+    # expert-compute region in `fp8_autocast`, and `_layer_forward` routes MoE layers
+    # through `transformer_engine.pytorch.checkpoint` (plain checkpoint double-updates the
+    # fp8 amax history). The acceptance tests — `test_fp8_expert_forward_matches_bf16` and
+    # `test_fp8_expert_checkpoint_backward_finite_grads` in `tests/test_cuda_fp8.py` — are
+    # un-skipped but gated on the `_hopper` fixture (sm_90+), so they have never executed —
+    # #240 stays open until they run green on a Hopper pod.
     fp8_experts: bool = False
 
     # --- training-free long-context extension (#54) ---

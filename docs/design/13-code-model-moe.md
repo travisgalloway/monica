@@ -10,10 +10,14 @@ from-scratch code model, described below.
 
 ## What this is
 
-> **Read this section as the target design, not as shipped state.** As of 2026-08-07 the MHM
-> components that are **built** are the tokenizer (MHM-P1b, #191/#245), aux-loss-free load
-> balancing (MHM-P2-T0, #213, portable — shared by both backends), and the **CUDA MoE backend**
-> (MHM-P2-T1, #214). `MambaConfig` carries the MoE and hybrid-attention knobs (`moe_every`,
+> **Read this section as the target design, not as shipped state.** As of 2026-08-08 the MHM
+> components that are **built** are the tokenizer (MHM-P1b, #191/#245), the ratified vocab
+> (#251, 49152), aux-loss-free load balancing (MHM-P2-T0, #213, portable — shared by both
+> backends), the **CUDA MoE backend** (MHM-P2-T1, #214), FIM training (#215), the length
+> curriculum + dataloader-state resume (#216), the code eval suite (#221), the pure-PyTorch
+> Mamba-2 reference (#218), and the three training-efficiency levers — hybrid Muon+AdamW (#237),
+> the WSD schedule (#238), and `torch.compile` default-on (#239). `MambaConfig` carries the MoE
+> and hybrid-attention knobs (`moe_every`,
 > `n_experts`, `top_k`, `n_shared_experts`, `moe_impl`, `attn_every`, `fp8_experts`,
 > `optimizer_8bit`, `moe_balance_rate`). Both the MLX and CUDA `MoEBlock`s now have a shared
 > expert (DeepSeek-V2/V3 form, additive, outside the router softmax/top-k renormalization) and
@@ -28,9 +32,11 @@ from-scratch code model, described below.
 > 8-bit AdamW-moments switch (bitsandbytes) are wired but **hardware-unverified** — see
 > docs/infrastructure.md's manual-verification checklist. `src/train/upcycle.py` +
 > `scripts/upcycle.py` (#214) turn a dense (degenerate `n_experts: 1`) checkpoint into a sparse-MoE
-> init that matches the dense forward at step 0. FIM, the Essential-Web + Stack-v2 mixture, and
-> repo-context packing described below are **designed, not implemented**. Per-item status is in
-> the MHM-P# list that follows; when the two disagree, the P# list wins.
+> init that matches the dense forward at step 0. What is **designed, not implemented** is the
+> Essential-Web + Stack-v2 mixture and repo-context packing described below — the pipeline is
+> #193 (closed) but the corpus itself is #252, and nothing has been built from it yet. (FIM used
+> to be listed here as unimplemented; it shipped with #215.) Per-item status is in the MHM-P#
+> list that follows; when the two disagree, the P# list wins.
 
 A from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code model**. The
 backbone is mostly Mamba-2/SSD state-space layers with a **minority (~12.5%) of full-attention
@@ -142,7 +148,7 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   or ported checkpoint routes as trained) → CUDA MoE backend (#214, **done** — dropless
   grouped-gather routing, shared expert, `src/train/upcycle.py` sparse-upcycle init, 8-bit AdamW
   moments and fp8 expert GEMMs wired but hardware-unverified; **FSDP/ZeRO-2 + expert parallel
-  split out to #271, blocking #223 but not #222) → FIM (#215, **done** — see the
+  split out to #271, blocking #223 but not #222**) → FIM (#215, **done** — see the
   resolved note below), length curriculum + dataloader-state resume
   (#216, **done** — `--curriculum "0.25:2048,0.5:4096,1.0:16384"` on `scripts/train.py`, plus
   explicit `MicroBatchStream` state committed inside the checkpoint slot; see
@@ -191,8 +197,9 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > *Architectural consequence — configuration guidance, not a validator rule.* In PSM the suffix is
 > consumed **before** the middle is generated, so every middle token depends on recalling the suffix
 > out of state — the fixed-width-state bottleneck the hybrid exists to patch. Therefore **the final
-> block should be an attention block**: `n_layers % attn_every == 0`, from `layer i is attention iff
-> (i+1) % attn_every == 0` (`src/model/blocks.py:192`). `config/toy-hybrid.yaml` satisfies it
+> block should be an attention block**: `n_layers % attn_every == 0`, from
+> `MambaConfig.is_attention_layer` (`src/model/blocks.py`) — `(i + 1) % attn_every == 0`.
+> `config/toy-hybrid.yaml` satisfies it
 > (4 layers, `attn_every 2` → `[Mamba, Attn, Mamba, Attn]`); `config/student-1b.yaml` (28 layers,
 > `attn_every 8` → attention at 7/15/23, top block Mamba) does **not**, so a future MHM config must
 > not copy that shape. This is deliberately *not* a `MambaConfig.validate()` rule — that validator
@@ -262,9 +269,36 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > | **#223** | **Large A** (~700M-active/3.5B-total), upcycled from **#200** | the headline model |
 >
 > This costs one extra dense run but buys the thing that matters: the MoE machinery is proven at
-> ~$100s rather than first being exercised on the ~$1.2k large run. It also means **#200 must be
-> re-dimensioned** off `poc-small.yaml`'s 97M shape to match the small rung's non-expert backbone
-> — otherwise the upcycle won't line up.
+> ~$100s rather than first being exercised on the ~$1.2k large run.
+
+> **What shape the "dense checkpoint" actually has (#214).** "Dense" here is a statement about
+> routing, not about block type, and reading it as "a plain non-MoE config" produces a checkpoint
+> the upcycle cannot use. Three constraints, all enforced in code:
+>
+> 1. **#200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE**, not as a `poc-small.yaml`-shaped
+>    dense model. `scripts/upcycle.py` replicates `layers.{i}.experts.0.{gate,up,down}` into the
+>    target's expert slots, and only a one-expert MoE block has those keys — a plain dense model has
+>    nothing to copy. At E=1 the router's softmax over a single logit is exactly `1.0` and
+>    `MoEBlock._moe` takes the `k == E` branch, so the block *is* a plain SwiGLU FFN: same math, right
+>    key layout. `MambaConfig.validate()` carries an explicit carve-out for E=1 (and requires
+>    `moe_balance_rate: null` there, since balancing one expert is `sign(0) == 0` forever).
+> 2. **`moe_d_ff` must be the fine-grained per-expert width (~`d_inner/8`), not the `null → d_inner`
+>    default.** This is the constraint most likely to be missed, because a dense config would normally
+>    leave it null. Fine-grained MoE means *many narrow* experts, not a few wide ones: at Large A's
+>    scale (`d_model 1536`, `d_inner 3072`), 64 full-width experts would cost **~906M params per MoE
+>    layer**, which the ~3.5B total budget cannot absorb at any useful depth. The target therefore
+>    sizes each expert at `d_inner/8`, and since `moe_d_ff_resolved` is one of the fields that must
+>    match, **#200's dense FFN blocks are deliberately narrow**.
+> 3. **Matching the non-expert backbone is necessary but NOT sufficient.**
+>    `src/train/upcycle.py:48-52` (`_MUST_MATCH`) is the authority — **15 fields** must agree,
+>    including `moe_every`, `moe_d_ff_resolved`, `attn_every` and `n_attn_heads_resolved`, not just
+>    `d_model`. `check_upcycle_compatible` reports every mismatch at once and refuses to transform.
+>    Treat that tuple as the spec rather than re-deriving the list here, where it would drift.
+>
+> Consequence for #200: it must be **re-dimensioned** off `poc-small.yaml`'s 97M shape to match the
+> small rung's non-expert backbone *and* carry the source shape above. `config/toy-moe-dense.yaml`
+> and `config/toy-moe-fine.yaml` are the worked source/target pair; `scripts/upcycle.py --dry-run`
+> checks compatibility in seconds, which is the cheap way to find this out rather than after a run.
 
 > **Open (#223) — #200's `d_model` doesn't match Large A.** The table above names #200
 > (`d_model 768`, the small rung) as *the single upcycle source for both MoE runs*, but Large A's
