@@ -2,7 +2,8 @@
 
 Why the Mamba-2 Hybrid POC is built the way it is. These files explain the **design
 choices and their rationale** — the *what* and *why*. The POC core (M1–M7), the **CUDA
-backend (M8, A40-verified)**, and the **post-training machinery (M9, SFT/DPO/GRPO)** are
+backend (M8, A40-verified — that run predates the M12 MoE/fp8/8-bit paths, which have not
+been exercised on it)**, and the **post-training machinery (M9, SFT/DPO/GRPO)** are
 implemented and verified; the M1–M8 milestones were tracked in
 [issue #2](https://github.com/travisgalloway/monica/issues/2). The **active program is M12 — the
 from-scratch Mamba-2 hybrid MoE code model** ([issue #198](https://github.com/travisgalloway/monica/issues/198));
@@ -50,9 +51,11 @@ Every claim here is sourced from a docstring or config comment in the code, with
     clean-rate tool (0.887→0.962) that leaves functional pass@1 flat (0.503) — the recorded
     rationale for demoting the LSP signal to secondary.
 13. **[The M12 code model — Mamba-2 hybrid MoE + SSI](13-code-model-moe.md)** — the **live
-    program** (#198): the MHM spine (own BPE — **native Swift**, #191/#245 → Essential-Web + Stack-v2 → aux-loss-free MoE →
-    CUDA MoE backend → FIM/curriculum/evals → ablation sweep → sparse-upcycled large run) and the
-    secondary SSI structural-signal fold (#225/#226/#227/#230).
+    program** (#198): the MHM spine (own BPE — **native Swift**, #191/#245 **done** →
+    Essential-Web + Stack-v2 corpus, #252 **the current blocker** → aux-loss-free MoE, #213
+    **done** → CUDA MoE backend, #214 **done** → FIM/curriculum/evals, #215/#216/#221 **done** →
+    ablation sweep #219 → small full run #222 → sparse-upcycled large run #223, **blocked on #271
+    and #272**) and the secondary SSI structural-signal fold (#225/#226/#227/#230).
 14. [The native inference + training engine (Swift + MLX)](14-inference-engine.md) — the M13
     engine (#163): prefill-via-scan, quantization, speculative decoding, the Swift train step +
     checkpoint I/O, and the B1–B4 investigation behind **Swift/MLX, Mac-first**.
@@ -87,7 +90,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | OLMES / lm-eval | implemented (Tier-2); scores near chance at POC scale | loglikelihood + generative tasks run end-to-end | `src/eval/olmes_adapter.py` |
 | Build method (M12) | **from-scratch** Mamba-2 hybrid **MoE** code model (not distillation) | model quality is the primary axis; MoE = capability per active param | `docs/design/13-code-model-moe.md` |
 | Tokenizer (M12) | **own byte-level BPE — native Swift** (`swift/MonicaTokenizer`, #191/#245) | cross-platform (macOS + Linux/CUDA), bit-identical; own tiktoken-style format; o200k-style pretokenizer (digit-split ≤3, indentation merge); uint16; **MLX deliberately not used** (BPE is CPU/integer work). Python code-path retired | `docs/design/13-code-model-moe.md` (MHM-P1b) |
-| Model sizes (M12) | small ~120M-act/700M-tot; large "Large A" ~700M-act/3.5B-tot | large is **sparse-upcycled** from the small dense ckpt; ablation sweep picks the layout (#219) | `docs/design/13-code-model-moe.md` |
+| Model sizes (M12) | small ~120M-act/700M-tot; large "Large A" ~700M-act/3.5B-tot | large is **sparse-upcycled** from the small dense ckpt (#200); ablation sweep picks the layout (#219). **⚠️ Open (#272):** #200 is `d_model 768` and Large A defaults to `1536` — replication cannot widen a tensor, so as currently dimensioned this does **not** work. Also **#271** (FSDP/expert-parallel) is unbuilt and blocks the large run | `docs/design/13-code-model-moe.md` |
 | Structural signal (M12, secondary) | LSP/opengrep as measurement + training signal (SSI) | validated clean-rate tool, functional ceiling found; #225/#226/#227/#230 | `docs/design/13-code-model-moe.md` |
 | Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data. For the M12 code corpus, Python **cleans** (→ `cleaned.jsonl`); the native Swift `monica-tokenize pack` **tokenizes+packs** | `docs/design/08-corpus-pipeline.md` |
 | Native engine (M13) | **Swift + MLX, Mac-first** (B1); ggml/llama.cpp port deferred | reuses our MLX numerics/weights/quant and the native `swift/MonicaTokenizer`; parity-checkable against the Python seam at fp32 ~1e-4. Not Mac-locked (mlx-swift#320 CUDA build) but Apple Silicon first; ggml is gated on arch freeze + MoE-Mamba support and has no training path | `docs/design/14-inference-engine.md` |

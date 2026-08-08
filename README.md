@@ -119,8 +119,10 @@ docs/usage.md              usage guide   docs/infrastructure.md  cloud runbook  
 
 ## Status
 
-The POC core is **implemented and verified on Apple Silicon**, and the **CUDA backend is now
-done and verified on a rented A40** (full suite green on both). The active program is **M12 — the
+The POC core is **implemented and verified on Apple Silicon**, and the **CUDA backend is done and
+was verified on a rented A40** at M8 (full suite green on both). Note the A40 run predates the M12
+MoE work: the CUDA MoE block, fp8 experts and 8-bit optimizer paths added since have **not** been
+exercised on that hardware — see `docs/infrastructure.md`'s manual-verification checklist. The active program is **M12 — the
 from-scratch Mamba-2 hybrid MoE code model**
 ([issue #198](https://github.com/travisgalloway/monica/issues/198)); the M1–M8 core was tracked in
 [issue #2](https://github.com/travisgalloway/monica/issues/2). The earlier M10 distillation program
@@ -136,18 +138,22 @@ from-scratch Mamba-2 hybrid MoE code model**
 | 5 POC scale run           | infra done; ~1.9B-token Qwen2.5 corpus built → R2; ~205M `poc-qwen` run on RunPod; prior OLMo run hit val-ppl ~77 |
 | 6 OLMES / lm-eval         | done — loglikelihood + generative (`generate_until`) tasks                        |
 | 7 Serving + chat + rewind | done — CLI generate/chat over `SessionStore` + `RewindTree`                       |
-| 8 CUDA backend            | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified |
+| 8 CUDA backend            | **done** — pure-PyTorch Mamba-2/SSD + optional mamba-ssm fast paths; A40-verified as of M8 |
 | 9 Post-training           | **done** — SFT / DPO / GRPO machinery on MLX (+ CUDA step-factory parity)         |
 | 10 Distillation           | machinery **built, then dropped** 2026-07-19 (reserve; see `docs/reserve/`)        |
-| 12 MoE code model         | **active** — MoE build (#213/#214) is the net-new work; SSI signal secondary       |
+| 12 MoE code model         | **active** — MoE build **done on both backends** (#213/#214); next: corpus #252, sweep #219 |
 
 **M12 — the active program.** A from-scratch **TypeScript-first Mamba-2 hybrid MoE code model**
 (tracker [#198](https://github.com/travisgalloway/monica/issues/198); design record
 [`docs/design/13-code-model-moe.md`](docs/design/13-code-model-moe.md)). The spine: own byte-level
-BPE (#191 — **done: native Swift, #245**) → Essential-Web + Stack-v2 corpus (#193) → aux-loss-free MoE router (#213) → CUDA MoE
-backend (#214) → FIM / length curriculum / evals → ablation sweep (#219) → small full run (#222) →
-sparse-upcycled large run (#223). The bulk of the net-new work is the MoE build — MoE is
-MLX-toy-only today. A **secondary axis (SSI)** studies language-server / static-analysis signal:
+BPE (#191 — **done: native Swift, #245**) → Essential-Web + Stack-v2 corpus (pipeline #193 done;
+the corpus build itself is #252, the current blocker) → aux-loss-free MoE router (#213 — **done**)
+→ CUDA MoE backend (#214 — **done**) → FIM / length curriculum / evals (#215/#216/#221 — **done**)
+→ ablation sweep (#219) → small full run (#222) → sparse-upcycled large run (#223). **MoE now runs
+on both backends**: MLX keeps the dense-evaluation reference, and CUDA adds grouped-gather dispatch,
+a shared expert and a sparse-upcycle init path. The net-new work remaining ahead of the runs is the
+corpus (#252), multi-GPU sharding (#271, which blocks #223 but not #222), and resolving #200's
+`d_model` conflict with Large A (#272). A **secondary axis (SSI)** studies language-server / static-analysis signal:
 a validated clean-rate tool with a found functional ceiling (#225/#226/#227/#230).
 
 **Reserve — M10 distillation (dropped 2026-07-19; code removed #189).** The frozen-teacher

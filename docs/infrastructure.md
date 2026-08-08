@@ -195,7 +195,9 @@ RunPod provides the on-demand compute. Two roles, kept separate:
 RunPod network volumes are **region-locked** and cannot be moved once created — every later pod
 that needs the corpus + checkpoints must be schedulable in that same region, so the pin is
 effectively permanent. Choose the region by **where the card you will actually train on has
-capacity** — H100 for the M12 large run (#223) — not by proximity to R2. R2 has no egress fee
+capacity** — H100 for the M12 large run (#223; but see the single-GPU warning under "GPU pod"
+below — #223 also needs **#271** built and **#272** resolved before it is runnable at all) — not
+by proximity to R2. R2 has no egress fee
 (above), so "network-close to R2" is a *latency*, not a *cost*, consideration: worth weighing once
 the H100-capacity region is chosen, but subordinate to it.
 
@@ -339,8 +341,22 @@ python scripts/train.py --backend cuda --config config/<student-or-poc>.yaml \
 ```
 
 Bring the pod up **in that order** so a config or throughput problem surfaces *before* the long
-run. The CUDA backend is already done and A40-verified (the full suite is green on a rented
-A40); the fused kernels auto-detect at runtime and degrade gracefully when absent.
+run. The CUDA backend is done and was A40-verified **at M8** (the full suite was green on a rented
+A40); the fused kernels auto-detect at runtime and degrade gracefully when absent. That run
+predates the M12 MoE work — the CUDA MoE block, fp8 experts and the 8-bit optimizer have **not**
+been exercised on that or any other GPU; see the manual-verification checklist below.
+
+> **⚠️ Every pod recipe in this document is single-GPU, and that is a real ceiling, not an
+> omission.** Multi-GPU sharding (FSDP/ZeRO-2 + in-node expert parallel) is **#271 — not built**.
+> Nothing in the tree imports `torch.distributed`. Practically:
+> - **#222** (small MoE, ~700M total) fits one card and is runnable on these recipes today.
+> - **#223** (Large A, ~700M-active/3.5B-total) does **not**. Model + optimizer state alone
+>   exceeds one 80GB card before activations. Renting an H100 for #223 today buys a pod that
+>   cannot run the job.
+>
+> #223 is additionally blocked on **#272** (#200 is `d_model 768`, Large A defaults to `1536`, and
+> sparse-upcycle replication cannot widen a tensor). Settle both before committing to a region or
+> a reservation.
 
 ### Manual verification: 8-bit optimizer + fp8 experts (#214)
 
