@@ -36,12 +36,25 @@ scale run) — but they are no longer the whole surface.
 
 The M12 code model's own configs (small ~120M-active/700M-total, "Large A"
 ~700M-active/3.5B-total) do **not** exist yet — they arrive with #200/#219. See
-[13-code-model-moe.md](13-code-model-moe.md). **Note (#200):** whatever `d_model` #200
-lands at, Large A's sparse-upcycle source must match it exactly — `src/train/upcycle.py`
-hard-raises `UpcycleError` on any `d_model` mismatch (expert replication copies a tensor,
-it cannot widen one). #200's currently-assumed `d_model 768` does not match Large A's
-current default of `d_model 1536`; see [13-code-model-moe.md](13-code-model-moe.md)'s
-"Open (#223)" note and its follow-up issue before dimensioning #200.
+[13-code-model-moe.md](13-code-model-moe.md).
+
+**Note (#200) — the sparse-upcycle source is a specific shape, not just a matching width.**
+Three things must hold, and only the first is about `d_model`:
+
+- **`d_model` must match the target exactly.** `src/train/upcycle.py` hard-raises
+  `UpcycleError` on a mismatch (expert replication copies a tensor, it cannot widen one).
+  #200's currently-assumed `d_model 768` does **not** match Large A's current default of
+  `d_model 1536` — see [13-code-model-moe.md](13-code-model-moe.md)'s "Open (#223)" note and
+  **#272** before dimensioning #200.
+- **…and so must 14 other fields.** `_MUST_MATCH` (`src/train/upcycle.py:48-52`) is the
+  authority: `moe_every`, `moe_d_ff_resolved`, `attn_every`, `n_attn_heads_resolved`,
+  `vocab_size`, `tie_embeddings` and the rest of the backbone. Matching only the non-expert
+  dims is necessary but not sufficient.
+- **#200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE with `moe_d_ff ≈ d_inner/8`**,
+  not as a plain dense config — a plain dense model has no `experts.0.*` keys to replicate, and
+  the narrow `moe_d_ff` is what makes 64 fine-grained experts fit Large A's budget. The
+  `toy-moe-dense.yaml` / `toy-moe-fine.yaml` pair above is the worked example;
+  `scripts/upcycle.py --dry-run` checks a real pair in seconds.
 
 ## `config/toy.yaml`
 

@@ -202,7 +202,7 @@ The smoke gate stresses exactly this round-trip.
   aux-loss-free MoE router #213 **— done** → CUDA MoE backend #214 **— done: dropless
   grouped-gather routing, shared expert, `src/train/upcycle.py` sparse-upcycle init; fp8
   expert GEMMs (#240) and 8-bit AdamW moments wired but hardware-unverified; FSDP/ZeRO-2 +
-  expert parallel split into a follow-up issue that blocks #223, not #222** →
+  expert parallel split out to **#271**, which blocks #223, not #222** →
   FIM/curriculum/eval build → ablation sweep #219 → small full run #222 → sparse-upcycled
   large run #223), with **SSI**
   (structural-signal integration) as a secondary

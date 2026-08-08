@@ -53,7 +53,8 @@ cuda-fast = ["torch>=2.0", "mamba-ssm>=2.0", "causal-conv1d>=1.0"]
 # TE is Hopper-only (sm_90+) and a heavy dependency, and fp8 applies only to the expert
 # GEMMs (gate/up/down), not the whole model. Auto-detected at runtime by
 # `cuda_backend._te_linear_cls()` and degrades to bf16/fp16 `nn.Linear` when absent or
-# pre-Hopper. DESIGN-ONLY today (blocked on #214's CUDA MoE experts).
+# pre-Hopper. Wired by #214, but hardware-unverified: the acceptance tests are sm_90-gated
+# and have never executed, so #240 stays open until they run on a Hopper pod.
 cuda-fp8 = ["torch>=2.0", "transformer-engine>=1.0"]
 # 8-bit AdamW optimizer states (#214) via bitsandbytes, a SEPARATE extra from
 # `cuda`/`cuda-fast`/`cuda-fp8`: bitsandbytes ships CUDA-only prebuilt wheels (no

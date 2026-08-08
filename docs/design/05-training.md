@@ -184,8 +184,11 @@ block reproduces the dense forward exactly at step 0 regardless of the combinati
 formula. `check_upcycle_compatible(src_cfg, dst_cfg)` reports **every** dimension mismatch
 at once (not one-at-a-time raises, which is how a run ends up mis-dimensioned) and hard-
 `UpcycleError`s on any `d_model` mismatch — expert replication can copy a tensor, not widen
-it; see [13-code-model-moe.md](13-code-model-moe.md#the-ssi-fold-structural-signal-integration--secondary)'s
-"Open (#223)" note for why that is a live constraint, not a hypothetical one.
+it; see [13-code-model-moe.md](13-code-model-moe.md#the-mhm-spine-the-programs-phases)'s "Open (#223)" note (and
+#272) for why that is a live constraint, not a hypothetical one. The same note records the
+rest of the source shape: #200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE with
+`moe_d_ff ≈ d_inner/8`, and `_MUST_MATCH` (`src/train/upcycle.py:48-52`) lists all 15 fields
+source and target must agree on.
 `scripts/upcycle.py` runs this offline as an explicit, one-shot CLI (never implicitly
 inside `train.py` — a mistyped `--init` reshaping instead of erroring would burn a whole
 run on a wrong init that still produces a plausible-looking loss curve), writing one
@@ -272,6 +275,14 @@ mamba-ssm kernels, grad checkpointing), so these are the net-new ones.
 | **`torch.compile`** default-on for real CUDA runs | #239 / `7a71073` | `src/model/cuda_backend.py` | **landed** |
 | **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240, landed with #214 | `src/model/cuda_backend.py` (`_te_linear_cls`, `MoEBlock._fp8_ctx`, `_layer_forward`'s TE-checkpoint branch) | **wired**, hardware-unverified (no Hopper CI runner) |
 | **8-bit AdamW moments** (bitsandbytes) | #214 | `src/model/backend.py` (`_cuda_backend._make_optimizer`'s `_adamw` helper) | **wired**, hardware-unverified (no CUDA CI runner) |
+| **FSDP/ZeRO-2 + in-node expert parallel** | #271 (split from #214) | — nothing in the tree; `torch.distributed` is not imported anywhere | **not built** — blocks #223, not #222 |
+
+The last row is the one to watch. Everything above it is a *throughput or memory* lever on a
+single card; #271 is the difference between "#223 can run" and "#223 cannot run at all". At
+~700M-active/3.5B-total with fp32 master weights, grads and AdamW moments, model + optimizer
+state alone exceeds one 80GB card before activations. The small MoE run (#222, ~700M total)
+fits one GPU, which is why it is not gated on this. See `docs/infrastructure.md` — the pod
+recipes there are all single-GPU today.
 
 Two details worth carrying:
 
