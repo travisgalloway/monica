@@ -1052,13 +1052,16 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         # retaining its activations. Only meaningful under autograd; use_reentrant=False
         # runs normally in no-grad (eval/parity) contexts.
         if self.config.grad_checkpoint and torch.is_grad_enabled():
-            if self.config.fp8_experts and isinstance(layer, MoEBlock):
+            if self.config.fp8_experts and fp8_status() and isinstance(layer, MoEBlock):
                 # `transformer_engine.pytorch.checkpoint`, NOT `torch.utils.checkpoint`
                 # (#214/#240): plain checkpoint's recompute pass re-runs the fp8_autocast
                 # region and double-updates the amax history TE uses to calibrate the fp8
                 # scale, which `te.checkpoint` knows to skip. It has NO `use_reentrant`
                 # kwarg — passing one is a TypeError, unlike the plain-checkpoint call
-                # below.
+                # below. Gated on `fp8_status()` (not just the config flag) so this import
+                # only fires when TE/Hopper is actually available — `fp8_experts=True` on
+                # CPU/CI or non-Hopper CUDA must fall through to the plain-checkpoint path
+                # below, matching `MoEBlock._fp8_ctx`'s own fp8_status() gate.
                 import transformer_engine.pytorch as te
                 if seg_ids is None:
                     return te.checkpoint(layer.forward_seq, h)

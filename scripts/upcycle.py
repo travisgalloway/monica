@@ -9,8 +9,9 @@ RESHAPE a checkpoint into something plausible-looking rather than raise, and a r
 burn a full training budget on a wrong init before anyone noticed the loss curve was
 merely "fine", not right.
 
-    # Inspect the plan without touching disk (no --src-config needed if <src> has a
-    # <src>.config.json sidecar, written by save_weights since day one):
+    # Inspect the plan without reading the (potentially large) --src weights file or
+    # writing --out — it still reads --config (and the <src>.config.json sidecar, no
+    # --src-config needed, if <src> has one written by save_weights since day one):
     python scripts/upcycle.py --src runs/dense/weights.safetensors \\
         --config config/toy-moe-fine.yaml --out /tmp/upcycled.safetensors \\
         --seed 214 --dry-run
