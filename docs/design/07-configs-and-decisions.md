@@ -43,18 +43,22 @@ Three things must hold, and only the first is about `d_model`:
 
 - **`d_model` must match the target exactly.** `src/train/upcycle.py` hard-raises
   `UpcycleError` on a mismatch (expert replication copies a tensor, it cannot widen one).
-  #200's currently-assumed `d_model 768` does **not** match Large A's current default of
-  `d_model 1536` — see [13-code-model-moe.md](13-code-model-moe.md)'s "Open (#223)" note and
-  **#272** before dimensioning #200.
+  **Resolved 2026-08-09 (#272): both rungs are `d_model 768`**, so one dense run (#200) seeds
+  both #222 and #223. Large A was re-shaped to 768 rather than #200 being re-run at 1536 — see
+  [13-code-model-moe.md](13-code-model-moe.md)'s resolved note under MHM-P5.
 - **…and so must 14 other fields.** `_MUST_MATCH` (`src/train/upcycle.py:48-52`) is the
   authority: `moe_every`, `moe_d_ff_resolved`, `attn_every`, `n_attn_heads_resolved`,
   `vocab_size`, `tie_embeddings` and the rest of the backbone. Matching only the non-expert
   dims is necessary but not sufficient.
-- **#200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE with `moe_d_ff ≈ d_inner/8`**,
-  not as a plain dense config — a plain dense model has no `experts.0.*` keys to replicate, and
-  the narrow `moe_d_ff` is what makes 64 fine-grained experts fit Large A's budget. The
-  `toy-moe-dense.yaml` / `toy-moe-fine.yaml` pair above is the worked example;
-  `scripts/upcycle.py --dry-run` checks a real pair in seconds.
+- **#200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE**, not as a plain dense config —
+  a plain dense model has no `experts.0.*` keys to replicate. Its `moe_d_ff` must equal the
+  target's per-expert width: **`d_inner` (1536) for Large A as resolved**. (An earlier revision
+  of this note said `≈ d_inner/8`; that shape reaches ~255M active against a ~700M target, because
+  narrowing experts cuts *total* params but not *active* ones. Corrected by #272.) The
+  `toy-moe-dense.yaml` / `toy-moe-fine.yaml` pair above is the worked mechanism — the fixtures
+  deliberately use a narrow `moe_d_ff` to prove a non-default width round-trips, which is a
+  *fixture* choice and not the real model's shape. `scripts/upcycle.py --dry-run` checks a real
+  pair in seconds.
 
 ## `config/toy.yaml`
 

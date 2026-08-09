@@ -354,9 +354,10 @@ been exercised on that or any other GPU; see the manual-verification checklist b
 >   exceeds one 80GB card before activations. Renting an H100 for #223 today buys a pod that
 >   cannot run the job.
 >
-> #223 is additionally blocked on **#272** (#200 is `d_model 768`, Large A defaults to `1536`, and
-> sparse-upcycle replication cannot widen a tensor). Settle both before committing to a region or
-> a reservation.
+> #272 (the `d_model` conflict) is **resolved** — Large A is now `d_model 768`, 56 layers,
+> 3.88B total / 710M active, so one dense run (#200) seeds both rungs. That removes a blocker but
+> not this one: **#271 is still the gate on #223**. Settle it before committing to a region or a
+> reservation.
 
 ### Manual verification: 8-bit optimizer + fp8 experts (#214)
 

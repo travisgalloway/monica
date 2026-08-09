@@ -10,10 +10,10 @@
 # expand, d_conv, head_dim, dt_rank, vocab_size, tie_embeddings, attn_every, moe_every,
 # and moe_d_ff itself) — only n_experts/top_k/moe_balance_rate may differ. Matching the
 # non-expert backbone is NECESSARY but NOT SUFFICIENT to make a real dense checkpoint a
-# valid upcycle source for a real MoE target: moe_d_ff also has to be sized the way the
-# fine-grained target wants it (see toy-moe-fine.yaml's comment) — that extra constraint
-# is not written down anywhere else in the design docs, and this fixture pair is where it
-# first becomes visible in the tree.
+# valid upcycle source for a real MoE target: moe_d_ff also has to match whatever width
+# the target uses. That constraint is now recorded in docs/design/13-code-model-moe.md
+# (the source-shape note under MHM-P5) and docs/design/07-configs-and-decisions.md; this
+# fixture pair is the executable version of it.
 d_model: 64
 n_layers: 4
 d_state: 16            # SSM state width N (per head)
@@ -27,13 +27,16 @@ dt_rank: auto
 moe_every: 2            # layers 1 and 3 (0-indexed (i+1)%2==0) are MoE
 n_experts: 1             # degenerate: ONE expert == a plain dense SwiGLU FFN (#214)
 top_k: 1                 # validate() REQUIRES top_k==1 whenever n_experts==1
-# Fine-grained width (d_inner/8 = 128/8 = 16), NOT the usual d_inner default. At Large
-# A's real scale (#223), 64 full-width (moe_d_ff == d_inner) experts per MoE layer would
-# cost ~906M params PER LAYER — far past budget. The fine-grained target
-# (toy-moe-fine.yaml) therefore sizes each expert at d_inner/8, and #200's real dense
-# checkpoint must be dimensioned THE SAME WAY (moe_d_ff: 16 here, matching this toy's
-# d_inner/8) so a single dense expert is upcycle-compatible with 64 narrow ones later —
-# not the usual null (-> d_inner) default a non-upcycle dense config would use.
+# A deliberately NON-DEFAULT expert width (d_inner/8 = 128/8 = 16), matching
+# toy-moe-fine.yaml. The point is to prove the upcycle carries moe_d_ff through rather
+# than silently working only at the `null -> d_inner` default — moe_d_ff_resolved is one
+# of the 15 fields check_upcycle_compatible requires to match.
+#
+# This is a FIXTURE width, not #200's. #200 must match whatever the real target uses:
+# #272 (resolved 2026-08-09) settled Large A at moe_d_ff == d_inner (full width), so
+# #200's dense FFN blocks are full-width too. An earlier version of this comment said the
+# real checkpoint had to be narrow like this fixture; that was wrong — see
+# docs/design/13-code-model-moe.md's resolved note under MHM-P5.
 moe_d_ff: 16
 # A single expert can never be balanced (sign(mean - load) == sign(0) == 0 forever, since
 # the one expert's load IS the mean); validate() REJECTS a non-null rate here.
