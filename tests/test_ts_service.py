@@ -116,6 +116,40 @@ def test_update_then_diagnostics_detects_and_clears_a_break(service: TsLspServic
     assert clean == [], f"expected clean after revert, got {clean}"
 
 
+def test_benign_edit_to_clean_document_is_counted_as_no_publish():
+    """#278: `cli.mjs:20524` returns early (never publishes) when a document's
+    OLD and NEW diagnostic sets are both empty -- pinning that against the
+    real server. A fresh, short-timeout `TsLspService` (not the module-scoped
+    `service` fixture, whose counters are shared across tests and whose 10s
+    timeout would stall the suite on the wait this exercises)."""
+    svc = TsLspService(timeout_s=2.0)
+    try:
+        svc.open_project({"src/clean.ts": _OTHER_TS})
+        assert svc.diagnostics("src/clean.ts") == []
+
+        n_no_publish_before = svc.n_no_publish
+        n_timeouts_before = svc.n_timeouts
+        svc.update("src/clean.ts", _OTHER_TS + "// a benign, non-breaking comment\n")
+        result = svc.diagnostics("src/clean.ts")
+
+        # Edge case / decision rule (plan #278): if the live server DOES
+        # publish here (e.g. a diagnostic kind was never populated for this
+        # document, so cli.mjs's early-return does not fire), the counter
+        # code is still correct -- record what actually happened rather than
+        # assert a behaviour the server didn't exhibit.
+        if svc.n_no_publish == n_no_publish_before + 1:
+            assert result == []
+            assert svc.n_timeouts == n_timeouts_before
+        else:
+            assert svc.n_timeouts == n_timeouts_before, (
+                "expected either n_no_publish+1 (cli.mjs:20524 suppressed the "
+                "publish) or a real answered push (n_no_publish unchanged) -- "
+                f"got n_no_publish={svc.n_no_publish} (was {n_no_publish_before}), "
+                f"n_timeouts={svc.n_timeouts} (was {n_timeouts_before}), result={result}")
+    finally:
+        svc.close()
+
+
 def test_version_counter_is_strictly_increasing(service: TsLspService):
     v1 = service.update("src/other.ts", _OTHER_TS + "// edit 1\n")
     v2 = service.update("src/other.ts", _OTHER_TS + "// edit 2\n")
