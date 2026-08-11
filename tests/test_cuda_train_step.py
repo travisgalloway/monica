@@ -286,6 +286,25 @@ def test_overflow_skip_does_not_pop_moe_load_counts():
     assert sum(sum(layer) for layer in survived) > 0
 
 
+def _capture_loads_during_step(model, step, micro_batches, lr):
+    """Run one train step, capturing the per-expert load counts at the moment #217's
+    routing-diagnostics pop drains them (`pop_moe_routing_stats`, called unconditionally
+    now — even with `balancer=None`). Reading `model.pop_moe_load()` AFTER the step
+    would see an already-drained (all-zero) accumulator, since the diagnostics pop is
+    no longer gated on a balancer being attached."""
+    captured = {}
+    orig = model.pop_moe_routing_stats
+
+    def spy():
+        stats = orig()
+        captured["stats"] = stats
+        return stats
+
+    model.pop_moe_routing_stats = spy
+    step(model, micro_batches, lr)
+    return [s["load"] for s in captured["stats"]]
+
+
 def test_grad_accum_two_microbatches_accumulates_moe_load_counts():
     """Grad accumulation sums counts across BOTH micro-batches, not just the last one."""
     cfg = _moe_cfg(moe_balance_rate=None)     # counting only, no balancer consuming it
@@ -295,15 +314,13 @@ def test_grad_accum_two_microbatches_accumulates_moe_load_counts():
     model1 = CUDAMambaModel(cfg)
     step1 = make_train_step(model1, _adam(model1), grad_clip=1.0, scaler=None, balancer=None)
     model1.set_moe_load_counting(True)
-    step1(model1, [(inp, tgt)], 1e-3)
-    single = model1.pop_moe_load()
+    single = _capture_loads_during_step(model1, step1, [(inp, tgt)], 1e-3)
 
     torch.manual_seed(0)                      # identical fresh weights, pre-optimizer-step
     model2 = CUDAMambaModel(cfg)
     step2 = make_train_step(model2, _adam(model2), grad_clip=1.0, scaler=None, balancer=None)
     model2.set_moe_load_counting(True)
-    step2(model2, [(inp, tgt), (inp, tgt)], 1e-3)
-    double = model2.pop_moe_load()
+    double = _capture_loads_during_step(model2, step2, [(inp, tgt), (inp, tgt)], 1e-3)
 
     assert sum(sum(l) for l in single) > 0     # sanity: routing actually happened
     for s_layer, d_layer in zip(single, double):

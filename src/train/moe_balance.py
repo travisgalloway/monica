@@ -127,6 +127,36 @@ class MoEBalancer:
         self.bias = [list(row) if row else [0.0] * self.n_experts for row in rows]
 
 
+def moe_routing_metrics(stats: list) -> dict:
+    """Flat, JSON-serializable per-step routing metrics from `pop_moe_routing_stats()` (#217).
+
+    `stats` is one dict per MoE layer: `{"load", "entropy", "n_tokens"}`. Emits
+
+      moe_util_var                 max over layers  (UNCHANGED key + meaning)
+      moe_util_var_per_layer       list[float]
+      moe_router_entropy           mean over layers (nats)
+      moe_router_entropy_per_layer list[float]
+
+    Each pair is emitted ONLY when it was actually observed — a layer set with zero total
+    routed load reports NO `moe_util_var` (0.0 would read as "perfectly balanced" rather
+    than "no signal", the BLIND failure), and layers with `entropy is None` (counting off,
+    or k==E with counting off) contribute no entropy key. So an un-instrumented step emits
+    exactly what it emits today: nothing.
+    """
+    out: dict = {}
+    loads = [s["load"] for s in stats]
+    if any(sum(layer_loads) > 0 for layer_loads in loads):
+        var_per_layer = MoEBalancer.utilization_variance(loads)
+        out["moe_util_var"] = max(var_per_layer)
+        out["moe_util_var_per_layer"] = var_per_layer
+    entropies = [s["entropy"] for s in stats]
+    observed = [e for e in entropies if e is not None]
+    if observed:
+        out["moe_router_entropy"] = sum(observed) / len(observed)
+        out["moe_router_entropy_per_layer"] = entropies
+    return out
+
+
 def balancer_for_config(cfg) -> "MoEBalancer | None":
     """Map a `MambaConfig` to the `MoEBalancer` its training driver needs, or `None`.
 

@@ -64,6 +64,59 @@ def test_val_dict_merged_and_tokens_per_sec_present():
     assert evald[0]["val_loss"] == 1.5
 
 
+def test_moe_diag_fires_only_on_its_cadence_and_merges_into_the_payload():
+    """#217: `moe_diag` is merged like `val_eval`, but on its own `moe_diag_every`
+    cadence (independent of `eval_every`)."""
+    def fake_step(model, micro, lr):
+        return {"loss": 1.0, "grad_norm": 0.5}
+
+    calls = []
+
+    def moe_diag(model):
+        calls.append(model)
+        return {"moe_domain_overlap": 0.5, "moe_kill_triggered": False}
+
+    loader = FakeLoader(n_batches=100)
+    cfg = TrainConfig(total_steps=6, grad_accum=1, warmup_steps=0, log_every=1,
+                      eval_every=100, ckpt_every=100, moe_diag_every=2)
+    logs = []
+    train("the-model", loader, cfg, fake_step, moe_diag=moe_diag, logger=logs.append)
+
+    diagged = [p for p in logs if "moe_domain_overlap" in p]
+    assert {p["step"] for p in diagged} == {0, 2, 4}
+    assert all(p["moe_kill_triggered"] is False for p in diagged)
+    assert calls == ["the-model"] * 3           # moe_diag(model) called with the real model
+
+
+def test_moe_diag_every_zero_never_fires_and_does_not_raise():
+    def fake_step(model, micro, lr):
+        return {"loss": 1.0, "grad_norm": 0.5}
+
+    def moe_diag(model):
+        raise AssertionError("moe_diag must not be called when moe_diag_every == 0")
+
+    loader = FakeLoader(n_batches=100)
+    cfg = TrainConfig(total_steps=4, grad_accum=1, warmup_steps=0, log_every=1,
+                      eval_every=100, ckpt_every=100, moe_diag_every=0)   # default: off
+    logs = []
+    train(None, loader, cfg, fake_step, moe_diag=moe_diag, logger=logs.append)   # no raise
+
+    assert not any("moe_domain_overlap" in p for p in logs)
+
+
+def test_moe_diag_none_with_nonzero_every_is_a_noop():
+    def fake_step(model, micro, lr):
+        return {"loss": 1.0, "grad_norm": 0.5}
+
+    loader = FakeLoader(n_batches=100)
+    cfg = TrainConfig(total_steps=4, grad_accum=1, warmup_steps=0, log_every=1,
+                      eval_every=100, ckpt_every=100, moe_diag_every=2)
+    logs = []
+    train(None, loader, cfg, fake_step, moe_diag=None, logger=logs.append)   # no raise
+
+    assert not any("moe_domain_overlap" in p for p in logs)
+
+
 def test_checkpoint_fires_at_interval():
     ckpts = []
 

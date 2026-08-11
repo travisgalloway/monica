@@ -28,6 +28,25 @@ def _np(a):
     return a.detach().cpu().numpy()
 
 
+def _capture_loads_during_step(model, step, micro_batches, lr):
+    """Run one train step, capturing the per-expert load counts at the moment #217's
+    routing-diagnostics pop drains them (`pop_moe_routing_stats`, called unconditionally
+    now — even with `balancer=None`). Reading `model.pop_moe_load()` AFTER the step
+    would see an already-drained (all-zero) accumulator, since the diagnostics pop is
+    no longer gated on a balancer being attached."""
+    captured = {}
+    orig = model.pop_moe_routing_stats
+
+    def spy():
+        stats = orig()
+        captured["stats"] = stats
+        return stats
+
+    model.pop_moe_routing_stats = spy
+    step(model, micro_batches, lr)
+    return [s["load"] for s in captured["stats"]]
+
+
 # --------------------------------------------------------------------------- #
 # D1 -- the bias is NOT a trained parameter
 # --------------------------------------------------------------------------- #
@@ -292,8 +311,8 @@ def test_grad_checkpoint_doubles_the_counts_and_changes_nothing_else():
         model.set_moe_load_counting(True)
         rng = np.random.default_rng(0)
         tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
-        step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
-        return model.pop_moe_load()
+        return _capture_loads_during_step(
+            model, step, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
 
     plain, checkpointed = counts(False), counts(True)
     assert checkpointed == [[2 * c for c in layer] for layer in plain]

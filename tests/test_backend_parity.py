@@ -165,6 +165,43 @@ def test_portable_weights_roundtrip_both_directions(tmp_path):
     assert np.allclose(before, after, rtol=1e-4, atol=1e-5), f"round-trip drift {max_abs:.3e}"
 
 
+@pytest.mark.skipif(not (HAVE_MLX and HAVE_TORCH),
+                    reason="needs both mlx and torch (run on a Mac)")
+def test_moe_routing_entropy_parity_mlx_vs_torch(tmp_path):
+    """#217: the two backends' routing-entropy diagnostic must agree, not just the
+    logits. Identical portable weights, identical input, load counting on in both --
+    per-layer mean entropy compared at fp32 ~1e-4 (same tolerance as the logits parity
+    tests above)."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.cuda_backend import CUDAMambaModel
+
+    cfg = load_config("config/toy-moe.yaml")
+    torch.manual_seed(0)
+    src = CUDAMambaModel(cfg)
+    path = str(tmp_path / "weights.safetensors")
+    src.save(path)
+
+    mlx_m = MLXMambaModel(cfg)
+    mlx_m.load(path)
+    cuda_m = CUDAMambaModel(cfg)
+    cuda_m.load(path)
+    mlx_m.set_moe_load_counting(True)
+    cuda_m.set_moe_load_counting(True)
+
+    tokens = _tokens(cfg)
+    mlx_m.forward(tokens)
+    with torch.no_grad():
+        cuda_m.forward(tokens)
+    mlx_stats = mlx_m.pop_moe_routing_stats()
+    cuda_stats = cuda_m.pop_moe_routing_stats()
+
+    assert len(mlx_stats) == len(cuda_stats) == cfg.n_moe_layers > 0
+    for a, b in zip(mlx_stats, cuda_stats):
+        assert a["entropy"] is not None and b["entropy"] is not None
+        assert a["entropy"] == pytest.approx(b["entropy"], rel=1e-4, abs=1e-5)
+        assert a["n_tokens"] == b["n_tokens"]
+
+
 @pytest.mark.skipif(not HAVE_TORCH, reason="needs torch")
 def test_parity_harness_torch_self(tmp_path):
     """Runnable without mlx: identical weights in two torch instances pass the parity

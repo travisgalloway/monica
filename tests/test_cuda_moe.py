@@ -194,6 +194,139 @@ def test_moe_degenerate_single_expert_equals_hand_computed_swiglu():
 
 
 # --------------------------------------------------------------------------- #
+# #217 routing-entropy diagnostics — torch mirror of tests/test_moe.py
+# --------------------------------------------------------------------------- #
+def test_entropy_uniform_routing_approaches_log_n_experts():
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    with torch.no_grad():
+        block.router.weight.zero_()
+    block.set_load_counting(True)
+    xn = torch.randn(5, cfg.d_model)
+    with torch.no_grad():
+        block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] == pytest.approx(np.log(cfg.n_experts), abs=1e-4)
+    assert stats["n_tokens"] == 5
+
+
+def test_entropy_near_zero_when_router_is_sharply_one_hot():
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    with torch.no_grad():
+        block.router.weight.fill_(-10.0)
+        block.router.weight[0, :] = 10.0
+    block.set_load_counting(True)
+    xn = torch.ones(5, cfg.d_model)
+    with torch.no_grad():
+        block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] < 1e-3
+
+
+def test_entropy_reported_at_top_k_equals_n_experts_while_load_is_zero():
+    cfg = _cfg(top_k=4)   # n_experts=4 (the _cfg default) -> k == E, no mask exists
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    block.set_load_counting(True)
+    xn = torch.randn(5, cfg.d_model)
+    with torch.no_grad():
+        block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] is not None
+    assert all(c == 0.0 for c in stats["load"])
+
+
+def test_pop_routing_stats_resets_the_accumulator():
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    block.set_load_counting(True)
+    xn = torch.randn(5, cfg.d_model)
+    with torch.no_grad():
+        block._moe(xn)
+    block.pop_routing_stats()
+    second = block.pop_routing_stats()
+    assert second["entropy"] is None
+    assert second["n_tokens"] == 0
+    assert second["load"] == [0.0] * cfg.n_experts
+
+
+def test_entropy_grad_checkpoint_ratio_invariant():
+    """`cuda_backend` has no grad-checkpoint concept identical to MLX's `mx.checkpoint`
+    wrapper for this toy path, but the entropy accumulation itself is checkpoint-agnostic
+    (it just sums whatever forward calls happen); pinned here at the block level: TWO
+    forward calls through the same accumulator must double both entropy_sum and
+    n_routed, leaving the reported MEAN unchanged (mirrors mlx_backend's D5 argument)."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    block = _moe_block(model)
+    block.set_load_counting(True)
+    xn = torch.randn(5, cfg.d_model)
+    with torch.no_grad():
+        block._moe(xn)
+    once = block.pop_routing_stats()
+
+    torch.manual_seed(0)
+    model2 = CUDAMambaModel(cfg)
+    block2 = _moe_block(model2)
+    block2.set_load_counting(True)
+    with torch.no_grad():
+        block2._moe(xn)
+        block2._moe(xn)
+    twice = block2.pop_routing_stats()
+
+    assert once["entropy"] == pytest.approx(twice["entropy"], abs=1e-5)
+    assert twice["n_tokens"] == 2 * once["n_tokens"]
+
+
+def test_no_balancer_path_still_emits_routing_metrics():
+    """Diagnostics must work with `moe_balance_rate: null` (#217) -- decoupled from
+    `balancer is not None`."""
+    from src.model.cuda_train_step import make_train_step
+
+    cfg = _cfg(moe_balance_rate=None)
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    step = make_train_step(model, opt, grad_clip=1.0, scaler=None, balancer=None)
+    model.set_moe_load_counting(True)
+    rng = np.random.default_rng(0)
+    tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
+    out = step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
+    for key in ("moe_router_entropy", "moe_router_entropy_per_layer",
+               "moe_util_var", "moe_util_var_per_layer"):
+        assert key in out
+
+
+def test_pop_once_balancer_gets_the_counts_and_they_are_not_popped_twice():
+    from src.model.cuda_train_step import make_train_step
+    from src.train.moe_balance import attach_balancer, balancer_for_config
+
+    cfg = _cfg(moe_balance_rate=0.1)
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    balancer = balancer_for_config(cfg)
+    step = make_train_step(model, opt, grad_clip=1.0, scaler=None, balancer=balancer)
+    attach_balancer(balancer, model)
+
+    rng = np.random.default_rng(0)
+    tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
+    step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
+
+    assert model.pop_moe_load() == [[0.0] * cfg.n_experts for _ in range(cfg.n_moe_layers)]
+    assert any(any(v != 0.0 for v in layer) for layer in balancer.biases())
+
+
+# --------------------------------------------------------------------------- #
 # Tie-break contract (#214).
 #
 # MLX, Swift and this backend all rank with `argsort(argsort(-sel))`, whose ties break by

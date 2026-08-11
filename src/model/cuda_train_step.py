@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..train.moe_balance import MoEBalancer
+from ..train.moe_balance import moe_routing_metrics
 
 
 def _global_grad_norm(params) -> torch.Tensor:
@@ -88,18 +88,25 @@ def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
     if scaler:
         out["loss_scale"] = scaler.scale
         out["skipped"] = False
-    if balancer is not None:
-        # Loss-Free-Balancing (#213/#214): update the bias from this step's routed-token
-        # counts, OUTSIDE the gradient, then push the new biases back into the model for
-        # the next forward. `pop_moe_load` returns `[]` for a model with no MoE layers.
-        # Placed at the VERY END, after `out` is assembled — i.e. AFTER the fp16 overflow
-        # early-return above, so a skipped step does NOT pop the counters (intentional,
-        # mirrors `mlx_backend.py:717-720` — do not "fix" with a `finally`).
-        loads = model.pop_moe_load()
-        if loads:
-            balancer.update(loads)
-            model.set_moe_biases(balancer.biases())
-            out["moe_util_var"] = max(MoEBalancer.utilization_variance(loads))
+    # --- MoE routing diagnostics + Loss-Free-Balancing (#213/#214/#217) -------
+    # ONE pop per step, shared: `pop_moe_routing_stats` drains the load counters too, so
+    # calling `pop_moe_load()` here as well would zero them and hand the balancer nothing.
+    # Placed at the VERY END, after `out` is assembled — i.e. AFTER the fp16 overflow
+    # early-return above, so a skipped step does NOT pop the counters (intentional,
+    # mirrors `mlx_backend.py:717-720` — do not "fix" with a `finally`). NOT gated on
+    # `balancer is not None`: diagnostics must work with `moe_balance_rate: null`, which
+    # is every config in the tree (#217). `model` here is the same model the caller
+    # passed to `_accumulate_and_step` — for DPO that is always `policy_model`, never
+    # `ref_model` (see `make_dpo_train_step`).
+    pop = getattr(model, "pop_moe_routing_stats", None)
+    if pop is not None:
+        stats = pop()
+        if stats:
+            loads = [s["load"] for s in stats]
+            if balancer is not None:
+                balancer.update(loads)
+                model.set_moe_biases(balancer.biases())
+            out.update(moe_routing_metrics(stats))
     return out
 
 

@@ -575,6 +575,11 @@ class AttentionBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 # Sparse Mixture-of-Experts FFN block (#53)
 # --------------------------------------------------------------------------- #
+_ROUTE_EPS = 1e-9      # #217: log-guard for the router-entropy diagnostic. Must be
+                       # IDENTICAL in cuda_backend.py — the two backends' entropies are
+                       # compared at fp32 ~1e-4 by the parity test.
+
+
 class _Expert(nn.Module):
     """A SwiGLU FFN expert: down(silu(gate(x)) * up(x)). Bias-free, matmuls in `cd`."""
 
@@ -649,6 +654,12 @@ class MoEBlock(nn.Module):
         # training wiring flips this on exactly when a balancer exists.
         self._count_loads = False
         self._load_counts = mx.zeros((config.n_experts,))
+        # #217 routing diagnostics. Same leading-underscore rule as `_load_counts`: an
+        # mx.array under a `_`-prefixed attribute is excluded from `parameters()` by
+        # `nn.Module.valid_parameter_filter`, so it can never be differentiated or
+        # stepped. Gated by the SAME `_count_loads` flag, for the same lazy-graph reason.
+        self._entropy_sum = mx.zeros(())
+        self._n_routed = 0            # plain int: a static shape count, no graph
 
     def set_route_bias(self, vec) -> None:
         """Set the per-expert selection bias (Loss-Free-Balancing, #213) — `vec` a
@@ -688,11 +699,48 @@ class MoEBlock(nn.Module):
         self._load_counts = mx.zeros_like(counts)
         return [float(c) for c in counts.tolist()]
 
+    def pop_routing_stats(self) -> dict:
+        """This block's routing diagnostics since the last pop, then reset.
+
+        Returns `{"load": list[float], "entropy": float | None, "n_tokens": int}`.
+        `entropy` is the MEAN per-token entropy (nats) of the UNBIASED router
+        distribution — `None` when nothing was observed (counting off), never `0.0`,
+        which would read as "perfectly one-hot / fully specialized".
+
+        This DRAINS the load accumulator too (it calls `pop_load()`), so a caller must
+        use either this or `pop_load()` for a given step, never both — the train step
+        pops here exactly once and shares the result (#217).
+        """
+        load = self.pop_load()
+        n = self._n_routed
+        total = float(self._entropy_sum.item()) if n else 0.0
+        self._entropy_sum = mx.zeros(())
+        self._n_routed = 0
+        return {"load": load, "entropy": (total / n) if n else None, "n_tokens": int(n)}
+
     def _moe(self, xn: Array) -> Array:
         cd = _DTYPES[self.config.precision]
         E, k = self.config.n_experts, self.config.top_k
         logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
         probs = mx.softmax(logits, axis=-1)                  # UNBIASED — always the gate weight
+        if self._count_loads:
+            # #217: mean per-token entropy of the UNBIASED gate distribution, the
+            # specialization signal. Deliberately OUTSIDE the `k < E` guard below:
+            # loads are meaningless at k == E (no mask exists, balancing is vacuous),
+            # but the gate distribution is still real, and an entropy that silently
+            # reported 0.0 there would read as "fully specialized" — the BLIND failure
+            # this repo forbids. Detached (`stop_gradient`): a diagnostic must never
+            # become a training signal. Gated by `_count_loads` for the same
+            # lazy-graph reason as the load counter (:646-649) — nothing would ever
+            # pop it on an un-instrumented run.
+            #
+            # With `grad_checkpoint: true` the layer's forward is RECOMPUTED in
+            # backward, so `_entropy_sum` AND `_n_routed` both double (#213 D5). The
+            # reported value is their RATIO, so it is exact — the same argument that
+            # makes the doubled load counts harmless.
+            ent = -mx.sum(probs * mx.log(probs + _ROUTE_EPS), axis=-1)   # (...,) nats
+            self._entropy_sum = self._entropy_sum + mx.stop_gradient(mx.sum(ent))
+            self._n_routed += int(probs.size // E)
         if k < E:                                            # keep EXACTLY top_k per token
             # Loss-Free-Balancing (#213 D2): when active, rank by the BIASED selection
             # score `logits + route_bias`; the gate weight below stays `probs` (unbiased).
@@ -941,6 +989,15 @@ class MLXMambaModel(ModelInterface, nn.Module):
         order), resetting each block's accumulator. `[]` when the model has no MoE
         layers (dense / hybrid-only models)."""
         return [block.pop_load() for block in self.moe_blocks()]
+
+    def pop_moe_routing_stats(self) -> List[dict]:
+        """Per-MoE-layer routing diagnostics since the last pop, in layer order (#217).
+
+        Each entry is `MoEBlock.pop_routing_stats()`'s dict. `[]` for a model with no MoE
+        layers. This is the ONLY pop the train step performs — it drains the load counters
+        as well, so `pop_moe_load()` must not also be called for the same step.
+        """
+        return [block.pop_routing_stats() for block in self.moe_blocks()]
 
     def init_state(self, batch_size: int) -> State:
         c = self.config

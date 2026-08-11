@@ -29,6 +29,7 @@ imports stay behind `src.model.backend.get_backend`, so the module stays importa
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 
@@ -58,6 +59,26 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ckpt-every", type=int, default=500)
     ap.add_argument("--eval-batches", type=int, default=50,
                     help="cap val batches per eval (None-like 0 = full val set)")
+    ap.add_argument("--moe-diag-every", type=int, default=0,
+                    help="#217: steps between MoE routing diagnostic passes (0 = off). "
+                         "Only fires on steps that are also --log-every steps, so use a "
+                         "multiple of it.")
+    ap.add_argument("--moe-diag-domains", type=Path, default=None,
+                    help="domains.json from scripts/build_domain_val_sets.py — the "
+                         "per-domain val sets the expert histograms are measured over. "
+                         "Packed training shards carry no domain tag (#252), so this is "
+                         "usage on held-out samples DRAWN FROM each domain, not over the "
+                         "live training mix.")
+    ap.add_argument("--moe-kill-pair", type=str, default="typescript,math",
+                    help="two domain names from domains.json whose expert histograms the "
+                         "kill-criterion compares.")
+    ap.add_argument("--moe-kill-overlap", type=float, default=0.90,
+                    help="routing overlap at or above which the pair is NOT specializing. "
+                         "Early in training routing is near-uniform by construction and "
+                         "overlap is legitimately ~1.0 — this REPORTS, it never aborts.")
+    ap.add_argument("--moe-diag-batches", type=int, default=8,
+                    help="cap batches per domain in a diagnostic pass (this is a probe, "
+                         "not an eval — keep it small).")
     ap.add_argument("--init-loss-scale", type=float, default=2.0 ** 13)
     ap.add_argument("--resume", type=Path, default=None,
                     help="resume bundle dir; if omitted, auto-detects <out>/resume")
@@ -103,6 +124,31 @@ def main() -> None:
     backend = get_backend(args.backend)
 
     cfg = load_config(str(args.config))                 # validates (vocab < 2**32, head_dim | d_inner, ...)
+
+    # #217: fail fast, before the model is built where possible — a bad routing-diagnostic
+    # flag should not surface 200 steps into a multi-day run.
+    if args.moe_diag_every and args.moe_diag_domains is None:
+        raise SystemExit("--moe-diag-every > 0 requires --moe-diag-domains "
+                         "(domains.json from scripts/build_domain_val_sets.py)")
+    moe_kill_pair = tuple(s.strip() for s in args.moe_kill_pair.split(","))
+    if len(moe_kill_pair) != 2:
+        raise SystemExit(f"--moe-kill-pair must be exactly two comma-separated domain "
+                         f"names, got {args.moe_kill_pair!r}")
+    if args.moe_diag_every and cfg.n_moe_layers == 0:
+        raise SystemExit(f"[moe-diag] {args.config} has no MoE layers (moe_every is "
+                         "unset) — there is no router to diagnose.")
+    if args.moe_diag_every and args.moe_diag_every % args.log_every != 0:
+        # The diagnostic is nested inside the log_every block (as `val_eval`/`eval_every`
+        # already is), so it fires only on steps that are multiples of BOTH — i.e. every
+        # lcm(log_every, moe_diag_every), NOT every moe_diag_every. It does still fire;
+        # the cadence is just coarser than asked for. Say which, so a run that logs a
+        # diagnostic every 200 steps when 15 was requested is not read as a bug.
+        effective = math.lcm(args.moe_diag_every, args.log_every)
+        print(f"[moe-diag] WARNING: --moe-diag-every={args.moe_diag_every} is not a "
+              f"multiple of --log-every={args.log_every} — the diagnostic pass only runs "
+              f"on steps that are also log steps, so its EFFECTIVE cadence is every "
+              f"{effective} steps, not {args.moe_diag_every}. Make it a multiple of "
+              f"--log-every to get the cadence you asked for.")
 
     tokens_per_step = args.batch_size * cfg.seq_len * args.grad_accum
     # Length curriculum (#216): the stage allocation, not the fixed shape, decides how
@@ -174,6 +220,44 @@ def main() -> None:
     max_b = args.eval_batches or None
     val_eval = lambda m: evaluate(m, val_loader, max_batches=max_b, to_numpy=np_to)
 
+    moe_diag = None
+    if args.moe_diag_every:
+        from src.eval.moe_routing import (expert_histograms, format_routing_report,
+                                          kill_check, specialization_report)
+        from src.eval.domain_bpb import load_domain_index
+        diag_index = load_domain_index(args.moe_diag_domains)      # raises early if bad
+        diag_domains = {n: e["packed"] for n, e in diag_index.items()}
+
+        def moe_diag(m):
+            hists = expert_histograms(m, diag_domains, batch_size=args.batch_size,
+                                      seq_len=cfg.seq_len,
+                                      max_batches=args.moe_diag_batches, to_numpy=np_to)
+            report = specialization_report(hists)
+            kill = kill_check(report, pair=moe_kill_pair, threshold=args.moe_kill_overlap)
+            if kill["triggered"]:
+                # Loud, and a machine-readable event line of its own — it does NOT abort
+                # the run (that is the user's call; see --moe-kill-overlap's help). No
+                # "step" key: the loop owns the step number and the payload this function
+                # returns lands on the logged step anyway — this event line is the loud
+                # one, the flat moe_kill_* fields below are the durable record. `logger`
+                # is defined further down in main(); this closure only runs once training
+                # starts, by which point it is bound in the enclosing scope.
+                print(f"[moe-kill] {kill['pair']} routing overlap "
+                      f"{kill['overlap']:.4f} >= {args.moe_kill_overlap:.4f}: the router "
+                      f"is NOT specializing between these domains. Reporting only — the "
+                      f"run continues. Early in training this is expected.")
+                print(format_routing_report(report, kill))
+                logger({"event": "moe_kill", "moe_kill_pair": kill["pair"],
+                       "moe_kill_overlap": kill["overlap"],
+                       "moe_kill_threshold": kill["threshold"],
+                       "moe_kill_triggered": kill["triggered"]})
+            return {"moe_domain_overlap": report["mean_overlap"],
+                    "moe_domain_overlap_max": report["max_overlap"],
+                    "moe_kill_pair": kill["pair"],
+                    "moe_kill_overlap": kill["overlap"],
+                    "moe_kill_triggered": kill["triggered"],
+                    "moe_expert_hist": hists}
+
     # --- resume (double-buffered, crash-safe checkpoint store) -----------------
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -219,6 +303,12 @@ def main() -> None:
     # counting. No-op when balancing is off. `CheckpointStore.save` is unchanged — there
     # is deliberately no second copy of the bias in the resume bundle.
     attach_balancer(balancer, model)
+    # #217: routing diagnostics are DECOUPLED from balancing. `attach_balancer` turns
+    # counting on only when a balancer exists (moe_balance.py:171), and moe_balance_rate is
+    # null in every config in the tree — so without this the diagnostics would observe
+    # nothing and report a uniform, blind zero.
+    if args.moe_diag_every:
+        model.set_moe_load_counting(True)
 
     logger = JsonlLogger(str(out / "metrics.jsonl"), append=resuming)
 
@@ -237,6 +327,7 @@ def main() -> None:
         log_every=args.log_every, eval_every=args.eval_every,
         ckpt_every=args.ckpt_every, out_dir=str(out), seed=args.seed,
         lr_schedule=args.lr_schedule, decay_frac=args.decay_frac,
+        moe_diag_every=args.moe_diag_every,
     )
 
     n_params = sum(int(np.asarray(v).size) for _, v in model._portable_state_dict().items())
@@ -264,7 +355,8 @@ def main() -> None:
                   "line in metrics.jsonl.")
 
     result = train(model, train_loader, tcfg, train_step,
-                   val_eval=val_eval, logger=logger, on_checkpoint=on_checkpoint,
+                   val_eval=val_eval, moe_diag=moe_diag, logger=logger,
+                   on_checkpoint=on_checkpoint,
                    start_step=start_step, curriculum=curriculum,
                    loader_factory=loader_factory if curriculum is not None else None,
                    start_data_state=start_data_state,
