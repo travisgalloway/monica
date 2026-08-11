@@ -1,0 +1,131 @@
+{
+  "summary": {
+    "verdict": "DEBOUNCE_CONFIRMED",
+    "a_spread_ms": 21.5,
+    "a_monotonic_rising": true,
+    "b_max_abs_residual_ms": 20.2,
+    "b_ratio": 2.41,
+    "any_blind": false,
+    "a_lines": 12,
+    "b_n_files": 200,
+    "iters": 20,
+    "b_iters": 12,
+    "warmup": 5
+  },
+  "sweep_a": [
+    {
+      "n_files": 10,
+      "edit_lines": 12,
+      "n": 20,
+      "median_ms": 361.7,
+      "min_ms": 357.7,
+      "p95_ms": 370.2,
+      "predicted_ms": 350,
+      "residual_ms": 11.7,
+      "pushes_with_errors": 13,
+      "pushes_total": 26,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 200,
+      "edit_lines": 12,
+      "n": 20,
+      "median_ms": 363.3,
+      "min_ms": 358.5,
+      "p95_ms": 368.2,
+      "predicted_ms": 350,
+      "residual_ms": 13.3,
+      "pushes_with_errors": 13,
+      "pushes_total": 26,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 2000,
+      "edit_lines": 12,
+      "n": 20,
+      "median_ms": 371.2,
+      "min_ms": 365.7,
+      "p95_ms": 376.2,
+      "predicted_ms": 350,
+      "residual_ms": 21.2,
+      "pushes_with_errors": 13,
+      "pushes_total": 26,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 5000,
+      "edit_lines": 12,
+      "n": 20,
+      "median_ms": 383.2,
+      "min_ms": 377.8,
+      "p95_ms": 386.2,
+      "predicted_ms": 350,
+      "residual_ms": 33.2,
+      "pushes_with_errors": 13,
+      "pushes_total": 26,
+      "n_unmeasurable": 0,
+      "blind": false
+    }
+  ],
+  "sweep_b": [
+    {
+      "n_files": 200,
+      "edit_lines": 12,
+      "n": 12,
+      "median_ms": 361.6,
+      "min_ms": 356.3,
+      "p95_ms": 364.6,
+      "predicted_ms": 350,
+      "residual_ms": 11.6,
+      "pushes_with_errors": 9,
+      "pushes_total": 18,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 200,
+      "edit_lines": 6000,
+      "n": 12,
+      "median_ms": 365.0,
+      "min_ms": 361.4,
+      "p95_ms": 372.0,
+      "predicted_ms": 350,
+      "residual_ms": 15.0,
+      "pushes_with_errors": 9,
+      "pushes_total": 18,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 200,
+      "edit_lines": 12000,
+      "n": 12,
+      "median_ms": 665.5,
+      "min_ms": 662.1,
+      "p95_ms": 677.1,
+      "predicted_ms": 650,
+      "residual_ms": 15.5,
+      "pushes_with_errors": 9,
+      "pushes_total": 18,
+      "n_unmeasurable": 0,
+      "blind": false
+    },
+    {
+      "n_files": 200,
+      "edit_lines": 20000,
+      "n": 12,
+      "median_ms": 870.2,
+      "min_ms": 865.6,
+      "p95_ms": 878.1,
+      "predicted_ms": 850,
+      "residual_ms": 20.2,
+      "pushes_with_errors": 9,
+      "pushes_total": 18,
+      "n_unmeasurable": 0,
+      "blind": false
+    }
+  ]
+}

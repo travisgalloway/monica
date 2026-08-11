@@ -37,6 +37,21 @@ settle like opengrep.py; it would defeat the reason this class exists.**
 are not available on this pin -- push-and-wait, gated by version/seq (see
 `diagnostics()`), is the only option.
 
+**Most of the measured `diagnostics` latency is a client-side timer, not
+type-checking (#278).** Two hardcoded timers in the pinned server, neither
+with a configuration gate: `cli.mjs:17868`'s
+`min(max(ceil(lineCount / 20), 300), 800)` ms delay on every `didChange`
+(our short synthetic files hit the 300 ms floor), plus `cli.mjs:20516`'s
+`pDebounce(..., 50)`. So a warm re-check on this pin costs >=350 ms of
+*client* wait before tsserver is asked anything, independent of project
+size -- a control probe sweeping project size (roughly flat ~350-380ms
+across 10..5000 files) and edit-file length (tracking the clamp's own
+formula from 350ms to 850ms) confirms this; the genuine recheck cost once
+the debounce is subtracted out is ~11-31ms, inside a 50ms bar. See
+`scripts/probe_ts_lsp_debounce.py` and #279 (a direct-`tsserver`
+`semanticDiagnosticsSync` bypass that would sidestep the client-side
+debounce entirely).
+
 Not safe for concurrent use -- one service instance == one sequential
 open/edit/query stream, matching `TsLspOracle`'s contract.
 
@@ -313,6 +328,7 @@ class TsLspService:
         self.n_calls = 0
         self.wall_s = 0.0
         self.n_timeouts = 0
+        self.n_no_publish = 0
         self.n_restarts = 0
         self.op_counts: Dict[str, int] = {}
         self.op_wall_s: Dict[str, float] = {}
@@ -475,6 +491,10 @@ class TsLspService:
             event = threading.Event()
             self._diag_events[uri] = event
         self._ensure_open(warm)
+        # Still n_timeouts, not n_no_publish (#278): a didOpen with no prior
+        # entry for this URI cannot hit cli.mjs:20524's "both sets empty"
+        # suppression -- there IS no previous set -- so no push here is a
+        # real cold-load failure, not the clean-document ambiguity.
         got = event.wait(self.timeout_s)
         with self._diag_lock:
             self._diag_events.pop(uri, None)
@@ -522,6 +542,15 @@ class TsLspService:
         version = self._versions[path]
         with self._diag_lock:
             self._update_marker[uri] = self._diag_seq_counter
+            # A push ALREADY RECORDED before this edit is not an answer to it.
+            # On the pinned 5.3.0, `publishDiagnostics` carries no `version`
+            # (cli.mjs:20535 publishes {uri, diagnostics} only), so
+            # `_push_is_current` falls through to seq-vs-marker -- and the
+            # marker is taken here, an instant before the didChange below.
+            # Without this pop, a pre-edit push satisfies `seq > marker` and is
+            # returned as the post-edit answer in ~0.3ms (#278: the min 0.292ms
+            # mode, ~28 of 200 samples in #277's run).
+            self._diag_state.pop(uri, None)
         self._notify_retrying("textDocument/didChange", _did_change_params(uri, version, text))
         return version
 
@@ -536,6 +565,14 @@ class TsLspService:
         # Server omits `version` (optional even with versionSupport: True) --
         # fall back to seq-vs-last-edit comparison. Never assume a push is
         # current just because it's the latest one seen.
+        #
+        # On the pinned typescript-language-server 5.3.0 this fallback is the
+        # ONLY live path: `version` is never populated (cli.mjs:20535 publishes
+        # `{uri, diagnostics}` only, no `version` field). The branch above is
+        # kept for a future server that does populate it, but its correctness
+        # on THIS pin rests entirely on `update()` popping `_diag_state[uri]`
+        # before bumping `_update_marker` (#278) -- otherwise a push recorded
+        # before the marker-taking instant still satisfies `seq > marker`.
         return state["seq"] > marker
 
     def diagnostics(self, path: str) -> List[Diagnostic]:
@@ -546,8 +583,18 @@ class TsLspService:
         `version`, post-dates the last `update()`/open), it is returned
         immediately from a cache -- the honest fast path for "diagnose the
         same unchanged document again", NOT a re-check. Otherwise waits up to
-        `timeout_s` for a matching push. Never raises on timeout or a dead
-        server -- returns `[]` and counts it (`n_timeouts`), `TsLspOracle`'s
+        `timeout_s` for a matching push.
+
+        `[]` is returned for TWO distinct situations that are **not
+        distinguishable** for an already-clean document on this pin: a
+        genuinely clean re-check, and "nothing has been published since the
+        edit" (`n_no_publish`, #278) -- `cli.mjs:20524` returns early and
+        never publishes when both the previous and new diagnostic sets are
+        empty, so a benign edit to an already-clean document may legitimately
+        never get a push. A stale, version-tagged push that fails
+        `_push_is_current` is a real timeout (`n_timeouts`) -- that case IS
+        distinguishable, because something was published, it just wasn't
+        current. Never raises on timeout or a dead server, `TsLspOracle`'s
         contract."""
         self._ensure_alive()
         self._ensure_open(path)
@@ -572,7 +619,7 @@ class TsLspService:
         # every call and make >=200 calls/s structurally unreachable. Do not
         # "fix" this to settle like opengrep.py -- that divergence is
         # intentional (see the module docstring).
-        got = event.wait(self.timeout_s)
+        event.wait(self.timeout_s)
         with self._diag_lock:
             self._diag_events.pop(uri, None)
             state = self._diag_state.get(uri)
@@ -580,7 +627,18 @@ class TsLspService:
 
         self._record_op("diagnostics", time.monotonic() - t0)
 
-        if not got or state is None or not self._push_is_current(state, want_version, marker):
+        if state is None:
+            # NOTHING was published for this document within timeout_s. On this
+            # pin that is AMBIGUOUS by construction: cli.mjs:20524 returns early
+            # when the previous and new diagnostic sets are BOTH empty, so a
+            # benign edit to an already-clean document legitimately never gets a
+            # push -- indistinguishable from a server that never answered.
+            # Counted separately from n_timeouts so the ambiguity is visible in
+            # the stats instead of silently folded into either a clean result or
+            # a failure.
+            self.n_no_publish += 1
+            return []
+        if not self._push_is_current(state, want_version, marker):
             self.n_timeouts += 1
             return []
         return self._filter_diagnostics_payload(list(state["payload"]), self._files[path])

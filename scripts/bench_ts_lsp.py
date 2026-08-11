@@ -11,6 +11,20 @@ BLIND-guarded sanity probe against KNOWN targets, then measures per-op
 median/mean/min/p95 latency and calls/s for `diagnostics`, `definition`,
 `references`, `completions`, `quickinfo`, `document_symbols`.
 
+**`diagnostics` alternates introduce/revert (#278).** Each timed iteration
+either introduces a real `TS2339` (`_broken_variant`) into a path or reverts
+the SAME path's previous introduction (`_diagnostics_targets`), so every
+edit produces an observable diagnostic-set transition. A loop that only ever
+appends a benign comment to an already-clean file hits
+`cli.mjs:20524`'s "old and new sets both empty -> suppress publish"
+early-return on every iteration -- the one case the server may legitimately
+never answer -- and reports `nonempty_rate: 0.0` for a reason that has
+nothing to do with correctness (exactly what #277's run did). `--edit-file-lines`
+pads the edited document to N lines before each edit -- the only input to the
+5.3.0 debounce clamp (`cli.mjs:17868`); see `scripts/probe_ts_lsp_debounce.py`
+and #279 for the debounce itself, which this bench does not attempt to work
+around.
+
     # Fast smoke first, to shake out protocol shape before the 5k run:
     .venv/bin/python scripts/bench_ts_lsp.py --n-files 50 --warmup 3 --iters 20
 
@@ -52,7 +66,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # Repo root on sys.path so `src.lsp.*` imports resolve when run as a script.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +102,52 @@ def _resolve_import(path: str, target_rel: str) -> str:
     `"hub"` or `"mod_0007"`. `path` (the importer) is unused; kept for a
     stable, obvious call signature at the two call sites (bench + test)."""
     return f"src/{target_rel}.ts"
+
+
+def _pad_to_lines(text: str, n_lines: Optional[int]) -> str:
+    """Append `// pad N` comment lines until `text` has `n_lines` lines. The
+    edited buffer's LINE COUNT is the only input to typescript-language-server
+    5.3.0's diagnostics delay clamp (cli.mjs:17868,
+    `min(max(ceil(lineCount/20), 300), 800)`), so this is the knob that moves
+    the measured latency -- see #278 and scripts/probe_ts_lsp_debounce.py.
+    Padding is appended at the END, so every offset computed from the unpadded
+    text stays valid. No-op when `n_lines` is None or already reached; never
+    truncates."""
+    if n_lines is None:
+        return text
+    current = text.count("\n") + (0 if text.endswith("\n") else 1)
+    missing = n_lines - current
+    if missing <= 0:
+        return text
+    filler = "\n".join(f"// pad {n}" for n in range(missing))
+    sep = "" if text.endswith("\n") else "\n"
+    return f"{text}{sep}{filler}\n"
+
+
+def _broken_variant(text: str, tag: int) -> str:
+    """`const vx = v.x;` -> `const vx = v.gorblak_{tag};` -- a real TS2339 on
+    `Vec`, the same defect shape `_sanity_probe` already validates. The tag
+    makes each introduction textually distinct."""
+    anchor = "const vx = v.x;"
+    if anchor not in text:
+        raise RuntimeError(
+            f"_broken_variant: anchor {anchor!r} not found -- a silent no-op "
+            "edit would produce a clean->clean iteration, exactly the "
+            "ambiguous case this change exists to avoid")
+    return text.replace(anchor, f"const vx = v.gorblak_{tag};", 1)
+
+
+def _diagnostics_targets(mod_paths: List[str]) -> List[Tuple[str, bool]]:
+    """`[(p, True), (p, False), ...]` -- iteration `2k` INTRODUCES an error in
+    mod `k`, `2k+1` REVERTS it. The two directions must be adjacent on the SAME
+    path: reverting a file that was never broken is the one clean->clean case
+    5.3.0 may never answer (cli.mjs:20524), which is exactly what made #277's
+    run report `nonempty_rate: 0.0`."""
+    out: List[Tuple[str, bool]] = []
+    for p in mod_paths:
+        out.append((p, True))
+        out.append((p, False))
+    return out
 
 
 def _generate_project(n_files: int, seed: int) -> Dict[str, str]:
@@ -218,22 +278,36 @@ def _summarize(op_name: str, samples_s: List[float], n_nonempty: int, iters: int
 
 
 def _measure_op(op_name: str, fn: Callable, targets: List[Tuple], *,
-                warmup: int, iters: int) -> dict:
+                warmup: int, iters: int,
+                label_of: Optional[Callable[..., str]] = None) -> dict:
     n = len(targets)
     if n == 0:
         raise RuntimeError(f"{op_name}: no targets generated -- project too small?")
     for w in range(warmup):
         fn(*targets[w % n])
     samples_s: List[float] = []
-    n_nonempty = 0
+    nonempty_flags: List[bool] = []
+    labels: List[str] = []
     for it in range(iters):
         args = targets[it % n]
         t0 = time.perf_counter()
         result = fn(*args)
         samples_s.append(time.perf_counter() - t0)
-        if _is_nonempty(result):
-            n_nonempty += 1
-    return _summarize(op_name, samples_s, n_nonempty, iters)
+        nonempty_flags.append(_is_nonempty(result))
+        if label_of is not None:
+            labels.append(label_of(*args))
+    n_nonempty = sum(nonempty_flags)
+    summary = _summarize(op_name, samples_s, n_nonempty, iters)
+    if label_of is not None:
+        buckets: Dict[str, List[int]] = {}
+        for i, label in enumerate(labels):
+            buckets.setdefault(label, []).append(i)
+        summary["by_direction"] = {
+            label: _summarize(f"{op_name}:{label}", [samples_s[i] for i in idx],
+                              sum(1 for i in idx if nonempty_flags[i]), len(idx))
+            for label, idx in buckets.items()
+        }
+    return summary
 
 
 def _run_measurements(service: TsLspService, files: Dict[str, str], args) -> Dict[str, dict]:
@@ -270,17 +344,24 @@ def _run_measurements(service: TsLspService, files: Dict[str, str], args) -> Dic
     # diagnostics: an EDIT -> RE-CHECK cycle, timed TOGETHER -- the shape
     # #226's consumer actually has (one edit per generated token). Timing a
     # cache hit and calling it a re-check would be the same BLIND failure in
-    # a different coat.
+    # a different coat. Alternates introduce/revert on the SAME path so every
+    # iteration forces an observable transition -- cli.mjs:20524 suppresses a
+    # publish only when the OLD and NEW diagnostic sets are both empty, which
+    # a revert-of-a-never-broken-file is (#278; #277's run hit exactly that
+    # and reported nonempty_rate 0.0 on all 200 iterations).
     counter = [0]
 
-    def _edit_and_check(path):
+    def _edit_and_check(path, introduce):
         counter[0] += 1
-        service.update(path, files[path] + f"\n// bench edit {counter[0]}\n")
+        clean = _pad_to_lines(files[path], args.edit_file_lines)
+        text = _broken_variant(clean, counter[0]) if introduce else clean
+        service.update(path, text)
         return service.diagnostics(path)
 
     ops["diagnostics"] = _measure_op(
-        "diagnostics", _edit_and_check, [(p,) for p in mod_paths],
-        warmup=args.warmup, iters=args.iters)
+        "diagnostics", _edit_and_check, _diagnostics_targets(mod_paths),
+        warmup=args.warmup, iters=args.iters,
+        label_of=lambda path, introduce: "introduce" if introduce else "revert")
 
     # diagnostics_cached: pure cache-hit path (unchanged document), reported
     # SEPARATELY -- explicitly NOT the SLA number.
@@ -322,11 +403,15 @@ def _print_report(summary: dict, ops: Dict[str, dict]) -> None:
         print(f"{name:<20}{s['median_ms']:>12.2f}{s['p95_ms']:>10.2f}"
               f"{s['calls_per_s']:>10.1f}{s['nonempty_rate'] * 100:>10.1f}%")
     print("-" * 72)
-    print(f"n_restarts={summary['n_restarts']}  n_timeouts={summary['n_timeouts']}")
+    print(f"n_restarts={summary['n_restarts']}  n_timeouts={summary['n_timeouts']}  "
+          f"n_no_publish={summary['n_no_publish']}")
     print(f"VERDICT: {summary['verdict']}")
     if summary["verdict"] in ("WARN", "KILL"):
         print("  -> #226 decode-time completion-list masking rescopes to OFFLINE "
               "if this holds (throughput gate: completions >= 200 calls/s).")
+        print("  -> most of `diagnostics`'s latency is a client-side debounce, "
+              "not type-checking (#278/scripts/probe_ts_lsp_debounce.py); a "
+              "direct-tsserver bypass (#279) is the addressable follow-up.")
     print("=" * 72)
 
 
@@ -342,6 +427,11 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--warmup", type=int, default=20, help="untimed ops per kind")
     ap.add_argument("--iters", type=int, default=200, help="timed ops per kind")
     ap.add_argument("--timeout-s", type=float, default=10.0)
+    ap.add_argument("--edit-file-lines", type=int, default=None,
+                    help="pad the EDITED document to N lines before each timed "
+                         "diagnostics edit -- the only input to the 5.3.0 delay "
+                         "clamp (cli.mjs:17868); default: the generated file's "
+                         "natural length (~12)")
     ap.add_argument("--out", type=str, default="results/ts_lsp_bench.json")
     ap.add_argument("--keep-scratch", action="store_true",
                     help="leave the generated project on disk for inspection")
@@ -356,6 +446,8 @@ def _parse_args() -> argparse.Namespace:
         ap.error("--iters must be >= 1")
     if args.warmup < 0:
         ap.error("--warmup must be >= 0")
+    if args.edit_file_lines is not None and args.edit_file_lines < 1:
+        ap.error("--edit-file-lines must be >= 1")
     return args
 
 
@@ -402,11 +494,13 @@ def main() -> int:
             "verdict": verdict,
             "n_files": args.n_files, "seed": args.seed,
             "warmup": args.warmup, "iters": args.iters,
+            "edit_file_lines": args.edit_file_lines,
             "cold_load_s": service.cold_load_s,
             "server_sync_kind": service.server_sync_kind,
             "diagnostic_provider": service.server_capabilities.get("diagnosticProvider"),
             "sanity_probe": probe,
             "n_restarts": service.n_restarts, "n_timeouts": service.n_timeouts,
+            "n_no_publish": service.n_no_publish,
         }
         _write_results(out_path, {"summary": summary, "ops": ops})
         _print_report(summary, ops)

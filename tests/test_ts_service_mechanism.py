@@ -146,6 +146,7 @@ class _FakeService(TsLspService):
         self.n_calls = 0
         self.wall_s = 0.0
         self.n_timeouts = 0
+        self.n_no_publish = 0
         self.n_restarts = 0
         self.op_counts: Dict[str, int] = {}
         self.op_wall_s: Dict[str, float] = {}
@@ -457,17 +458,80 @@ def test_diagnostics_version_gating(fake):
     assert svc._versions["a.ts"] == 2
 
     # A STALE v1 push arrives AFTER the edit -- must not be mistaken for current.
+    # (#278: update() now pops _diag_state[uri] under the lock, so -- unlike
+    # before the fix -- the dict genuinely has no entry for `uri` until this
+    # push is processed; `.get(uri, {})` avoids a KeyError race against the
+    # notification-reader thread rather than relying on a stale leftover
+    # entry that happened to make this assertion trivially true.)
     scripted.push_diagnostics(uri, [_raw_diag(9999, message="stale")], version=1)
-    assert _wait_until(lambda: svc._diag_state[uri]["version"] == 1)
+    assert _wait_until(lambda: svc._diag_state.get(uri, {}).get("version") == 1)
     stale_result = svc.diagnostics("a.ts")   # times out -- no v2 push yet
     assert stale_result == []
     assert svc.n_timeouts == 1
 
     # Now the real post-edit v2 push arrives.
     scripted.push_diagnostics(uri, [_raw_diag(1234, message="new error")], version=2)
-    assert _wait_until(lambda: svc._diag_state[uri]["version"] == 2)
+    assert _wait_until(lambda: svc._diag_state.get(uri, {}).get("version") == 2)
     fresh = svc.diagnostics("a.ts")
     assert [d.code for d in fresh] == ["TS1234"]
+
+
+def test_stale_push_before_didchange_is_not_returned(fake):
+    """The #278 regression test. A push already recorded BEFORE update() is
+    not an answer to the edit that follows it -- even though 5.3.0 sends no
+    `version` (so `_push_is_current` falls through to seq-vs-marker), because
+    `update()` now pops `_diag_state[uri]` under the lock before bumping the
+    marker. PRE-FIX (no pop in update()), this returns `["TS2339"]` instead
+    of `[]`: the stale pre-edit push's seq is still > the marker taken an
+    instant later, so `_push_is_current` accepts it as current."""
+    svc, scripted = fake
+    uri = _seed_open_file(svc, "a.ts", "old text", version=1)
+    svc._open.add("a.ts")
+
+    scripted.push_diagnostics(uri, [_raw_diag(2339)])   # no version -- 5.3.0's real shape
+    assert _wait_until(lambda: uri in svc._diag_state)
+
+    svc.update("a.ts", "new text")
+    assert uri not in svc._diag_state   # the pop
+
+    assert svc.diagnostics("a.ts") == []   # times out waiting for a NEW push
+    assert svc.n_no_publish == 1
+    assert svc.n_timeouts == 0
+
+
+def test_no_push_after_didchange_counts_no_publish_not_timeout(fake):
+    """Same shape as the stale-push test but with no pre-edit push at all --
+    `state is None` after the wait, classified as `n_no_publish` (the
+    ambiguous "clean or never answered" case, cli.mjs:20524), not
+    `n_timeouts`."""
+    svc, scripted = fake
+    _seed_open_file(svc, "a.ts", "old text", version=1)
+    svc._open.add("a.ts")
+
+    svc.update("a.ts", "new text")
+    assert svc.diagnostics("a.ts") == []
+    assert svc.n_no_publish == 1
+    assert svc.n_timeouts == 0
+
+
+def test_post_edit_push_still_answers(fake):
+    """The pop must not over-invalidate: a push that genuinely arrives AFTER
+    the edit is still returned."""
+    svc, scripted = fake
+    uri = _seed_open_file(svc, "a.ts", "old text", version=1)
+    svc._open.add("a.ts")
+
+    svc.update("a.ts", "new text")
+    timer = threading.Timer(
+        0.05, lambda: scripted.push_diagnostics(uri, [_raw_diag(1234)]))
+    timer.start()
+    try:
+        diags = svc.diagnostics("a.ts")
+    finally:
+        timer.join()
+    assert [d.code for d in diags] == ["TS1234"]
+    assert svc.n_no_publish == 0
+    assert svc.n_timeouts == 0
 
 
 def test_diagnostics_falls_back_to_seq_when_server_omits_version(fake):
@@ -546,3 +610,45 @@ def test_generate_project_imports_resolve_and_are_acyclic():
             assert target_path in files, f"{path} imports missing {target_path}"
             assert mod._module_index(target_path) < my_idx or target_path == "src/hub.ts", (
                 f"{path} imports {target_path}, not lower-indexed -- would create a cycle")
+
+
+# --------------------------------------------------------------------------- #
+# 10. #278 bench helpers: _pad_to_lines / _broken_variant / _diagnostics_targets
+# --------------------------------------------------------------------------- #
+
+def test_pad_to_lines_exact_and_noop():
+    mod = _bench_module()
+    text = "line1\nline2\nline3\n"   # 3 lines
+
+    padded = mod._pad_to_lines(text, 6)
+    assert padded.count("\n") == 6 or padded.rstrip("\n").count("\n") + 1 == 6
+    assert padded.startswith(text)   # original text is a prefix
+
+    # None is a no-op.
+    assert mod._pad_to_lines(text, None) == text
+    # A target at or below the current length is a no-op -- never truncates.
+    assert mod._pad_to_lines(text, 3) == text
+    assert mod._pad_to_lines(text, 1) == text
+
+
+def test_broken_variant_differs_and_is_tagged():
+    mod = _bench_module()
+    clean = "export function f(v):Vec {\n  const vx = v.x;\n  return v;\n}\n"
+    broken = mod._broken_variant(clean, 7)
+    assert broken != clean
+    assert "gorblak_7" in broken
+    assert "const vx = v.x;" not in broken
+
+    with pytest.raises(RuntimeError):
+        mod._broken_variant("no anchor here", 1)
+
+
+def test_diagnostics_targets_alternate_on_same_path():
+    mod = _bench_module()
+    mod_paths = [f"src/mod_{i:04d}.ts" for i in range(1, 4)]
+    targets = mod._diagnostics_targets(mod_paths)
+
+    assert len(targets) == 2 * len(mod_paths)
+    for k, path in enumerate(mod_paths):
+        assert targets[2 * k] == (path, True)
+        assert targets[2 * k + 1] == (path, False)
