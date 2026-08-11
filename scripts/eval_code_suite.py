@@ -356,7 +356,7 @@ def _run_tsc(args):
         n_clean = 0
         for row in rows:
             artifact = row["prompt"] + row.get("gold_completion", "")
-            codes = [d.code for d in oracle.diagnose(artifact)]
+            codes = [d.code for d in oracle.diagnostics(artifact)]
             clean = not codes
             n_clean += int(clean)
             records.append(make_record(

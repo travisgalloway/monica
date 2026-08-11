@@ -12,6 +12,8 @@ The driver runs with `--stub-model --byte-tokenizer`, so no backend, no checkpoi
 network are involved.
 """
 
+import argparse
+import importlib.util
 import json
 import subprocess
 import sys
@@ -21,6 +23,20 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts/eval_code_suite.py"
+
+
+def _script_module():
+    """Import `scripts/eval_code_suite.py` as a module without running it --
+    the `tests/test_build_domain_val_sets.py:22-29` idiom -- so `_run_tsc` can
+    be called directly with a monkeypatched oracle, no subprocess."""
+    spec = importlib.util.spec_from_file_location("eval_code_suite", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+    return mod
 
 OFFLINE = ("--stub-model", "--byte-tokenizer", "--context-lens", "512",
            "--depths", "0.0,0.5,1.0", "--batch-size", "4")
@@ -155,3 +171,67 @@ def test_a_tokenizer_must_be_chosen(tmp_path):
                          cwd=REPO_ROOT, capture_output=True, text=True)
     assert res.returncode != 0
     assert "--byte-tokenizer" in res.stderr
+
+
+# --------------------------------------------------------------------------------------- #
+# Regression: `_run_tsc` must call the oracle by its REAL method name (#220).
+#
+# scripts/eval_code_suite.py:359 called `oracle.diagnose(artifact)` -- `CompositeOracle`
+# (src/lsp/oracle.py) has never had a `diagnose` method, only `diagnostics`. That is the
+# ONLY `.diagnose(` call site in the repo, so `--suites tsc` raised AttributeError on its
+# very first row. This pins the fix by monkeypatching in a stub oracle with no `diagnose`
+# method at all, so the pre-fix code fails loudly and the fixed code passes -- no node
+# toolchain needed, so it runs in CI.
+# --------------------------------------------------------------------------------------- #
+
+class _StubOracle:
+    """Minimal stand-in for `CompositeOracle`: only what `_run_tsc` actually
+    uses (`diagnostics`, `close`, `sources_active`, `n_calls`, `wall_s`) --
+    deliberately NO `diagnose` method, so calling that name raises
+    `AttributeError` exactly as it would against the real class."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.sources_active = ["ts"]
+        self.n_calls = 0
+        self.wall_s = 0.0
+
+    def diagnostics(self, source: str):
+        from src.lsp.diagnostics import Diagnostic
+        self.n_calls += 1
+        if "gorblak" in source:
+            return [Diagnostic(code="TS2339", line=1, col=1, message="stub finding", offset=0)]
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def test_run_tsc_calls_the_oracle_by_its_real_method_name(monkeypatch, tmp_path):
+    mod = _script_module()
+    monkeypatch.setattr("src.lsp.oracle.resolve_oracle", lambda kind: True)
+    monkeypatch.setattr("src.lsp.oracle.CompositeOracle", _StubOracle)
+
+    tsc_set = tmp_path / "tsc_set.jsonl"
+    rows = [
+        {"id": "clean-1", "prompt": "const x = 1;\n", "gold_completion": "",
+         "error_class": "none", "expected_diagnostic": None},
+        {"id": "error-1", "prompt": "console.log(u.", "gold_completion": "gorblak);\n",
+         "error_class": "unfamiliar_member_access", "expected_diagnostic": "TS2339"},
+    ]
+    with open(tsc_set, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    args = argparse.Namespace(tsc_set=tsc_set, limit=None)
+    result, src = mod._run_tsc(args)
+
+    assert result["summary"]["n"] == 2
+    assert result["summary"]["clean_rate"] == 0.5   # one clean, one flagged
+    assert src["sources_active"] == ["ts"]
+
+
+def test_composite_oracle_has_no_diagnose_method():
+    from src.lsp.oracle import CompositeOracle
+
+    assert not hasattr(CompositeOracle, "diagnose")

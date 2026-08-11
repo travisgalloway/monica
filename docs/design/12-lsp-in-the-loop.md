@@ -699,6 +699,78 @@ risk for a *different* server or config that front-loads a syntactic-only push �
 retained so it can be re-run if the pinned toolchain changes — but it is not a live bug, and **#211 is
 closed** on this evidence.
 
+## The multi-op LSP service and its measured throughput ceiling (#220)
+
+`TsLspOracle` (above) is deliberately **one-shot**: a fresh, never-reused `cand_{n}.ts` URI per
+call, single-file, no `didChange`, no version counter, no cross-file program. That contract is
+load-bearing for the #194/#211 harness path this whole document is about, but two M12 consumers
+need the *opposite* shape and cannot be served from it: **#226** completion-list logit masking
+needs a per-decode-step `textDocument/completion` against a **warm, multi-file program** (one edit
+plus one query per generated token), and the code eval suite's cross-file/type-aware arm needs
+`definition`/`references`/`documentSymbol` over a real multi-file project. `src/lsp/ts_service.py`
+adds `TsLspService` as a **new, separate** class for exactly this — stable URIs, monotonically
+versioned `didChange` edits, lazy `didOpen` (only *diagnostics* need a document open at all; the
+tsconfig's directory-wide `include` already puts every file in the program, so cross-file
+`definition`/`references` resolve without any file being open). `ts_lsp.py` and `oracle.py` are
+**untouched** — both classes share only the already op-agnostic `jsonrpc.py`.
+
+**No settle window, by design.** `TsLspService.diagnostics()` is first-push-wins, same as
+`TsLspOracle`, citing the #211 evidence directly above in this document: the pinned
+`typescript-language-server` 5.3.0's first `publishDiagnostics` push is semantically complete (0/97
+disagreed), so a settle/quiescence window (`opengrep.py`'s `_SETTLE_S`) would put a floor of
+*seconds* on every call and make the throughput this section measures structurally unreachable.
+That divergence from `opengrep.py` — which settles deliberately, for a *different* server with a
+confirmed stale-generation race — is intentional; it is not something to "fix" to match. 5.3.0 also
+advertises no `capabilities.diagnosticProvider`, confirmed again below, so LSP 3.17 pull diagnostics
+remain unavailable on this pin — version/seq-gated push-and-wait is the only option.
+
+### Measured (`scripts/bench_ts_lsp.py --n-files 5000 --warmup 20 --iters 200`, seed 0)
+
+A deterministic synthetic 5000-file TypeScript project (one `hub.ts` exporting widely-used
+`Vec`/`scale`, every other module importing it plus 1–3 acyclic imports from lower-indexed
+modules), opened once as a warm program. The BLIND-guarded sanity probe passed every check (a real
+`definition` into hub, `references` fan-in across ≥2 files, `completions` containing `"x"`, non-empty
+`quickinfo`/`document_symbols`, and a deliberately broken `v.gorblak` edit correctly detected and
+cleared) — the numbers below are real measurements, not an empty-and-fast run:
+
+| op | median | p95 | calls/s | non-empty rate |
+|---|---:|---:|---:|---:|
+| `diagnostics` (edit→re-check, the #226 shape) | **378.1 ms** | 383.0 ms | 3.1 | 0% (benign edits — expected; correctness is what the sanity probe checks) |
+| `diagnostics_cached` (unchanged-document cache hit — **not** the SLA number) | 0.007 ms | 0.017 ms | 112,110 | 0% |
+| `definition` | 1.74 ms | 2.17 ms | 595 | 100% |
+| `references` | 506.0 ms | 523.3 ms | 2.0 | 100% |
+| `completions` | 0.38 ms | 0.45 ms | **2,629** | 100% |
+| `quickinfo` | 0.31 ms | 0.39 ms | 3,102 | 100% |
+| `document_symbols` | 0.42 ms | 0.54 ms | 2,332 | 100% |
+
+Cold `open_project` load: **1.23 s**. `server_sync_kind = 2` (Incremental). `diagnosticProvider =
+null` (pull diagnostics confirmed unavailable on this pin, consistent with the #211 finding above).
+`n_restarts = 0`, `n_timeouts = 0` — a clean run, not one papered over by the reliability counters.
+
+### Verdict: WARN
+
+Per the issue's two gates — latency (`diagnostics` edit→re-check median < 50 ms) for the type-aware
+eval arm, throughput (`completions` ≥ 200 calls/s) for #226's per-decode-step masking — this run is
+**WARN**: the throughput gate clears comfortably (2,629 calls/s, 13× the bar), but the latency gate
+misses by nearly 8× (378 ms vs. the 50 ms bar). Per-request `completions`/`quickinfo`/
+`document_symbols`/`definition` are all sub-millisecond-to-low-single-digit-ms at 5000 files — the
+cost is concentrated in whatever `diagnostics()` and `references()` do at this project size (both
+in the several-hundred-ms range), consistent with tsserver doing real whole-program semantic work
+proportional to project size for those two operations, not with a broken or degraded measurement
+(the sanity probe and the 100% non-empty rates on every op rule that out).
+
+**Consequence for #226:** completion-list logit masking is throughput-clear on its own gate, so a
+decode loop that queries `completions()` once per generated token is not structurally blocked by
+this measurement. The **type-aware eval arm**, which is what actually drives the `diagnostics`
+number measured here (an edit-then-recheck cycle per candidate), is the one that misses its latency
+bar at this project size — a consumer needing sub-50ms diagnostics against a 5000-file warm program
+should budget for ~378ms per check, or reduce project scope, rather than assume the number in the
+issue's accept criterion. This is a measured finding, not a to-do to "fix" this module — the
+mechanism is behaving correctly (see the sanity probe and the zero-timeout, zero-restart run); the
+cost is inherent to whole-program semantic analysis at this scale.
+
+See `scripts/bench_ts_lsp.py` and the full per-op breakdown in `results/ts_lsp_bench.json`.
+
 ## Verdict
 
 The persistent-LSP swap is **not a free upgrade over batch `tsc`**: it trades the slow loop's
