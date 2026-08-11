@@ -731,7 +731,9 @@ A deterministic synthetic 5000-file TypeScript project (one `hub.ts` exporting w
 modules), opened once as a warm program. The BLIND-guarded sanity probe passed every check (a real
 `definition` into hub, `references` fan-in across ≥2 files, `completions` containing `"x"`, non-empty
 `quickinfo`/`document_symbols`, and a deliberately broken `v.gorblak` edit correctly detected and
-cleared) — the numbers below are real measurements, not an empty-and-fast run:
+cleared) — the numbers below are real measurements, not an empty-and-fast run.
+
+**Pre-fix (#277, as merged) — `diagnostics` measured a benign clean→clean edit:**
 
 | op | median | p95 | calls/s | non-empty rate |
 |---|---:|---:|---:|---:|
@@ -743,33 +745,153 @@ cleared) — the numbers below are real measurements, not an empty-and-fast run:
 | `quickinfo` | 0.31 ms | 0.39 ms | 3,102 | 100% |
 | `document_symbols` | 0.42 ms | 0.54 ms | 2,332 | 100% |
 
-Cold `open_project` load: **1.23 s**. `server_sync_kind = 2` (Incremental). `diagnosticProvider =
+`n_restarts = 0`, `n_timeouts = 0`. `min_ms = 0.292` on `diagnostics` — a sub-millisecond result for
+an operation the debounce clamp alone should floor at ~350 ms.
+
+**Post-fix (#278) — seq race closed, `diagnostics` alternates introduce/revert every iteration:**
+
+| op | median | p95 | calls/s | non-empty rate |
+|---|---:|---:|---:|---:|
+| `diagnostics` (edit→re-check, the #226 shape) | **376.4 ms** | 381.6 ms | 3.1 | 33.5% overall — `introduce` 67% (67/100), `revert` 0% (100/100, correctly clean) |
+| `diagnostics_cached` (unchanged-document cache hit — **not** the SLA number) | 0.006 ms | 0.007 ms | 162,064 | 0% |
+| `definition` | 1.69 ms | 2.12 ms | 612 | 100% |
+| `references` | 502.2 ms | 519.6 ms | 2.0 | 100% |
+| `completions` | 0.38 ms | 0.53 ms | 2,501 | 100% |
+| `quickinfo` | 0.33 ms | 0.49 ms | 2,917 | 100% |
+| `document_symbols` | 0.40 ms | 0.60 ms | 2,337 | 100% |
+
+`n_restarts = 0`, `n_timeouts = 0`, `n_no_publish = 0` (every timed iteration forced an observable
+transition, as designed — no iteration hit the clean→clean ambiguity during the timed loop itself).
+Cold `open_project` load: **1.22 s**. `server_sync_kind = 2` (Incremental). `diagnosticProvider =
 null` (pull diagnostics confirmed unavailable on this pin, consistent with the #211 finding above).
-`n_restarts = 0`, `n_timeouts = 0` — a clean run, not one papered over by the reliability counters.
+
+**The median got worse, and that is the correct outcome.** 378.1 ms → 376.4 ms reads flat, but that
+similarity hides the actual change: pre-fix, ~14% of the 200 samples (the `min 0.292 ms` mode) were
+stale-push short-circuits — a push recorded *before* the edit, wrongly accepted as the edit's answer
+by the seq-race in `_push_is_current` (`src/lsp/ts_service.py:532-539`, closed by `update()` now
+popping `_diag_state[uri]` under the lock before bumping the marker). Removing that mode should have
+pulled the *mean* up to meet the median (it was 324.1 ms, visibly below the 378.1 ms median only
+because of those artificially-fast stale hits) — post-fix the mean is 319.1 ms, still measurably
+below the 376.4 ms median. The reason is a **different, narrower residual the fix does not close**
+(documented in `update()`'s comment as deliberate): a push already **in flight** — queued by an
+*earlier* `_ensure_open()`'s `didOpen`, for a document this bench's `definition`/`completions`/
+`quickinfo`/`document_symbols` measurements already opened before the `diagnostics` phase runs — can
+still land *after* the marker is taken but *before* the genuine post-edit push, satisfying the
+version-less `seq > marker` fallback the same way a stale push did. Unlike the pre-fix bug this is
+not silently wrong forever: `min_ms` moved from **0.292 ms to 2.249 ms** — no longer sub-millisecond,
+but still fast enough to show it is a race, not real work — and it costs real signal: 33/100
+`introduce` iterations under-report a break that a slower, unraced check would have caught (0%
+`revert` false positives; the direction that shouldn't produce a push never did). The seq-race fix
+is correct and necessary — it closes the *observable*, indefinitely-recurring case — but a
+version-less server cannot fully close the in-flight case without an extra request/response barrier
+per edit, which is deliberately not implemented here (see the risk noted in `update()`'s comment);
+#279's direct-`tsserver` bypass sidesteps this whole notification-race class rather than patching
+around it further.
+
+### What the 378 ms actually is (#278)
+
+**~350 ms of the `diagnostics` cost is a fixed client-side debounce inside the pinned
+`typescript-language-server` 5.3.0, spent before tsserver is asked anything — not whole-program
+type-checking.** Two hardcoded timers in the vendored
+`eval_sets/ts_error_injection/node_modules/typescript-language-server/lib/cli.mjs`, neither with a
+configuration gate:
+
+| Anchor | Source | Cost |
+|---|---|---|
+| `cli.mjs:17858` | `triggerDiagnostics(delay = 200) {` | (default; overridden per-call below) |
+| `cli.mjs:17868` | `const delay = Math.min(Math.max(Math.ceil(buffer.lineCount / 20), 300), 800);` | **300 ms** floor for our ~12-line files |
+| `cli.mjs:20516` | `firePublishDiagnostics = pDebounce(() => this.publishDiagnostics(), 50);` | **+50 ms** |
+| `cli.mjs:20524` | `if (this.diagnosticsPerKind.get(kind)?.length === 0 && diagnostics.length === 0) { return; }` | clean→clean publishes **nothing** |
+| `cli.mjs:20535` | `this.onPublishDiagnostics({ uri: this.uri, diagnostics: diagnostics });` | no `version` field is ever sent |
+
+A control probe (`scripts/probe_ts_lsp_debounce.py`, `results/ts_lsp_debounce_probe.json`)
+deliberately bypasses `TsLspService` entirely — raw JSON-RPC, no cache, no seq-marker, no
+first-push-wins bookkeeping — timing exactly `didChange` → `publishDiagnostics`, alternating a real
+type error in and out every iteration so a push is always produced. Two falsifiable, opposite
+predictions:
+
+**A. project-size sweep (edit-file fixed at 12 lines)** — the debounce hypothesis predicts roughly
+FLAT; whole-program work predicts RISING with project size:
+
+| n_files | median | minus the predicted 350 ms |
+|---:|---:|---:|
+| 10 | 361.7 ms | 11.7 |
+| 200 | 363.3 ms | 13.3 |
+| 2,000 | 371.2 ms | 21.2 |
+| 5,000 | 383.2 ms | 33.2 |
+
+500× the files buys ~22 ms of real movement on top of the ~350 ms floor — not the shape whole-program
+semantic work would produce.
+
+**B. file-LENGTH sweep (project fixed at 200 files)**, against the clamp's own formula
+`min(max(ceil(lines/20), 300), 800) + 50`:
+
+| edit-file lines | predicted | measured | residual |
+|---:|---:|---:|---:|
+| 12 | 350 ms | 361.6 | +11.6 |
+| 6,000 | 350 ms | 365.0 | +15.0 |
+| 12,000 | 650 ms | 665.5 | +15.5 |
+| 20,000 | 850 ms | 870.2 | +20.2 |
+
+6,000 lines stays at the floor (`ceil(6000/20) = 300`, still clamped to the 300 ms minimum) while
+12,000 jumps to ~650 ms — the clamp's exact shape, reproduced across a 2.4× latency range. A positive
+confirmation, not a null result. The probe's own verdict on this run: **`DEBOUNCE_CONFIRMED`**
+(`a_spread_ms=21.5 <= 100`, `b_max_abs_residual_ms=20.2 <= 60`, `b_ratio=2.41 >= 2.0`).
+
+Corroborating: the original run's `diagnostics` median 378.1 ms / p95 383.0 ms was a **~5 ms**
+spread (the post-fix run: 376.4 / 381.6 ms, a similarly tight ~5 ms spread). Whole-program semantic
+analysis, which scales with the graph reachable from the edited file, does not produce that
+distribution across a 5000-file project; a `setTimeout` does.
+
+**Consequence:** the genuine recheck cost, once the ~350 ms debounce floor is subtracted out, is
+**~11–33 ms** — *inside* the 50 ms bar. The type-aware eval arm is not structurally blocked by
+tsserver doing real work; it is blocked by a client-side timer, which is a different and addressable
+problem. See #279 (a direct-`tsserver` `semanticDiagnosticsSync` bypass, filed and blocked on this
+issue's confirmation) — patching the vendored `cli.mjs` itself is off-limits under the #246
+bit-identity pin discipline, so #279's own JSON-RPC channel to `tsserver` is the addressable path,
+not a patch to this server.
+
+**The `n_no_publish` ambiguity.** `cli.mjs:20524` means an already-clean document that receives a
+benign edit may legitimately never get a `publishDiagnostics` push — indistinguishable, on this pin,
+from a server that simply never answered. `TsLspService.diagnostics()` now counts this case
+separately (`n_no_publish`, distinct from `n_timeouts`, which stays reserved for a push that *did*
+arrive but didn't match the current version/marker) so the ambiguity is visible in the stats instead
+of silently folded into either a clean result or a failure. `scripts/bench_ts_lsp.py`'s `diagnostics`
+loop now alternates **introduce**/**revert** on the same path every iteration
+(`_diagnostics_targets`) specifically to keep the *timed* measurement out of this ambiguous case
+entirely — a revert-of-a-never-broken file is the one case that could hit it, and the loop never
+does that. The result: `n_no_publish = 0` for the whole post-fix run above, confirming the loop did
+its job — every counted `diagnostics` sample is a real answer, not a suppressed publish miscounted as
+one.
 
 ### Verdict: WARN
 
 Per the issue's two gates — latency (`diagnostics` edit→re-check median < 50 ms) for the type-aware
 eval arm, throughput (`completions` ≥ 200 calls/s) for #226's per-decode-step masking — this run is
-**WARN**: the throughput gate clears comfortably (2,629 calls/s, 13× the bar), but the latency gate
-misses by nearly 8× (378 ms vs. the 50 ms bar). Per-request `completions`/`quickinfo`/
-`document_symbols`/`definition` are all sub-millisecond-to-low-single-digit-ms at 5000 files — the
-cost is concentrated in whatever `diagnostics()` and `references()` do at this project size (both
-in the several-hundred-ms range), consistent with tsserver doing real whole-program semantic work
-proportional to project size for those two operations, not with a broken or degraded measurement
-(the sanity probe and the 100% non-empty rates on every op rule that out).
+still **WARN**: the throughput gate clears comfortably (2,501 calls/s, 12× the bar), but the latency
+gate misses by ~7.5× (376 ms vs. the 50 ms bar). The verdict itself is unchanged from #277 — what
+changed is *why* it misses. `diagnostics` and `references` remain the two operations in the
+several-hundred-ms range; `references` at **502 ms** (min 445.8 / p95 519.6) is **genuine and
+unaffected by this issue** — it queries `Vec`/`scale` in `hub.ts`, which all 4,998 generated modules
+import (`scripts/bench_ts_lsp.py`'s `_generate_project`), real whole-project reference fan-in with no
+per-request debounce to subtract. Only the `diagnostics` attribution was wrong; do not read this
+correction as "the whole measurement was an artifact" — every other op's numbers (including
+`references`) stand.
 
-**Consequence for #226:** completion-list logit masking is throughput-clear on its own gate, so a
-decode loop that queries `completions()` once per generated token is not structurally blocked by
-this measurement. The **type-aware eval arm**, which is what actually drives the `diagnostics`
-number measured here (an edit-then-recheck cycle per candidate), is the one that misses its latency
-bar at this project size — a consumer needing sub-50ms diagnostics against a 5000-file warm program
-should budget for ~378ms per check, or reduce project scope, rather than assume the number in the
-issue's accept criterion. This is a measured finding, not a to-do to "fix" this module — the
-mechanism is behaving correctly (see the sanity probe and the zero-timeout, zero-restart run); the
-cost is inherent to whole-program semantic analysis at this scale.
+**Consequence for #226:** unchanged and unaffected — `completions` at ~2,500 calls/s was never in
+question, decode-time completion-list masking remains throughput-clear on its own gate, and this
+issue does not touch that conclusion.
 
-See `scripts/bench_ts_lsp.py` and the full per-op breakdown in `results/ts_lsp_bench.json`.
+**What changes materially for the type-aware eval arm:** it is **not** structurally blocked by
+tsserver doing real whole-program work at this project size — it is blocked by a client-side timer
+(above), a different and addressable problem. A consumer needing sub-50ms diagnostics against a
+5000-file warm program on *this* server pin should still budget for ~376ms per check today, but the
+follow-up that would close that gap is filed and scoped: **#279**, a direct-`tsserver`
+`semanticDiagnosticsSync` bypass that skips `typescript-language-server`'s notification layer (and
+its debounce) entirely, now unblocked by this issue's confirmation.
+
+See `scripts/bench_ts_lsp.py`, `scripts/probe_ts_lsp_debounce.py`, and the full per-op breakdown in
+`results/ts_lsp_bench.json` / `results/ts_lsp_debounce_probe.json`.
 
 ## Verdict
 
