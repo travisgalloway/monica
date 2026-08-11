@@ -724,6 +724,11 @@ class AttentionBlock(nn.Module):
 # port of mlx_backend's MoE block, now with a real gathered-dispatch kernel alongside
 # the dense evaluate-every-expert reference.
 # --------------------------------------------------------------------------- #
+_ROUTE_EPS = 1e-9      # #217: log-guard for the router-entropy diagnostic. Must be
+                       # IDENTICAL to mlx_backend.py's — the two backends' entropies are
+                       # compared at fp32 ~1e-4 by the parity test.
+
+
 class _Expert(nn.Module):
     """A SwiGLU FFN expert: down(silu(gate(x)) * up(x)). Bias-free. Torch port of
     `mlx_backend._Expert`, built via `_expert_linear`: a plain `nn.Linear` unless
@@ -811,6 +816,10 @@ class MoEBlock(nn.Module):
         self._bias_active = False
         self._count_loads = False
         self.register_buffer("_load_counts", torch.zeros(E), persistent=False)
+        # #217 routing diagnostics, torch mirror of mlx_backend.MoEBlock. `persistent=False`
+        # for the same reason as `_load_counts`: absent from `state_dict()`, moved by `.to()`.
+        self.register_buffer("_entropy_sum", torch.zeros(()), persistent=False)
+        self._n_routed = 0
 
     def set_route_bias(self, vec) -> None:
         """Set the per-expert selection bias (#213) — `vec` a `list[float]` of length
@@ -836,6 +845,19 @@ class MoEBlock(nn.Module):
         counts = self._load_counts.clone()
         self._load_counts.zero_()
         return [float(c) for c in counts.tolist()]
+
+    def pop_routing_stats(self) -> dict:
+        """This block's routing diagnostics since the last pop, then reset. Torch mirror
+        of `mlx_backend.MoEBlock.pop_routing_stats` — see there for the full contract.
+
+        DRAINS the load accumulator too (calls `pop_load()`), so a caller must use either
+        this or `pop_load()` for a given step, never both (#217)."""
+        load = self.pop_load()
+        n = self._n_routed
+        total = float(self._entropy_sum.item()) if n else 0.0
+        self._entropy_sum.zero_()
+        self._n_routed = 0
+        return {"load": load, "entropy": (total / n) if n else None, "n_tokens": int(n)}
 
     def _fp8_ctx(self):
         """Context manager for the expert-compute region (#214/#240). A `te.Linear`
@@ -913,6 +935,16 @@ class MoEBlock(nn.Module):
         E, k = self.config.n_experts, self.config.top_k
         logits = _f32(_linear(self.router, xn, cd))          # (..., E) — route in fp32
         probs = F.softmax(logits, dim=-1)                    # UNBIASED — always the gate weight
+
+        if self._count_loads:
+            # #217 — see mlx_backend.MoEBlock._moe for the full rationale (outside the
+            # k<E guard; gated by _count_loads; grad_checkpoint doubles numerator AND
+            # denominator so the ratio is exact). Kept literally in step with MLX: the
+            # two entropies are compared at fp32 ~1e-4 in tests.
+            with torch.no_grad():
+                ent = -(probs * torch.log(probs + _ROUTE_EPS)).sum(dim=-1)
+                self._entropy_sum += ent.sum()
+                self._n_routed += int(probs.numel() // E)
 
         if k < E:                                             # keep EXACTLY top_k per token
             # Loss-Free-Balancing (#213 D2): when active, rank by the BIASED selection
@@ -1170,6 +1202,13 @@ class CUDAMambaModel(ModelInterface, nn.Module):
 
     def pop_moe_load(self) -> List[List[float]]:
         return [block.pop_load() for block in self.moe_blocks()]
+
+    def pop_moe_routing_stats(self) -> List[dict]:
+        """Per-MoE-layer routing diagnostics since the last pop, in layer order (#217).
+        Torch mirror of `MLXMambaModel.pop_moe_routing_stats` — see there for the
+        contract. This is the ONLY pop the train step performs; `pop_moe_load()` must
+        not also be called for the same step."""
+        return [block.pop_routing_stats() for block in self.moe_blocks()]
 
     def init_state(self, batch_size: int) -> State:
         c = self.config

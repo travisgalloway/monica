@@ -326,6 +326,47 @@ builds dropless grouped-gather MoE with a shared expert and a sparse-upcycle ini
 remains before a real RunPod run is FSDP/ZeRO-2 + expert parallel (#271, blocking #223 but not
 #222) and resolving the `d_model` conflict above (#272).
 
+### #217 — routing diagnostics + kill-criterion
+
+Before #217 the only routing signal reaching `metrics.jsonl` was `moe_util_var` (a single scalar,
+`max` over layers), and only when a `MoEBalancer` is attached (`moe_balance_rate` set) — which is
+`null` in every config in the tree. There was no way to tell mid-run whether the router was
+*specializing*, the thing the #222/#223 runs turn on. #217 adds three signals, all keyed off the
+same per-block `_count_loads` gate the balancer already uses:
+
+- **`moe_router_entropy`** (+ `moe_router_entropy_per_layer`) — mean per-token entropy (nats) of
+  the UNBIASED gate distribution, accumulated in `MoEBlock._moe` on both backends, **outside** the
+  `top_k < n_experts` guard (loads are meaningless at `top_k == n_experts`, but the gate
+  distribution is still real). `MoEBlock.pop_routing_stats()` / the model-level
+  `pop_moe_routing_stats()` drain both the entropy accumulator and the load counter in ONE pop —
+  the train step (`_accumulate_and_step`, both backends) calls it exactly once per step and shares
+  the result between the balancer and the diagnostics, which are no longer gated on
+  `balancer is not None`.
+- **`moe_util_var`** (+ `moe_util_var_per_layer`) — unchanged key/meaning, now reported on every
+  step that observed any routed load, independent of whether a balancer is attached.
+- **Per-domain expert histograms** (`src/eval/moe_routing.py`) — a periodic diagnostic eval pass
+  (`--moe-diag-every`) over the per-domain val sets `scripts/build_domain_val_sets.py` builds (the
+  same `domains.json` input `src/eval/domain_bpb.py` consumes). **Packed training shards carry no
+  domain tag** (documented at `src/eval/domain_bpb.py:15-31`; #252, which would add one, is open
+  and blocked on #251), so this measures expert usage on held-out samples *drawn from* each
+  domain, not over the live training mix. `histogram_overlap` / `specialization_report` compute
+  pairwise routing overlap (`1 - TV`, 1.0 = identical routing) across every measured domain pair,
+  written to `metrics.jsonl` as `moe_domain_overlap` (mean), `moe_domain_overlap_max`, and the raw
+  `moe_expert_hist`.
+
+**The kill-criterion (`kill_check`) reports; it does not abort.** `--moe-kill-pair` /
+`--moe-kill-overlap` (default 0.90) name two domains and a routing-overlap threshold; when the
+measured overlap is `>= threshold` the run prints a loud `[moe-kill]` line and a `moe_kill` event
+in `metrics.jsonl` (`moe_kill_triggered`, echoed live), but **never stops the run** — killing a
+multi-day run from a threshold is the operator's call, not this module's. Early in training
+routing is near-uniform by construction, so a high overlap there is *expected*, not evidence of a
+broken router; a threshold crossed at step 50 does not mean what the same crossing means at step
+50,000.
+
+Standing repo rule applied throughout: a check that cannot observe its target reports BLIND,
+never healthy. An unmeasured domain, an all-zero histogram, or counting-off entropy never reads
+as "the router is fine" — each case raises or is recorded as an explicit `None`.
+
 ## The SSI fold (structural signal integration — secondary)
 
 "Does feeding language-server / static-analysis signal into the model help?" — retained as a

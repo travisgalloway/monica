@@ -292,6 +292,154 @@ def test_moe_impl_auto_and_dense_unchanged():
         assert np.all(np.isfinite(y))
 
 
+# --------------------------------------------------------------------------- #
+# #217 routing-entropy diagnostics
+# --------------------------------------------------------------------------- #
+@requires_mlx
+def test_entropy_uniform_routing_approaches_log_n_experts():
+    """A zeroed router makes the gate distribution exactly uniform -> entropy == ln(E)."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    block.router.weight = mx.zeros_like(block.router.weight)
+    block.set_load_counting(True)
+    xn = mx.random.normal((5, cfg.d_model))
+    block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] == pytest.approx(np.log(cfg.n_experts), abs=1e-4)
+    assert stats["n_tokens"] == 5
+
+
+@requires_mlx
+def test_entropy_near_zero_when_router_is_sharply_one_hot():
+    """Large logit magnitude on one expert -> softmax collapses -> entropy ~ 0."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    # A fixed all-ones input with expert 0's row strongly positive and every other row
+    # strongly negative -> logit0 >> logit_i for i>0 regardless of any input scale noise,
+    # so softmax collapses onto expert 0 by construction (not by luck of a random xn).
+    w = np.full((cfg.n_experts, cfg.d_model), -10.0, dtype=np.float32)
+    w[0, :] = 10.0
+    block.router.weight = mx.array(w)
+    block.set_load_counting(True)
+    xn = mx.ones((5, cfg.d_model))
+    block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] < 1e-3
+
+
+@requires_mlx
+def test_entropy_reported_at_top_k_equals_n_experts_while_load_is_zero():
+    """The key case the placement OUTSIDE the `k < E` guard exists for: at top_k==E there
+    is no mask (no load), but the gate distribution is still real and must be measured."""
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=4)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    block.set_load_counting(True)
+    xn = mx.random.normal((5, cfg.d_model))
+    block._moe(xn)
+    stats = block.pop_routing_stats()
+    assert stats["entropy"] is not None
+    assert all(c == 0.0 for c in stats["load"])
+
+
+@requires_mlx
+def test_pop_routing_stats_resets_the_accumulator():
+    from src.model.mlx_backend import MLXMambaModel, MoEBlock
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    block = next(l for l in model.layers if isinstance(l, MoEBlock))
+    block.set_load_counting(True)
+    xn = mx.random.normal((5, cfg.d_model))
+    block._moe(xn)
+    block.pop_routing_stats()
+    second = block.pop_routing_stats()
+    assert second["entropy"] is None
+    assert second["n_tokens"] == 0
+    assert second["load"] == [0.0] * cfg.n_experts
+
+
+@requires_mlx
+def test_entropy_grad_checkpoint_ratio_invariant():
+    """`grad_checkpoint` doubles BOTH the entropy sum and the token count (the layer's
+    forward is recomputed in backward); the reported MEAN must be exactly the ratio, so
+    it agrees between checkpointed and non-checkpointed runs, while n_tokens doubles."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.mlx_train_step import make_train_step
+    import mlx.optimizers as optim
+
+    def run(grad_checkpoint):
+        cfg = _cfg(moe_every=2, n_experts=4, top_k=2, grad_checkpoint=grad_checkpoint)
+        mx.random.seed(0)
+        model = MLXMambaModel(cfg)
+        opt = optim.AdamW(learning_rate=1e-3)
+        step = make_train_step(model, opt, grad_clip=1.0, scaler=None, balancer=None)
+        model.set_moe_load_counting(True)
+        rng = np.random.default_rng(0)
+        tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
+        out = step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
+        return out["moe_router_entropy"]
+
+    plain, checkpointed = run(False), run(True)
+    assert plain == pytest.approx(checkpointed, abs=1e-5)
+
+
+@requires_mlx
+def test_no_balancer_path_still_emits_routing_metrics():
+    """Diagnostics must work with `moe_balance_rate: null` (every config in the tree,
+    #217) — the whole point of decoupling the pop from `balancer is not None`."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.mlx_train_step import make_train_step
+    import mlx.optimizers as optim
+
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_balance_rate=None)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    opt = optim.AdamW(learning_rate=1e-3)
+    step = make_train_step(model, opt, grad_clip=1.0, scaler=None, balancer=None)
+    model.set_moe_load_counting(True)     # normally attach_balancer's job; no balancer here
+    rng = np.random.default_rng(0)
+    tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
+    out = step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
+    for key in ("moe_router_entropy", "moe_router_entropy_per_layer",
+               "moe_util_var", "moe_util_var_per_layer"):
+        assert key in out
+
+
+@requires_mlx
+def test_pop_once_balancer_gets_the_counts_and_they_are_not_popped_twice():
+    """After one train step with a balancer attached, a fresh `pop_moe_load()` sees an
+    already-drained (all-zero) accumulator, AND the balancer's biases moved off zero --
+    i.e. the balancer consumed the same pop the diagnostics did, not a second one."""
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.mlx_train_step import make_train_step
+    from src.train.moe_balance import attach_balancer, balancer_for_config
+    import mlx.optimizers as optim
+
+    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_balance_rate=0.1)
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    opt = optim.AdamW(learning_rate=1e-3)
+    balancer = balancer_for_config(cfg)
+    step = make_train_step(model, opt, grad_clip=1.0, scaler=None, balancer=balancer)
+    attach_balancer(balancer, model)
+
+    rng = np.random.default_rng(0)
+    tokens = rng.integers(0, cfg.vocab_size, size=(4, cfg.seq_len + 1))
+    step(model, [(tokens[:, :-1], tokens[:, 1:])], 1e-3)
+
+    assert model.pop_moe_load() == [[0.0] * cfg.n_experts for _ in range(cfg.n_moe_layers)]
+    assert any(any(v != 0.0 for v in layer) for layer in balancer.biases())
+
+
 @requires_mlx
 def test_router_keeps_exactly_k_on_ties():
     """A zeroed router makes all experts tie; exactly top_k must be kept (not all of

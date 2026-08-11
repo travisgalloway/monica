@@ -15,7 +15,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
-from ..train.moe_balance import MoEBalancer
+from ..train.moe_balance import moe_routing_metrics
 
 
 def _global_grad_norm(grads) -> mx.array:
@@ -78,15 +78,22 @@ def _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches, lr,
     if scaler:
         out["loss_scale"] = scaler.scale
         out["skipped"] = False
-    if balancer is not None:
-        # Loss-Free-Balancing (#213): update the bias from this step's routed-token
-        # counts, OUTSIDE the gradient, then push the new biases back into the model for
-        # the next forward. `pop_moe_load` returns `[]` for a model with no MoE layers.
-        loads = model.pop_moe_load()
-        if loads:
-            balancer.update(loads)
-            model.set_moe_biases(balancer.biases())
-            out["moe_util_var"] = max(MoEBalancer.utilization_variance(loads))
+    # --- MoE routing diagnostics + Loss-Free-Balancing (#213/#217) ------------
+    # ONE pop per step, shared: `pop_moe_routing_stats` drains the load counters too, so
+    # calling `pop_moe_load()` here as well would zero them and hand the balancer nothing.
+    # Placed at the VERY END, after the fp16 overflow early-return above, so a skipped
+    # step does NOT pop the counters (intentional — do not "fix" with a `finally`).
+    # NOT gated on `balancer is not None`: diagnostics must work with
+    # `moe_balance_rate: null`, which is every config in the tree (#217).
+    pop = getattr(model, "pop_moe_routing_stats", None)
+    if pop is not None:
+        stats = pop()
+        if stats:
+            loads = [s["load"] for s in stats]
+            if balancer is not None:
+                balancer.update(loads)
+                model.set_moe_biases(balancer.biases())
+            out.update(moe_routing_metrics(stats))
     return out
 
 

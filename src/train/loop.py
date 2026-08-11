@@ -42,6 +42,9 @@ class TrainConfig:
     seed: int = 0
     lr_schedule: str = "cosine"
     decay_frac: float = 0.2
+    moe_diag_every: int = 0  # #217: steps between MoE routing diagnostic passes, 0 = off.
+                              # Like eval_every, only fires on a step that is also a
+                              # log_every step — pick a multiple of log_every.
 
 
 # A backend-provided step: (model, micro_batches, lr) -> dict(loss=, grad_norm=, ...).
@@ -73,6 +76,7 @@ def train(
     train_step: TrainStepFn,
     *,
     val_eval: Optional[Callable[[ModelInterface], dict]] = None,
+    moe_diag: Optional[Callable[[ModelInterface], dict]] = None,
     logger: Optional[Callable[[dict], None]] = None,
     on_checkpoint: Optional[Callable[[int, Any], None]] = None,
     start_step: int = 0,
@@ -88,7 +92,9 @@ def train(
     + a within-backend resume bundle) are injected so this stays backend-free. Resume is
     driven by `start_step` plus, since #216, an explicit `start_data_state`.
     `val_eval(model)` returns a metrics dict (e.g. {val_loss, val_perplexity}) merged into
-    the logged payload.
+    the logged payload. `moe_diag(model)` (#217) is the same shape — a periodic MoE
+    routing-diagnostic pass (per-domain expert histograms + the kill-criterion) — merged
+    in on its own `cfg.moe_diag_every` cadence.
 
     Length curriculum (#216). Pass a `LengthCurriculum` plus a
     `loader_factory(seq_len, batch_size) -> loader` to ramp `seq_len` (and shrink
@@ -173,6 +179,8 @@ def train(
                        "tokens": tokens_seen}
             if val_eval and step % cfg.eval_every == 0:
                 payload.update(val_eval(model))
+            if moe_diag and cfg.moe_diag_every and step % cfg.moe_diag_every == 0:
+                payload.update(moe_diag(model))
             log(payload)
             t0 = time.perf_counter()
             tokens_since_log = 0

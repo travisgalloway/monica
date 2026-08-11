@@ -26,8 +26,12 @@ class JsonlLogger:
             # `event`/`seq_len` make a #216 length-curriculum stage change visible in the
             # terminal — otherwise a boundary (and the CUDA recompile that follows it)
             # looks like an unexplained stall.
+            # #217 — the routing signal has to be visible live, not only in
+            # metrics.jsonl; `moe_kill_triggered` is a bool and formats through the
+            # non-float branch below.
             keys = ("event", "step", "seq_len", "lr", "loss", "grad_norm",
-                    "val_loss", "val_perplexity")
+                    "val_loss", "val_perplexity", "moe_util_var", "moe_router_entropy",
+                    "moe_domain_overlap", "moe_kill_triggered")
             parts = [f"{k}={payload[k]:.4g}" if isinstance(payload.get(k), float)
                      else f"{k}={payload[k]}" for k in keys if k in payload]
             print("  ".join(parts))
