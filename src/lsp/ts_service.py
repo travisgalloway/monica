@@ -482,6 +482,19 @@ class TsLspService:
         if not got:
             self.n_timeouts += 1
 
+    def _notify_retrying(self, method: str, params: dict) -> None:
+        """`self._endpoint.notify(...)`, retried once after `_restart()` if the
+        write itself raises `OSError` (e.g. `BrokenPipeError` -- the server died
+        in the narrow window between `_ensure_alive()`'s `poll()` and this
+        write). Without this, that race would surface as an unhandled
+        exception from `_ensure_open`/`update`, breaking `diagnostics()`'s
+        documented "never raises on a dead server" contract two frames up."""
+        try:
+            self._endpoint.notify(method, params)
+        except OSError:
+            self._restart()
+            self._endpoint.notify(method, params)
+
     def _ensure_open(self, path: str) -> None:
         if path in self._open:
             return
@@ -489,7 +502,7 @@ class TsLspService:
         text = self._files[path]
         with self._diag_lock:
             self._update_marker.setdefault(uri, self._diag_seq_counter)
-        self._endpoint.notify("textDocument/didOpen", {
+        self._notify_retrying("textDocument/didOpen", {
             "textDocument": {"uri": uri, "languageId": "typescript",
                               "version": self._versions[path], "text": text},
         })
@@ -509,7 +522,7 @@ class TsLspService:
         version = self._versions[path]
         with self._diag_lock:
             self._update_marker[uri] = self._diag_seq_counter
-        self._endpoint.notify("textDocument/didChange", _did_change_params(uri, version, text))
+        self._notify_retrying("textDocument/didChange", _did_change_params(uri, version, text))
         return version
 
     # ----------------------------------------------------------------- #
@@ -605,10 +618,14 @@ class TsLspService:
     def _timed_request(self, op_name: str, fn: Callable[[], object], *, empty):
         """`_ensure_alive()`, run `fn()`, record cost. A `TimeoutError` or
         `ConnectionError` is counted (`n_timeouts`) and returns `empty` --
-        never raises. A JSON-RPC `error` reply (`RuntimeError` from
-        `jsonrpc.py:210`) is RE-RAISED, not swallowed: a server that rejects
-        our params is a bug in us, and hiding it as "no completions" would be
-        exactly the BLIND failure mode this repo guards hardest."""
+        never raises. `ConnectionError` already covers the write-side dead-
+        server case (`BrokenPipeError` etc. are `ConnectionError` subclasses
+        in the stdlib, unlike the bare `notify()` calls in `_ensure_open`/
+        `update` -- see `_notify_retrying` -- those had no handler at all). A
+        JSON-RPC `error` reply (`RuntimeError` from `jsonrpc.py:210`) is
+        RE-RAISED, not swallowed: a server that rejects our params is a bug in
+        us, and hiding it as "no completions" would be exactly the BLIND
+        failure mode this repo guards hardest."""
         self._ensure_alive()
         t0 = time.monotonic()
         try:

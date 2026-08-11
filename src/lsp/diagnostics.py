@@ -153,6 +153,17 @@ def _line_start_offsets(source: str) -> List[int]:
     return starts
 
 
+def _line_text(source: str, starts: List[int], line0: int) -> str:
+    """Slice out 0-indexed line `line0` using already-computed line-start
+    offsets `starts` (from `_line_start_offsets`) -- O(length of the line),
+    not O(len(source)): avoids `source.split("\\n")`'s full-list allocation on
+    every call, which dominates cost for high-frequency ops like #226's
+    per-token completions."""
+    start = starts[line0]
+    end = starts[line0 + 1] - 1 if line0 + 1 < len(starts) else len(source)
+    return source[start:end]
+
+
 def _utf16_col_to_char_index(line: str, col: int) -> int:
     """1-indexed UTF-16-code-unit column -> 0-indexed Python `str` character index
     within `line`. Most characters are 1 UTF-16 unit; astral-plane characters
@@ -175,7 +186,7 @@ def _utf16_col_to_char_index(line: str, col: int) -> int:
 def line_col_to_offset(source: str, line: int, col: int) -> int:
     """1-indexed (line, col) -> 0-indexed character offset into `source`."""
     starts = _line_start_offsets(source)
-    line_text = source.split("\n")[line - 1]
+    line_text = _line_text(source, starts, line - 1)
     return starts[line - 1] + _utf16_col_to_char_index(line_text, col)
 
 
@@ -206,7 +217,7 @@ def offset_to_lsp_position(source: str, offset: int) -> dict:
         raise ValueError(f"offset {offset} out of range for source of length {len(source)}")
     starts = _line_start_offsets(source)
     line0 = bisect.bisect_right(starts, offset) - 1
-    line_text = source.split("\n")[line0]
+    line_text = _line_text(source, starts, line0)
     char_index = offset - starts[line0]
     character0 = _char_index_to_utf16_col(line_text, char_index) - 1
     return {"line": line0, "character": character0}
