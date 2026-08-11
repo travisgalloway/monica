@@ -29,6 +29,7 @@ imports stay behind `src.model.backend.get_backend`, so the module stays importa
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 
@@ -137,9 +138,17 @@ def main() -> None:
         raise SystemExit(f"[moe-diag] {args.config} has no MoE layers (moe_every is "
                          "unset) — there is no router to diagnose.")
     if args.moe_diag_every and args.moe_diag_every % args.log_every != 0:
-        print(f"[moe-diag] WARNING: --moe-diag-every={args.moe_diag_every} does not "
-              f"divide --log-every={args.log_every} — the diagnostic pass will silently "
-              "never fire (it only runs on steps that are also log_every steps).")
+        # The diagnostic is nested inside the log_every block (as `val_eval`/`eval_every`
+        # already is), so it fires only on steps that are multiples of BOTH — i.e. every
+        # lcm(log_every, moe_diag_every), NOT every moe_diag_every. It does still fire;
+        # the cadence is just coarser than asked for. Say which, so a run that logs a
+        # diagnostic every 200 steps when 15 was requested is not read as a bug.
+        effective = math.lcm(args.moe_diag_every, args.log_every)
+        print(f"[moe-diag] WARNING: --moe-diag-every={args.moe_diag_every} is not a "
+              f"multiple of --log-every={args.log_every} — the diagnostic pass only runs "
+              f"on steps that are also log steps, so its EFFECTIVE cadence is every "
+              f"{effective} steps, not {args.moe_diag_every}. Make it a multiple of "
+              f"--log-every to get the cadence you asked for.")
 
     tokens_per_step = args.batch_size * cfg.seq_len * args.grad_accum
     # Length curriculum (#216): the stage allocation, not the fixed shape, decides how
