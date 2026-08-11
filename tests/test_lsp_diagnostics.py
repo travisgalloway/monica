@@ -6,11 +6,14 @@ Real-compiler format pinning lives in `test_lsp_tsc.py`; this file only exercise
 
 from __future__ import annotations
 
+import pytest
+
 from src.lsp.diagnostics import (Diagnostic, FORWARD_RESOLVABLE_CODES,
                                   MODULE_RESOLUTION_CODES, SUPPRESSION_RE,
                                   close_open_delimiters, drop_codes, filter_diagnostics,
                                   is_incomplete, is_source_balanced, line_col_to_offset,
-                                  parse_tsc_output, statement_boundary, strip_suggestion)
+                                  offset_to_lsp_position, parse_tsc_output,
+                                  statement_boundary, strip_suggestion)
 
 
 # --------------------------------------------------------------------------- #
@@ -339,3 +342,59 @@ def test_drop_codes_passes_everything_through_when_no_match():
     diags = [Diagnostic(code="TS2339", line=1, col=1, message="x", offset=0)]
     wrapped = drop_codes(lambda src: list(diags), MODULE_RESOLUTION_CODES)
     assert [d.code for d in wrapped("s")] == ["TS2339"]
+
+
+# --------------------------------------------------------------------------- #
+# offset_to_lsp_position — the inverse of line_col_to_offset (#220)
+# --------------------------------------------------------------------------- #
+
+def test_offset_to_lsp_position_first_char():
+    source = "abc\ndef\nghi"
+    assert offset_to_lsp_position(source, 0) == {"line": 0, "character": 0}
+
+
+def test_offset_to_lsp_position_mid_line():
+    source = "abc\ndef\nghi"
+    # 'e' in "def" -- second line, second character.
+    assert offset_to_lsp_position(source, source.index("e")) == {"line": 1, "character": 1}
+
+
+def test_offset_to_lsp_position_line_start():
+    source = "abc\ndef\nghi"
+    assert offset_to_lsp_position(source, source.index("g")) == {"line": 2, "character": 0}
+
+
+def test_offset_to_lsp_position_end_of_source_is_legal():
+    # The decode-frontier position (#226's use case) -- EOF, not out of range.
+    source = "abc\ndef\nghi"
+    pos = offset_to_lsp_position(source, len(source))
+    assert pos == {"line": 2, "character": 3}
+
+
+def test_offset_to_lsp_position_round_trips_against_line_col_to_offset():
+    source = "const é = 1;\nconst y = 2;\nfunction f() {\n  return y;\n}\n"
+    for offset in range(len(source) + 1):
+        pos = offset_to_lsp_position(source, offset)
+        back = line_col_to_offset(source, pos["line"] + 1, pos["character"] + 1)
+        assert back == offset, (offset, pos, back)
+
+
+def test_offset_to_lsp_position_round_trips_astral_surrogate_pair():
+    # Mirrors test_line_col_to_offset_astral_surrogate_pair: an emoji outside the
+    # BMP is 1 Python str character but a 2-unit UTF-16 surrogate pair.
+    source = "const s = \"\U0001F600\"; const after = 1;"
+    after_idx = source.index("after")
+    pos = offset_to_lsp_position(source, after_idx)
+    back = line_col_to_offset(source, pos["line"] + 1, pos["character"] + 1)
+    assert back == after_idx
+
+
+def test_offset_to_lsp_position_rejects_negative_offset():
+    with pytest.raises(ValueError):
+        offset_to_lsp_position("abc", -1)
+
+
+def test_offset_to_lsp_position_rejects_offset_past_end():
+    source = "abc"
+    with pytest.raises(ValueError):
+        offset_to_lsp_position(source, len(source) + 1)

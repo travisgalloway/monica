@@ -23,6 +23,7 @@ ABOVE THE SEAM — stdlib only. No `mlx`/`torch` import anywhere in this module
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, replace
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple
@@ -176,6 +177,39 @@ def line_col_to_offset(source: str, line: int, col: int) -> int:
     starts = _line_start_offsets(source)
     line_text = source.split("\n")[line - 1]
     return starts[line - 1] + _utf16_col_to_char_index(line_text, col)
+
+
+def _char_index_to_utf16_col(line: str, index: int) -> int:
+    """0-indexed Python `str` character index within `line` -> 1-indexed UTF-16-
+    code-unit column. Exact inverse of `_utf16_col_to_char_index` on every index
+    that is not inside a surrogate pair (a Python `str` index never is)."""
+    units = 0
+    for ch in line[:index]:
+        units += 2 if ord(ch) > 0xFFFF else 1
+    return units + 1
+
+
+def offset_to_lsp_position(source: str, offset: int) -> dict:
+    """0-indexed character offset into `source` -> an LSP `Position`
+    (`{"line": l0, "character": c0}`, BOTH 0-indexed, `character` in UTF-16 code
+    units). The inverse of `line_col_to_offset`, which is 1-indexed on both axes
+    because that is `tsc`'s reporting convention; LSP's wire format is 0-indexed on
+    both, so the conversion happens here once rather than at each call site.
+
+    Raises `ValueError` on `offset < 0` or `offset > len(source)` -- silently
+    clamping an out-of-range offset would hand the server a plausible-but-wrong
+    position and get back confidently wrong completions, which is exactly the
+    BLIND failure mode this module exists to prevent. `offset == len(source)`
+    (EOF) is legal and must work -- it is the decode-frontier position #226 uses.
+    """
+    if offset < 0 or offset > len(source):
+        raise ValueError(f"offset {offset} out of range for source of length {len(source)}")
+    starts = _line_start_offsets(source)
+    line0 = bisect.bisect_right(starts, offset) - 1
+    line_text = source.split("\n")[line0]
+    char_index = offset - starts[line0]
+    character0 = _char_index_to_utf16_col(line_text, char_index) - 1
+    return {"line": line0, "character": character0}
 
 
 def parse_tsc_output(output: str, source: str) -> List[Diagnostic]:

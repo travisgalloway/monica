@@ -1,0 +1,106 @@
+{
+  "ops": {
+    "completions": {
+      "calls_per_s": 2629.4,
+      "iters": 200,
+      "mean_ms": 0.38,
+      "median_ms": 0.378,
+      "min_ms": 0.299,
+      "n_nonempty": 200,
+      "nonempty_rate": 1.0,
+      "op": "completions",
+      "p95_ms": 0.447
+    },
+    "definition": {
+      "calls_per_s": 595.19,
+      "iters": 200,
+      "mean_ms": 1.68,
+      "median_ms": 1.744,
+      "min_ms": 0.377,
+      "n_nonempty": 200,
+      "nonempty_rate": 1.0,
+      "op": "definition",
+      "p95_ms": 2.172
+    },
+    "diagnostics": {
+      "calls_per_s": 3.09,
+      "iters": 200,
+      "mean_ms": 324.144,
+      "median_ms": 378.11,
+      "min_ms": 0.292,
+      "n_nonempty": 0,
+      "nonempty_rate": 0.0,
+      "op": "diagnostics",
+      "p95_ms": 383.041
+    },
+    "diagnostics_cached": {
+      "calls_per_s": 112110.38,
+      "iters": 200,
+      "mean_ms": 0.009,
+      "median_ms": 0.007,
+      "min_ms": 0.006,
+      "n_nonempty": 0,
+      "nonempty_rate": 0.0,
+      "op": "diagnostics_cached",
+      "p95_ms": 0.017
+    },
+    "document_symbols": {
+      "calls_per_s": 2331.87,
+      "iters": 200,
+      "mean_ms": 0.429,
+      "median_ms": 0.42,
+      "min_ms": 0.301,
+      "n_nonempty": 200,
+      "nonempty_rate": 1.0,
+      "op": "document_symbols",
+      "p95_ms": 0.538
+    },
+    "quickinfo": {
+      "calls_per_s": 3102.3,
+      "iters": 200,
+      "mean_ms": 0.322,
+      "median_ms": 0.314,
+      "min_ms": 0.261,
+      "n_nonempty": 200,
+      "nonempty_rate": 1.0,
+      "op": "quickinfo",
+      "p95_ms": 0.389
+    },
+    "references": {
+      "calls_per_s": 1.98,
+      "iters": 200,
+      "mean_ms": 505.144,
+      "median_ms": 505.993,
+      "min_ms": 467.505,
+      "n_nonempty": 200,
+      "nonempty_rate": 1.0,
+      "op": "references",
+      "p95_ms": 523.29
+    }
+  },
+  "summary": {
+    "cold_load_s": 1.2276767080184072,
+    "diagnostic_provider": null,
+    "iters": 200,
+    "n_files": 5000,
+    "n_restarts": 0,
+    "n_timeouts": 0,
+    "sanity_probe": {
+      "checks": {
+        "completions_contains_x": true,
+        "definition_resolves_to_hub": true,
+        "diagnostics_clean_after_revert": true,
+        "diagnostics_detects_break": true,
+        "document_symbols_nonempty": true,
+        "quickinfo_nonempty": true,
+        "references_fan_in": true
+      },
+      "failed": [],
+      "ok": true
+    },
+    "seed": 0,
+    "server_sync_kind": 2,
+    "verdict": "WARN",
+    "warmup": 20
+  }
+}

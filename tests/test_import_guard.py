@@ -100,6 +100,7 @@ PORTABLE_MODULES = [
     "src.lsp.execute",
     "src.lsp.jsonrpc",
     "src.lsp.ts_lsp",
+    "src.lsp.ts_service",
     "src.lsp.opengrep",
     "src.lsp.oracle",
     "src.lsp.ts_boundaries",
