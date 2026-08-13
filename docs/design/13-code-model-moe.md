@@ -345,7 +345,7 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 The MoE backend build (#213/#214, **done**) scales on both MLX and CUDA now — the CUDA backend
 builds dropless grouped-gather MoE with a shared expert and a sparse-upcycle init path. What
 remains before a real RunPod run is FSDP/ZeRO-2 + expert parallel (#271, blocking #223 but not
-#222) and resolving the `d_model` conflict above (#272).
+#222) — the `d_model` conflict above (#272) is resolved.
 
 ### #217 — routing diagnostics + kill-criterion
 

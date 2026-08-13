@@ -196,8 +196,8 @@ RunPod network volumes are **region-locked** and cannot be moved once created �
 that needs the corpus + checkpoints must be schedulable in that same region, so the pin is
 effectively permanent. Choose the region by **where the card you will actually train on has
 capacity** — H100 for the M12 large run (#223; but see the single-GPU warning under "GPU pod"
-below — #223 also needs **#271** built and **#272** resolved before it is runnable at all) — not
-by proximity to R2. R2 has no egress fee
+below — #223 also needs **#271** built before it is runnable at all; the `d_model` conflict,
+**#272**, is already resolved) — not by proximity to R2. R2 has no egress fee
 (above), so "network-close to R2" is a *latency*, not a *cost*, consideration: worth weighing once
 the H100-capacity region is chosen, but subordinate to it.
 

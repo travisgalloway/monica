@@ -6,14 +6,18 @@
 # target's expert slots, and only an n_experts=1 MoE block has them.
 #
 # Pairs with toy-moe-fine.yaml (the upcycle TARGET) below. `check_upcycle_compatible`
-# requires the pair to agree on every NON-expert dimension (d_model, n_layers, d_state,
-# expand, d_conv, head_dim, dt_rank, vocab_size, tie_embeddings, attn_every, moe_every,
-# and moe_d_ff itself) — only n_experts/top_k/moe_balance_rate may differ. Matching the
-# non-expert backbone is NECESSARY but NOT SUFFICIENT to make a real dense checkpoint a
-# valid upcycle source for a real MoE target: moe_d_ff also has to match whatever width
-# the target uses. That constraint is now recorded in docs/design/13-code-model-moe.md
-# (the source-shape note under MHM-P5) and docs/design/07-configs-and-decisions.md; this
-# fixture pair is the executable version of it.
+# requires the pair to agree on every NON-expert dimension — `src/train/upcycle.py`'s
+# `_MUST_MATCH` deliberately compares the RESOLVED properties (d_model, n_layers,
+# d_state, expand, d_conv, head_dim, dt_rank_resolved, d_inner, n_heads, vocab_size,
+# tie_embeddings, attn_every, n_attn_heads_resolved, moe_every, moe_d_ff_resolved)
+# rather than the raw Optional fields they derive from, so "auto"/None on one side and
+# an equal concrete value on the other compare equal — only n_experts/top_k/
+# moe_balance_rate may differ. Matching the non-expert backbone is NECESSARY but NOT
+# SUFFICIENT to make a real dense checkpoint a valid upcycle source for a real MoE
+# target: moe_d_ff_resolved also has to match whatever width the target uses. That
+# constraint is now recorded in docs/design/13-code-model-moe.md (the source-shape note
+# under MHM-P5) and docs/design/07-configs-and-decisions.md; this fixture pair is the
+# executable version of it.
 d_model: 64
 n_layers: 4
 d_state: 16            # SSM state width N (per head)
