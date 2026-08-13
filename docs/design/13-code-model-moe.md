@@ -44,7 +44,8 @@ layers** for the cross-file symbol recall that pure SSMs are weak at, and **MoE 
 (Jamba-style: fine-grained experts, top-k routing, one shared expert, aux-loss-free load
 balancing). It targets two sizes — a **small** rung (~120M active / ~700M total) and a **large**
 rung ("Large A", ~700M active / ~3.5B total, the default), the large one **sparse-upcycled** from
-the small dense checkpoint. It trains on a general multilingual **Essential-Web + Stack-v2**
+the small dense checkpoint. **Both rungs share `d_model 768`** (resolved 2026-08-09, #272 — see
+the resolved note under MHM-P5), which is what lets a single dense run (#200) seed both. It trains on a general multilingual **Essential-Web + Stack-v2**
 mixture with its **own byte-level BPE** (a native cross-platform Swift tokenizer, #191/#245 — see
 MHM-P1b) and **fill-in-the-middle (FIM)**. Success stays the POC
 bar: a smoothly improving curve plus a local-hardware win (context length + tok/s), with **BPB**
@@ -282,13 +283,18 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 >    `MoEBlock._moe` takes the `k == E` branch, so the block *is* a plain SwiGLU FFN: same math, right
 >    key layout. `MambaConfig.validate()` carries an explicit carve-out for E=1 (and requires
 >    `moe_balance_rate: null` there, since balancing one expert is `sign(0) == 0` forever).
-> 2. **`moe_d_ff` must be the fine-grained per-expert width (~`d_inner/8`), not the `null → d_inner`
->    default.** This is the constraint most likely to be missed, because a dense config would normally
->    leave it null. Fine-grained MoE means *many narrow* experts, not a few wide ones: at Large A's
->    scale (`d_model 1536`, `d_inner 3072`), 64 full-width experts would cost **~906M params per MoE
->    layer**, which the ~3.5B total budget cannot absorb at any useful depth. The target therefore
->    sizes each expert at `d_inner/8`, and since `moe_d_ff_resolved` is one of the fields that must
->    match, **#200's dense FFN blocks are deliberately narrow**.
+> 2. **`moe_d_ff` must equal the target's per-expert width — for Large A that is `d_inner` (1536).**
+>    This is the constraint most likely to be missed, because a dense config would normally leave it
+>    null, and `null → d_inner` only *happens* to be right here. It is not a default to rely on:
+>    `moe_d_ff_resolved` is one of the 15 `_MUST_MATCH` fields, so if the sweep (#219) moves the
+>    target's expert width, #200 moves with it.
+>
+>    > *An earlier revision of this section said `moe_d_ff ≈ d_inner/8`, reasoning that 64 full-width
+>    > experts at `d_model 1536` would cost ~906M params per MoE layer. The per-layer arithmetic was
+>    > right; the conclusion was not. Narrowing experts cuts **total** params but barely moves
+>    > **active** ones — active is dominated by the backbone plus `top_k` experts — so the
+>    > `d_inner/8` shape lands near ~255M active against a ~700M target. Resolved by #272 (below):
+>    > every shape that hits both targets wants `d_inner` or `d_inner/2`.*
 > 3. **Matching the non-expert backbone is necessary but NOT sufficient.**
 >    `src/train/upcycle.py:48-52` (`_MUST_MATCH`) is the authority — **15 fields** must agree,
 >    including `moe_every`, `moe_d_ff_resolved`, `attn_every` and `n_attn_heads_resolved`, not just
@@ -300,23 +306,38 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > and `config/toy-moe-fine.yaml` are the worked source/target pair; `scripts/upcycle.py --dry-run`
 > checks compatibility in seconds, which is the cheap way to find this out rather than after a run.
 
-> **Open (#223) — #200's `d_model` doesn't match Large A.** The table above names #200
-> (`d_model 768`, the small rung) as *the single upcycle source for both MoE runs*, but Large A's
-> current default dims are `d_model 1536` — and `src/train/upcycle.py::check_upcycle_compatible`
-> hard-**raises `UpcycleError`** on any `d_model` mismatch between source and target (#214, by
-> design: expert replication can copy a dense FFN into E expert slots, but it cannot *widen* a
-> tensor). #200-at-768 is therefore NOT a valid upcycle source for Large A as currently dimensioned.
-> Four exits, tracked in #272 (blocks #223's budget):
->  1. A **second dense run at `d_model 1536`** — the simplest fix, at the cost of a second (larger)
->     dense pretrain before Large A can start.
->  2. **Width-expansion upcycling** (Net2Net / bert2BERT-style tensor widening) as its own
->     from-scratch mechanism — reuses #200-at-768, but is real new research/engineering, not a
->     config change.
->  3. **Large A from scratch** — abandons sparse-upcycle entirely for the large run, giving up the
->     "upcycled init matches dense at step 0" cost savings this PR (#214) built.
->  4. **Re-shape Large A to `d_model 768`** — keeps the single-source plan intact by changing the
->     large-model target instead of the source, at the cost of Large A's stated ~700M-active/
->     3.5B-total budget (more experts / more layers would need to make up the difference).
+> **Resolved 2026-08-09 (#272) — Large A is `d_model 768`, deep-and-narrow.** The conflict:
+> #200 is the small rung (`d_model 768`) and was named the single upcycle source for both MoE runs,
+> but Large A was dimensioned at `d_model 1536`, and
+> `src/train/upcycle.py::check_upcycle_compatible` hard-**raises `UpcycleError`** on any `d_model`
+> mismatch (#214, by design — expert replication copies a dense FFN into E expert slots; a `.copy()`
+> cannot *widen* a tensor). Of the four exits considered, **exit 4 — re-shape Large A to 768** was
+> chosen, because it is the only one that keeps a single dense pretrain:
+>
+> | | Large A |
+> |---|---|
+> | `d_model` | **768** (was 1536) |
+> | `n_layers` | **56** (`56 % attn_every == 0`, so the final block is attention — the FIM constraint above) |
+> | `attn_every` | 8 → 7 attention layers (12.5%) |
+> | `moe_every` | **3** → 16 MoE layers, **33 Mamba layers survive** |
+> | `moe_d_ff` | **`d_inner` (1536)** — full width, *not* `d_inner/8` |
+> | experts | 64 routed, **top-8**, + 1 shared |
+> | **total / active** | **3.88B / 710M** (target ~3.5B / ~700M) |
+>
+> Two things this rules out, both verified against `MambaConfig`'s own accounting rather than
+> estimated:
+>
+> - **`moe_every: 1` is disqualified outright.** MoE blocks *replace* Mamba blocks, so routing every
+>   non-attention layer leaves **zero** state-space layers — an attention+MoE transformer, not a
+>   Mamba-2 hybrid. Two otherwise-attractive shapes were eliminated on this alone.
+> - **Narrow experts cannot buy active params.** Shrinking `moe_d_ff` cuts total but not active, so
+>   no amount of fine-graining reaches ~700M active; depth and expert width do. This is what
+>   invalidated the earlier `d_inner/8` guidance.
+>
+> Cost of the choice: Large A is deeper and narrower than a 1536-wide model of the same budget (56
+> layers vs ~24), so it carries more sequential depth per token — a real consideration for the
+> local-hardware tok/s headline. **#219's sweep should confirm the shape before the #223 budget is
+> committed**; these numbers establish that the shape *exists*, not that it is optimal.
 
 - **Cross-cutting:** rented-pod ops runbook (#224). **Parked:** post-training SFT (#101) / RLVR
   (#103).
@@ -324,7 +345,7 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 The MoE backend build (#213/#214, **done**) scales on both MLX and CUDA now — the CUDA backend
 builds dropless grouped-gather MoE with a shared expert and a sparse-upcycle init path. What
 remains before a real RunPod run is FSDP/ZeRO-2 + expert parallel (#271, blocking #223 but not
-#222) and resolving the `d_model` conflict above (#272).
+#222) — the `d_model` conflict above (#272) is resolved.
 
 ### #217 — routing diagnostics + kill-criterion
 

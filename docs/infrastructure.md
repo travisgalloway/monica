@@ -196,8 +196,8 @@ RunPod network volumes are **region-locked** and cannot be moved once created �
 that needs the corpus + checkpoints must be schedulable in that same region, so the pin is
 effectively permanent. Choose the region by **where the card you will actually train on has
 capacity** — H100 for the M12 large run (#223; but see the single-GPU warning under "GPU pod"
-below — #223 also needs **#271** built and **#272** resolved before it is runnable at all) — not
-by proximity to R2. R2 has no egress fee
+below — #223 also needs **#271** built before it is runnable at all; the `d_model` conflict,
+**#272**, is already resolved) — not by proximity to R2. R2 has no egress fee
 (above), so "network-close to R2" is a *latency*, not a *cost*, consideration: worth weighing once
 the H100-capacity region is chosen, but subordinate to it.
 
@@ -354,9 +354,10 @@ been exercised on that or any other GPU; see the manual-verification checklist b
 >   exceeds one 80GB card before activations. Renting an H100 for #223 today buys a pod that
 >   cannot run the job.
 >
-> #223 is additionally blocked on **#272** (#200 is `d_model 768`, Large A defaults to `1536`, and
-> sparse-upcycle replication cannot widen a tensor). Settle both before committing to a region or
-> a reservation.
+> #272 (the `d_model` conflict) is **resolved** — Large A is now `d_model 768`, 56 layers,
+> 3.88B total / 710M active, so one dense run (#200) seeds both rungs. That removes a blocker but
+> not this one: **#271 is still the gate on #223**. Settle it before committing to a region or a
+> reservation.
 
 ### Manual verification: 8-bit optimizer + fp8 experts (#214)
 

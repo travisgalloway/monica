@@ -184,11 +184,13 @@ block reproduces the dense forward exactly at step 0 regardless of the combinati
 formula. `check_upcycle_compatible(src_cfg, dst_cfg)` reports **every** dimension mismatch
 at once (not one-at-a-time raises, which is how a run ends up mis-dimensioned) and hard-
 `UpcycleError`s on any `d_model` mismatch — expert replication can copy a tensor, not widen
-it; see [13-code-model-moe.md](13-code-model-moe.md#the-mhm-spine-the-programs-phases)'s "Open (#223)" note (and
-#272) for why that is a live constraint, not a hypothetical one. The same note records the
+it; see [13-code-model-moe.md](13-code-model-moe.md#the-mhm-spine-the-programs-phases)'s resolved
+#272 note for why that constraint bit in practice — Large A was re-shaped to `d_model 768` to keep
+a single dense source rather than re-running #200 at 1536. The same note records the
 rest of the source shape: #200 is trained as a degenerate `n_experts: 1, top_k: 1` MoE with
-`moe_d_ff ≈ d_inner/8`, and `_MUST_MATCH` (`src/train/upcycle.py:48-52`) lists all 15 fields
-source and target must agree on.
+`moe_d_ff` equal to the target's per-expert width (for Large A, `d_inner` — see #272's resolved
+note), and `_MUST_MATCH` (`src/train/upcycle.py:48-52`) lists all 15 fields source and target must
+agree on.
 `scripts/upcycle.py` runs this offline as an explicit, one-shot CLI (never implicitly
 inside `train.py` — a mistyped `--init` reshaping instead of erroring would burn a whole
 run on a wrong init that still produces a plausible-looking loss curve), writing one
