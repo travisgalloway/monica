@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import threading
 
 import pytest
 
@@ -41,6 +42,27 @@ class _FakeS3Client:
         if blob_id not in self.blobs:
             raise KeyError(f"no such blob {blob_id}")
         return {"Body": _FakeBody(self.blobs[blob_id])}
+
+
+class _GatedS3Client(_FakeS3Client):
+    """Like `_FakeS3Client`, but every fetch after the first parks until released.
+
+    A canned blob decompresses in microseconds, so against the plain fake a pool worker
+    outruns anything the main thread wants to observe mid-chunk. Parking makes "the rest of
+    the chunk has not been fetched yet" a fact rather than a race. The park happens *before*
+    the call is recorded, so `calls` is exact at the suspension point.
+    """
+
+    def __init__(self, blobs: dict, release: threading.Event):
+        super().__init__(blobs)
+        self._release = release
+        self._first_served = False
+
+    def get_object(self, Bucket: str, Key: str):
+        if self._first_served:
+            assert self._release.wait(timeout=10), "gated fetch was never released"
+        self._first_served = True
+        return super().get_object(Bucket=Bucket, Key=Key)
 
 
 class _FakeColumn:
@@ -201,17 +223,29 @@ def test_fetch_contents_is_a_no_op_for_a_zero_target():
     assert client.calls == []
 
 
-def test_fetch_contents_cancels_unstarted_work_once_target_is_reached_mid_chunk():
-    # With the old `pool.map`, crossing the target early still pays for the rest of the
-    # chunk (the bug this fixes). A single worker makes the savings observable: once the
-    # first result crosses the target, the rest of the chunk is still queued (not yet
-    # running) and gets cancelled, so far fewer than the full chunk is ever fetched.
+def test_fetch_contents_yields_the_first_result_without_draining_the_chunk():
+    """With the old `pool.map`, nothing came back until every future in the chunk was done.
+
+    Submitting individual futures means the first result is available immediately, so a
+    target crossed mid-chunk never pays for the remainder. Gating the client is what makes
+    that observable: the pool's single worker parks on `b1`, so `calls` at the suspension
+    point is exactly what has been paid for. Under `pool.map` this hangs instead of passing.
+
+    The `f.cancel()` on the unstarted remainder is deliberately *not* asserted here — whether
+    a queued future is cancelled before the worker picks it up is thread scheduling, not
+    behaviour, and asserting it is what made this test flaky on loaded CI runners (#281).
+    """
     texts = {f"b{i}": gzip.compress(b"z" * 300) for i in range(20)}
-    client = _FakeS3Client(texts)
+    release = threading.Event()
+    client = _GatedS3Client(texts, release)
     rows = [_row(f"b{i}") for i in range(20)]
-    out = list(fetch_contents(rows, 100, s3_client=client, threads=1, chunk=20))
-    assert len(out) == 1
-    assert len(client.calls) < len(rows)
+    gen = fetch_contents(rows, 100, s3_client=client, threads=1, chunk=20)
+    try:
+        assert next(gen) is not None      # the first doc alone crosses the 100-byte target
+        assert client.calls == ["b0"]     # ...and the rest of the chunk was never fetched
+    finally:
+        release.set()                     # unpark the worker so the pool can join
+        gen.close()
 
 
 # --- mixture + manifest --------------------------------------------------------------
