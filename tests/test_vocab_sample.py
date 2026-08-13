@@ -60,7 +60,9 @@ class _GatedS3Client(_FakeS3Client):
 
     def get_object(self, Bucket: str, Key: str):
         if self._first_served:
-            assert self._release.wait(timeout=10), "gated fetch was never released"
+            # Bounded, so a mistake here fails the test rather than hanging the pool. Not an
+            # `assert`: `python -O` would strip the wait itself and resurrect the race.
+            self._release.wait(timeout=10)
         self._first_served = True
         return super().get_object(Bucket=Bucket, Key=Key)
 
@@ -229,7 +231,8 @@ def test_fetch_contents_yields_the_first_result_without_draining_the_chunk():
     Submitting individual futures means the first result is available immediately, so a
     target crossed mid-chunk never pays for the remainder. Gating the client is what makes
     that observable: the pool's single worker parks on `b1`, so `calls` at the suspension
-    point is exactly what has been paid for. Under `pool.map` this hangs instead of passing.
+    point is exactly what has been paid for. Under `pool.map` this fails (after the gated
+    client's 10s timeout) instead of passing.
 
     The `f.cancel()` on the unstarted remainder is deliberately *not* asserted here — whether
     a queued future is cancelled before the worker picks it up is thread scheduling, not
@@ -241,7 +244,8 @@ def test_fetch_contents_yields_the_first_result_without_draining_the_chunk():
     rows = [_row(f"b{i}") for i in range(20)]
     gen = fetch_contents(rows, 100, s3_client=client, threads=1, chunk=20)
     try:
-        assert next(gen) is not None      # the first doc alone crosses the 100-byte target
+        first = next(gen)
+        assert first is not None          # the first doc alone crosses the 100-byte target
         assert client.calls == ["b0"]     # ...and the rest of the chunk was never fetched
     finally:
         release.set()                     # unpark the worker so the pool can join
