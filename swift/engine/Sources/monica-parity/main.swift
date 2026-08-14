@@ -537,6 +537,116 @@ for dir in fixtureDirs {
             failures.append("\(name): P5 threw — \(error)")
         }
 
+        // --- #263 P6: packing-aware seg_ids forward path (chunk mask, boundary conv,
+        // block-diagonal attention) --------------------------------------------------
+        // `packed.safetensors` is OPTIONAL — absent means this fixture doesn't exercise
+        // packing (skip), present-but-unreadable is a FAILURE (the `try loadArrays` below
+        // bubbles into this section's `do`'s outer `catch`, same rule as every other
+        // required-once-present artifact in this file).
+        let packedURL = dir.appendingPathComponent("packed.safetensors")
+        if FileManager.default.fileExists(atPath: packedURL.path) {
+            let packedData = try loadArrays(url: packedURL)
+            guard let packedTokens = packedData["packed_tokens"],
+                  let packedSegIds = packedData["packed_seg_ids"],
+                  let docLengths = packedData["doc_lengths"],
+                  let packedLogitsRef = packedData["packed_logits"] else {
+                failures.append("\(name): packed.safetensors is missing one of "
+                                + "packed_tokens/packed_seg_ids/doc_lengths/packed_logits")
+                continue
+            }
+            // Rebuild each document's REAL-token span within the packed sequence, using
+            // the SAME chunk-aligned packing rule the exporter used
+            // (`check_doc_boundary_parity`'s contract): doc `n` pads to a multiple of Q,
+            // and consecutive docs are laid out back to back.
+            let q = model.config.q
+            let docLens = docLengths.asType(.int32).asArray(Int32.self).map { Int($0) }
+            var spans: [(Int, Int)] = []
+            var off = 0
+            for n in docLens {
+                let plen = ((n + q - 1) / q) * q
+                spans.append((off, off + n))
+                off += plen
+            }
+            if spans.count < 2 {
+                failures.append("\(name): P6 packed.safetensors has fewer than 2 "
+                                + "documents — a single-doc fixture cannot prove "
+                                + "packing-awareness")
+                continue
+            }
+
+            // Assertion (1) cross-language, and the anti-no-op baseline (3): the SAME
+            // blind forward (no segIds) both feeds assertion (3) below and would be
+            // exactly what a no-op seg_ids implementation returns for the packed-aware
+            // call — so if this whole section silently degenerated to a no-op port,
+            // assertion (1) would already fail against Python's packing-aware oracle.
+            let blindLogits = model.forward(packedTokens)
+            let packedAware = model.forward(packedTokens, segIds: packedSegIds)
+            MLX.eval([blindLogits, packedAware])
+            let p6CrossLang = compare(packedAware.asType(.float32).asArray(Float.self),
+                                      packedLogitsRef.asType(.float32).asArray(Float.self),
+                                      rtol: rtol, atol: atol)   // the FILE-LEVEL fp32 gate,
+                                                                 // never a per-fixture override
+
+            // Assertions (2) self-consistency and (3) anti-no-op, per document.
+            var p6WorstSelf = 0.0
+            var p6FirstBadSelf: Int? = nil
+            var p6MinBlindGap = Double.infinity
+            var p6BlindGapFails: [Int] = []
+            for (d, span) in spans.enumerated() {
+                let (s, e) = span
+                let docTokens = packedTokens[0..<1, s..<e]
+                let solo = model.forward(docTokens)                    // standalone, in-process
+                let sub = packedAware[0..<1, s..<e, 0...]
+                MLX.eval([solo, sub])
+                let cSelf = compare(sub.asType(.float32).asArray(Float.self),
+                                    solo.asType(.float32).asArray(Float.self),
+                                    rtol: rtol, atol: atol)
+                if cSelf.maxAbs > p6WorstSelf { p6WorstSelf = cSelf.maxAbs }
+                if !cSelf.ok && p6FirstBadSelf == nil { p6FirstBadSelf = d }
+
+                if d > 0 {   // doc 0 never leaks a PRIOR document's state, so it proves
+                             // nothing about packing-awareness — matches the plan's
+                             // "for every doc after the first" wording.
+                    let blindSub = blindLogits[0..<1, s..<e, 0...]
+                    MLX.eval(blindSub)
+                    let cBlind = compare(blindSub.asType(.float32).asArray(Float.self),
+                                         solo.asType(.float32).asArray(Float.self),
+                                         rtol: 0, atol: 0)   // only .maxAbs is read below
+                    if cBlind.maxAbs < p6MinBlindGap { p6MinBlindGap = cBlind.maxAbs }
+                    if cBlind.maxAbs <= 1e-2 { p6BlindGapFails.append(d) }
+                }
+            }
+
+            print(String(
+                format: "%@: P6 packing-aware forward — cross-lang max|d| = %.3e, "
+                + "self-consistency max|d| = %.3e, anti-no-op min gap = %.3e  %@",
+                name, p6CrossLang.maxAbs, p6WorstSelf,
+                p6MinBlindGap.isFinite ? p6MinBlindGap : 0,
+                p6CrossLang.ok && p6FirstBadSelf == nil && p6BlindGapFails.isEmpty
+                    ? "OK" : "FAIL"))
+            if !p6CrossLang.ok {
+                failures.append(String(
+                    format: "%@: P6(1) packed-aware forward vs the Python packed_logits "
+                    + "oracle differ (max|d| = %.3e)", name, p6CrossLang.maxAbs))
+            }
+            if let bad = p6FirstBadSelf {
+                failures.append(String(
+                    format: "%@: P6(2) FIRST DIVERGENCE — packed-aware doc %d's logit "
+                    + "slice vs its own standalone forward (worst max|d| across docs = "
+                    + "%.3e) — state leaked across a packed document boundary",
+                    name, bad, p6WorstSelf))
+            }
+            if !p6BlindGapFails.isEmpty {
+                failures.append(String(
+                    format: "%@: P6(3) anti-no-op check failed for doc(s) %@ — the "
+                    + "packing-BLIND forward is not provably different from the "
+                    + "standalone forward at the 1e-2 threshold (min observed gap = "
+                    + "%.3e); this makes P6(2) unable to distinguish a real port from a "
+                    + "no-op one on this fixture — see swift/engine/Fixtures/README.md",
+                    name, "\(p6BlindGapFails)", p6MinBlindGap))
+            }
+        }
+
         // --- #196: checkpoint round trip (the Swift WRITER, not just the reader) ------
         // Writes this fixture's already-loaded model back out with `Checkpoint.save`,
         // reloads it, and checks the result is functionally — and, for tensors,

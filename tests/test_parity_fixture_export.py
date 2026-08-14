@@ -35,7 +35,8 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
     assert FIXTURE.is_dir(), f"missing checked-in fixture {FIXTURE}"
     meta_ref = load_file(str(FIXTURE / "reference.safetensors"))
 
-    build_fixture("config/toy.yaml", str(tmp_path / "toy"), batch=2, seq=129)
+    build_fixture("config/toy.yaml", str(tmp_path / "toy"), batch=2, seq=129,
+                  packed_doc_lengths="Q,2*Q,5")
     fresh = load_file(str(tmp_path / "toy" / "reference.safetensors"))
 
     for key in ("forward_logits", "step_logits"):
@@ -75,6 +76,31 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             "change is intended, regenerate the fixtures — see "
             "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
         )
+
+    # #68/#263: extend the staleness check to the packed (seg_ids) oracle — same
+    # rationale as the extensions above, applied to monica-parity's P6 fixture. The
+    # tokens/seg_ids/doc_lengths are EXACT int equality (the packing is deterministic
+    # from the seed, same as the tokens themselves); packed_logits is a tolerance
+    # comparison, same as every other logit array here.
+    packed_ref = load_file(str(FIXTURE / "packed.safetensors"))
+    fresh_packed = load_file(str(tmp_path / "toy" / "packed.safetensors"))
+    assert set(fresh_packed.keys()) == set(packed_ref.keys()), (
+        "packed.safetensors keys drifted from the checked-in Swift-parity oracle.")
+    for key in ("packed_tokens", "packed_seg_ids", "doc_lengths"):
+        np.testing.assert_array_equal(
+            fresh_packed[key], packed_ref[key],
+            err_msg=f"packed.safetensors[{key!r}] drifted from the checked-in "
+                    "Swift-parity oracle. If the backend change is intended, regenerate "
+                    "the fixtures — see swift/engine/Fixtures/README.md — and re-run "
+                    "`swift run monica-parity`.")
+    assert np.allclose(fresh_packed["packed_logits"], packed_ref["packed_logits"],
+                       rtol=RTOL, atol=ATOL), (
+        "packed.safetensors['packed_logits'] drifted from the checked-in Swift-parity "
+        f"oracle (max|d| = "
+        f"{np.abs(fresh_packed['packed_logits'] - packed_ref['packed_logits']).max():.3e})"
+        ". If the backend change is intended, regenerate the fixtures — see "
+        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+    )
 
 
 def test_checked_in_tokens_are_reproducible():

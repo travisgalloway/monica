@@ -3,9 +3,9 @@
 // pre-norm -> input proj -> split main+gate -> causal depthwise conv -> SiLU
 // -> selective SSM -> * SiLU(gate) -> output proj, with a residual.
 //
-// Not ported (out of scope for #166): `_conv_seq_seg` (the packing-aware conv) and
-// `mixing_matrix`. `_conv_window`/`forward_prefill` landed in #169 as `convWindow`/
-// `forwardPrefill`.
+// `_conv_seq_seg` (the packing-aware conv) landed in #263 as `convSeqSeg`.
+// `_conv_window`/`forward_prefill` landed in #169 as `convWindow`/`forwardPrefill`.
+// `mixing_matrix` (a dropped-M10-distillation auxiliary) stays unported.
 
 import MLX
 import MLXNN
@@ -75,17 +75,67 @@ public final class MambaBlock: Block {
         return y
     }
 
-    /// `forward_seq` (`:394-408`), the `seg_ids == nil` arm.
-    public override func forwardSeq(_ x: MLXArray) -> MLXArray {
+    /// `_conv_seq_seg` (`mlx_backend.py:365-392`, #68/#263). Boundary-aware causal
+    /// depthwise conv: taps reaching into a previous document are zeroed, so the conv
+    /// window can't bleed across a packed boundary (the conv is part of the per-doc
+    /// recurrent state). `seg` is (B, L). Returns length L DIRECTLY — unlike `convSeq`
+    /// (which pads both sides and needs a `[:L]` trim), this path never over-pads.
+    func convSeqSeg(_ xMain: MLXArray, _ cd: DType, _ seg: MLXArray) -> MLXArray {
+        let k = config.dConv
+        let bSize = xMain.dim(0)
+        let l = xMain.dim(1)
+        let di = xMain.dim(2)
+        let x = xMain.asType(cd)
+        let w = conv.weight.asType(cd)     // (dInner, K, 1) — mlx-swift Conv1d layout
+        var acc: MLXArray? = nil
+        for kk in 0..<k {
+            let shift = k - 1 - kk         // how far this tap reaches into the past
+            let wk = w[0..., kk..<(kk + 1), 0..<1].reshaped([di])       // (di,)
+            var xs: MLXArray
+            if shift == 0 {
+                xs = x
+            } else if shift >= l {
+                continue                   // tap reaches entirely before the sequence start
+            } else {
+                let xPrefix = x[0..., 0..<(l - shift), 0...]            // x[t-shift]
+                let xZeroPad = MLXArray.zeros([bSize, shift, di], dtype: cd)
+                xs = concatenated([xZeroPad, xPrefix], axis: 1)         // (B, L, di), left-padded
+                let segShift = seg[0..., shift..<l]
+                let segPrefix = seg[0..., 0..<(l - shift)]
+                let same = (segShift .== segPrefix).asType(cd)          // (B, L-shift)
+                let validZeroPad = MLXArray.zeros([bSize, shift], dtype: cd)
+                let valid = concatenated([validZeroPad, same], axis: 1) // (B, L): 0 across a boundary
+                xs = xs * valid.expandedDimensions(axis: -1)
+            }
+            let term = xs * wk
+            acc = acc == nil ? term : acc! + term
+        }
+        if acc == nil {                    // K > L: every tap reaches before the start
+            acc = MLXArray.zeros([bSize, l, di], dtype: cd)
+        }
+        return acc! + conv.bias!.asType(cd)
+    }
+
+    /// `forward_seq` (`:394-408`). `segIds == nil` is the original single-segment path;
+    /// otherwise the conv is boundary-aware (`convSeqSeg`) and the SSM scan's inter-chunk
+    /// carry is masked (`SelectiveSSM.parallel(_:segIds:)`) so recurrent state can't cross
+    /// a packed document boundary (#68/#263).
+    public override func forwardSeq(_ x: MLXArray, _ segIds: MLXArray?) -> MLXArray {
         let l = x.dim(1)
         let cd = config.cd
         let xn = norm(x)
         let proj = split(linear(inProj, xn, cd), parts: 2, axis: -1)   // (B,L,di) each
         let xMain = proj[0]
         let z = proj[1]
-        // Causal depthwise conv: pad both sides (d_conv-1), keep the FIRST L outputs.
-        let xc = silu(split(convSeq(xMain, cd), indices: [l], axis: 1)[0])
-        var y = ssm.parallel(xc)
+        // Causal depthwise conv: pad both sides (d_conv-1), keep the FIRST L outputs. With
+        // segIds the conv is boundary-aware so its window can't cross a packed boundary.
+        let xc: MLXArray
+        if let seg = segIds {
+            xc = silu(convSeqSeg(xMain, cd, seg))
+        } else {
+            xc = silu(split(convSeq(xMain, cd), indices: [l], axis: 1)[0])
+        }
+        var y = ssm.parallel(xc, segIds: segIds)
         y = y * silu(z)
         return x + linear(outProj, y, cd)
     }

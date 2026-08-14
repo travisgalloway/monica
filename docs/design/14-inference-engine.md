@@ -432,6 +432,17 @@ DPO/GRPO step factories.
   is gone. Swift porting the CUDA-specific gather dispatch remains out of scope for #166
   (Swift is inference-only and evaluates every expert the same way the MLX/dense reference
   does; gather is a training-throughput optimization with no logit effect to port).
+- **`seg_ids` packing-aware forward path — RESOLVED (#263).** The three forward-path arms
+  (`_chunk_seg_mask` -> `SelectiveSSM.chunkSegMask`, `_conv_seq_seg` -> `MambaBlock.
+  convSeqSeg`, `AttentionBlock.forward_seq`'s block-diagonal mask) are ported and gated by
+  `monica-parity`'s P6 section against a new checked-in `packed.safetensors` oracle
+  (`toy`/`toy-hybrid`/`toy-moe`; see `swift/engine/Fixtures/README.md`). Deliberately
+  scoped to inference: `forwardPrefill`/`prefill` still take no `segIds` — that is the
+  same #165 exclusion as before (a packing-aware carry-out reads as zeros; see
+  `SelectiveSSM.scan`'s `carryOutRequested` precondition), not a gap #263 left open. Also
+  out of scope: plumbing `seg_ids` through a Swift training loop, data loader, or shard
+  reader — none of that exists yet (#195/#271 territory), and this port is a
+  prerequisite of #195 rather than a dependent of it.
 - **`SessionStore`'s budget math ignores the attention KV cache.** `per_session_state_floats`
   (`src/serve/sessions.py:40`) charges every layer a conv window plus an SSM state and has **no
   attention term**. That is exact for a pure-Mamba config, but the M12 hybrid's ~12.5% attention
