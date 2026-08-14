@@ -47,6 +47,28 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
         )
 
+    # #264: extend the staleness check to every hidden.{i} and mixing.{i} key. A silently
+    # DROPPED oracle key (the exporter's loop shrinking, a layer-count regression) is the
+    # same class of failure as a drifted one, so the key sets must match exactly, not just
+    # a subset comparison.
+    ref_keys = set(meta_ref.keys())
+    fresh_keys = set(fresh.keys())
+    assert fresh_keys == ref_keys, (
+        f"reference.safetensors key set drifted from the checked-in Swift-parity oracle "
+        f"(missing={sorted(ref_keys - fresh_keys)}, extra={sorted(fresh_keys - ref_keys)}). "
+        "If the backend change is intended, regenerate the fixtures — see "
+        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+    )
+    for key in sorted(ref_keys):
+        if not (key.startswith("hidden.") or key.startswith("mixing.")):
+            continue
+        assert np.allclose(fresh[key], meta_ref[key], rtol=RTOL, atol=ATOL), (
+            f"reference.safetensors[{key!r}] drifted from the checked-in Swift-parity "
+            f"oracle (max|d| = {np.abs(fresh[key] - meta_ref[key]).max():.3e}). If the "
+            "backend change is intended, regenerate the fixtures — see "
+            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+        )
+
     # #167: extend the staleness check to the greedy-id oracle. Unlike the logits above,
     # this is EXACT int equality, not a tolerance — `monica-parity`'s AC1 check is exact too,
     # so a fixture that silently drifted here would rot just as quietly as a logit fixture

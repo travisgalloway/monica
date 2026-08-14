@@ -937,15 +937,26 @@ class MLXMambaModel(ModelInterface, nn.Module):
 
     def mixing_matrices(self, token_batch: Array) -> List[Tuple[int, Array]]:
         """For the `mixing-match` stage: each Mamba layer's head-averaged mixing matrix
-        `(B, L, L)` paired with its layer index. Attention layers are skipped (their mixer is
-        the teacher's attention they were matched against)."""
+        `(B, L, L)` paired with its layer index. Attention AND MoE layers are skipped
+        (`MoEBlock` has no `mixing_matrix` — it is pointwise, not a mixer; matches
+        `cuda_backend.CUDAMambaModel.mixing_matrices`)."""
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)
         out: List[Tuple[int, Array]] = []
         # Advance through the checkpointed closures (grad_checkpoint-aware); the mixing
         # matrix itself is read off the layer input separately.
         for i, (layer, layer_fn) in enumerate(zip(self.layers, self._layer_fns)):
-            if not self.config.is_attention_layer(i):
-                out.append((i, layer.mixing_matrix(h).mean(axis=1)))    # head-average -> (B,L,L)
+            # Materialize `h` before forking it into two independent consumers
+            # (`layer.mixing_matrix(h)` below and `layer_fn(h)`'s own advance). Without
+            # this barrier, this MLX build (0.32.0) has been observed to silently corrupt
+            # a LATER, unrelated call — `prefill(..., last_only=True)` on this same model
+            # two-process-later — even though every value read back from THIS function
+            # is itself correct. Reproduced in isolation and confirmed to disappear with
+            # this barrier; not a tolerance issue, so it is fixed here rather than
+            # loosened at any gate.
+            mx.eval(h)
+            if not self.config.is_attention_layer(i) and not self.config.is_moe_layer(i):
+                m = layer.mixing_matrix(h).mean(axis=1)    # head-average -> (B,L,L)
+                out.append((i, m))
             h = layer_fn(h)
         return out
 

@@ -11,8 +11,10 @@
 // The `seg_ids` packing-aware chunk mask (`_chunk_seg_mask`) landed in #263 as
 // `chunkSegMask`. `return_state` (prefill) landed in #169 as `parallelWithState` — it
 // does NOT take `seg_ids` (see `scan`'s `carryOutRequested` precondition below), matching
-// #165's `forwardPrefill` exclusion. `mixing_matrix` (a dropped-M10-distillation
-// auxiliary, and not `seg_ids`-aware even in Python) stays unported.
+// #165's `forwardPrefill` exclusion. `mixing_matrix` (#100's dropped-M10-distillation
+// interpretability auxiliary) lands in #264 as `mixingMatrix` — single-segment only (not
+// `seg_ids`-aware, same restriction Python documents), dense `O(L^2)`, and an
+// interpretability auxiliary, not the training path.
 
 import Foundation
 import MLX
@@ -255,6 +257,30 @@ public final class SelectiveSSM: Module {
         // to cd (state stays fp32, matching `recurrence`).
         let carry = newStatesSplit[1].squeezed(axis: 1)   // (B,H,P,N)
         return (cast(y.reshaped([bSize, l, dInner]), cd), carry)
+    }
+
+    // MARK: - dense mixing matrix (`mixing_matrix`, :280-298, #264)
+
+    /// Materializes the dense `(B, H, L, L)` 1-semiseparable mixing matrix `M` such that
+    /// `einsum("bhij,bjhp->bihp", M, X) == parallel(x)` (`X` = the head-split input) in the
+    /// SINGLE-SEGMENT case (no `segIds`). Folds in the per-step `delta` scaling (on the
+    /// COLUMN axis — `M[b,h,i,j]` multiplies position `j`'s input to produce position `i`'s
+    /// output) and the per-head `D` skip on the diagonal, so it maps the RAW (unscaled)
+    /// input. Does NOT model the packing-aware `seg_ids` path (#68) — the equality holds
+    /// only without `segIds`. Dense `O(L^2)`, an interpretability auxiliary, not the
+    /// chunked training path.
+    public func mixingMatrix(_ x: MLXArray) -> MLXArray {
+        let l = x.dim(1)
+        let (delta, a, bm, cm) = project(x)                     // delta (B,L,H); bm,cm (B,L,N) fp32
+        let gh = (delta * a).transposed(0, 2, 1)                // (B,H,L) log-decay (<= 0)
+        let decay = exp(segsum(gh))                             // (B,H,L,L), causal
+        let cb = einsum("bin,bjn->bij", cm, bm)                 // (B,L,L) shared B/C group
+        // delta_col: (B,H,1,L) = delta_j, broadcasting over the ROW axis (scales column j).
+        let deltaCol = delta.transposed(0, 2, 1).expandedDimensions(axis: 2)
+        let m = decay * cb.expandedDimensions(axis: 1) * deltaCol         // (B,H,L,L)
+        let identity = MLXArray.eye(l, dtype: m.dtype)
+        return m + d.reshaped([1, config.nHeads, 1, 1])
+            * identity.expandedDimensions(axes: [0, 1])                  // + D skip on the diagonal
     }
 
     // MARK: - one-step recurrence (`recurrence`, :300-311)

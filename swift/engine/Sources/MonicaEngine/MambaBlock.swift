@@ -5,7 +5,11 @@
 //
 // `_conv_seq_seg` (the packing-aware conv) landed in #263 as `convSeqSeg`.
 // `_conv_window`/`forward_prefill` landed in #169 as `convWindow`/`forwardPrefill`.
-// `mixing_matrix` (a dropped-M10-distillation auxiliary) stays unported.
+// `mixing_matrix` (#100's interpretability auxiliary) lands in #264 as `mixingMatrix`,
+// backed by a new `ssmInput` (the block's front-end, `forwardSeq`'s `segIds == nil` arm up
+// to and including the post-conv SiLU) that exposes the SSM's scan input so
+// `monica-parity` can apply `ssm.mixingMatrix` to it directly without re-deriving the
+// front-end.
 
 import MLX
 import MLXNN
@@ -47,7 +51,9 @@ public final class MambaBlock: Block {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "in_proj") var inProj: Linear
     @ModuleInfo(key: "conv") var conv: Conv1d
-    @ModuleInfo(key: "ssm") var ssm: SelectiveSSM
+    // Public since #264, same precedent as `MonicaModel.layers`/`normF` (#196): lets
+    // `monica-parity` apply `ssm.mixingMatrix` to this block's own `ssmInput` output.
+    @ModuleInfo(key: "ssm") public var ssm: SelectiveSSM
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
     public init(_ config: MambaConfig) {
@@ -171,6 +177,27 @@ public final class MambaBlock: Block {
     public override func initState(batch: Int) -> LayerState {
         .mamba(conv: MLXArray.zeros([batch, config.dConv - 1, config.dInner]),
                ssm: MLXArray.zeros([batch, config.nHeads, config.headDim, config.dState]))
+    }
+
+    /// `mixing_matrix`'s front-end (`mlx_backend.py:426-435`): `norm` -> `in_proj` main
+    /// half (index 0 of the 2-way split — swapping main/gate here is a silent
+    /// plausible-but-wrong failure) -> causal conv -> SiLU. This is `forwardSeq`'s
+    /// `segIds == nil` arm up to (not including) the SSM scan, factored out so
+    /// `mixingMatrix` and `monica-parity`'s in-process identity check can both reach the
+    /// SSM's raw scan input without re-deriving it.
+    public func ssmInput(_ x: MLXArray) -> MLXArray {
+        let l = x.dim(1)
+        let cd = config.cd
+        let xn = norm(x)
+        let xMain = split(linear(inProj, xn, cd), parts: 2, axis: -1)[0]
+        return silu(split(convSeq(xMain, cd), indices: [l], axis: 1)[0])
+    }
+
+    /// `mixing_matrix` (`mlx_backend.py:426-435`, #264/#100): this block's head-split SSM
+    /// mixing matrix `(B, H, L, L)`. Runs the block front-end (`ssmInput`) then
+    /// materializes the SSM matrix on that input.
+    public func mixingMatrix(_ x: MLXArray) -> MLXArray {
+        ssm.mixingMatrix(ssmInput(x))
     }
 
     /// `forward_prefill` (`:410-424`) — `forwardSeq`'s body verbatim (deliberately

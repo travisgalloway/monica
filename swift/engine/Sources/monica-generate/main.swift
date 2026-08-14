@@ -235,6 +235,14 @@ func runSelfTest(tokenizerPath: String?) -> Never {
            "--bench-iterations parses as an int")
     }
 
+    // --- #264: flag parsing for --dump-activations (no MLX involved) ---
+    do {
+        let f3 = parseFlags(["--dump-activations", "out.safetensors", "--prompt-ids", "1,2,3"])
+        check(f3["dump-activations"] == "out.safetensors",
+              "--dump-activations parses its path argument")
+        check(f3["prompt-ids"] == "1,2,3", "--prompt-ids still parses alongside it")
+    }
+
     // --- optional tokenizer round-trip ---
     if let path = tokenizerPath {
         do {
@@ -447,6 +455,29 @@ func buildLspMaskSession(flags: [String: String], tok: Tokenizer, promptText: St
 /// MLX device is. Split out so `MONICA_ENGINE_CPU=1` can scope it with `Device.withDefaultDevice`
 /// (the same scoped-not-global convention `monica-parity` uses) rather than the deprecated
 /// `Device.setDefault`.
+/// `--dump-activations <file.safetensors>` (#264): writes `hidden.{i}` / `mixing.{i}`
+/// (fp32) for the prompt batch, using the SAME key convention
+/// `scripts/export_parity_fixture.py` uses for `reference.safetensors`, so a user can
+/// diff a Swift dump against a Python one directly (e.g. with
+/// `python -c "from safetensors.numpy import load_file; ..."`). Reuses the tokenizer-free
+/// `--prompt-ids` path, so this surface needs no tokenizer.
+func dumpActivations(model: MonicaModel, promptIds: [Int], to url: URL) {
+    let tokens = MLXArray(promptIds.map { Int32($0) }).reshaped([1, promptIds.count])
+    let hs = model.hiddenStates(tokens)
+    let mixing = model.mixingMatrices(tokens)
+    MLX.eval(hs)
+    MLX.eval(mixing.map { $0.1 })
+    var out: [String: MLXArray] = [:]
+    for (i, h) in hs.enumerated() { out["hidden.\(i)"] = h.asType(.float32) }
+    for (i, m) in mixing { out["mixing.\(i)"] = m.asType(.float32) }
+    do {
+        try MLX.save(arrays: out, url: url)
+        print("wrote \(url.path): \(hs.count) hidden.*, \(mixing.count) mixing.*")
+    } catch {
+        fail("failed to write \(url.path): \(error)")
+    }
+}
+
 func runMain(_ flags: [String: String]) {
     guard let weightsPath = flags["weights"] else {
         fail("--weights <weights.safetensors> is required (or pass --self-test)")
@@ -463,6 +494,22 @@ func runMain(_ flags: [String: String]) {
         let promptLen = intFlag(flags, "bench-prompt-len", default: 512)
         let iterations = intFlag(flags, "bench-iterations", default: 5)
         runBenchPrefill(model: model, promptLen: promptLen, iterations: iterations)
+        return
+    }
+
+    if let dumpPath = flags["dump-activations"] {
+        guard let idsRaw = flags["prompt-ids"] else {
+            fail("--dump-activations requires --prompt-ids 1,2,3 (the tokenizer-free "
+                + "debug path)")
+        }
+        let promptIds = idsRaw.split(separator: ",").map { s -> Int in
+            guard let v = Int(s.trimmingCharacters(in: .whitespaces)) else {
+                fail("--prompt-ids must be a comma-separated list of integers, got '\(idsRaw)'")
+            }
+            return v
+        }
+        if promptIds.isEmpty { fail("--prompt-ids must be non-empty") }
+        dumpActivations(model: model, promptIds: promptIds, to: URL(fileURLWithPath: dumpPath))
         return
     }
 

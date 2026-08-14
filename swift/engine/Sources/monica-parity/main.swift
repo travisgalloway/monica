@@ -39,10 +39,15 @@ struct FixtureMeta: Decodable {
     let rtol: Double?
     let atol: Double?
     let quant_bits: Int?
+    // #264: the ABSOLUTE layer indices `mixing.{i}` was exported for (attention AND MoE
+    // layers skipped). Absent only for the two quantized fixtures — the exporter omits
+    // the mixing oracle there (a lossy path must not drag the loose #168 tolerance hook
+    // into this strict gate).
+    let mixing_layers: [Int]?
 }
 
 func loadFixtureMeta(_ dir: URL) -> FixtureMeta {
-    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil)
+    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil, mixing_layers: nil)
     guard let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else {
         return empty
     }
@@ -331,28 +336,44 @@ for dir in fixtureDirs {
                      name, fwdCmp.maxAbs, stepCmp.maxAbs, batch, seq, fxRtol, fxAtol,
                      fwdCmp.ok && stepCmp.ok ? "OK" : "FAIL"))
 
-        if !fwdCmp.ok || !stepCmp.ok {
-            // Localize before reporting the logit diff: a whole-model mismatch is nearly
-            // impossible to place by hand across 24 layers, but the exporter checked in each
-            // layer's output, so "first divergence at layer 7" is one comparison away.
-            let hs = model.hiddenStates(tokens)
-            MLX.eval(hs)
-            var located = false
-            for i in 0..<hs.count {
-                guard let refH = reference["hidden.\(i)"] else { continue }
-                let c = compare(hs[i].asType(.float32).asArray(Float.self),
-                                refH.asType(.float32).asArray(Float.self),
-                                rtol: fxRtol, atol: fxAtol)
-                if !c.ok {
-                    failures.append(String(
-                        format: "%@: FIRST DIVERGENCE at hidden state %d (max|d| = %.3e) — "
-                        + "that is layer %d's output (state 0 is the embedding)",
-                        name, i, c.maxAbs, i - 1))
-                    located = true
-                    break
-                }
+        // --- #264: hidden states, UNCONDITIONAL (previously only checked on a forward/step
+        // failure, to localize it). Every hidden state has the SAME shape (B, L, dModel), so
+        // a shape check cannot catch an off-by-one accessor (e.g. appending before applying
+        // the layer, which puts the embedding at index 1 and mismatches from there on while
+        // `forward`'s SEPARATE loop stays perfect) — only an unconditional per-index numeric
+        // compare does. `hs.count` wrong, or a missing `hidden.{i}` key, is a FAILURE, not a
+        // skip — the same "absent => failure" rule this file already applies to
+        // generation.safetensors/prefill.safetensors.
+        let hs = model.hiddenStates(tokens)
+        MLX.eval(hs)
+        if hs.count != model.layers.count + 1 {
+            failures.append("\(name): hiddenStates returned \(hs.count) entries, want "
+                            + "\(model.layers.count + 1) (nLayers + 1)")
+        }
+        var hsWorst = 0.0
+        var hsFirstBad: Int? = nil
+        for i in 0..<hs.count {
+            guard let refH = reference["hidden.\(i)"] else {
+                failures.append("\(name): reference.safetensors is missing hidden.\(i)")
+                continue
             }
-            if !located {
+            let c = compare(hs[i].asType(.float32).asArray(Float.self),
+                            refH.asType(.float32).asArray(Float.self),
+                            rtol: fxRtol, atol: fxAtol)
+            if c.maxAbs > hsWorst { hsWorst = c.maxAbs }
+            if !c.ok && hsFirstBad == nil { hsFirstBad = i }
+        }
+        // Print the max|d| on success too, matching this file's habit elsewhere.
+        print(String(format: "%@: hidden states max|d| = %.3e  %@", name, hsWorst,
+                     hsFirstBad == nil ? "OK" : "FAIL"))
+
+        if !fwdCmp.ok || !stepCmp.ok {
+            if let bad = hsFirstBad {
+                failures.append(String(
+                    format: "%@: FIRST DIVERGENCE at hidden state %d (max|d| = %.3e) — "
+                    + "that is layer %d's output (state 0 is the embedding)",
+                    name, bad, hsWorst, bad - 1))
+            } else {
                 failures.append("\(name): logits differ but every checked-in hidden state "
                                 + "matches — suspect norm_f or the tied head")
             }
@@ -364,6 +385,131 @@ for dir in fixtureDirs {
                 failures.append(String(format: "%@: step logits differ (max|d| = %.3e)", name,
                                        stepCmp.maxAbs))
             }
+        } else if let bad = hsFirstBad {
+            // forward/step both matched but a hidden state didn't -- can only happen if a
+            // layer's PARTIAL computation is wrong in a way its own OUTPUT still cancels
+            // out of by the time the next layer/forward's separate loop finishes. Still a
+            // real divergence worth surfacing on its own.
+            failures.append(String(
+                format: "%@: hidden state %d diverges (max|d| = %.3e) even though forward/"
+                + "step logits matched", name, bad, hsWorst))
+        }
+
+        // --- #264: mixing-matrix interpretability accessor -----------------------------
+        // `mixing_layers` in meta.json is present for every non-quantized fixture and
+        // absent only for the two quantized ones (a lossy path that must not drag the
+        // loose #168 tolerance hook into this strict gate) — print an explicit SKIP line
+        // for those rather than silently doing nothing.
+        if let mixingLayers = meta.mixing_layers {
+            let mixing = model.mixingMatrices(tokens)
+            let swiftIndices = mixing.map { $0.0 }
+            if swiftIndices != mixingLayers {
+                failures.append("\(name): mixing-matrix layer index list \(swiftIndices) "
+                                + "!= checked-in mixing_layers \(mixingLayers) — layer "
+                                + "classification (attention/MoE skip) has diverged from "
+                                + "Python")
+            }
+            var mixWorst = 0.0
+            var mixFirstBad: Int? = nil
+            var mixMaxAbs = 0.0   // anti-zero-matrix: the raw magnitude, not a diff
+            for (i, m) in mixing {
+                MLX.eval(m)
+                let flat = m.asType(.float32).asArray(Float.self)
+                for v in flat { mixMaxAbs = max(mixMaxAbs, Double(abs(v))) }
+                guard let ref = reference["mixing.\(i)"] else {
+                    failures.append("\(name): reference.safetensors is missing mixing.\(i)")
+                    continue
+                }
+                let c = compare(flat, ref.asType(.float32).asArray(Float.self),
+                                rtol: fxRtol, atol: fxAtol)
+                if c.maxAbs > mixWorst { mixWorst = c.maxAbs }
+                if !c.ok && mixFirstBad == nil { mixFirstBad = i }
+            }
+            print(String(format: "%@: mixing matrices max|d| = %.3e  (max|M| = %.3e)  %@",
+                         name, mixWorst, mixMaxAbs, mixFirstBad == nil ? "OK" : "FAIL"))
+            if let bad = mixFirstBad {
+                failures.append(String(
+                    format: "%@: mixing.%d drifted from the checked-in Swift-parity oracle "
+                    + "(max|d| = %.3e)", name, bad, mixWorst))
+            }
+            if mixMaxAbs == 0 {
+                failures.append("\(name): every mixing matrix is exactly all-zero — a "
+                                + "degenerate/no-op accessor would look like this")
+            }
+
+            // (iii)/(iv)/(v): the FULL per-head matrix of the FIRST Mamba layer, computed
+            // in-process — head-averaging (above) hides a transposed matrix's antisymmetric
+            // structure, so causality and the defining identity must run on the un-averaged
+            // (B, H, L, L) tensor.
+            if let firstMamba = model.layers.enumerated().first(where: { $0.element is MambaBlock }) {
+                let idx = firstMamba.offset
+                // swiftlint-safe forced cast: the `first(where:)` predicate above already
+                // proved this element is a MambaBlock.
+                let block = firstMamba.element as! MambaBlock
+                let xc = block.ssmInput(hs[idx])          // hs[idx] is layer idx's INPUT
+                let mFull = block.ssm.mixingMatrix(xc)    // (B, H, L, L)
+                MLX.eval(mFull)
+
+                let bFull = mFull.dim(0), hFull = mFull.dim(1), lFull = mFull.dim(2)
+                let mHost = mFull.asType(.float32).asArray(Float.self)
+                var causalMax = 0.0
+                var fullMaxAbs = 0.0
+                for b in 0..<bFull {
+                    for h in 0..<hFull {
+                        let base = (b * hFull + h) * lFull * lFull
+                        for i in 0..<lFull {
+                            for j in 0..<lFull {
+                                let v = Double(mHost[base + i * lFull + j])
+                                fullMaxAbs = max(fullMaxAbs, abs(v))
+                                if j > i { causalMax = max(causalMax, abs(v)) }
+                            }
+                        }
+                    }
+                }
+                if causalMax != 0 {
+                    failures.append(String(
+                        format: "%@: mixing matrix at layer %d is NOT strictly causal — "
+                        + "max|upper triangle| = %.3e (want exactly 0) — a transposed or "
+                        + "wrongly-oriented matrix would mix future positions into the past",
+                        name, idx, causalMax))
+                }
+                if fullMaxAbs == 0 {
+                    failures.append("\(name): the full per-head mixing matrix at layer "
+                                    + "\(idx) is exactly all-zero")
+                }
+
+                // (v) the defining identity: einsum("bhij,bjhp->bihp", M, X) == parallel(x).
+                let bSize = xc.dim(0)
+                let l = xc.dim(1)
+                let nHeads = model.config.nHeads
+                let p = model.config.headDim
+                let xh = xc.reshaped([bSize, l, nHeads, p])
+                let yFromMatrix = einsum("bhij,bjhp->bihp", mFull, xh)
+                    .reshaped([bSize, l, nHeads * p])
+                let yFromParallel = block.ssm.parallel(xc)
+                // Evaluate separately, not as one combined multi-array `MLX.eval` call: see
+                // tests/test_mlx_mixing_matrix.py's matching comment on the Python side —
+                // this MLX/mlx-swift generation has been observed to corrupt an unrelated
+                // later computation when two independent graphs are realized together here.
+                MLX.eval(yFromMatrix)
+                MLX.eval(yFromParallel)
+                let identityCmp = compare(
+                    yFromMatrix.asType(.float32).asArray(Float.self),
+                    yFromParallel.asType(.float32).asArray(Float.self),
+                    rtol: fxRtol, atol: fxAtol)
+                print(String(
+                    format: "%@: mixing-matrix identity (layer %d) max|d| = %.3e  "
+                    + "causal max|upper| = %.3e  %@", name, idx, identityCmp.maxAbs,
+                    causalMax, identityCmp.ok && causalMax == 0 ? "OK" : "FAIL"))
+                if !identityCmp.ok {
+                    failures.append(String(
+                        format: "%@: mixing-matrix identity FAILED at layer %d — "
+                        + "einsum(\"bhij,bjhp->bihp\", M, X) != ssm.parallel(x) "
+                        + "(max|d| = %.3e)", name, idx, identityCmp.maxAbs))
+                }
+            }
+        } else {
+            print("\(name): mixing matrices — SKIP (no mixing oracle: quantized fixture)")
         }
 
         // --- #169: prefill (parallel-scan) checks -------------------------------------
@@ -535,6 +681,99 @@ for dir in fixtureDirs {
             }
         } catch {
             failures.append("\(name): P5 threw — \(error)")
+        }
+
+        // --- #264: verifyBlock, the #172 speculative-decoding prerequisite -------------
+        // Gated against oracles that already exist (no new checked-in tensor, per
+        // swift/engine/Fixtures/README.md's #195 note): row 0's logits vs `step_logits`,
+        // the FINAL state vs `prefill.safetensors` (state after L tokens is, by contract,
+        // the stepped state after L tokens — already gated Python-side by
+        // `check_prefill_decode_parity`), and an in-process rollback identity that proves
+        // `states[k]` is not simply the final state repeated.
+        do {
+            let row0Ids = tokens[0..<1, 0..<seq].reshaped([seq])
+                .asType(.int32).asArray(Int32.self).map { Int($0) }
+            let (vbLogits, vbStates) = try model.verifyBlock(row0Ids, model.initState(batch: 1))
+            if vbLogits.count != row0Ids.count || vbStates.count != row0Ids.count {
+                failures.append("\(name): verifyBlock returned \(vbLogits.count) logits / "
+                                + "\(vbStates.count) states for \(row0Ids.count) tokens")
+            } else {
+                // (ii) row 0's per-token logits vs the checked-in step_logits[0:1].
+                let stackedLogits = stacked(vbLogits, axis: 1)     // (1, T, V)
+                MLX.eval(stackedLogits)
+                let refRow0 = refStep[0..<1, 0..., 0...]
+                let vbCmp = compare(stackedLogits.asType(.float32).asArray(Float.self),
+                                    refRow0.asType(.float32).asArray(Float.self),
+                                    rtol: fxRtol, atol: fxAtol)
+                if !vbCmp.ok {
+                    failures.append(String(
+                        format: "%@: verifyBlock logits vs step_logits[0:1] differ "
+                        + "(max|d| = %.3e)", name, vbCmp.maxAbs))
+                }
+
+                // (iii) the FINAL state vs prefill.safetensors, sliced to row 0.
+                let finalState = vbStates[vbStates.count - 1]
+                var vbFinalWorst = 0.0
+                var vbFinalBad: String? = nil
+                for i in 0..<finalState.count {
+                    for (slot, arr) in layerStateSlots(finalState[i]) {
+                        let key = "state.\(i).\(slot)"
+                        guard let ref = preRef[key] else {
+                            failures.append("\(name): verifyBlock final-state check: "
+                                            + "prefill.safetensors is missing '\(key)'")
+                            continue
+                        }
+                        let refRow0Slot = ref[0..<1]
+                        MLX.eval(arr)
+                        let c = compare(arr.asType(.float32).asArray(Float.self),
+                                        refRow0Slot.asType(.float32).asArray(Float.self),
+                                        rtol: fxRtol, atol: fxAtol)
+                        if c.maxAbs > vbFinalWorst { vbFinalWorst = c.maxAbs }
+                        if !c.ok && vbFinalBad == nil { vbFinalBad = "layer \(i) \(slot)" }
+                    }
+                }
+                if let bad = vbFinalBad {
+                    failures.append(String(
+                        format: "%@: verifyBlock final state vs prefill.safetensors row 0 "
+                        + "FIRST DIVERGENCE at %@ (max|d| = %.3e)", name, bad, vbFinalWorst))
+                }
+
+                // (iv) in-process rollback identity: states[k] must equal a SEQUENTIAL
+                // `step` walk over tokens[0...k], at k=0 and mid-sequence — the property
+                // #172 depends on, and what distinguishes real per-token states from the
+                // final state simply repeated.
+                var rollbackBad: [Int] = []
+                for k in [0, row0Ids.count / 2] where k < vbStates.count {
+                    var walkState = model.initState(batch: 1)
+                    for t in 0...k {
+                        let (_, st) = try model.step(MLXArray([Int32(row0Ids[t])]), walkState)
+                        walkState = st
+                    }
+                    let vbArrays = vbStates[k].flatMap(\.arrays)
+                    let walkArrays = walkState.flatMap(\.arrays)
+                    MLX.eval(vbArrays)
+                    MLX.eval(walkArrays)
+                    var kBad = false
+                    for (a, b) in zip(vbArrays, walkArrays) {
+                        let c = compare(a.asType(.float32).asArray(Float.self),
+                                        b.asType(.float32).asArray(Float.self),
+                                        rtol: fxRtol, atol: fxAtol)
+                        if !c.ok { kBad = true }
+                    }
+                    if kBad { rollbackBad.append(k) }
+                }
+                if !rollbackBad.isEmpty {
+                    failures.append("\(name): verifyBlock intermediate-state rollback "
+                                    + "FAILED at k=\(rollbackBad) — states[k] does not equal "
+                                    + "a sequential step walk over tokens[0...k]")
+                }
+                print(String(
+                    format: "%@: verifyBlock (%d tokens) logits max|d| = %.3e, final-state "
+                    + "max|d| = %.3e  %@", name, row0Ids.count, vbCmp.maxAbs, vbFinalWorst,
+                    vbCmp.ok && vbFinalBad == nil && rollbackBad.isEmpty ? "OK" : "FAIL"))
+            }
+        } catch {
+            failures.append("\(name): verifyBlock threw — \(error)")
         }
 
         // --- #263 P6: packing-aware seg_ids forward path (chunk mask, boundary conv,
