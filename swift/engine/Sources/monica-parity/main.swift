@@ -16,6 +16,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import MonicaEngine
 
 // The fp32 gate's constants — UNCHANGED by #168. A fixture's `meta.json` MAY carry its
