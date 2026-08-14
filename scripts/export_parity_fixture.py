@@ -94,6 +94,13 @@ def _export_train_oracle(cfg, weights_path: str, tokens, *, out: "Path",
         return m
 
     def run(grad_clip: float, want_grads: bool):
+        # Reseed before every call (not just once at the top of `main`, #293 review): the
+        # graph has no randomness today, but `run()` is invoked multiple times per export
+        # (natural-norm dry run, real run, determinism re-run) and if a future objective
+        # variant introduces one (e.g. dropout), the seed argument must actually govern
+        # each of those calls rather than silently drifting with ambient RNG state — the
+        # determinism check at step 3 below would then have a real seed to reproduce.
+        mx.random.seed(seed)
         model = fresh_model()
         opt = optim.AdamW(learning_rate=lrs[0])
         scaler = scaler_for_precision(cfg.precision)

@@ -109,8 +109,12 @@ func scaleTree(_ a: ModuleParameters, _ factor: MLXArray) -> ModuleParameters {
 /// objective-specific piece (`lossAndGrad`) varies between train-step flavors; everything
 /// below is identical, so a future SFT masked-CE step reuses this function unchanged.
 ///
-/// `gradClip <= 0` disables clipping — mirrors Python's `if grad_clip:` truthiness check
-/// (default `1.0`, `0` is the "off" sentinel; MLX's `grad_clip: float = 1.0` signature).
+/// `gradClip == 0` disables clipping — mirrors Python's `if grad_clip:` truthiness check
+/// exactly (default `1.0`, `0` is the "off" sentinel; MLX's `grad_clip: float = 1.0`
+/// signature). A negative `gradClip` is truthy in Python too (clipping stays enabled,
+/// producing a negative — nonsensical but reproduced — scale factor), so this checks
+/// `!= 0` rather than `> 0` to match that behavior bit-for-bit instead of silently
+/// diverging on out-of-range inputs (#293 review).
 /// MoE Loss-Free-Balancing (`balancer` in Python) is DEFERRED (see the plan) — this
 /// function has no `balancer` parameter at all, matching the deferral rather than
 /// threading an always-nil one through.
@@ -174,7 +178,7 @@ public func accumulateAndStep(
     // R2: hand-rolled to match `min(1.0, grad_clip / (norm + 1e-6))` UNCONDITIONALLY —
     // deliberately NOT `MLXOptimizers.clipGradNorm`, whose strict `totalNorm .< maxNorm`
     // branch differs from Python's form at and just above the clip boundary.
-    if gradClip > 0 {
+    if gradClip != 0 {
         let factor = MLX.minimum(MLXArray(Float(1.0)), MLXArray(gradClip) / (norm + MLXArray(Float(1e-6))))
         grads = scaleTree(grads, factor)
     }
