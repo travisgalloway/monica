@@ -131,7 +131,7 @@ public enum Checkpoint {
     /// half-written weights file. `MambaConfig.save(sidecar:)` does its own atomic write
     /// for the sidecar.
     public static func save(_ model: MonicaModel, to weightsURL: URL) throws {
-        var sd = portableStateDict(model)
+        let sd = portableStateDict(model)
         for (k, v) in sd where v.dtype == .bfloat16 {
             // `safetensors.numpy.load_file` (what `load_weights_dict` uses on the Python
             // side) has no bf16 numpy dtype and would fail on the Python side, far from
@@ -144,18 +144,6 @@ public enum Checkpoint {
         // Realize the lazy graph before handing arrays to mlx-swift's `save`, which
         // needs concrete (not lazily-graphed) arrays.
         MLX.eval(Array(sd.values))
-
-        // Force each tensor into a genuinely independent, host-backed buffer — a real
-        // byte-for-byte copy, not merely an evaluated-but-possibly-shared handle. Without
-        // this, a parameter whose value was produced in place over a buffer this process
-        // still shares with (or aliases the identity of) an earlier load/eval graph node
-        // can, in edge cases, have its write dispatch resolve against stale/shared state
-        // instead of the model's current values — exactly the failure mode #196's
-        // round-trip (b) mutation check guards against ("the writer may be copying the
-        // source file rather than serializing the model's actual parameters"). Routing
-        // through `asData(access: .copy)` (an explicit host memcpy) and rebuilding a
-        // fresh `MLXArray` from those bytes breaks any such aliasing unconditionally.
-        sd = sd.mapValues { MLXArray(data: $0.asData(access: .copy)) }
 
         let fm = FileManager.default
         let dir = weightsURL.deletingLastPathComponent()
