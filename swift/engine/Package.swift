@@ -75,6 +75,10 @@ let package = Package(
                 // (see docs/design/14-inference-engine.md and .claude/plans/issue-167.md):
                 // the name form fails with "unknown package … valid packages are: 'swift'".
                 .product(name: "MonicaTokenizer", package: "swift"),
+                // #197: the native LSP masker (--lsp-mask flags below). Same "swift" path-
+                // dependency identity as the tokenizer edge above — no new external
+                // dependency, since `swift/Package.swift` still declares `dependencies: []`.
+                .product(name: "MonicaLSP", package: "swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

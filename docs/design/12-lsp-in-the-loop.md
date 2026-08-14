@@ -962,6 +962,107 @@ the issue's acceptance criteria) is a follow-up run, not yet executed as of this
 section will be updated with the actual numbers once it lands
 (`.venv/bin/python scripts/eval_completion_mask.py --seeds 0,1,2 --temperature 0.2`).
 
+## A native Swift harness for the fast loop (#197)
+
+#197 (M13 #163) ports the `completions`-driven fast loop above to Swift — `MonicaLSP`
+(`swift/Sources/MonicaLSP/`), a new target in the zero-dependency `swift/` (`MonicaTokenizer`)
+package, wired into `monica-generate --lsp-mask`. This is a **latency/native-path** change, not a
+re-litigation of the Verdict/Assessment sections below: the repo has already measured that LSP
+signal raises clean rate (0.887→0.962) while leaving functional pass@1 flat (~0.503, see
+"Assessment / conclusion" below), and #197 does not touch that finding.
+
+**What a Swift client can and cannot move**, decomposed up front so a passing bench can't quietly
+lean on the wrong term:
+
+- **`diagnostics`: no win is possible, by construction.** #278 (above) diagnosed ~350ms of the
+  measured round trip as a hardcoded **client-side debounce inside `typescript-language-server`
+  5.3.0** (`cli.mjs:17868`/`:20516`), not type-checking — that timer lives in the Node process on
+  the far side of the pipe, so no client-language rewrite touches it. #279 (a direct-`tsserver`
+  `semanticDiagnosticsSync` bypass) is the addressable path, and is a separate issue/transport
+  from #197.
+- **`completions` client-side round trip: the term Swift can move**, but the Python reference is
+  already 0.38ms median at 2,500+ calls/s (the #220 table above), so the ceiling on this term is
+  sub-millisecond.
+- **End-to-end masked-decode step time: the term that actually matters**, and most of its win
+  comes from #166/#169 (the native model step), not from this issue's LSP client. The masker
+  issues exactly **one completion query per identifier span, not per token** — reported as queries
+  per 100 generated tokens so that amortization stays visible rather than getting folded into a
+  single "tokens/s" number that hides where the query cost went.
+
+**Package placement — the same zero-dependency discipline as #191/#245's tokenizer.**
+`MonicaLSP` needs no MLX at all (`Process` + pipes + JSON + string scanning), so it lives in
+`swift/`, not `swift/engine/`: `swift/Package.swift` stays `dependencies: []` (a new *target*
+is not a new dependency *edge* — `swift package show-dependencies --format flatlist` is still
+empty), and the framing/demux/trie/scanner majority of the code — the parts with real
+correctness risk — is self-checked by `swift run monica-lsp --self-test` (binary-free, no
+subprocess, no node) on **both** `swift-macos` and `swift-linux` in CI. Only the wiring —
+`monica-generate`'s `--lsp-mask`/`--lsp-project`/`--lsp-file` flags constructing a `TsLspClient`
++ `CompletionMasker` and handing `allowedIdsFor:` to `Generator.generate` — lives in
+`swift/engine/`, gated by the macOS-only `swift-engine` CI job (mlx-swift). Absent the flags,
+`allowedIdsFor` stays `nil`: an exact no-op, matching this document's earlier "the unconstrained
+arm is a true control" property for `masked_decode.py`.
+
+**Reaping.** A leaked `typescript-language-server` looks fine locally and wedges CI, so
+`ProcessSupervisor` (`swift/Sources/MonicaLSP/ProcessSupervisor.swift`) is the only type allowed
+to own the child process, follows the same terminate → bounded-wait → kill → bounded-wait ladder
+as `src/lsp/ts_service.py:446`'s `_teardown_process`, and installs a process-wide
+`sig_atomic_t` + `SIGINT`/`SIGTERM`/`SIGHUP`/`atexit` backstop for the one exit path Swift's
+`defer` cannot cover (a signal that kills the process outright). `monica-lsp --probe-reap`
+exercises clean-close, a thrown error mid-session, a request timeout, an external `SIGINT`, and
+(informationally) an external `SIGKILL` — each in `--probe-reap`'s own child invocation — and
+empirically confirmed that the pinned `typescript-language-server` 5.3.0 honors the LSP
+`processId` parent-death watch: even a `SIGKILL`ed `monica-lsp` (no handler ever runs) leaves no
+orphaned server, because the child notices its parent pid is gone on its own. CI's orphan check
+(`ci.yml`'s `swift-macos` job) reruns this and asserts `pgrep -f 'typescript-language-server|tsserver'`
+does not grow across the run, guarded so a probe that never spawned a child reports BLIND rather
+than a vacuous pass.
+
+**Mask-set parity (V5).** Following #195's lesson (a checked-in gradient oracle proved
+irreducible across machines), no numeric fixture is checked in. `VocabTrie`/`allowedExtensions`
+are pure integer/string operations, so CI generates the expected allowed-id sets **at run time**
+from `src/serve/constrained.py` over a small fixed synthetic vocab/label pair and `cmp`s them
+against `monica-lsp --emit-mask-parity`'s output — bit-stable by construction, no floating point
+anywhere in the comparison.
+
+**Measured numbers** (local run, `n_files=500 iters=100`, same synthetic-project shape both
+sides, `swift run monica-lsp --bench` vs `scripts/bench_ts_lsp.py`; both PASS/non-BLIND —
+sanity probes confirmed real answers before timing started):
+
+| op          | Python median | Python calls/s | Swift median | Swift calls/s |
+|-------------|---------------:|---------------:|--------------:|---------------:|
+| completions |         0.34ms |          2,842 |         3.12ms |            317 |
+| quickinfo   |         0.27ms |          3,516 |         0.84ms |          1,053 |
+
+**Honest read: this naive Swift client is currently SLOWER than the Python reference on both
+ops**, not faster — the opposite of the a-priori expectation in Step 0's "a bounded win is
+plausible" framing. This is reported as-is rather than reframed, per the standing measurement
+discipline this document already follows elsewhere (e.g. the #211/#278 sections above). The
+most likely causes, none yet isolated by profiling (follow-up, not fixed in #197): (1)
+`JsonRpcEndpoint`'s per-message `JSONSerialization`/`NSDictionary` boxing, materially heavier
+than Python's `json` module for this message shape; (2) the `NSCondition`-based
+`ManualResetEvent`/`RpcWaiter` wait path, which is a fair port of the Python `threading.Event`
+model but has not been benchmarked against it in isolation; (3) `Process`/`Pipe`'s
+`FileHandle`-backed stdio vs Python `subprocess.Popen`'s raw fds. None of these are structural —
+they are implementation-detail overhead in a straightforward first port, not inherent to
+"Swift talking to the same server" — but until profiled, **the fast-loop latency win this
+program needs comes from #166/#169's native model step, not from this issue's LSP client term**,
+exactly the attribution Step 0 called for. A profiling/optimization pass is filed as a follow-up
+rather than guessed at here.
+
+The end-to-end masked-decode step (V9, `monica-generate --lsp-mask`) is gated CI-only on this
+host (`swift-engine`, mlx-swift needs a compiled Metal shader library this Command-Line-Tools-only
+Mac cannot produce) — it is a correctness gate (every masked-span token is a member of that
+span's allowed set), not a timing one, so it does not change the attribution above.
+
+**Boundary with #279.** #279 (open, not built here) owns a **Python** client speaking
+**tsserver's own protocol** (`semanticDiagnosticsSync`) to bypass the debounce for the type-aware
+eval arm's *diagnostics*. #197 owns a **Swift** client speaking **LSP** to
+`typescript-language-server`, driving *completions* for the decode-time mask. Different
+language, different transport, different op, different consumer — the only shared surface is the
+LSP framing layer, which each side writes independently, so neither blocks the other. If #279
+lands and the raw-protocol bypass proves worth it, a Swift port of that transport is a follow-up
+issue, not scope creep into #197.
+
 ## Verdict
 
 The persistent-LSP swap is **not a free upgrade over batch `tsc`**: it trades the slow loop's

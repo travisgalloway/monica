@@ -21,6 +21,7 @@
 import Foundation
 import MLX
 import MonicaEngine
+import MonicaLSP
 import MonicaTokenizer
 
 // MARK: - arg parsing (hand-rolled; mirrors monica-tokenize's parseFlags)
@@ -287,7 +288,8 @@ func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
 /// per-token decoding would emit replacement characters mid-multibyte. A real improvement
 /// over `scripts/generate.py`'s per-token `tok.decode([t])`.
 func streamCompletion(model: MonicaModel, tok: Tokenizer?, promptIds: [Int], sampler: Sampler,
-                      maxNewTokens: Int, eosId: Int?, usePrefill: Bool = true) throws {
+                      maxNewTokens: Int, eosId: Int?, usePrefill: Bool = true,
+                      allowedIdsFor: (([Int]) -> [Int]?)? = nil) throws {
     var generatedIds: [Int] = []
     var prevDecoded = ""
     _ = try Generator.generate(
@@ -306,7 +308,7 @@ func streamCompletion(model: MonicaModel, tok: Tokenizer?, promptIds: [Int], sam
             prevDecoded = full
             FileHandle.standardOutput.write(Data(delta.utf8))
             fflush(stdout)
-        }, usePrefill: usePrefill)
+        }, allowedIdsFor: allowedIdsFor, usePrefill: usePrefill)
     print()
 }
 
@@ -356,6 +358,79 @@ struct StandardError: TextOutputStream {
     mutating func write(_ string: String) { FileHandle.standardError.write(Data(string.utf8)) }
 }
 var standardError = StandardError()
+
+// MARK: - #197 LSP-masked decode wiring
+//
+// `--lsp-mask` builds a native `TsLspClient` + `CompletionMasker` (swift/Sources/MonicaLSP)
+// and hands `Generator.generate` an `allowedIdsFor` closure. Absent the flag, `allowedIdsFor`
+// stays `nil` — an exact no-op, so every existing `monica-generate` invocation (and CI step)
+// is byte-identical in behavior to before this issue (`masked_decode.py`'s "the unconstrained
+// arm is a true control" property, carried over).
+//
+// The EOS id is unioned into every non-nil mask HERE, not inside `CompletionMasker` — masking
+// must never make generation unstoppable (`src/lsp/masked_decode.py`'s invariant), and
+// keeping that fold at the call site keeps `MonicaLSP` model/tokenizer-agnostic.
+
+struct LspMaskSession {
+    let client: TsLspClient
+    let allowedIdsFor: ([Int]) -> [Int]?
+}
+
+func buildLspMaskSession(flags: [String: String], tok: Tokenizer, promptText: String,
+                         vocabSize: Int, eosId: Int?) -> LspMaskSession {
+    let setDirPath = flags["lsp-eval-set-dir"] ?? "../../eval_sets/ts_error_injection"
+    let setDir = URL(fileURLWithPath: setDirPath)
+    guard let argv = resolveTsLsp(setDir: setDir) else {
+        fail("--lsp-mask needs a typescript-language-server toolchain under "
+            + "\(setDir.path)/node_modules (run `npm ci` there), or pass "
+            + "--lsp-eval-set-dir pointing at one")
+    }
+    let tsconfigText = (try? String(contentsOf: setDir.appendingPathComponent("tsconfig.json"),
+                                     encoding: .utf8))
+        ?? "{\"compilerOptions\":{\"strict\":true,\"target\":\"es2020\",\"module\":\"commonjs\"}}"
+
+    let lspFile = flags["lsp-file"] ?? "gen.ts"
+    var projectFiles: [String: String] = [:]
+    if let projectDir = flags["lsp-project"] {
+        let base = URL(fileURLWithPath: projectDir)
+        if let enumerator = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator where fileURL.pathExtension == "ts" {
+                let rel = fileURL.path.replacingOccurrences(of: base.path + "/", with: "")
+                projectFiles[rel] = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+            }
+        }
+        if projectFiles[lspFile] == nil { projectFiles[lspFile] = "" }
+    } else {
+        // No project given: seed a minimal single-file program from the prompt text itself,
+        // so `--prompt` alone is enough to exercise --lsp-mask end to end (V9's Fixtures/toy
+        // usage has no real TS project to point at).
+        projectFiles[lspFile] = promptText
+    }
+
+    guard let client = try? TsLspClient(argv: argv, tsconfigText: tsconfigText, scratchParent: setDir) else {
+        fail("--lsp-mask: could not start typescript-language-server")
+    }
+    do {
+        try client.openProject(projectFiles, warmPath: lspFile)
+    } catch {
+        fail("--lsp-mask: openProject failed: \(error)")
+    }
+
+    let originalText = projectFiles[lspFile] ?? ""
+    let labelSource = LspLabels(client: client, path: lspFile)
+    let masker = CompletionMasker(labelSource: labelSource, path: lspFile,
+                                  decode: { ids in tok.decode(ids) },
+                                  encode: { s in tok.encode(s) })
+
+    let allowedIdsFor: ([Int]) -> [Int]? = { generatedIds in
+        let fullText = originalText + tok.decode(generatedIds)
+        guard let allowed = masker.maskFor(fullText, vocabSize: vocabSize) else { return nil }
+        var withEos = Set(allowed)
+        if let eos = eosId { withEos.insert(eos) }
+        return Array(withEos)
+    }
+    return LspMaskSession(client: client, allowedIdsFor: allowedIdsFor)
+}
 
 // MARK: - dispatch
 
@@ -433,9 +508,18 @@ func runMain(_ flags: [String: String]) {
         let promptIds = tok.encode(prompt)
         if promptIds.isEmpty { fail("--prompt encoded to zero tokens") }
         FileHandle.standardOutput.write(Data(prompt.utf8))
+
+        var lspSession: LspMaskSession? = nil
+        if flags["lsp-mask"] != nil {
+            lspSession = buildLspMaskSession(flags: flags, tok: tok, promptText: prompt,
+                                             vocabSize: model.config.vocabSize, eosId: eosId)
+        }
+        defer { lspSession?.client.close() }
+
         do {
             try streamCompletion(model: model, tok: tok, promptIds: promptIds, sampler: sampler,
-                                 maxNewTokens: maxNewTokens, eosId: eosId, usePrefill: usePrefill)
+                                 maxNewTokens: maxNewTokens, eosId: eosId, usePrefill: usePrefill,
+                                 allowedIdsFor: lspSession?.allowedIdsFor)
         } catch { fail("generation failed: \(error)") }
     } else {
         fail("provide --prompt <text>, --prompt-ids 1,2,3, --chat, or --self-test")
