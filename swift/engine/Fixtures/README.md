@@ -23,6 +23,9 @@ function and a mismatch between them is exactly the bug this harness exists to c
   sequence with `seg_ids`, exercising the packing-aware forward path (chunk-boundary SSM
   mask, boundary-aware conv, block-diagonal attention). See "The packed (`seg_ids`) oracle"
   below.
+* `hidden.{i}` (#264) — per-layer hidden states, checked UNCONDITIONALLY (not only on a
+  forward/step failure, as before #264) and `mixing.{i}` (#264/#100) — each Mamba layer's
+  head-averaged mixing matrix. See "Interpretability accessors (#264)" below.
 
 ## The checkpoint round trip (#196) adds NO fixture
 
@@ -48,16 +51,67 @@ comparisons by construction, which makes them immune to the cross-machine drift 
 | `weights.safetensors` | Portable weights, written by `MLXMambaModel.save` |
 | `weights.safetensors.config.json` | The `MambaConfig` sidecar — self-describing, so Swift needs no config override |
 | `inputs.safetensors` | `tokens` `int32 (B, L)` |
-| `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers` |
+| `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers` and (non-quantized fixtures only) `mixing.{i}` for each Mamba layer's absolute index (#264) |
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
-| `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. |
+| `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. Also #264's `verifyBlock` oracle — see below; it adds no new tensor. |
 | `packed.safetensors` (OPTIONAL) | `packed_tokens`/`packed_seg_ids` `int32 (1, Lp)`, `doc_lengths` `int32 (D,)` (real, pre-pad token count per doc), `packed_logits` `fp32 (1, Lp, V)` — #68/#263's packing-aware `seg_ids` oracle. Present only for `toy`/`toy-hybrid`/`toy-moe`; see "The packed (`seg_ids`) oracle" below. |
-| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, and (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len` |
+| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, and (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264) |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
-`i`'s output — the HF convention). `monica-parity` only reads it on failure, to report
-**which layer diverged first**; localizing a whole-model logit mismatch by hand across 24
-layers is otherwise a week's work.
+`i`'s output — the HF convention). As of #264 `monica-parity` checks it UNCONDITIONALLY on
+every fixture (previously only on a forward/step failure, to localize it) — a whole-model
+logit mismatch is still localized to "first divergence at layer N" the same way, but an
+accessor bug that leaves `forward`'s own separate loop unaffected (e.g. appending a hidden
+state before applying the layer, an off-by-one that shifts every later index) would
+previously never have fired this check at all.
+
+## Interpretability accessors (#264)
+
+Two more accessors, both `MonicaModel.mixingMatrices`/`SelectiveSSM.mixingMatrix`/
+`MonicaModel.verifyBlock` ports of the `#100`/`#52` Python interpretability/speculative-
+decoding auxiliaries (`mlx_backend.py:280-298`/`:426-435`/`:938-950`/`:897-920`), gated at
+the SAME strict fp32 contract as everything else here — interpretability accessors are not
+a lossy path, so neither uses the #168/#266 per-fixture `rtol`/`atol` hook.
+
+* **`mixing.{i}`** — each Mamba layer's head-averaged `(B, L, L)` mixing matrix, keyed by
+  its ABSOLUTE layer index (attention AND MoE layers are skipped — a MoE block is pointwise,
+  not a mixer). `meta.json`'s `mixing_layers` records which indices to expect; a fixture
+  whose config has at least one Mamba layer but an EMPTY `mixing_layers` would make the
+  whole section a silent no-op, so the exporter refuses to write one. `monica-parity`
+  additionally re-derives the FULL (un-averaged) per-head matrix of the first Mamba layer
+  in-process and checks two properties a numeric compare against the head-averaged oracle
+  alone cannot: strict causality (`max|upper triangle| == 0` exactly — `segsum`'s `-inf`
+  above the diagonal `exp`s to exact zero) and the defining identity
+  `einsum("bhij,bjhp->bihp", M, X) == ssm.parallel(x)`. Both catch a transposed or
+  wrongly-oriented matrix that a plain numeric diff against a head-averaged reference could
+  miss (averaging over heads can wash out an antisymmetric structural defect that survives
+  in the full tensor). Present only for non-quantized fixtures — quantization is a lossy
+  path and must not drag the loose #168/#266 tolerance hook into this strict gate (same
+  carve-out `packed.safetensors` already uses); `monica-parity` prints an explicit
+  `SKIP (no mixing oracle: quantized fixture)` line for `toy-moe-int8`/`toy-moe-int4`
+  rather than silently doing nothing.
+* **`verifyBlock`** — the #172 speculative-decoding prerequisite: consumes a batch of
+  tokens through `step` from a given state in ONE `MLX.eval`, returning per-token logits
+  and per-token states. Adds **no new checked-in tensor** (same rationale as the checkpoint
+  round trip above, and the reason #195's checked-in gradient oracle is not reproduced
+  here): `monica-parity` gates row 0's per-token logits against the already-checked-in
+  `step_logits`, the FINAL returned state against `prefill.safetensors`'s `state.{i}.{slot}`
+  sliced to row 0 (prefill's state after `L` tokens is, by contract, the stepped state
+  after `L` tokens — already gated Python-side by `check_prefill_decode_parity`), and an
+  in-process rollback identity — `states[k]` must equal a sequential `step` walk over
+  `tokens[0...k]` at `k=0` and mid-sequence — proving the per-token state list is not
+  simply the final state repeated. `verify_block` is MLX-only per
+  `docs/design/14-inference-engine.md`: not on `ModelInterface`, no CUDA port.
+
+`hiddenStates`/`mixingMatrices` under `seg_ids` are out of scope for #264: the packed
+(`seg_ids`) oracle above only carries `packed_logits`, and per-layer hidden states or
+mixing matrices under packing would need a new exporter key this issue does not add.
+
+`monica-generate --dump-activations <file.safetensors>` (#264) is the CLI surface these
+accessors get: given `--weights` + `--prompt-ids` (the tokenizer-free debug path, so no
+tokenizer is required), it writes `hidden.{i}`/`mixing.{i}` for the prompt batch using the
+SAME key convention as `reference.safetensors` above, so a user can diff a Swift dump
+against a Python one directly.
 
 `generation.safetensors`'s `prompt_ids` are the first `min(8, L)` ids of the token batch's
 row 0; `greedy_ids` are `gen_steps` (default 16) ids produced by driving `model.step`

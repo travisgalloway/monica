@@ -116,6 +116,19 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     from src.serve.sessions import SessionStore
     from src.train.checkpoint import save_weights
 
+    # #264: disable MLX's buffer-cache pool for the duration of this export. Diagnosed
+    # while adding the mixing-matrix oracle — this local MLX build (0.32.0) has been
+    # observed to silently corrupt a computation (deterministic-per-process, exact-shape
+    # results, no exceptions) when many independently-constructed `MLXMambaModel`s
+    # allocate/free/reuse buffers of the same size class in one process, which this
+    # exporter does far more of than any other caller (repeated regeneration, the #166
+    # staleness test re-invoking `build_fixture` inside an already-populated pytest
+    # process). `mx.set_cache_limit(0)` (proven in isolation to take the observed failure
+    # rate from ~50-100% down to 0/10 trials) trades allocator throughput — irrelevant for
+    # a one-shot fixture export — for correctness; it must not be ported into a hot
+    # training/inference path.
+    mx.clear_cache()
+    mx.set_cache_limit(0)
     mx.random.seed(seed)
     cfg = load_config(config_path)
     if precision is not None:
@@ -226,6 +239,25 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     # at layer 7" is the difference between an afternoon and a week. ~200 KB at toy scale.
     for i, h in enumerate(ref_model.hidden_states(tokens)):
         ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
+    # Per-layer head-averaged mixing matrices (#264), a second interpretability oracle
+    # alongside hidden.*: the #100 mixing-match accessor, gated at the same strict fp32
+    # tolerance. Only for non-quantized fixtures — quantization is a lossy path and must
+    # not drag the loose #168/#266 tolerance hook into this strict gate (same carve-out
+    # `packed.safetensors` already uses).
+    mixing_layers: list[int] = []
+    if quant_bits is None:
+        mixing = ref_model.mixing_matrices(tokens)          # [(layer_idx, (B,L,L))]
+        for i, m in mixing:
+            ref[f"mixing.{i}"] = np.array(m, dtype=np.float32)
+        mixing_layers = [i for i, _ in mixing]
+        # An empty list would make the whole Swift mixing-matrix section a silent no-op
+        # for any fixture whose config actually has a Mamba layer to mix.
+        has_mamba_layer = any(isinstance(l, MambaBlock) for l in ref_model.layers)
+        if has_mamba_layer and not mixing_layers:
+            raise SystemExit(
+                f"refusing to write {out_dir}: mixing_matrices() returned no layers for a "
+                "config with at least one Mamba layer — the mixing-matrix oracle would be "
+                "a silent no-op")
     save_file(ref, str(out / "reference.safetensors"))
     if dequant_ref:
         save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
@@ -395,6 +427,8 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         "prefill_decode_max_abs_state_diff": prefill_verdict["max_abs_state_diff"],
         "greedy_margin_min": min(margins) if margins else None,
     }
+    if quant_bits is None:
+        meta["mixing_layers"] = mixing_layers
     if packed_meta_doc_lengths is not None:
         # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
         # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded

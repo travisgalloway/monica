@@ -12,6 +12,10 @@
   "prefill_decode_max_abs_diff": 2.384185791015625e-07,
   "prefill_decode_max_abs_state_diff": 3.5762786865234375e-07,
   "greedy_margin_min": 6.3131983280181885,
+  "mixing_layers": [
+    0,
+    1
+  ],
   "packed_doc_lengths": [
     64,
     128,

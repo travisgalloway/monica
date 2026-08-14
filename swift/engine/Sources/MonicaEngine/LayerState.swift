@@ -14,6 +14,17 @@ public enum LayerState {
     case attention(k: MLXArray, v: MLXArray)
     /// MoE FFN blocks are pointwise and stateless.
     case moe
+
+    /// The `MLXArray` leaves of this state case (#264, `verifyBlock`'s prerequisite): lets
+    /// a caller collect every intermediate state across a whole token batch into ONE
+    /// `MLX.eval` call without a per-case switch of its own. `.moe` carries none.
+    public var arrays: [MLXArray] {
+        switch self {
+        case .mamba(let conv, let ssm): return [conv, ssm]
+        case .attention(let k, let v): return [k, v]
+        case .moe: return []
+        }
+    }
 }
 
 public enum EngineError: Error, CustomStringConvertible {

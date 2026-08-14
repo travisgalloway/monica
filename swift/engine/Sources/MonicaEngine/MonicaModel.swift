@@ -141,4 +141,63 @@ public final class MonicaModel: Module {
     public func moeBlocks() -> [MoEBlock] {
         layers.compactMap { $0 as? MoEBlock }
     }
+
+    // MARK: - interpretability accessors (`mixing_matrices`/`verify_block`, #264/#100/#52)
+
+    /// `mixing_matrices` (`mlx_backend.py:938-950`, corrected guard): each Mamba layer's
+    /// head-averaged mixing matrix `(B, L, L)` paired with its ABSOLUTE layer index.
+    /// Attention AND MoE layers are skipped — `layer as? MambaBlock` is the natural Swift
+    /// expression of that skip (an `AttentionBlock`/`MoEBlock` simply fails the cast).
+    /// Computed on the layer's INPUT before advancing `h`: computing after the advance
+    /// would pair layer `i`'s index with layer `i+1`'s input — same shape, wrong values,
+    /// the off-by-one hazard #264 flags.
+    public func mixingMatrices(_ tokens: MLXArray) -> [(Int, MLXArray)] {
+        var h = cast(embedding(tokens), config.cd)
+        var out: [(Int, MLXArray)] = []
+        for (i, layer) in layers.enumerated() {
+            if let mamba = layer as? MambaBlock {
+                out.append((i, mamba.mixingMatrix(h).mean(axis: 1)))   // head-average -> (B,L,L)
+            }
+            h = layer.forwardSeq(h, nil)
+        }
+        return out
+    }
+
+    /// `verify_block` (`mlx_backend.py:897-920`, #52's speculative-decoding prerequisite):
+    /// consumes `tokens` (HOST-side ids) through the `step` recurrence from `state`,
+    /// returning the per-token next-token logits and per-token states in a SINGLE
+    /// `MLX.eval`. `states[k]` is the state after consuming `tokens[0...k]`, so a caller
+    /// can roll back to an accepted prefix without recomputing — the wall-clock win comes
+    /// from one graph eval, not per-token launch/sync. Empty `tokens` returns `([], [])`.
+    ///
+    /// Throws `EngineError.stateMismatch` if any incoming state leaf's batch is not 1 —
+    /// `step`'s own `MLXArray([Int32(tok)])` token is shape `(1,)`, so this rejects
+    /// nothing a well-formed single-sequence `state` would pass; it just fails legibly
+    /// instead of via a broadcast error deep inside `step`.
+    public func verifyBlock(_ tokens: [Int], _ state: [LayerState])
+        throws -> (logits: [MLXArray], states: [[LayerState]])
+    {
+        for st in state {
+            if let leaf = st.arrays.first, leaf.dim(0) != 1 {
+                throw EngineError.stateMismatch(
+                    "verifyBlock: state batch must be 1, got \(leaf.dim(0))")
+            }
+        }
+        guard !tokens.isEmpty else { return ([], []) }
+        var logitsList: [MLXArray] = []
+        var stateList: [[LayerState]] = []
+        var hState = state
+        for tok in tokens {
+            let tokArr = MLXArray([Int32(tok)])
+            let (logit, newState) = try step(tokArr, hState)
+            logitsList.append(logit)
+            stateList.append(newState)
+            hState = newState
+        }
+        // One eval realizes the whole block (logits + every intermediate state) together.
+        var leaves = logitsList
+        leaves += stateList.flatMap { $0.flatMap(\.arrays) }
+        MLX.eval(leaves)
+        return (logitsList, stateList)
+    }
 }
