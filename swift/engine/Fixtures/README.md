@@ -403,9 +403,23 @@ Swift gate testing a stale oracle.
 
 ## `poc` is deliberately NOT checked in
 
-At fp32 the `config/poc.yaml` weights alone are ~508 MB. The exporter supports it and
-`monica-parity --fixtures <dir>` takes any fixture directory, so the poc run is a **manual,
-local acceptance step**, not a CI gate:
+At fp32 the `config/poc.yaml` fixture is **571 MB** total (`weights.safetensors` 507 MB,
+`reference.safetensors` 62.9 MB, `prefill.safetensors` 28.8 MB, the remaining 4 files under
+2 KB combined) — too large to check into git or Git LFS for a fixture that shares 100% of its
+code paths with `toy` (pure Mamba, no attention, no MoE) at larger dimensions.
+
+It IS still gated in CI (#267), just not on every PR: jobs `poc-fixture-oracle` +
+`poc-parity` in `.github/workflows/ci.yml`, triggered only on `workflow_dispatch` or a
+weekly `schedule` (Monday 09:17 UTC) — **never on `pull_request` or `push`**. Generation is
+cheap (measured on an M1 Pro): **5.2-5.8 s wall**, ~2 GB peak RSS — not the ~10 minutes an
+earlier draft of this note assumed — so the fixture is never checked in, and the **571 MB
+fixture output itself never crosses the network**: `poc-fixture-oracle` generates it, hashes
+it, and uploads only a **~2 KB sha256 manifest + `meta.json`** (those two small files *do*
+cross the network as a CI artifact); `poc-parity` regenerates its own independent copy on a
+second runner and `cmp`s the two manifests before trusting either as an oracle (the
+cross-process #298 guard below) — measured **bit-identical, 7/7 files**, during planning.
+
+Run it locally the same way CI does:
 
 ```bash
 .venv/bin/python scripts/export_parity_fixture.py \
@@ -414,8 +428,24 @@ local acceptance step**, not a CI gate:
 cd swift/engine && swift run monica-parity --fixtures /tmp/monica-poc-fixture
 ```
 
-poc shares 100% of its code paths with `toy` (pure Mamba, no attention, no MoE) at larger
-dimensions, so gating it in CI would need Git LFS or a ~10-minute in-runner generation step
-for no new coverage. The known upgrade path, if it is ever wanted: have the existing
-`full-macos` job (which already installs MLX) generate the fixture and hand it to a
-dependent job as an artifact.
+**Why generate-on-runner isn't vacuous.** The oracle (Python/MLX,
+`scripts/export_parity_fixture.py`) and the consumer (`swift/engine`'s hand-written
+mlx-swift port) share nothing but the `.safetensors` bytes — running them in the same CI
+run changes nothing about that independence; it only avoids paying to move 571 MB over the
+network. What this gate buys over `toy` is **scale coverage of the tolerance contract**,
+not new code-path coverage: at poc, `forward_step_max_abs_diff = 3.62e-05` (25x toy's
+1.43e-06) and `greedy_margin_min = 23.94`, so `src/conformance/tolerances.py`'s fp32 band
+(`rtol=1e-4/atol=1e-5`, derived on toy configs and assuming an absolute-dominated band at
+`|logit| ~ 8`) becomes **relative-dominated** at poc's larger logits. Headroom is still
+~66x, so the contract holds — but nothing kept that true before this gate existed.
+
+**The #298 cross-process guard.** #298 is silent, deterministic-per-process numerical
+corruption during MLX 0.32.0 export. Two independently-generated fixtures, on two separate
+runners, in two fresh processes, would have to corrupt identically to pass the manifest
+`diff` — so a `poc-fixture-oracle`/`poc-parity` manifest mismatch is treated as a #298
+sighting, not a flake to rerun past.
+
+**Why dispatch/schedule only, not per-PR.** `poc-parity` is a second macOS runner carrying
+an mlx-swift xcodebuild (warm-cache: minutes; cold: up to 40) plus a `pip install mlx` —
+against zero new code-path coverage over `toy`, that is not a per-PR trade worth making. See
+`docs/design/14-inference-engine.md` §Staged roadmap for the full record.
