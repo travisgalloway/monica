@@ -128,336 +128,344 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     # a one-shot fixture export — for correctness; it must not be ported into a hot
     # training/inference path.
     mx.clear_cache()
-    mx.set_cache_limit(0)
-    mx.random.seed(seed)
-    cfg = load_config(config_path)
-    if precision is not None:
-        # The harness gates fp32 (poc.yaml is fp16). Override BEFORE `model.save`, so the
-        # emitted sidecar is self-describing and the Swift loader needs no override of
-        # its own.
-        cfg.precision = precision
-        cfg.validate()
-    if vocab_size is not None:
-        # Alongside --precision: override BEFORE `model.save` so the sidecar stays
-        # self-describing and the Swift loader needs no override of its own. `toy-gen`
-        # (#167) uses this — a `monica-tokenize`-trained tokenizer's vocab (256 base bytes +
-        # specials) cannot fit `toy.yaml`'s 256-wide model, so the fixture widens the model
-        # instead of shrinking the tokenizer.
-        cfg.vocab_size = vocab_size
-        cfg.validate()
+    # #264 (review follow-up): capture the prior limit and restore it in `finally`
+    # below so the disable is scoped to this export, not process-global — while still
+    # covering the ENTIRE rest of the function (including every early `raise SystemExit`
+    # refusal path), so the cache stays off for the full duration the mitigation above
+    # depends on.
+    _prev_cache_limit = mx.set_cache_limit(0)
+    try:
+        mx.random.seed(seed)
+        cfg = load_config(config_path)
+        if precision is not None:
+            # The harness gates fp32 (poc.yaml is fp16). Override BEFORE `model.save`, so the
+            # emitted sidecar is self-describing and the Swift loader needs no override of
+            # its own.
+            cfg.precision = precision
+            cfg.validate()
+        if vocab_size is not None:
+            # Alongside --precision: override BEFORE `model.save` so the sidecar stays
+            # self-describing and the Swift loader needs no override of its own. `toy-gen`
+            # (#167) uses this — a `monica-tokenize`-trained tokenizer's vocab (256 base bytes +
+            # specials) cannot fit `toy.yaml`'s 256-wide model, so the fixture widens the model
+            # instead of shrinking the tokenizer.
+            cfg.vocab_size = vocab_size
+            cfg.validate()
 
-    model = MLXMambaModel(cfg)
+        model = MLXMambaModel(cfg)
 
-    if moe_bias:
-        # One fixture carries `moe_route_bias.*` keys, so the biased-ranking branch AND the
-        # loader's pop path are both exercised. A fixed, deliberately asymmetric vector:
-        # a uniform bias would not change the ranking and would gate nothing.
-        blocks = model.moe_blocks()
-        if not blocks:
-            raise SystemExit("--moe-bias needs a config with MoE layers")
-        model.set_moe_biases([
-            [0.5 * ((-1) ** e) * (e + 1) for e in range(cfg.n_experts)]
-            for _ in blocks
-        ])
+        if moe_bias:
+            # One fixture carries `moe_route_bias.*` keys, so the biased-ranking branch AND the
+            # loader's pop path are both exercised. A fixed, deliberately asymmetric vector:
+            # a uniform bias would not change the ranking and would gate nothing.
+            blocks = model.moe_blocks()
+            if not blocks:
+                raise SystemExit("--moe-bias needs a config with MoE layers")
+            model.set_moe_biases([
+                [0.5 * ((-1) ** e) * (e + 1) for e in range(cfg.n_experts)]
+                for _ in blocks
+            ])
 
-    # The exact token construction used by tests/test_mlx_parity.py.
-    tokens = np.random.default_rng(seed).integers(
-        0, cfg.vocab_size, size=(batch, seq)).astype(np.int32)
+        # The exact token construction used by tests/test_mlx_parity.py.
+        tokens = np.random.default_rng(seed).integers(
+            0, cfg.vocab_size, size=(batch, seq)).astype(np.int32)
 
-    # --- #168: quantize, and point the rest of the export at the FAKE-QUANT reference ---
-    quant_block = None
-    fp_forward_logits = None
-    dequant_ref = {}
-    # `ref_model` is what forward_logits/step_logits/hidden.*/generation.safetensors get
-    # computed from — the fp model normally, or the fake-quant (dequantized) reference
-    # for a quantized fixture. `weights_sd`/`weights_quant` are what actually gets
-    # written to weights.safetensors: the fp portable state dict normally, or the REAL
-    # packed checkpoint for a quantized fixture (never the fake-quant float weights).
-    ref_model = model
-    weights_sd = None   # None => use ref_model.save() (fp path, unchanged from before)
-    if quant_bits is not None:
-        fp_forward_logits = np.array(model.forward(tokens), dtype=np.float32)
-        sd = model._portable_state_dict()
-        targets = quant_targets(sd, group_size=quant_group_size, bits=quant_bits,
-                                head_bits=quant_head_bits)
-        if not targets:
+        # --- #168: quantize, and point the rest of the export at the FAKE-QUANT reference ---
+        quant_block = None
+        fp_forward_logits = None
+        dequant_ref = {}
+        # `ref_model` is what forward_logits/step_logits/hidden.*/generation.safetensors get
+        # computed from — the fp model normally, or the fake-quant (dequantized) reference
+        # for a quantized fixture. `weights_sd`/`weights_quant` are what actually gets
+        # written to weights.safetensors: the fp portable state dict normally, or the REAL
+        # packed checkpoint for a quantized fixture (never the fake-quant float weights).
+        ref_model = model
+        weights_sd = None   # None => use ref_model.save() (fp path, unchanged from before)
+        if quant_bits is not None:
+            fp_forward_logits = np.array(model.forward(tokens), dtype=np.float32)
+            sd = model._portable_state_dict()
+            targets = quant_targets(sd, group_size=quant_group_size, bits=quant_bits,
+                                    head_bits=quant_head_bits)
+            if not targets:
+                raise SystemExit(
+                    f"--quant-bits {quant_bits}: no quantizable tensors for "
+                    f"group_size={quant_group_size} against config {config_path}")
+            qsd, quant_block = quantize_portable_state_dict(sd, targets, group_size=quant_group_size)
+            deq_sd = dequantize_portable_state_dict(qsd, quant_block)
+            for path in targets:
+                dequant_ref[f"{path}.weight"] = np.asarray(deq_sd[f"{path}.weight"], dtype=np.float32)
+            qmodel = MLXMambaModel(cfg)
+            qmodel._load_portable(deq_sd)
+            ref_model = qmodel
+            weights_sd = qsd
+
+        # A fixture that fails PYTHON's own forward/step gate must never reach disk — it would
+        # make the Swift gate compare against a reference that is itself internally inconsistent.
+        verdict = check_forward_step_parity(ref_model, tokens, to_numpy=np.array)
+        if not verdict["ok"]:
             raise SystemExit(
-                f"--quant-bits {quant_bits}: no quantizable tensors for "
-                f"group_size={quant_group_size} against config {config_path}")
-        qsd, quant_block = quantize_portable_state_dict(sd, targets, group_size=quant_group_size)
-        deq_sd = dequantize_portable_state_dict(qsd, quant_block)
-        for path in targets:
-            dequant_ref[f"{path}.weight"] = np.asarray(deq_sd[f"{path}.weight"], dtype=np.float32)
-        qmodel = MLXMambaModel(cfg)
-        qmodel._load_portable(deq_sd)
-        ref_model = qmodel
-        weights_sd = qsd
+                f"refusing to write {out_dir}: the Python model fails its own forward/step "
+                f"parity check (max_abs_diff={verdict['max_abs_diff']:.3e})")
 
-    # A fixture that fails PYTHON's own forward/step gate must never reach disk — it would
-    # make the Swift gate compare against a reference that is itself internally inconsistent.
-    verdict = check_forward_step_parity(ref_model, tokens, to_numpy=np.array)
-    if not verdict["ok"]:
-        raise SystemExit(
-            f"refusing to write {out_dir}: the Python model fails its own forward/step "
-            f"parity check (max_abs_diff={verdict['max_abs_diff']:.3e})")
-
-    # Same rule for #169's state handoff: a fixture whose own Python prefill state
-    # disagrees with its stepped state (or whose prefill logits disagree with forward, or
-    # whose prefill-then-decode disagrees with pure step-by-step) can never reach disk —
-    # it would make the Swift gate compare against an internally-inconsistent oracle.
-    prefill_verdict = check_prefill_decode_parity(
-        ref_model, tokens, to_numpy=np.array, n_decode=min(4, seq - 1))
-    if not prefill_verdict["ok"]:
-        raise SystemExit(
-            f"refusing to write {out_dir}: the Python model fails its own prefill/decode "
-            f"parity check ({prefill_verdict})")
-
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    weights_path = str(out / "weights.safetensors")
-    if weights_sd is None:
-        ref_model.save(weights_path)        # weights.safetensors + .config.json sidecar
-    else:
-        save_weights(weights_sd, weights_path, config=cfg, quant=quant_block)
-
-    save_file({"tokens": tokens}, str(out / "inputs.safetensors"))
-
-    forward_logits = np.array(ref_model.forward(tokens), dtype=np.float32)
-    state = ref_model.init_state(batch)
-    steps = []
-    for t in range(seq):
-        logits_t, state = ref_model.step(tokens[:, t], state)
-        steps.append(np.array(logits_t, dtype=np.float32))
-    step_logits = np.stack(steps, axis=1)
-
-    ref = {"forward_logits": forward_logits, "step_logits": step_logits}
-    if fp_forward_logits is not None:
-        ref["fp_forward_logits"] = fp_forward_logits
-    # Per-layer hidden states: a deliberate debugging investment. A whole-model logit
-    # mismatch is nearly impossible to localize by hand across 24 layers; "first divergence
-    # at layer 7" is the difference between an afternoon and a week. ~200 KB at toy scale.
-    for i, h in enumerate(ref_model.hidden_states(tokens)):
-        ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
-    # Per-layer head-averaged mixing matrices (#264), a second interpretability oracle
-    # alongside hidden.*: the #100 mixing-match accessor, gated at the same strict fp32
-    # tolerance. Only for non-quantized fixtures — quantization is a lossy path and must
-    # not drag the loose #168/#266 tolerance hook into this strict gate (same carve-out
-    # `packed.safetensors` already uses).
-    mixing_layers: list[int] = []
-    if quant_bits is None:
-        mixing = ref_model.mixing_matrices(tokens)          # [(layer_idx, (B,L,L))]
-        for i, m in mixing:
-            ref[f"mixing.{i}"] = np.array(m, dtype=np.float32)
-        mixing_layers = [i for i, _ in mixing]
-        # An empty list would make the whole Swift mixing-matrix section a silent no-op
-        # for any fixture whose config actually has a Mamba layer to mix.
-        has_mamba_layer = any(isinstance(l, MambaBlock) for l in ref_model.layers)
-        if has_mamba_layer and not mixing_layers:
+        # Same rule for #169's state handoff: a fixture whose own Python prefill state
+        # disagrees with its stepped state (or whose prefill logits disagree with forward, or
+        # whose prefill-then-decode disagrees with pure step-by-step) can never reach disk —
+        # it would make the Swift gate compare against an internally-inconsistent oracle.
+        prefill_verdict = check_prefill_decode_parity(
+            ref_model, tokens, to_numpy=np.array, n_decode=min(4, seq - 1))
+        if not prefill_verdict["ok"]:
             raise SystemExit(
-                f"refusing to write {out_dir}: mixing_matrices() returned no layers for a "
-                "config with at least one Mamba layer — the mixing-matrix oracle would be "
-                "a silent no-op")
-    save_file(ref, str(out / "reference.safetensors"))
-    if dequant_ref:
-        save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
+                f"refusing to write {out_dir}: the Python model fails its own prefill/decode "
+                f"parity check ({prefill_verdict})")
 
-    # --- prefill.safetensors: the state-handoff oracle (#169) -----------------------------
-    # One entry per STATEFUL leaf, keyed by layer index and slot, derived from the layer's
-    # CLASS (not tensor shapes) — so Swift, which iterates its OWN layers and demands
-    # exactly the keys its own LayerState case implies, fails loudly on a missing key if the
-    # two sides ever disagree about layer structure, instead of silently skipping a check.
-    pre_logits, pre_state = ref_model.prefill(tokens)
-    pre_last, _ = ref_model.prefill(tokens, last_only=True)
-    prefill_out = {
-        "prefill_logits": np.array(pre_logits, dtype=np.float32),
-        "prefill_last_logits": np.array(pre_last, dtype=np.float32),
-    }
-    for i, (layer, st) in enumerate(zip(ref_model.layers, pre_state)):
-        if isinstance(layer, MambaBlock):
-            conv, ssm = st
-            prefill_out[f"state.{i}.conv"] = np.array(conv, dtype=np.float32)
-            prefill_out[f"state.{i}.ssm"] = np.array(ssm, dtype=np.float32)
-        elif isinstance(layer, AttentionBlock):
-            k, v = st
-            prefill_out[f"state.{i}.k"] = np.array(k, dtype=np.float32)
-            prefill_out[f"state.{i}.v"] = np.array(v, dtype=np.float32)
-        elif isinstance(layer, MoEBlock):
-            pass   # stateless — emitting a zero-sized placeholder would only add a
-                   # round-tripping risk for no coverage; Swift's .moe case carries nothing.
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        weights_path = str(out / "weights.safetensors")
+        if weights_sd is None:
+            ref_model.save(weights_path)        # weights.safetensors + .config.json sidecar
         else:
+            save_weights(weights_sd, weights_path, config=cfg, quant=quant_block)
+
+        save_file({"tokens": tokens}, str(out / "inputs.safetensors"))
+
+        forward_logits = np.array(ref_model.forward(tokens), dtype=np.float32)
+        state = ref_model.init_state(batch)
+        steps = []
+        for t in range(seq):
+            logits_t, state = ref_model.step(tokens[:, t], state)
+            steps.append(np.array(logits_t, dtype=np.float32))
+        step_logits = np.stack(steps, axis=1)
+
+        ref = {"forward_logits": forward_logits, "step_logits": step_logits}
+        if fp_forward_logits is not None:
+            ref["fp_forward_logits"] = fp_forward_logits
+        # Per-layer hidden states: a deliberate debugging investment. A whole-model logit
+        # mismatch is nearly impossible to localize by hand across 24 layers; "first divergence
+        # at layer 7" is the difference between an afternoon and a week. ~200 KB at toy scale.
+        for i, h in enumerate(ref_model.hidden_states(tokens)):
+            ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
+        # Per-layer head-averaged mixing matrices (#264), a second interpretability oracle
+        # alongside hidden.*: the #100 mixing-match accessor, gated at the same strict fp32
+        # tolerance. Only for non-quantized fixtures — quantization is a lossy path and must
+        # not drag the loose #168/#266 tolerance hook into this strict gate (same carve-out
+        # `packed.safetensors` already uses).
+        mixing_layers: list[int] = []
+        if quant_bits is None:
+            mixing = ref_model.mixing_matrices(tokens)          # [(layer_idx, (B,L,L))]
+            for i, m in mixing:
+                ref[f"mixing.{i}"] = np.array(m, dtype=np.float32)
+            mixing_layers = [i for i, _ in mixing]
+            # An empty list would make the whole Swift mixing-matrix section a silent no-op
+            # for any fixture whose config actually has a Mamba layer to mix.
+            has_mamba_layer = any(isinstance(l, MambaBlock) for l in ref_model.layers)
+            if has_mamba_layer and not mixing_layers:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: mixing_matrices() returned no layers for a "
+                    "config with at least one Mamba layer — the mixing-matrix oracle would be "
+                    "a silent no-op")
+        save_file(ref, str(out / "reference.safetensors"))
+        if dequant_ref:
+            save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
+
+        # --- prefill.safetensors: the state-handoff oracle (#169) -----------------------------
+        # One entry per STATEFUL leaf, keyed by layer index and slot, derived from the layer's
+        # CLASS (not tensor shapes) — so Swift, which iterates its OWN layers and demands
+        # exactly the keys its own LayerState case implies, fails loudly on a missing key if the
+        # two sides ever disagree about layer structure, instead of silently skipping a check.
+        pre_logits, pre_state = ref_model.prefill(tokens)
+        pre_last, _ = ref_model.prefill(tokens, last_only=True)
+        prefill_out = {
+            "prefill_logits": np.array(pre_logits, dtype=np.float32),
+            "prefill_last_logits": np.array(pre_last, dtype=np.float32),
+        }
+        for i, (layer, st) in enumerate(zip(ref_model.layers, pre_state)):
+            if isinstance(layer, MambaBlock):
+                conv, ssm = st
+                prefill_out[f"state.{i}.conv"] = np.array(conv, dtype=np.float32)
+                prefill_out[f"state.{i}.ssm"] = np.array(ssm, dtype=np.float32)
+            elif isinstance(layer, AttentionBlock):
+                k, v = st
+                prefill_out[f"state.{i}.k"] = np.array(k, dtype=np.float32)
+                prefill_out[f"state.{i}.v"] = np.array(v, dtype=np.float32)
+            elif isinstance(layer, MoEBlock):
+                pass   # stateless — emitting a zero-sized placeholder would only add a
+                       # round-tripping risk for no coverage; Swift's .moe case carries nothing.
+            else:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: layer {i} has unrecognized type "
+                    f"{type(layer).__name__} — teach the exporter its state slot names")
+        save_file(prefill_out, str(out / "prefill.safetensors"))
+
+        # --- packed.safetensors: the packing-aware seg_ids oracle (#68/#263) -------------------
+        # Only for non-quantized fixtures (`quant_bits is None`): quantized packing is a
+        # separate concern and would drag the loose #168/#266 tolerance hook into a gate this
+        # issue keeps STRICT (fp32 rtol=1e-4/atol=1e-5, same as the other fixture arrays).
+        # Uses the SAME packing rule `check_doc_boundary_parity` uses — that function is the
+        # contract, not reinvented here — so this artifact is a Swift-consumable snapshot of
+        # exactly what the Python conformance gate already checks.
+        packed_meta_doc_lengths = None
+        packed_meta_seq_len = None
+        if packed_doc_lengths is not None and quant_bits is None:
+            Q = cfg.chunk_size or 64
+            doc_lens = _resolve_packed_doc_lengths(packed_doc_lengths, Q)
+            rng = np.random.default_rng(seed)
+            docs = [rng.integers(0, cfg.vocab_size, size=n).tolist() for n in doc_lens]
+
+            packed: list[int] = []
+            seg: list[int] = []
+            for d, doc in enumerate(docs):
+                n = len(doc)
+                plen = ((n + Q - 1) // Q) * Q
+                packed.extend(doc + [0] * (plen - n))   # pad_id=0, following the real tokens
+                seg.extend([d] * plen)
+
+            packed_arr = np.asarray(packed, dtype=np.int32)[None]      # (1, Lp)
+            seg_arr = np.asarray(seg, dtype=np.int32)[None]            # (1, Lp)
+
+            # A single-document (or otherwise degenerate) fixture would make the whole Swift
+            # P6 gate vacuous — assert this in the export path, not only by eye (the plan's
+            # "Verification" step 5 rule).
+            if len(set(seg)) < 2:
+                raise SystemExit(
+                    f"refusing to write {out_dir}/packed.safetensors: packed_doc_lengths="
+                    f"{doc_lens!r} produced only {len(set(seg))} distinct document id(s) — "
+                    "the anti-no-op gate would be vacuous")
+            expected_len = sum(((n + Q - 1) // Q) * Q for n in doc_lens)
+            assert seg_arr.shape[1] == expected_len, (
+                f"packed sequence length {seg_arr.shape[1]} != expected {expected_len} for "
+                f"doc_lengths={doc_lens!r}, chunk_size={Q}")
+
+            packed_logits = np.asarray(
+                ref_model.forward(packed_arr, seg_arr), dtype=np.float32)   # (1, Lp, V)
+
+            save_file({
+                "packed_tokens": packed_arr,
+                "packed_seg_ids": seg_arr,
+                "doc_lengths": np.asarray(doc_lens, dtype=np.int32),
+                "packed_logits": packed_logits,
+            }, str(out / "packed.safetensors"))
+            packed_meta_doc_lengths = doc_lens
+            packed_meta_seq_len = int(seg_arr.shape[1])
+
+        # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
+        # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
+        # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
+        # `monica-parity` reproduces in Swift) with temperature=0 (argmax, first-max-on-tie).
+        rtol_gen, atol_gen = 1e-4, 1e-5
+        if quant_bits is not None:
+            # Quantization shrinks logit margins, and Swift will decode this fixture through
+            # the TRUE quantized kernel (not the dequantized fake-quant reference this
+            # margin check runs against) — accumulation-order differences can plausibly flip
+            # a near-tie argmax even where fp32-vs-fp32 would not. Require a much wider
+            # margin here than the base fp32 parity band demands.
+            atol_gen = max(atol_gen, 0.25)
+        prompt_len = min(8, seq)
+        prompt_ids = [int(t) for t in tokens[0, :prompt_len].tolist()]
+
+        state = ref_model.init_state(1)
+        logits = None
+        for t in prompt_ids:
+            logits, state = ref_model.step(np.array([t], dtype=np.int64), state)
+
+        greedy_ids: list[int] = []
+        margins: list[float] = []
+        top1s: list[float] = []
+        for _ in range(gen_steps):
+            row = np.array(logits, dtype=np.float32).reshape(-1)
+            nxt = int(np.argmax(row))
+            top1 = float(row[nxt])
+            row2 = row.copy()
+            row2[nxt] = -np.inf
+            top2 = float(row2.max())
+            margins.append(top1 - top2)
+            top1s.append(top1)
+            greedy_ids.append(nxt)
+            logits, state = ref_model.step(np.array([nxt], dtype=np.int64), state)
+
+        # A near-tie greedy argmax makes cross-implementation id equality ill-posed: two fp32
+        # implementations that agree to 1e-4 relative can still cross a near-zero margin and pick
+        # different tokens. Refusing to write a flaky fixture is the point — see the module
+        # docstring's rationale and swift/engine/Fixtures/README.md.
+        bad_steps = [i for i, (m, t1) in enumerate(zip(margins, top1s))
+                    if m < atol_gen + rtol_gen * abs(t1)]
+        if bad_steps:
             raise SystemExit(
-                f"refusing to write {out_dir}: layer {i} has unrecognized type "
-                f"{type(layer).__name__} — teach the exporter its state slot names")
-    save_file(prefill_out, str(out / "prefill.safetensors"))
+                f"refusing to write {out_dir}: greedy margin at step(s) {bad_steps} is inside the "
+                f"parity band (atol={atol_gen} + rtol={rtol_gen}*|top1|) — a near-tie argmax makes "
+                "cross-implementation id equality flaky. Bump --seed or --gen-steps and retry "
+                f"(margins={margins})")
 
-    # --- packed.safetensors: the packing-aware seg_ids oracle (#68/#263) -------------------
-    # Only for non-quantized fixtures (`quant_bits is None`): quantized packing is a
-    # separate concern and would drag the loose #168/#266 tolerance hook into a gate this
-    # issue keeps STRICT (fp32 rtol=1e-4/atol=1e-5, same as the other fixture arrays).
-    # Uses the SAME packing rule `check_doc_boundary_parity` uses — that function is the
-    # contract, not reinvented here — so this artifact is a Swift-consumable snapshot of
-    # exactly what the Python conformance gate already checks.
-    packed_meta_doc_lengths = None
-    packed_meta_seq_len = None
-    if packed_doc_lengths is not None and quant_bits is None:
-        Q = cfg.chunk_size or 64
-        doc_lens = _resolve_packed_doc_lengths(packed_doc_lengths, Q)
-        rng = np.random.default_rng(seed)
-        docs = [rng.integers(0, cfg.vocab_size, size=n).tolist() for n in doc_lens]
-
-        packed: list[int] = []
-        seg: list[int] = []
-        for d, doc in enumerate(docs):
-            n = len(doc)
-            plen = ((n + Q - 1) // Q) * Q
-            packed.extend(doc + [0] * (plen - n))   # pad_id=0, following the real tokens
-            seg.extend([d] * plen)
-
-        packed_arr = np.asarray(packed, dtype=np.int32)[None]      # (1, Lp)
-        seg_arr = np.asarray(seg, dtype=np.int32)[None]            # (1, Lp)
-
-        # A single-document (or otherwise degenerate) fixture would make the whole Swift
-        # P6 gate vacuous — assert this in the export path, not only by eye (the plan's
-        # "Verification" step 5 rule).
-        if len(set(seg)) < 2:
+        # --- prefill parity: assert the SessionStore/generate.py path agrees, id-for-id ---------
+        # Ties the fixture to "the same token ids as scripts/generate.py greedy", not to an
+        # exporter-private step loop.
+        store = SessionStore(ref_model, max_concurrent=1)
+        store.create("fixture")
+        greedy_sampler = partial(sampling.sample, temperature=0.0)
+        via_generate = py_generate(store, "fixture", prompt_ids, sampler=greedy_sampler,
+                                   to_numpy=np.array, max_new_tokens=gen_steps)
+        store.remove("fixture")
+        if via_generate != greedy_ids:
             raise SystemExit(
-                f"refusing to write {out_dir}/packed.safetensors: packed_doc_lengths="
-                f"{doc_lens!r} produced only {len(set(seg))} distinct document id(s) — "
-                "the anti-no-op gate would be vacuous")
-        expected_len = sum(((n + Q - 1) // Q) * Q for n in doc_lens)
-        assert seg_arr.shape[1] == expected_len, (
-            f"packed sequence length {seg_arr.shape[1]} != expected {expected_len} for "
-            f"doc_lengths={doc_lens!r}, chunk_size={Q}")
-
-        packed_logits = np.asarray(
-            ref_model.forward(packed_arr, seg_arr), dtype=np.float32)   # (1, Lp, V)
+                f"refusing to write {out_dir}: step-driven greedy_ids {greedy_ids} disagree with "
+                f"src.serve.generate's prefill-based path {via_generate} — the two Python code "
+                "paths (step-by-step vs one-shot prefill) must produce identical greedy ids "
+                "(src/conformance/prefill_decode_parity.py's contract)")
 
         save_file({
-            "packed_tokens": packed_arr,
-            "packed_seg_ids": seg_arr,
-            "doc_lengths": np.asarray(doc_lens, dtype=np.int32),
-            "packed_logits": packed_logits,
-        }, str(out / "packed.safetensors"))
-        packed_meta_doc_lengths = doc_lens
-        packed_meta_seq_len = int(seg_arr.shape[1])
+            "prompt_ids": np.array(prompt_ids, dtype=np.int32),
+            "greedy_ids": np.array(greedy_ids, dtype=np.int32),
+            "margins": np.array(margins, dtype=np.float32),
+        }, str(out / "generation.safetensors"))
 
-    # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
-    # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
-    # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
-    # `monica-parity` reproduces in Swift) with temperature=0 (argmax, first-max-on-tie).
-    rtol_gen, atol_gen = 1e-4, 1e-5
-    if quant_bits is not None:
-        # Quantization shrinks logit margins, and Swift will decode this fixture through
-        # the TRUE quantized kernel (not the dequantized fake-quant reference this
-        # margin check runs against) — accumulation-order differences can plausibly flip
-        # a near-tie argmax even where fp32-vs-fp32 would not. Require a much wider
-        # margin here than the base fp32 parity band demands.
-        atol_gen = max(atol_gen, 0.25)
-    prompt_len = min(8, seq)
-    prompt_ids = [int(t) for t in tokens[0, :prompt_len].tolist()]
-
-    state = ref_model.init_state(1)
-    logits = None
-    for t in prompt_ids:
-        logits, state = ref_model.step(np.array([t], dtype=np.int64), state)
-
-    greedy_ids: list[int] = []
-    margins: list[float] = []
-    top1s: list[float] = []
-    for _ in range(gen_steps):
-        row = np.array(logits, dtype=np.float32).reshape(-1)
-        nxt = int(np.argmax(row))
-        top1 = float(row[nxt])
-        row2 = row.copy()
-        row2[nxt] = -np.inf
-        top2 = float(row2.max())
-        margins.append(top1 - top2)
-        top1s.append(top1)
-        greedy_ids.append(nxt)
-        logits, state = ref_model.step(np.array([nxt], dtype=np.int64), state)
-
-    # A near-tie greedy argmax makes cross-implementation id equality ill-posed: two fp32
-    # implementations that agree to 1e-4 relative can still cross a near-zero margin and pick
-    # different tokens. Refusing to write a flaky fixture is the point — see the module
-    # docstring's rationale and swift/engine/Fixtures/README.md.
-    bad_steps = [i for i, (m, t1) in enumerate(zip(margins, top1s))
-                if m < atol_gen + rtol_gen * abs(t1)]
-    if bad_steps:
-        raise SystemExit(
-            f"refusing to write {out_dir}: greedy margin at step(s) {bad_steps} is inside the "
-            f"parity band (atol={atol_gen} + rtol={rtol_gen}*|top1|) — a near-tie argmax makes "
-            "cross-implementation id equality flaky. Bump --seed or --gen-steps and retry "
-            f"(margins={margins})")
-
-    # --- prefill parity: assert the SessionStore/generate.py path agrees, id-for-id ---------
-    # Ties the fixture to "the same token ids as scripts/generate.py greedy", not to an
-    # exporter-private step loop.
-    store = SessionStore(ref_model, max_concurrent=1)
-    store.create("fixture")
-    greedy_sampler = partial(sampling.sample, temperature=0.0)
-    via_generate = py_generate(store, "fixture", prompt_ids, sampler=greedy_sampler,
-                               to_numpy=np.array, max_new_tokens=gen_steps)
-    store.remove("fixture")
-    if via_generate != greedy_ids:
-        raise SystemExit(
-            f"refusing to write {out_dir}: step-driven greedy_ids {greedy_ids} disagree with "
-            f"src.serve.generate's prefill-based path {via_generate} — the two Python code "
-            "paths (step-by-step vs one-shot prefill) must produce identical greedy ids "
-            "(src/conformance/prefill_decode_parity.py's contract)")
-
-    save_file({
-        "prompt_ids": np.array(prompt_ids, dtype=np.int32),
-        "greedy_ids": np.array(greedy_ids, dtype=np.int32),
-        "margins": np.array(margins, dtype=np.float32),
-    }, str(out / "generation.safetensors"))
-
-    meta = {
-        "config": os.path.basename(config_path),
-        "batch": batch,
-        "seq": seq,
-        "seed": seed,
-        "precision": cfg.precision,
-        "vocab_size": cfg.vocab_size,
-        "gen_steps": gen_steps,
-        "mlx_version": getattr(mx, "__version__", "unknown"),
-        "moe_bias": moe_bias,
-        "forward_step_max_abs_diff": verdict["max_abs_diff"],
-        "prefill_decode_max_abs_diff": prefill_verdict["max_abs_diff"],
-        "prefill_decode_max_abs_state_diff": prefill_verdict["max_abs_state_diff"],
-        "greedy_margin_min": min(margins) if margins else None,
-    }
-    if quant_bits is None:
-        meta["mixing_layers"] = mixing_layers
-    if packed_meta_doc_lengths is not None:
-        # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
-        # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded
-        # model config, not from here.
-        meta["packed_doc_lengths"] = packed_meta_doc_lengths
-        meta["packed_seq_len"] = packed_meta_seq_len
-    if quant_bits is not None:
-        from src.conformance.quant_parity import check_quant_parity
-        q = check_quant_parity(fp_forward_logits, forward_logits, bits=quant_bits)
-        # A quantized fixture carries its OWN rtol/atol (#168's minimal #266 hook) —
-        # deliberately looser than the fp32 gate's 1e-4/1e-5, and never applied to a
-        # fixture that omits them (monica-parity defaults absent rtol/atol to the fp32
-        # constants unchanged).
-        meta["rtol"] = 2e-2
-        meta["atol"] = 2e-2
-        meta["quant_bits"] = quant_bits
-        meta["quant_group_size"] = quant_group_size
-        meta["quant_targets"] = sorted(targets)
-        meta["quant_top1_agreement"] = q["top1_agreement"]
-        meta["quant_mean_kl"] = q["mean_kl"]
-        meta["quant_max_abs_drift"] = q["max_abs_drift"]
-        meta["quant_ok_vs_thresholds"] = q["ok"]
-        if not q["ok"]:
-            raise SystemExit(
-                f"refusing to write {out_dir}: quantized-vs-fp quality gate failed "
-                f"(top1={q['top1_agreement']:.4f} kl={q['mean_kl']:.4f}) — try "
-                "--quant-head-bits 8, a larger --quant-group-size, or a different seed")
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    return meta
+        meta = {
+            "config": os.path.basename(config_path),
+            "batch": batch,
+            "seq": seq,
+            "seed": seed,
+            "precision": cfg.precision,
+            "vocab_size": cfg.vocab_size,
+            "gen_steps": gen_steps,
+            "mlx_version": getattr(mx, "__version__", "unknown"),
+            "moe_bias": moe_bias,
+            "forward_step_max_abs_diff": verdict["max_abs_diff"],
+            "prefill_decode_max_abs_diff": prefill_verdict["max_abs_diff"],
+            "prefill_decode_max_abs_state_diff": prefill_verdict["max_abs_state_diff"],
+            "greedy_margin_min": min(margins) if margins else None,
+        }
+        if quant_bits is None:
+            meta["mixing_layers"] = mixing_layers
+        if packed_meta_doc_lengths is not None:
+            # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
+            # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded
+            # model config, not from here.
+            meta["packed_doc_lengths"] = packed_meta_doc_lengths
+            meta["packed_seq_len"] = packed_meta_seq_len
+        if quant_bits is not None:
+            from src.conformance.quant_parity import check_quant_parity
+            q = check_quant_parity(fp_forward_logits, forward_logits, bits=quant_bits)
+            # A quantized fixture carries its OWN rtol/atol (#168's minimal #266 hook) —
+            # deliberately looser than the fp32 gate's 1e-4/1e-5, and never applied to a
+            # fixture that omits them (monica-parity defaults absent rtol/atol to the fp32
+            # constants unchanged).
+            meta["rtol"] = 2e-2
+            meta["atol"] = 2e-2
+            meta["quant_bits"] = quant_bits
+            meta["quant_group_size"] = quant_group_size
+            meta["quant_targets"] = sorted(targets)
+            meta["quant_top1_agreement"] = q["top1_agreement"]
+            meta["quant_mean_kl"] = q["mean_kl"]
+            meta["quant_max_abs_drift"] = q["max_abs_drift"]
+            meta["quant_ok_vs_thresholds"] = q["ok"]
+            if not q["ok"]:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: quantized-vs-fp quality gate failed "
+                    f"(top1={q['top1_agreement']:.4f} kl={q['mean_kl']:.4f}) — try "
+                    "--quant-head-bits 8, a larger --quant-group-size, or a different seed")
+        (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+        return meta
+    finally:
+        mx.set_cache_limit(_prev_cache_limit)
 
 
 def main() -> None:

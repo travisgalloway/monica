@@ -173,12 +173,16 @@ public final class MonicaModel: Module {
     /// Throws `EngineError.stateMismatch` if any incoming state leaf's batch is not 1 —
     /// `step`'s own `MLXArray([Int32(tok)])` token is shape `(1,)`, so this rejects
     /// nothing a well-formed single-sequence `state` would pass; it just fails legibly
-    /// instead of via a broadcast error deep inside `step`.
+    /// instead of via a broadcast error deep inside `step`. Checks EVERY leaf of every
+    /// `LayerState` (`.arrays`, not just `.arrays.first`) — a mamba/attention state
+    /// carries two leaves (conv+ssm, k+v), and a mismatch confined to the second leaf
+    /// must not slip past this guard and surface later as a less legible broadcast/shape
+    /// error inside `step`.
     public func verifyBlock(_ tokens: [Int], _ state: [LayerState])
         throws -> (logits: [MLXArray], states: [[LayerState]])
     {
         for st in state {
-            if let leaf = st.arrays.first, leaf.dim(0) != 1 {
+            for leaf in st.arrays where leaf.dim(0) != 1 {
                 throw EngineError.stateMismatch(
                     "verifyBlock: state batch must be 1, got \(leaf.dim(0))")
             }
