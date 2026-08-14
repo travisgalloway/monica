@@ -898,6 +898,70 @@ its debounce) entirely, now unblocked by this issue's confirmation.
 See `scripts/bench_ts_lsp.py`, `scripts/probe_ts_lsp_debounce.py`, and the full per-op breakdown in
 `results/ts_lsp_bench.json` / `results/ts_lsp_debounce_probe.json`.
 
+## Constrained decode: completion-list logit masking (#226)
+
+The #220 bench above cleared the throughput precondition (`completions` at ~2,500 calls/s, 12× the
+≥200 calls/s gate) for the surviving SSI arm this finding implies: restrict the next-token
+distribution, at decode time, to tokens that can still extend into a name the language server says
+is valid at this cursor — a per-token trie over `textDocument/completion`'s result, not a hard-ban
+after the fact.
+
+**Five arms, not three.** The #225 M4 null-sibling rule (`validate_arms`) forces a same-
+`(variable, baseline)`, `signal_available=True, signal_used=False` sibling for every arm that
+actually applies the signal — otherwise "the mask helped" is indistinguishable from "the arm paid a
+different cost / ran a different code path." So the runnable set is `unconstrained`, `masked-null`,
+`masked`, `masked-oracle-null`, `masked-oracle` (`scripts/eval_completion_mask.py`). The headline is
+the paired `masked` → `masked-oracle` gap: `masked` says "a valid completion list was available and
+the model still couldn't pick" (can't-name); `masked-oracle` restricts to the reference's own
+identifier names, so the residual gap isolates *names-wrong* from *can't-name*.
+
+**Mechanism.** `src/serve/constrained.py` is the LSP-agnostic core: `build_vocab_table` probes every
+vocab id's decoded text IN CONTEXT (byte-level BPE makes `decode([i])` alone unsound — the same trap
+`src/lsp/lm.py`'s `offset_map` docstring records), excluding any id whose probe is empty or contains
+the replacement character; `VocabTrie` is a char-trie over the survivors; `allowed_extensions` walks
+the still-reachable labels given the identifier text typed so far and unions in "exit" tokens (those
+that begin with a non-identifier character) once the typed prefix is itself a complete label —
+without that union the model could spell a valid name and then never be allowed to leave the span.
+`src/lsp/completion_mask.py`'s `CompletionMasker` owns a cheap left-to-right scanner
+(string/template/comment-aware via `diagnostics.mask_strings_and_comments`, so a `.` inside a string
+literal never opens a span) that tracks whether generation is currently inside a maskable span.
+
+**One LSP query per span, not per token** is the load-bearing performance decision this mechanism
+was built to protect: on entering a span (a `.` / `?.` for `mask_scope="member"`, the default) the
+masker calls `service.update(...)` + `service.completions(...)` exactly once and caches the label
+list for the life of the span; every subsequent token within that span is filtered locally against
+the cached labels. Querying per token would put a `didChange` on every decode step, which is exactly
+what the #220 bench's `completions` throughput number does NOT cover.
+
+**Label sources** (`LabelSource` protocol): `LspLabels` (the real oracle, `masked`/`masked-null`),
+`OracleLabels` (identifiers regex-extracted from the record's own reference — the ceiling arm,
+`masked-oracle`/`masked-oracle-null`; raises on a blank reference, and the driver excludes that
+record from every arm in the paired comparison rather than silently degrading), and `NullLabels`
+(delegates to an inner source so its query, latency, and counters ALL still happen, then returns "no
+mask" — the M4 null).
+
+**Token-boundary limitation**, measured rather than hidden: a token that overshoots the label as one
+piece (e.g. `name);` generated whole) is disallowed even though its text is legal, the standard
+constrained-decode "token healing" problem. Every step whose allowed set comes out empty is a
+*bypass* (`n_mask_bypass`, mask dropped for that one step, generation continues unconstrained) rather
+than a crash or a silently-injected random token (`src/serve/sampling.py`'s `allowed_ids=[]` raises
+`ValueError` for exactly this reason — an empty constraint set must never reach `sample()`).
+
+**Primary eval set:** `eval_sets/ts_error_injection/eval.jsonl` (96 records) — every prompt ends at a
+member-access `.` (e.g. `console.log(u.` → gold `name);\n`), exactly the shape this arm constrains,
+with a real gold name for the `masked-oracle` ceiling arm. HumanEval-TS ships `gold_completion ==
+"\n"` (a placeholder, not a real name) and is not usable for the ceiling arm without an explicit
+`--oracle-reference` file — the driver refuses rather than silently degrading.
+
+**Wiring verified live** (`--limit`, single seed, Apple Silicon + local `typescript-language-server`):
+all five arms run end to end against a warm `TsLspService` project, `masked`/`masked-oracle` visibly
+confine generation to the completion list, `masked-null`/`masked-oracle-null` pay the same query cost
+and apply no mask, and `validate_arms` rejects a naive three-arm declaration. The full multi-seed
+measurement run (resolve-rate / clean-rate deltas + `masked`→`masked-oracle` gap + added latency, per
+the issue's acceptance criteria) is a follow-up run, not yet executed as of this writeup — this
+section will be updated with the actual numbers once it lands
+(`.venv/bin/python scripts/eval_completion_mask.py --seeds 0,1,2 --temperature 0.2`).
+
 ## Verdict
 
 The persistent-LSP swap is **not a free upgrade over batch `tsc`**: it trades the slow loop's

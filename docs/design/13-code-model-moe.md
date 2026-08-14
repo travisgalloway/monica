@@ -401,7 +401,11 @@ measurement contract:
   implemented`, `declare` stubs, deletion-of-target). See
   [`15-ssi-measurement-contract.md`](15-ssi-measurement-contract.md) and
   `src/eval/ssi_contract.py`.
-- **Surviving arms:** completion-list logit masking / constrained decode (#226), diagnostic
+- **Surviving arms:** completion-list logit masking / constrained decode (**#226, built** — the
+  trie mechanism, the 5-arm #225-compliant driver, and the decode-loop seam are in; wiring verified
+  live end-to-end against a real model + `typescript-language-server`; the full multi-seed
+  resolve-rate/clean-rate/latency measurement is a follow-up run, see
+  [`12-lsp-in-the-loop.md`](12-lsp-in-the-loop.md)'s "#226" section), diagnostic
   supervision — rejection-sampled FT + contrastive hard negatives (#227), and **RLVR/GRPO with an
   LSP/opengrep verifier reward** (#230).
 - **Dropped arms:** two-clock "slow-clock structural state" (conflicts with the MoE spine) and the

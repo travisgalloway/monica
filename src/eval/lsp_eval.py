@@ -14,6 +14,9 @@ measurement so results can't be rationalized after the fact):
   `as any`) forces "not clean" even if `tsc` itself is silent.
 - `error_avoidance_rate` — **primary**. Over the 84 non-`clean_control` rows:
   `rec["expected_diagnostic"] not in codes(tsc(artifact))`.
+- `resolve_rate` (#226) — no unresolved-name diagnostic (`RESOLUTION_CODES`) survived on
+  the artifact. Narrower than `clean` (ignores non-resolution diagnostics); derived from
+  `codes`, zero additional oracle calls.
 - `exact_gold_rate` — secondary/informational only (see the design doc's risks:
   exact-match-to-gold would score an equally-correct alternative completion as a
   failure, so it is never the headline).
@@ -41,6 +44,15 @@ DiagnoseFn = Callable[[str], List[Diagnostic]]
 
 _COST_FIELDS = ("n_forward_tokens", "n_forward_tokens_nocache", "n_generated_tokens",
                 "n_tsc_calls", "n_rollbacks", "n_soft_repairs", "n_retries", "wall_s", "tsc_wall_s")
+
+#: #226 acceptance metric — "did the model still fail to RESOLVE the name", i.e. any
+#: unresolved-identifier/member/import diagnostic survived on the artifact. A narrower
+#: signal than `clean` (which also fails on e.g. a stray unused-var warning that has
+#: nothing to do with name resolution): TS2304 (Cannot find name), TS2339 (Property does
+#: not exist), TS2551 (Property does not exist, did-you-mean variant), TS2552 (Cannot
+#: find name, did-you-mean variant), TS2694 (Namespace has no exported member), TS2724
+#: (no exported member named X, did-you-mean variant).
+RESOLUTION_CODES = frozenset({"TS2304", "TS2339", "TS2551", "TS2552", "TS2694", "TS2724"})
 
 
 def score_record(rec: dict, gen_result: Any, diagnose: DiagnoseFn) -> dict:
@@ -72,6 +84,11 @@ def score_record(rec: dict, gen_result: Any, diagnose: DiagnoseFn) -> dict:
     exact_gold = gen_result.completion == rec["gold_completion"]
     rolled_back = gen_result.n_rollbacks > 0
 
+    # #226 resolve-rate: derived from `codes`, already collected above -- zero
+    # additional oracle calls. `not any(...)` so a record with no diagnostics at
+    # all is trivially "resolved" (nothing unresolved to complain about).
+    resolved = not any(code in RESOLUTION_CODES for code in codes)
+
     # A "suggestion leak": a soft-repair round was exposed to tsc's own spelling
     # correction ("Did you mean 'x'?") -- an exposure signal, not proof the model
     # copied it; see the design doc's risks section on this ablation's purpose.
@@ -86,6 +103,7 @@ def score_record(rec: dict, gen_result: Any, diagnose: DiagnoseFn) -> dict:
         "is_error_row": is_error_row,
         "clean": clean,
         "avoided": avoided,
+        "resolved": resolved,
         "exact_gold": exact_gold,
         "rolled_back": rolled_back,
         "no_progress": bool(getattr(gen_result, "no_progress", False)),
@@ -122,6 +140,7 @@ def summarize(scored: Sequence[dict]) -> dict:
         "n": n,
         "diagnostic_clean_rate": _rate(scored, "clean"),
         "error_avoidance_rate": _rate(error_rows, "avoided"),
+        "resolve_rate": _rate(scored, "resolved"),
         "exact_gold_rate": _rate(scored, "exact_gold"),
         "over_repair_rate": _rate(clean_control_rows, "rolled_back"),
         "no_progress_rate": _rate(soft_repair_rows, "no_progress"),
