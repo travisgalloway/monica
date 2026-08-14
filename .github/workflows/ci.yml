@@ -785,8 +785,12 @@ jobs:
           N=$(wc -l < oracle/poc-manifest.txt)
           [ "$N" -eq 7 ] || { echo "BLIND: short oracle manifest ($N lines)"; exit 2; }
           diff oracle/poc-manifest.txt "$RUNNER_TEMP/poc-manifest-local.txt"
-          test -s oracle/meta.json || { echo "BLIND: oracle meta.json missing/empty"; exit 2; }
-          diff <(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' oracle/meta.json) \
+          # upload-artifact's multi-path least-common-ancestor is $RUNNER_TEMP (shared by
+          # poc-manifest.txt and poc-fixture/meta.json in job 9), so the poc-fixture/
+          # subdir survives into the download — the file lands at oracle/poc-fixture/meta.json,
+          # not oracle/meta.json.
+          test -s oracle/poc-fixture/meta.json || { echo "BLIND: oracle meta.json missing/empty"; exit 2; }
+          diff <(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' oracle/poc-fixture/meta.json) \
                <(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' "$RUNNER_TEMP/poc-fixture/meta.json")
       - name: Record the poc-scale tolerance headroom (informational, but printed)
         # NOT a threshold check — src/conformance/tolerances.py's fp32 band (rtol=1e-4/

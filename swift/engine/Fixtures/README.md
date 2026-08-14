@@ -412,9 +412,10 @@ It IS still gated in CI (#267), just not on every PR: jobs `poc-fixture-oracle` 
 `poc-parity` in `.github/workflows/ci.yml`, triggered only on `workflow_dispatch` or a
 weekly `schedule` (Monday 09:17 UTC) — **never on `pull_request` or `push`**. Generation is
 cheap (measured on an M1 Pro): **5.2-5.8 s wall**, ~2 GB peak RSS — not the ~10 minutes an
-earlier draft of this note assumed — so the fixture is never checked in and never crosses
-the network either: `poc-fixture-oracle` generates it, hashes it, and uploads only a **~2 KB
-sha256 manifest + `meta.json`**; `poc-parity` regenerates its own independent copy on a
+earlier draft of this note assumed — so the fixture is never checked in, and the **571 MB
+fixture output itself never crosses the network**: `poc-fixture-oracle` generates it, hashes
+it, and uploads only a **~2 KB sha256 manifest + `meta.json`** (those two small files *do*
+cross the network as a CI artifact); `poc-parity` regenerates its own independent copy on a
 second runner and `cmp`s the two manifests before trusting either as an oracle (the
 cross-process #298 guard below) — measured **bit-identical, 7/7 files**, during planning.
 
