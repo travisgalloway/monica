@@ -114,6 +114,23 @@ def test_span_opens_on_dot_issues_exactly_one_query_per_span():
     assert source.n_queries == 2
 
 
+def test_identifier_scope_does_not_arm_on_a_numeric_literal():
+    # A digit can't start an identifier (`_IDENT_RE` requires a letter/_/$ first
+    # char), so a word-boundary digit like the "1" in "; 123;" must not open a
+    # masking span in mask_scope="identifier".
+    source = _CountingSource(["name"])
+    masker = CompletionMasker(source, "f.ts", _decode, mask_scope="identifier")
+    masker.mask_for("; 123;", vocab_size=_vocab_size())
+    assert source.n_queries == 0
+
+
+def test_identifier_scope_still_arms_on_a_letter_start():
+    source = _CountingSource(["name"])
+    masker = CompletionMasker(source, "f.ts", _decode, mask_scope="identifier")
+    masker.mask_for("; na", vocab_size=_vocab_size())
+    assert source.n_queries == 1
+
+
 def test_never_arms_inside_a_string():
     source = _CountingSource(["name"])
     masker = CompletionMasker(source, "f.ts", _decode, mask_scope="member")

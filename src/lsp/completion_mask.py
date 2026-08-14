@@ -33,6 +33,7 @@ from ..serve.constrained import (VocabTable, VocabTrie, allowed_extensions,
 from .diagnostics import mask_strings_and_comments
 
 _IDENT_CHAR_RE = re.compile(r"[A-Za-z0-9_$]")
+_IDENT_START_RE = re.compile(r"[A-Za-z_$]")
 _IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 
 
@@ -208,7 +209,7 @@ class CompletionMasker:
                 continue
             if ch == "." and self.mask_scope in ("member", "identifier"):
                 self._open_span(text, i + 1)
-            elif self.mask_scope == "identifier" and _IDENT_CHAR_RE.match(ch):
+            elif self.mask_scope == "identifier" and _IDENT_START_RE.match(ch):
                 prev = masked[i - 1] if i > 0 else ""
                 if not _IDENT_CHAR_RE.match(prev):
                     self._open_span(text, i)
