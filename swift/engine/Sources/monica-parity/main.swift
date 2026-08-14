@@ -156,8 +156,14 @@ let defaultFixtureNames = [
     "toy-short",  // #169: L=2, gates the conv-window LEFT-PAD branch
 ]
 
-// --- argument parsing (hand-rolled; the runner takes one repeatable flag) ---
+// --- argument parsing (hand-rolled; the runner takes repeatable/optional flags) ---
 var explicitFixtures: [URL] = []
+// #196: where to write Swift-authored round-trip checkpoints for the Python-side
+// `scripts/check_swift_checkpoint.py` gate to read. `nil` (the default, and every
+// pre-#196 invocation) means "use a scratch temp dir and don't keep it around" — CI is
+// the only caller that passes this, so a plain local `swift run monica-parity` never
+// litters the working tree.
+var roundtripOut: URL? = nil
 var args = Array(CommandLine.arguments.dropFirst())
 while let first = args.first {
     args.removeFirst()
@@ -169,6 +175,13 @@ while let first = args.first {
         }
         args.removeFirst()
         explicitFixtures.append(URL(fileURLWithPath: dir))
+    case "--roundtrip-out":
+        guard let dir = args.first else {
+            FileHandle.standardError.write(Data("--roundtrip-out needs a directory\n".utf8))
+            exit(2)
+        }
+        args.removeFirst()
+        roundtripOut = URL(fileURLWithPath: dir)
     default:
         FileHandle.standardError.write(Data("unknown argument '\(first)'\n".utf8))
         exit(2)
@@ -521,6 +534,152 @@ for dir in fixtureDirs {
             }
         } catch {
             failures.append("\(name): P5 threw — \(error)")
+        }
+
+        // --- #196: checkpoint round trip (the Swift WRITER, not just the reader) ------
+        // Writes this fixture's already-loaded model back out with `Checkpoint.save`,
+        // reloads it, and checks the result is functionally — and, for tensors,
+        // EXACTLY — the same model. This is the Swift half of #196's acceptance
+        // criterion ("a checkpoint round-trips without changing the model's function");
+        // the Python half is `scripts/check_swift_checkpoint.py` reading whatever this
+        // section writes under `--roundtrip-out`. No new checked-in fixture: every
+        // comparison below is computed in-process from the fixture already loaded above,
+        // and the two SAME-PROCESS exact-tensor comparisons ((a) and (b)) are immune to
+        // the cross-machine drift that broke #293's checked-in gradient oracle.
+        do {
+            let rtBase = (roundtripOut?.appendingPathComponent(name))
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("monica-parity-roundtrip-\(UUID().uuidString)")
+                    .appendingPathComponent(name)
+            try FileManager.default.createDirectory(
+                at: rtBase, withIntermediateDirectories: true)
+
+            // (a) identity round trip: save this model, reload it, compare everything.
+            let rtWeightsA = rtBase.appendingPathComponent("weights.safetensors")
+            try Checkpoint.save(model, to: rtWeightsA)
+            let (modelB, ckptKeysB) = try Checkpoint.load(weights: rtWeightsA)
+            let modelBKeys = Set(modelB.parameters().flattened().map { $0.0 })
+
+            if ckptKeysB != ckptKeys || modelBKeys != modelKeys {
+                failures.append("\(name): round trip (a) key-set mismatch — ckpt: "
+                                + "\(ckptKeysB) vs \(ckptKeys), model: \(modelBKeys) vs \(modelKeys)")
+            }
+
+            // Every parameter tensor must be BIT-IDENTICAL — save/load is lossless, so
+            // anything else is a serializer bug, not a numerics question.
+            let flatA = Dictionary(
+                model.parameters().flattened(), uniquingKeysWith: { a, _ in a })
+            let flatB = Dictionary(
+                modelB.parameters().flattened(), uniquingKeysWith: { a, _ in a })
+            var badTensor: String? = nil
+            for (k, a) in flatA {
+                guard let b = flatB[k] else { continue }   // key-set mismatch reported above
+                MLX.eval([a, b])
+                if a.shape != b.shape || !MLX.all(a .== b).item(Bool.self) {
+                    badTensor = badTensor ?? k
+                }
+            }
+            if let bad = badTensor {
+                failures.append("\(name): round trip (a) tensor '\(bad)' is not "
+                                + "bit-identical after save/load")
+            }
+
+            // The reloaded sidecar must parse to the SAME config — known fields AND the
+            // raw-JSON passthrough (`MambaConfig == ` covers both; see Config.swift).
+            if model.config != modelB.config {
+                failures.append("\(name): round trip (a) sidecar mismatch — the reloaded "
+                                + "config (known fields + raw passthrough) differs from "
+                                + "the source — sidecar fidelity is broken")
+            }
+
+            // End-to-end: the round-tripped model must still match the Python oracle.
+            let rtFwd = modelB.forward(tokens)
+            MLX.eval(rtFwd)
+            let rtCmp = compare(rtFwd.asType(.float32).asArray(Float.self),
+                                refForward.asType(.float32).asArray(Float.self),
+                                rtol: fxRtol, atol: fxAtol)
+            if !rtCmp.ok {
+                failures.append(String(
+                    format: "%@: round trip (a) forward logits (post save/load) differ "
+                    + "from the Python oracle (max|d| = %.3e)", name, rtCmp.maxAbs))
+            }
+
+            // (b) mutation round trip — the anti-file-copy check. Without this, a `save`
+            // that just byte-copied the source file would pass (a) too. Mutates modelB
+            // (the round-tripped copy from (a), otherwise unused from here on) rather
+            // than the shared `model`, which the #168 quant section below still reads.
+            modelB.normF.weight = modelB.normF.weight * MLXArray(Float(2))
+            MLX.eval(modelB.normF.weight)
+            let rtWeightsB = rtBase.appendingPathComponent("weights-mutated.safetensors")
+            try Checkpoint.save(modelB, to: rtWeightsB)
+            let (modelC, _) = try Checkpoint.load(weights: rtWeightsB)
+            MLX.eval([modelB.normF.weight, modelC.normF.weight])
+            if modelB.normF.weight.shape != modelC.normF.weight.shape
+                || !MLX.all(modelB.normF.weight .== modelC.normF.weight).item(Bool.self) {
+                failures.append("\(name): round trip (b) mutation not preserved exactly "
+                                + "— the writer may be copying the source file rather "
+                                + "than serializing the model's actual parameters")
+            }
+
+            // (c) MoE route bias survives (or correctly does NOT ride) the round trip.
+            let savedKeys = Set(try loadArrays(url: rtWeightsA).keys)
+            let savedBiasKeys = savedKeys.filter { $0.hasPrefix(Checkpoint.moeBiasPrefix) }
+            let expectBias = model.moeBlocks().contains { $0.routeBias != nil }
+            if expectBias {
+                for (i, layer) in model.layers.enumerated() {
+                    guard let moe = layer as? MoEBlock, let bias = moe.routeBias else {
+                        continue
+                    }
+                    guard let moeB = modelB.layers[i] as? MoEBlock,
+                          let biasB = moeB.routeBias else {
+                        failures.append("\(name): round trip (c) layer \(i) lost its "
+                                        + "route bias entirely")
+                        continue
+                    }
+                    if bias != biasB {
+                        failures.append("\(name): round trip (c) layer \(i) route bias "
+                                        + "changed across the round trip (want \(bias), "
+                                        + "got \(biasB))")
+                    }
+                }
+                if savedBiasKeys.isEmpty {
+                    failures.append("\(name): round trip (c) model has an active route "
+                                    + "bias but the saved checkpoint carries no "
+                                    + "\(Checkpoint.moeBiasPrefix)* key")
+                }
+            } else if !savedBiasKeys.isEmpty {
+                failures.append("\(name): round trip (c) model has NO active route bias "
+                                + "but the saved checkpoint carries "
+                                + "\(savedBiasKeys.sorted()) — an unconditional bias key "
+                                + "would break Python's num_parameters()")
+            }
+
+            // (d) quantized checkpoints: (a) already bit-compares the packed
+            // weight/scales/biases tensors; additionally confirm the `quant` block
+            // itself re-decodes to the same mode/group_size/targets.
+            if let bits = meta.quant_bits {
+                let sidecarURL = URL(fileURLWithPath: weights.path + ".config.json")
+                if let origSpec = try QuantSpec.load(sidecar: sidecarURL) {
+                    let rtSidecarURL = URL(fileURLWithPath: rtWeightsA.path + ".config.json")
+                    if let rtSpec = try QuantSpec.load(sidecar: rtSidecarURL) {
+                        if rtSpec.mode != origSpec.mode
+                            || rtSpec.groupSize != origSpec.groupSize
+                            || rtSpec.targets != origSpec.targets {
+                            failures.append("\(name): round trip (d) quant block changed "
+                                            + "across the round trip (bits=\(bits))")
+                        }
+                    } else {
+                        failures.append("\(name): round trip (d) the saved sidecar lost "
+                                        + "its quant block entirely (bits=\(bits))")
+                    }
+                }
+            }
+
+            print("\(name): round trip (save -> load) OK — tensors bit-identical, "
+                  + "sidecar fidelity, mutation, and route-bias checks passed"
+                  + (meta.quant_bits != nil ? " (+ quant-block re-decode)" : ""))
+        } catch {
+            failures.append("\(name): round trip threw — \(error)")
         }
 
         // --- #168: quantized-fixture-only checks -------------------------------------

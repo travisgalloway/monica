@@ -216,12 +216,76 @@ implementation reproduces the policy; it does not re-invent it. See
 **The gate.** Loss and grad-norm versus the Python MLX train step on a fixed-seed toy batch,
 in the spirit of `src/conformance/backend_parity.py` — fp32, ~1e-4.
 
-**Checkpoint I/O (#196).** Both directions against `src/train/checkpoint.py:75` (`save_weights`):
-safetensors plus the `<path>.config.json` sidecar. Python-written checkpoints must load in Swift
-and Swift-written checkpoints must load in Python, bit-for-bit on the tensors. The **slot-a/slot-b
-resume bundle** (`CheckpointStore`, `src/train/checkpoint.py:121`) is explicitly **out of
-scope** — that is the within-backend concern the two-concern split exists to keep separate
-(optimizer state does not need to port).
+**Checkpoint I/O (#196) — shipped.** Both directions against `src/train/checkpoint.py:75`
+(`save_weights`): safetensors plus the `<path>.config.json` sidecar. Python-written checkpoints
+load in Swift and Swift-written checkpoints load in Python, bit-for-bit on the tensors.
+
+*The reader half already existed.* `Checkpoint.load`/`loadInto`
+(`swift/engine/Sources/MonicaEngine/Checkpoint.swift`) landed with #166/#168 — decode the
+sidecar, apply an optional `quant` block, pop the non-parameter `moe_route_bias.{i}` keys, and
+`update(parameters:verify: .all)`. #196's net-new work was the **writer**
+(`Checkpoint.save`/`portableStateDict`) and the Swift→Python direction of the round trip.
+
+*The writer* mirrors `_portable_state_dict` exactly: `model.parameters().flattened()` plus,
+for each `MoEBlock` whose route bias is ACTIVE, `moe_route_bias.{i}` — emitted conditionally,
+because an unconditional key would break Python's `num_parameters()` accounting
+(`tests/test_moe.py`, `tests/test_sizing_mlx.py`; the bias is training-side routing state, not
+a parameter, on either side of the seam). It rejects `bfloat16` at save time (Python's
+`safetensors.numpy` reader has no bf16 numpy dtype — better to fail at the write, not three
+files later on the read), and writes atomically (`.safetensors`-suffixed temp path,
+`replaceItemAt`/`moveItem`), mirroring `checkpoint.py`'s `_atomic_write_bytes` discipline.
+
+*The sidecar-fidelity decision.* `MambaConfig.to_dict()` on the Python side is
+`dataclasses.asdict(self)` — **every** field (Muon / `torch_compile` / `fp8_experts` /
+data-side knobs / `quant`). Swift's `MambaConfig` only *decodes* the ~22 fields the inference
+path reads. Re-encoding just that subset on save would silently reset every other field to a
+Python dataclass default on the next Python read — a quiet corruption of the cross-backend
+bridge. Instead, `MambaConfig.load(sidecar:)` decodes the file **twice**: once into
+`MambaConfig` (typed, known fields), once into a raw `[String: JSONValue]`
+(`swift/engine/Sources/MonicaEngine/Config.swift`'s minimal `Any`-Codable enum, order-sensitive
+— `Int` is tried before `Double` so `"d_model": 64` doesn't become `64.0`). `save(sidecar:)`
+writes the raw dict back, **overlaid** with the known fields' current values, so an unmodeled
+field (or `quant`) survives verbatim while a config actually mutated in Swift is still
+reflected. This is deliberately **not** byte-identical to Python's `json.dumps(cfg, indent=2)`
+(dataclass field order can't be reproduced without hardcoding it); the gate is *semantic* dict
+equality (`scripts/check_swift_checkpoint.py`), not `cmp`. A config built directly in Swift
+(no `rawSidecar`) writes only the known fields — lossy by construction, documented at the call
+site, and not a path any checkpoint destined for Python should go through.
+
+*The round-trip gate* has two halves, because a Swift binary alone cannot prove the direction
+that matters to Python. `monica-parity --roundtrip-out <dir>` (Swift side, no new checked-in
+fixture — see `swift/engine/Fixtures/README.md`) exercises, per fixture: (a) an identity round
+trip — save, reload, assert every parameter tensor is **bit-identical** (save/load is lossless
+by construction, so `rtol`/`atol` would be the wrong tool here), the sidecar round-trips to an
+equal `MambaConfig`, and forward logits still match the Python oracle; (b) a mutation round
+trip — perturb one parameter, save, reload, confirm the perturbation survived exactly, which is
+what catches a writer that degenerates into a file copy; (c) route-bias presence/absence
+matching `_portable_state_dict`'s conditional; (d) for the quantized fixtures, that the `quant`
+block re-decodes to the same `mode`/`group_size`/`targets` (the packed tensors themselves are
+already covered by (a)'s exact comparison). `scripts/check_swift_checkpoint.py` (Python side)
+then loads what that step wrote: sidecar dict equality, quant-block equality, key-set equality,
+and forward logits vs each fixture's `reference.safetensors`. It explicitly **SKIPs** — never
+silently passes — the two quantized fixtures' model-construction/forward checks, because
+`src/eval/quantize.py` is a fake-quant *measurement* spike (see "Quantization" above): the
+Python MLX backend never builds an `nn.QuantizedLinear`/`nn.QuantizedEmbedding`, so there is no
+loader reachable from a plain `MLXMambaModel` that can consume packed
+`.weight`/`.scales`/`.biases`. Sidecar/quant-block equality still gates those two fixtures; the
+packed-tensor and quant-block round trip is gated Swift-side by (a)/(d) above. An empty
+`--roundtrip-dir` is itself a FAIL in the Python script, not a pass — a checker that can't see
+its target must never read green.
+
+*Explicitly out of scope, and why.* The **slot-a/slot-b resume bundle**
+(`CheckpointStore`, `src/train/checkpoint.py:121` — step / loss-scale / RNG / optimizer state /
+dataloader position) is **not** implemented here. That's the within-backend concern the
+two-concern split exists to keep separate from portable weights (optimizer state does not need
+to port across backends), and #196 delivers exactly concern (1) of that split. Concretely: at
+the time #196 landed, #195 (the Swift train step) had not merged — `main` had no Swift
+optimizer type, no `monica-train`, and no `train.safetensors` fixture — so there was nothing
+real to serialize yet, and inventing an optimizer-state format against nonexistent types would
+have collided with #195 when it eventually lands. `Checkpoint.save` takes only a model and a
+destination URL, so a future optimizer serializer is an orthogonal file written into the same
+directory, not a refactor of this one. Swift resume (optimizer state + step) should be filed as
+its own issue once #195 lands, referencing this note.
 
 **The LSP fast loop (#197).** A native persistent `tsserver` client — the Python reference is
 `src/lsp/ts_lsp.py` plus `src/lsp/harness.py`, driven through the `LMAdapter` seam
