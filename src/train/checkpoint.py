@@ -71,10 +71,23 @@ def _atomic_write_text(path: str, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
 
 
+# A sidecar key that lives alongside `config.to_dict()` but is NOT a `MambaConfig`
+# field — `load_config_sidecar` must drop these SILENTLY (no "dropping fields unknown
+# to this MambaConfig" note), because they are expected, not a stale/mismatched sidecar.
+# `"quant"` (#168) is the first member.
+_NON_CONFIG_SIDECAR_KEYS = {"quant"}
+
+
 # --- portable weights -------------------------------------------------------
 def save_weights(state_dict: Dict[str, np.ndarray], path: str,
-                 config: Optional[Any] = None) -> None:
-    """Save weights as safetensors + a `<path>.config.json` sidecar (atomically)."""
+                 config: Optional[Any] = None,
+                 quant: Optional[dict] = None) -> None:
+    """Save weights as safetensors + a `<path>.config.json` sidecar (atomically).
+
+    `quant` (#168), if given, is merged into the sidecar JSON as `{"quant": quant}` —
+    the on-disk record of `quantize_portable_state_dict`'s `quant_block` (`mode`,
+    `group_size`, `targets`). Absent (`None`, the default) leaves the sidecar
+    byte-identical to before #168: an fp checkpoint carries no `quant` key at all."""
     from safetensors.numpy import save_file  # lazy
 
     path = str(path)
@@ -97,7 +110,13 @@ def save_weights(state_dict: Dict[str, np.ndarray], path: str,
         raise
     if config is not None:
         cfg = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+        if quant is not None:
+            cfg = {**cfg, "quant": quant}
         _atomic_write_text(path + ".config.json", json.dumps(cfg, indent=2))
+    elif quant is not None:
+        # No MambaConfig sidecar requested, but a quant block was — write a
+        # quant-only sidecar rather than silently dropping it.
+        _atomic_write_text(path + ".config.json", json.dumps({"quant": quant}, indent=2))
 
 
 def load_weights_dict(path: str) -> Dict[str, np.ndarray]:
@@ -135,13 +154,29 @@ def load_config_sidecar(weights_path: str) -> Optional[Any]:
         return None
     raw = json.loads(p.read_text())
     known = {f.name for f in fields(MambaConfig)}
-    dropped = sorted(set(raw) - known)
+    # `_NON_CONFIG_SIDECAR_KEYS` (e.g. "quant", #168) are expected sidecar keys that
+    # simply aren't MambaConfig fields — drop them silently. Anything else unknown is
+    # unexpected (a stale/mismatched sidecar) and still gets the printed note.
+    dropped = sorted(set(raw) - known - _NON_CONFIG_SIDECAR_KEYS)
     if dropped:
         print(f"[load_config_sidecar] {p}: dropping fields unknown to this "
               f"MambaConfig: {dropped}")
     cfg = MambaConfig(**{k: v for k, v in raw.items() if k in known})
     cfg.validate()
     return cfg
+
+
+def load_quant_sidecar(weights_path: str) -> Optional[dict]:
+    """Read `<weights_path>.config.json` and return its `quant` block (`mode`,
+    `group_size`, `targets`), or `None` if the sidecar is absent or carries no `quant`
+    key — the fp-checkpoint case. Independent of `load_config_sidecar` so a caller that
+    only needs the quant block (e.g. the Swift-format exporter, or a script that never
+    reconstructs a `MambaConfig`) doesn't pay for a `MambaConfig` round-trip."""
+    p = Path(str(weights_path) + ".config.json")
+    if not p.exists():
+        return None
+    raw = json.loads(p.read_text())
+    return raw.get("quant")
 
 
 def check_weight_keys(weights: Dict[str, Any], expected: Dict[str, Any], *,
