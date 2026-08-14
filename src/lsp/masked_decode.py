@@ -30,6 +30,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 from ..serve.sampling import sample
+from .completion_mask import CompletionMasker
 from .diagnostics import statement_boundary
 from .harness import GenResult, _eos_ids, _first_stop
 from .lm import LMAdapter
@@ -40,7 +41,7 @@ _DEFAULT_BLOCK_SIZE = 96
 
 def generate_masked(
     lm: LMAdapter,
-    masker,
+    masker: Optional[CompletionMasker],
     prompt: str,
     *,
     budget: str = "stmt",
@@ -49,12 +50,18 @@ def generate_masked(
     temperature: float = 0.0,
     rng: Optional[np.random.Generator] = None,
     stop_strings: Optional[Sequence[str]] = None,
-    strategy: str = "masked",
+    strategy: Optional[str] = None,
 ) -> GenResult:
     """Free-running generation, exactly like `generate_baseline`, except each
     step consults `masker.mask_for(...)` (a `CompletionMasker`, or `None` for the
     unconstrained control) for the allowed next-token id set.
+
+    `strategy` labels the result (for scoring/logging); when not given it is
+    derived from whether masking is actually active, so a `masker=None` run is
+    never silently labeled `"masked"`.
     """
+    if strategy is None:
+        strategy = "masked" if masker is not None else "unconstrained"
     if budget not in ("stmt", "block"):
         raise ValueError(f"unknown budget {budget!r}")
     t0 = time.monotonic()
@@ -68,14 +75,16 @@ def generate_masked(
     checkpoints: List[int] = []
     stop_at: Optional[int] = None
     eos = _eos_ids(lm) if not stop_at_boundary else set()   # EOS ends a real-code body
+    gen_text = ""  # lm.decode(gen_ids), kept in sync so each step decodes only once
     for _ in range(target):
         allowed = None
         if masker is not None:
-            text = prompt + lm.decode(gen_ids)
-            allowed = masker.mask_for(text, vocab_size=int(np.asarray(logits).size))
-            if allowed is not None:
+            allowed = masker.mask_for(prompt + gen_text, vocab_size=int(np.asarray(logits).size))
+            if allowed is not None and eos:
                 # EOS must always be reachable through an active mask -- masking
-                # can never make a generation unstoppable.
+                # can never make a generation unstoppable. `allowed` is already
+                # sorted/deduped by `mask_for`, so skip the set/sort when there's
+                # no EOS set to fold in.
                 allowed = sorted(set(allowed) | eos)
         tok = sample(logits, temperature=temperature, rng=rng, previous_tokens=gen_ids,
                      allowed_ids=allowed)
@@ -83,7 +92,8 @@ def generate_masked(
             break
         logits = lm.step(tok)
         gen_ids.append(tok)
-        text = lm.decode(gen_ids)
+        gen_text = lm.decode(gen_ids)
+        text = gen_text
         if stop_at_boundary:
             if statement_boundary(text) is not None:
                 break
@@ -95,7 +105,7 @@ def generate_masked(
             if b is not None and (not checkpoints or checkpoints[-1] != len(prompt) + b):
                 checkpoints.append(len(prompt) + b)
 
-    completion = lm.decode(gen_ids)
+    completion = gen_text
     if stop_at is not None:
         completion = completion[:stop_at]
     result = GenResult(
