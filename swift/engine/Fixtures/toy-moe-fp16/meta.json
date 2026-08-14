@@ -1,0 +1,25 @@
+{
+  "config": "toy-moe.yaml",
+  "batch": 2,
+  "seq": 40,
+  "seed": 15,
+  "precision": "fp16",
+  "vocab_size": 256,
+  "gen_steps": 16,
+  "mlx_version": "0.32.0",
+  "moe_bias": true,
+  "forward_step_max_abs_diff": 0.002865612506866455,
+  "prefill_decode_max_abs_diff": 0.0010426044464111328,
+  "prefill_decode_max_abs_state_diff": 0.0009765625,
+  "greedy_margin_min": 3.3444323539733887,
+  "mixing_layers": [
+    0,
+    2
+  ],
+  "moe_load_layers": [
+    1,
+    3
+  ],
+  "moe_route_margin_min": 0.371337890625,
+  "lowp_self_mean_kl": 8.313451758829565e-08
+}

@@ -34,6 +34,8 @@ import numpy as np
 
 from src.conformance.forward_step_parity import check_forward_step_parity
 from src.conformance.prefill_decode_parity import check_prefill_decode_parity
+from src.conformance.quant_parity import check_quant_parity
+from src.conformance.tolerances import LOWP_MEAN_KL_MAX, band_for, route_margin_min
 from src.model.blocks import load_config
 
 
@@ -85,12 +87,48 @@ def _resolve_packed_doc_lengths(spec: str, q: int) -> list[int]:
             for tok in spec.split(",")]
 
 
+def _save_finite(arrays: dict, path: str) -> None:
+    """`safetensors.numpy.save_file`, but refuse a non-finite float array first (#266
+    edge case). fp16's max finite value is 65504; attention logits pre-softmax and the
+    SSD decay accumulation are the exposed overflow sites at low precision. Without this,
+    an overflow silently becomes NaN/Inf that only surfaces later as a confusing
+    tolerance-comparison failure — this reports it as what it is."""
+    from safetensors.numpy import save_file
+
+    non_finite = sorted(
+        k for k, v in arrays.items()
+        if np.issubdtype(v.dtype, np.floating) and not np.all(np.isfinite(v)))
+    if non_finite:
+        raise SystemExit(
+            f"refusing to write {path}: non-finite values in {non_finite} — likely fp16 "
+            "overflow (max finite 65504) or an underlying numerics bug; this is an "
+            "overflow, not a tolerance failure")
+    save_file(arrays, path)
+
+
+def _np_f32(x) -> np.ndarray:
+    """`np.array(x, dtype=np.float32)`, but for an MLX array cast to float32 IN MLX
+    first. This local MLX build (0.32.0) cannot convert a `bfloat16` array to numpy via
+    the buffer protocol directly (`RuntimeError: Item size 2 for PEP 3118 buffer format
+    string B does not match the dtype B item size 1`) — final logits are already fp32 by
+    the time they leave the model (the head computes in fp32, `mlx_backend.py`'s `_f32`
+    convention), so this bug was invisible before #266 added bf16 fixtures; INTERMEDIATE
+    arrays (hidden states, mixing matrices, per-layer state) stay in the model's native
+    compute dtype and hit it. A no-op for anything already fp32/fp16."""
+    import mlx.core as mx
+
+    if isinstance(x, mx.array):
+        x = x.astype(mx.float32)
+    return np.array(x, dtype=np.float32)
+
+
 def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                   precision: str | None = None, moe_bias: bool = False,
                   seed: int = 0, vocab_size: int | None = None,
                   gen_steps: int = 16, quant_bits: int | None = None,
                   quant_group_size: int = 64, quant_head_bits: int | None = None,
-                  packed_doc_lengths: str | None = None) -> dict:
+                  packed_doc_lengths: str | None = None,
+                  allow_moe_load_omit: bool = False) -> dict:
     """Build and write one fixture directory. Returns the `meta.json` contents.
 
     `quant_bits` (#168), if given, makes this a QUANTIZED fixture: `weights.safetensors`
@@ -106,7 +144,6 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     correctness gate).
     """
     import mlx.core as mx  # local import: this script is MLX-only, like scripts/smoke_test.py
-    from safetensors.numpy import save_file
 
     from src.eval.quantize import (
         dequantize_portable_state_dict, quant_targets, quantize_portable_state_dict)
@@ -183,7 +220,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         ref_model = model
         weights_sd = None   # None => use ref_model.save() (fp path, unchanged from before)
         if quant_bits is not None:
-            fp_forward_logits = np.array(model.forward(tokens), dtype=np.float32)
+            fp_forward_logits = _np_f32(model.forward(tokens))
             sd = model._portable_state_dict()
             targets = quant_targets(sd, group_size=quant_group_size, bits=quant_bits,
                                     head_bits=quant_head_bits)
@@ -200,24 +237,71 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
             ref_model = qmodel
             weights_sd = qsd
 
+        # #266: the precision-derived elementwise band this fixture's own consistency
+        # checks (and later the greedy-margin/generation checks) are measured against —
+        # NOT the fp32 constants, which are too tight to be meaningful for fp16/bf16 (see
+        # src/conformance/tolerances.py's module docstring). This is also the blocker fix:
+        # before #266, both calls below ran with their fp32 DEFAULTS regardless of
+        # `cfg.precision`, so a fp16/bf16 model always failed its own forward/step check
+        # and no low-precision fixture could ever reach disk.
+        rtol_fp, atol_fp = band_for(cfg.precision)
+
         # A fixture that fails PYTHON's own forward/step gate must never reach disk — it would
         # make the Swift gate compare against a reference that is itself internally inconsistent.
-        verdict = check_forward_step_parity(ref_model, tokens, to_numpy=np.array)
+        verdict = check_forward_step_parity(ref_model, tokens, to_numpy=np.array,
+                                            rtol=rtol_fp, atol=atol_fp)
         if not verdict["ok"]:
             raise SystemExit(
                 f"refusing to write {out_dir}: the Python model fails its own forward/step "
-                f"parity check (max_abs_diff={verdict['max_abs_diff']:.3e})")
+                f"parity check (max_abs_diff={verdict['max_abs_diff']:.3e}, "
+                f"rtol={rtol_fp}, atol={atol_fp}, precision={cfg.precision})")
 
         # Same rule for #169's state handoff: a fixture whose own Python prefill state
         # disagrees with its stepped state (or whose prefill logits disagree with forward, or
         # whose prefill-then-decode disagrees with pure step-by-step) can never reach disk —
         # it would make the Swift gate compare against an internally-inconsistent oracle.
         prefill_verdict = check_prefill_decode_parity(
-            ref_model, tokens, to_numpy=np.array, n_decode=min(4, seq - 1))
+            ref_model, tokens, to_numpy=np.array, n_decode=min(4, seq - 1),
+            rtol=rtol_fp, atol=atol_fp)
         if not prefill_verdict["ok"]:
             raise SystemExit(
                 f"refusing to write {out_dir}: the Python model fails its own prefill/decode "
-                f"parity check ({prefill_verdict})")
+                f"parity check ({prefill_verdict}, rtol={rtol_fp}, atol={atol_fp}, "
+                f"precision={cfg.precision})")
+
+        # #266 anti-vacuity refusals (low precision only — fp32's elementwise band IS the
+        # load-bearing gate, see tolerances.py Step 3/4). A fixture whose OWN measured
+        # noise floor is not comfortably inside its gate would make the whole low-precision
+        # contract vacuous, so refuse before anything reaches disk rather than after.
+        lowp_self_mean_kl = None
+        if cfg.precision != "fp32":
+            elementwise_ceiling = atol_fp / 4
+            if verdict["max_abs_diff"] > elementwise_ceiling:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: forward/step max_abs_diff="
+                    f"{verdict['max_abs_diff']:.3e} exceeds the anti-vacuity ceiling "
+                    f"atol/4={elementwise_ceiling:.3e} for precision={cfg.precision} — "
+                    "the fixture's own noise floor sits too close to its gate")
+            # A second, throwaway forward+step pass purely to measure the intra-Python
+            # KL noise floor (the load-bearing low-precision tier, tolerances.py Step 4) —
+            # this cannot reuse `verdict`, which only returns max_abs_diff/ok, not the
+            # underlying logit arrays.
+            probe_fwd = _np_f32(ref_model.forward(tokens))
+            probe_state = ref_model.init_state(batch)
+            probe_steps = []
+            for t in range(seq):
+                logits_t, probe_state = ref_model.step(tokens[:, t], probe_state)
+                probe_steps.append(_np_f32(logits_t))
+            probe_step = np.stack(probe_steps, axis=1)
+            lowp_self_mean_kl = check_quant_parity(
+                probe_fwd, probe_step, bits=0,
+                thresholds={"top1": 0.0, "kl": float("inf")})["mean_kl"]
+            kl_ceiling = LOWP_MEAN_KL_MAX[cfg.precision] / 4
+            if lowp_self_mean_kl > kl_ceiling:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: intra-Python forward-vs-step "
+                    f"mean_kl={lowp_self_mean_kl:.3e} exceeds the anti-vacuity ceiling "
+                    f"kl_max/4={kl_ceiling:.3e} for precision={cfg.precision}")
 
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -228,7 +312,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         else:
             save_weights(weights_sd, weights_path, config=cfg, quant=quant_block)
 
-        save_file({"tokens": tokens}, str(out / "inputs.safetensors"))
+        _save_finite({"tokens": tokens}, str(out / "inputs.safetensors"))
 
         # --- #265: MoE load counting + route-bias write-back oracle ------------------------
         # Load counting does not depend on the balancer (`moe_balance_rate` is null in every
@@ -245,10 +329,11 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
             # already ran forwards on this model and would otherwise contribute counts to
             # the pinned pass below.
             ref_model.pop_moe_load()
-        forward_logits = np.array(ref_model.forward(tokens), dtype=np.float32)
+        forward_logits = _np_f32(ref_model.forward(tokens))
         moe_load_layers: list[int] = []
         moe_loads: list[list[float]] = []
         moe_route_margin_min = None
+        moe_load_omitted_reason: str | None = None
         if count_loads:
             moe_loads = ref_model.pop_moe_load()
             ref_model.set_moe_load_counting(False)   # off before hidden_states/generation below
@@ -287,12 +372,33 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                 margin = sorted_desc[..., cfg.top_k - 1] - sorted_desc[..., cfg.top_k]
                 margin_per_layer[i] = float(mx.min(margin).item())
             moe_route_margin_min = min(margin_per_layer.values())
-            if moe_route_margin_min < 1e-5:
-                raise SystemExit(
-                    f"refusing to write {out_dir}: moe_route_margin_min="
-                    f"{moe_route_margin_min:.3e} is inside the exact-comparison hazard band "
-                    "(< 1e-5) — a near-tie routing rank makes load.{i} equality flaky across "
-                    f"implementations. Bump --seed and retry (per-layer minima={margin_per_layer})")
+            # #266: generalised from the hardcoded `1e-5` to `max(1e-5, 128 * u)` — that
+            # recovers today's fp32 constant exactly (`128 * u_fp32 = 7.6e-6 < 1e-5`, so the
+            # floor wins) and scales the hazard band for fp16/bf16 (see
+            # src/conformance/tolerances.route_margin_min's docstring).
+            route_margin_threshold = route_margin_min(cfg.precision)
+            if moe_route_margin_min < route_margin_threshold:
+                if allow_moe_load_omit:
+                    # The declared-omission fallback (README's fallback ladder: bump
+                    # --seed, then --moe-bias, then this) — a skipped load-count oracle
+                    # must be DECLARED, never silent, so main.swift's anti-BLIND rule can
+                    # accept it as a legitimate skip rather than a stale fixture.
+                    moe_load_omitted_reason = (
+                        f"moe_route_margin_min={moe_route_margin_min:.3e} < "
+                        f"route_margin_min({cfg.precision})={route_margin_threshold:.3e} — "
+                        "omitting the load-count oracle rather than writing a flaky exact "
+                        "comparison (per-layer minima="
+                        f"{margin_per_layer}, #266 fallback ladder)")
+                    moe_load_layers = []
+                    moe_loads = []
+                else:
+                    raise SystemExit(
+                        f"refusing to write {out_dir}: moe_route_margin_min="
+                        f"{moe_route_margin_min:.3e} is inside the exact-comparison hazard "
+                        f"band (< {route_margin_threshold:.3e} for precision={cfg.precision}) "
+                        "— a near-tie routing rank makes load.{i} equality flaky across "
+                        f"implementations. Bump --seed and retry (per-layer minima="
+                        f"{margin_per_layer})")
             for i, m in margin_per_layer.items():
                 if m < 1e-3:
                     print(f"WARNING: {out_dir} layer {i} moe_route_margin_min={m:.3e} is "
@@ -303,7 +409,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         steps = []
         for t in range(seq):
             logits_t, state = ref_model.step(tokens[:, t], state)
-            steps.append(np.array(logits_t, dtype=np.float32))
+            steps.append(_np_f32(logits_t))
         step_logits = np.stack(steps, axis=1)
 
         ref = {"forward_logits": forward_logits, "step_logits": step_logits}
@@ -313,7 +419,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         # mismatch is nearly impossible to localize by hand across 24 layers; "first divergence
         # at layer 7" is the difference between an afternoon and a week. ~200 KB at toy scale.
         for i, h in enumerate(ref_model.hidden_states(tokens)):
-            ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
+            ref[f"hidden.{i}"] = _np_f32(h)
         # Per-layer head-averaged mixing matrices (#264), a second interpretability oracle
         # alongside hidden.*: the #100 mixing-match accessor, gated at the same strict fp32
         # tolerance. Only for non-quantized fixtures — quantization is a lossy path and must
@@ -323,7 +429,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         if quant_bits is None:
             mixing = ref_model.mixing_matrices(tokens)          # [(layer_idx, (B,L,L))]
             for i, m in mixing:
-                ref[f"mixing.{i}"] = np.array(m, dtype=np.float32)
+                ref[f"mixing.{i}"] = _np_f32(m)
             mixing_layers = [i for i, _ in mixing]
             # An empty list would make the whole Swift mixing-matrix section a silent no-op
             # for any fixture whose config actually has a Mamba layer to mix.
@@ -339,9 +445,9 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         # byte-identical metadata.
         for i, counts in zip(moe_load_layers, moe_loads):
             ref[f"load.{i}"] = np.asarray(counts, dtype=np.float32)
-        save_file(ref, str(out / "reference.safetensors"))
+        _save_finite(ref, str(out / "reference.safetensors"))
         if dequant_ref:
-            save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
+            _save_finite(dequant_ref, str(out / "dequant_ref.safetensors"))
 
         # --- prefill.safetensors: the state-handoff oracle (#169) -----------------------------
         # One entry per STATEFUL leaf, keyed by layer index and slot, derived from the layer's
@@ -351,18 +457,18 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         pre_logits, pre_state = ref_model.prefill(tokens)
         pre_last, _ = ref_model.prefill(tokens, last_only=True)
         prefill_out = {
-            "prefill_logits": np.array(pre_logits, dtype=np.float32),
-            "prefill_last_logits": np.array(pre_last, dtype=np.float32),
+            "prefill_logits": _np_f32(pre_logits),
+            "prefill_last_logits": _np_f32(pre_last),
         }
         for i, (layer, st) in enumerate(zip(ref_model.layers, pre_state)):
             if isinstance(layer, MambaBlock):
                 conv, ssm = st
-                prefill_out[f"state.{i}.conv"] = np.array(conv, dtype=np.float32)
-                prefill_out[f"state.{i}.ssm"] = np.array(ssm, dtype=np.float32)
+                prefill_out[f"state.{i}.conv"] = _np_f32(conv)
+                prefill_out[f"state.{i}.ssm"] = _np_f32(ssm)
             elif isinstance(layer, AttentionBlock):
                 k, v = st
-                prefill_out[f"state.{i}.k"] = np.array(k, dtype=np.float32)
-                prefill_out[f"state.{i}.v"] = np.array(v, dtype=np.float32)
+                prefill_out[f"state.{i}.k"] = _np_f32(k)
+                prefill_out[f"state.{i}.v"] = _np_f32(v)
             elif isinstance(layer, MoEBlock):
                 pass   # stateless — emitting a zero-sized placeholder would only add a
                        # round-tripping risk for no coverage; Swift's .moe case carries nothing.
@@ -370,7 +476,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                 raise SystemExit(
                     f"refusing to write {out_dir}: layer {i} has unrecognized type "
                     f"{type(layer).__name__} — teach the exporter its state slot names")
-        save_file(prefill_out, str(out / "prefill.safetensors"))
+        _save_finite(prefill_out, str(out / "prefill.safetensors"))
 
         # --- packed.safetensors: the packing-aware seg_ids oracle (#68/#263) -------------------
         # Only for non-quantized fixtures (`quant_bits is None`): quantized packing is a
@@ -414,7 +520,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
             packed_logits = np.asarray(
                 ref_model.forward(packed_arr, seg_arr), dtype=np.float32)   # (1, Lp, V)
 
-            save_file({
+            _save_finite({
                 "packed_tokens": packed_arr,
                 "packed_seg_ids": seg_arr,
                 "doc_lengths": np.asarray(doc_lens, dtype=np.int32),
@@ -427,7 +533,11 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
         # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
         # `monica-parity` reproduces in Swift) with temperature=0 (argmax, first-max-on-tie).
-        rtol_gen, atol_gen = 1e-4, 1e-5
+        # #266: derived from the precision band (2x it — the `greedy_margin_floor`
+        # doubling in src/conformance/tolerances.py), not hardcoded fp32 constants — a
+        # fp16/bf16 fixture needs a wider margin for the SAME reason a quantized one does
+        # below (a looser kernel/dtype tolerance can flip a near-tie argmax).
+        rtol_gen, atol_gen = 2 * rtol_fp, 2 * atol_fp
         if quant_bits is not None:
             # Quantization shrinks logit margins, and Swift will decode this fixture through
             # the TRUE quantized kernel (not the dequantized fake-quant reference this
@@ -447,7 +557,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         margins: list[float] = []
         top1s: list[float] = []
         for _ in range(gen_steps):
-            row = np.array(logits, dtype=np.float32).reshape(-1)
+            row = _np_f32(logits).reshape(-1)
             nxt = int(np.argmax(row))
             top1 = float(row[nxt])
             row2 = row.copy()
@@ -487,7 +597,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                 "paths (step-by-step vs one-shot prefill) must produce identical greedy ids "
                 "(src/conformance/prefill_decode_parity.py's contract)")
 
-        save_file({
+        _save_finite({
             "prompt_ids": np.array(prompt_ids, dtype=np.int32),
             "greedy_ids": np.array(greedy_ids, dtype=np.int32),
             "margins": np.array(margins, dtype=np.float32),
@@ -510,9 +620,16 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         }
         if quant_bits is None:
             meta["mixing_layers"] = mixing_layers
-        if count_loads:
+        if count_loads and moe_load_layers:
             meta["moe_load_layers"] = moe_load_layers
             meta["moe_route_margin_min"] = moe_route_margin_min
+        if moe_load_omitted_reason is not None:
+            meta["moe_load_omitted_reason"] = moe_load_omitted_reason
+        if lowp_self_mean_kl is not None:
+            # A MEASUREMENT, never a threshold — Swift reads thresholds only from its own
+            # precisionBands/lowpKLMax table, never from a fixture-carried value (that
+            # would reopen the "measure, then widen until green" loop #266 must not create).
+            meta["lowp_self_mean_kl"] = lowp_self_mean_kl
         if packed_meta_doc_lengths is not None:
             # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
             # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded
@@ -520,7 +637,6 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
             meta["packed_doc_lengths"] = packed_meta_doc_lengths
             meta["packed_seq_len"] = packed_meta_seq_len
         if quant_bits is not None:
-            from src.conformance.quant_parity import check_quant_parity
             q = check_quant_parity(fp_forward_logits, forward_logits, bits=quant_bits)
             # A quantized fixture carries its OWN rtol/atol (#168's minimal #266 hook) —
             # deliberately looser than the fp32 gate's 1e-4/1e-5, and never applied to a
@@ -580,6 +696,11 @@ def main() -> None:
                         "chunk-length-relative doc lengths, e.g. 'Q,2*Q,5' — 'Q' resolves "
                         "to the config's chunk_size (default 64). Ignored for quantized "
                         "fixtures (--quant-bits set)")
+    p.add_argument("--allow-moe-load-omit", action="store_true",
+                   help="#266 fallback ladder: if the MoE route-margin refusal would fire, "
+                        "omit load.{i}/moe_load_layers instead of raising, and record why "
+                        "in meta.json's moe_load_omitted_reason — only use after a --seed "
+                        "search and --moe-bias have both failed to clear the margin guard")
     args = p.parse_args()
 
     quant_head_bits = args.quant_head_bits
@@ -591,7 +712,8 @@ def main() -> None:
                          vocab_size=args.vocab_size, gen_steps=args.gen_steps,
                          quant_bits=args.quant_bits, quant_group_size=args.quant_group_size,
                          quant_head_bits=quant_head_bits,
-                         packed_doc_lengths=args.packed_doc_lengths)
+                         packed_doc_lengths=args.packed_doc_lengths,
+                         allow_moe_load_omit=args.allow_moe_load_omit)
     print(f"wrote {args.out}: {json.dumps(meta)}")
 
 

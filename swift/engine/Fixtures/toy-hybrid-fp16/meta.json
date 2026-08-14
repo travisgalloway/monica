@@ -1,0 +1,20 @@
+{
+  "config": "toy-hybrid.yaml",
+  "batch": 2,
+  "seq": 40,
+  "seed": 0,
+  "precision": "fp16",
+  "vocab_size": 256,
+  "gen_steps": 16,
+  "mlx_version": "0.32.0",
+  "moe_bias": false,
+  "forward_step_max_abs_diff": 0.002408444881439209,
+  "prefill_decode_max_abs_diff": 0.0013875961303710938,
+  "prefill_decode_max_abs_state_diff": 0.0010860264301300049,
+  "greedy_margin_min": 1.4527502059936523,
+  "mixing_layers": [
+    0,
+    2
+  ],
+  "lowp_self_mean_kl": 9.032631043867583e-08
+}

@@ -19,9 +19,9 @@ import MLX
 import MLXNN
 import MonicaEngine
 
-// The fp32 gate's constants — UNCHANGED by #168. A fixture's `meta.json` MAY carry its
-// own `rtol`/`atol` (the #168/#266 hook); absent, every comparison below defaults to
-// these exact values, so the four pre-#168 fixtures behave byte-for-byte as before.
+// The fp32 gate's constants — UNCHANGED by #168/#266. A fixture's `meta.json` MAY carry
+// its own `rtol`/`atol` (the #168/#266 hook); absent, every comparison below defaults to
+// these exact values, so the pre-#168 fixtures behave byte-for-byte as before.
 let rtol: Double = 1e-4
 let atol: Double = 1e-5
 
@@ -30,12 +30,40 @@ let atol: Double = 1e-5
 // tolerates real but bounded drift).
 let quantThresholds: [Int: (top1: Double, kl: Double)] = [8: (0.99, 1e-3), 4: (0.95, 5e-2)]
 
+// #266: the precision -> elementwise-band table, hand-mirroring
+// `src/conformance.tolerances.PARITY_TOLERANCES` (Swift cannot import Python, so
+// `tests/test_lowp_parity_band.py`'s T5 is the structural guard against the two tables
+// drifting apart — it walks every checked-in fixture and re-derives the RESOLVED band
+// for the 8 pre-#266 fixtures, asserting it is unchanged). fp32's entry is
+// BYTE-IDENTICAL to the bare `rtol`/`atol` constants above.
+let precisionBands: [String: (rtol: Double, atol: Double)] = [
+    "fp32": (1e-4, 1e-5),
+    "fp16": (4e-3, 3e-2),
+    "bf16": (3e-2, 2.5e-1),
+]
+
+// #266: the load-bearing low-precision distributional tier — mirrors
+// `src/conformance.tolerances.LOWP_MEAN_KL_MAX`/`LOWP_TOP1_MIN`. fp32 has no entry: its
+// elementwise band above IS the load-bearing gate (see tolerances.py's derivation,
+// including why this is calibrated on the WORST of three toy configs — toy-moe.yaml —
+// rather than toy.yaml alone).
+let lowpKLMax: [String: Double] = ["fp16": 9e-7, "bf16": 6e-5]
+let lowpTop1Min: Double = 0.99
+
 var failures: [String] = []
+// #266: per-precision fixture counts, for the final summary line (which can no longer
+// hardcode "at rtol=1e-4 / atol=1e-5" now that fixtures run at different bands).
+var precisionCounts: [String: Int] = [:]
 
 /// A fixture's optional `meta.json` overrides — just the #168/#266 fields this runner
 /// reads. Every field is optional so a pre-#168 `meta.json` (no `rtol`/`atol`/
 /// `quant_bits`) decodes fine and changes nothing.
 struct FixtureMeta: Decodable {
+    /// #266: the dtype this fixture's reference logits were computed at. Required —
+    /// missing or unrecognised is a FAILURE, never a default (the anti-BLIND rule this
+    /// file already applies elsewhere): a fixture the runner cannot classify must never
+    /// read green.
+    let precision: String?
     let rtol: Double?
     let atol: Double?
     let quant_bits: Int?
@@ -54,11 +82,18 @@ struct FixtureMeta: Decodable {
     /// the `greedy_margin_min` analogue that makes `load.{i}`'s EXACT comparison safe.
     /// Printed alongside a count mismatch so a near-tie flake is diagnosed in one read.
     let moe_route_margin_min: Double?
+    /// #266 fallback ladder: DECLARES that the load-count oracle was deliberately
+    /// omitted (route-margin hazard too close for this precision even after a seed
+    /// search), so the anti-BLIND skip-discipline check below can accept it as a
+    /// legitimate skip rather than a stale-fixture failure. Never present alongside
+    /// `moe_load_layers`.
+    let moe_load_omitted_reason: String?
 }
 
 func loadFixtureMeta(_ dir: URL) -> FixtureMeta {
-    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil, mixing_layers: nil,
-                            moe_load_layers: nil, moe_route_margin_min: nil)
+    let empty = FixtureMeta(precision: nil, rtol: nil, atol: nil, quant_bits: nil,
+                            mixing_layers: nil, moe_load_layers: nil,
+                            moe_route_margin_min: nil, moe_load_omitted_reason: nil)
     guard let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else {
         return empty
     }
@@ -171,6 +206,7 @@ let defaultFixtureNames = [
     "toy", "toy-hybrid", "toy-moe", "toy-moe-biased",
     "toy-moe-int8", "toy-moe-int4",  // #168
     "toy-short",  // #169: L=2, gates the conv-window LEFT-PAD branch
+    "toy-fp16", "toy-bf16", "toy-moe-fp16", "toy-hybrid-fp16",  // #266
 ]
 
 // --- argument parsing (hand-rolled; the runner takes repeatable/optional flags) ---
@@ -220,8 +256,32 @@ func runGate() {
 for dir in fixtureDirs {
     let name = dir.lastPathComponent
     let meta = loadFixtureMeta(dir)
-    let fxRtol = meta.rtol ?? rtol
-    let fxAtol = meta.atol ?? atol
+    // #266: the precision -> band lookup. Missing/unrecognised `precision` is a FAILURE,
+    // never a default — the same anti-BLIND rule this file already applies to a missing
+    // fixtures directory and a missing generation.safetensors/prefill.safetensors.
+    guard let precision = meta.precision, let band = precisionBands[precision] else {
+        failures.append("\(name): meta.json has no recognised 'precision' (got "
+                        + "\(meta.precision.map { "'\($0)'" } ?? "nil")) — a fixture the "
+                        + "runner cannot classify must never read green")
+        continue
+    }
+    // Mechanism 2 of the fp32/strict-gate guarantee: a per-fixture `rtol`/`atol`
+    // override is accepted ONLY for a quantized fixture. A non-quantized fixture
+    // carrying one is a hard failure with an explanatory message — never a silently
+    // honoured loosening (this is what keeps an fp32 fixture from EVER reaching a
+    // looser row of `precisionBands` through the back door).
+    if (meta.rtol != nil || meta.atol != nil) && meta.quant_bits == nil {
+        failures.append("\(name): meta.json carries rtol/atol but quant_bits is nil — "
+                        + "only a quantized fixture may override the precision-derived "
+                        + "band (precision=\(precision))")
+        continue
+    }
+    // Mechanism 3: the override can only LOOSEN, never tighten below the physical
+    // floor — `max(band, override)`. For the two quantized fixtures (fp32 + quant_bits)
+    // this reproduces today's `max(1e-4, 2e-2) = 2e-2` exactly.
+    let fxRtol = max(band.rtol, meta.rtol ?? 0)
+    let fxAtol = max(band.atol, meta.atol ?? 0)
+    precisionCounts[precision, default: 0] += 1
     do {
         let weights = dir.appendingPathComponent("weights.safetensors")
         guard FileManager.default.fileExists(atPath: weights.path) else {
@@ -346,6 +406,37 @@ for dir in fixtureDirs {
                      + "rtol=%.1e atol=%.1e) %@",
                      name, fwdCmp.maxAbs, stepCmp.maxAbs, batch, seq, fxRtol, fxAtol,
                      fwdCmp.ok && stepCmp.ok ? "OK" : "FAIL"))
+
+        // --- #266: the low-precision LOAD-BEARING distributional tier -----------------
+        // The elementwise band above is deliberately coarse at fp16/bf16 (see
+        // src/conformance/tolerances.py's derivation Step 3/4) — mean KL + top-1
+        // agreement against Python's OWN reference logits is what actually catches a
+        // real defect at those precisions. An fp32 fixture's control flow is UNTOUCHED:
+        // this tier only runs when `precision != "fp32"`.
+        if precision != "fp32" {
+            let klMax = lowpKLMax[precision] ?? .infinity
+            let vocabLP = fwd.dim(-1)
+            let (fwdTop1, fwdKL) = quantParity(
+                fp: refForward.asType(.float32).asArray(Float.self),
+                q: fwd.asType(.float32).asArray(Float.self), vocab: vocabLP)
+            let (stepTop1, stepKL) = quantParity(
+                fp: refStep.asType(.float32).asArray(Float.self),
+                q: stepped.asType(.float32).asArray(Float.self), vocab: vocabLP)
+            let lpOk = fwdTop1 >= lowpTop1Min && fwdKL <= klMax
+                     && stepTop1 >= lowpTop1Min && stepKL <= klMax
+            print(String(
+                format: "%@: low-precision tier (%@) — forward top1=%.4f kl=%.3e, step "
+                + "top1=%.4f kl=%.3e (want top1>=%.2f, kl<=%.1e)  %@",
+                name, precision, fwdTop1, fwdKL, stepTop1, stepKL, lowpTop1Min, klMax,
+                lpOk ? "OK" : "FAIL"))
+            if !lpOk {
+                failures.append(String(
+                    format: "%@: low-precision distributional gate failed (%@) — forward "
+                    + "top1=%.4f kl=%.3e, step top1=%.4f kl=%.3e (want top1>=%.2f, "
+                    + "kl<=%.1e)", name, precision, fwdTop1, fwdKL, stepTop1, stepKL,
+                    lowpTop1Min, klMax))
+            }
+        }
 
         // --- #264: hidden states, UNCONDITIONAL (previously only checked on a forward/step
         // failure, to localize it). Every hidden state has the SAME shape (B, L, dModel), so
@@ -695,10 +786,17 @@ for dir in fixtureDirs {
                 failures.append("\(name): round trip (e) route-bias write-back check "
                                 + "threw: \(error)")
             }
+        } else if let omitted = meta.moe_load_omitted_reason {
+            // #266 fallback ladder: a DECLARED omission (the route-margin hazard was too
+            // close for this precision even after a seed search) is a legitimate skip,
+            // not a stale fixture — see scripts/export_parity_fixture.py's
+            // --allow-moe-load-omit.
+            print("\(name): MoE load counts — SKIP (declared omission: \(omitted))")
         } else if hasMoeBlocks && meta.quant_bits == nil {
             failures.append("\(name): stale fixture — model has MoE layers and is not "
-                            + "quantized, but meta.json has no moe_load_layers — "
-                            + "regenerate with scripts/export_parity_fixture.py")
+                            + "quantized, but meta.json has no moe_load_layers and no "
+                            + "moe_load_omitted_reason — regenerate with "
+                            + "scripts/export_parity_fixture.py")
         } else {
             print("\(name): MoE load counts — SKIP (\(hasMoeBlocks ? "quantized fixture" : "no MoE layers"))")
         }
@@ -1012,16 +1110,25 @@ for dir in fixtureDirs {
             let blindLogits = model.forward(packedTokens)
             let packedAware = model.forward(packedTokens, segIds: packedSegIds)
             MLX.eval([blindLogits, packedAware])
+            // #266: the DTYPE band (`fxRtol`/`fxAtol`, resolved above from `precision`),
+            // not the file-level fp32 constants — byte-identical for every fp32 fixture
+            // (the only kind that carries packed.safetensors today), and correct if a
+            // low-precision packed fixture is ever added. Still NEVER the per-fixture
+            // `rtol`/`atol` override hook (that stays reserved for quantized fixtures).
             let p6CrossLang = compare(packedAware.asType(.float32).asArray(Float.self),
                                       packedLogitsRef.asType(.float32).asArray(Float.self),
-                                      rtol: rtol, atol: atol)   // the FILE-LEVEL fp32 gate,
-                                                                 // never a per-fixture override
+                                      rtol: fxRtol, atol: fxAtol)
 
             // Assertions (2) self-consistency and (3) anti-no-op, per document.
             var p6WorstSelf = 0.0
             var p6FirstBadSelf: Int? = nil
             var p6MinBlindGap = Double.infinity
             var p6BlindGapFails: [Int] = []
+            // #266: scale the anti-no-op threshold from the bare `1e-2` to
+            // `max(1e-2, 4 * fxAtol)` — unchanged at fp32 (`4 * 1e-5 = 4e-5 < 1e-2`), but
+            // correct if a low-precision packed fixture is ever added (its own noise
+            // floor could otherwise exceed a hardcoded 1e-2).
+            let p6BlindGapThreshold = max(1e-2, 4 * fxAtol)
             for (d, span) in spans.enumerated() {
                 let (s, e) = span
                 let docTokens = packedTokens[0..<1, s..<e]
@@ -1030,7 +1137,7 @@ for dir in fixtureDirs {
                 MLX.eval([solo, sub])
                 let cSelf = compare(sub.asType(.float32).asArray(Float.self),
                                     solo.asType(.float32).asArray(Float.self),
-                                    rtol: rtol, atol: atol)
+                                    rtol: fxRtol, atol: fxAtol)
                 if cSelf.maxAbs > p6WorstSelf { p6WorstSelf = cSelf.maxAbs }
                 if !cSelf.ok && p6FirstBadSelf == nil { p6FirstBadSelf = d }
 
@@ -1043,7 +1150,7 @@ for dir in fixtureDirs {
                                          solo.asType(.float32).asArray(Float.self),
                                          rtol: 0, atol: 0)   // only .maxAbs is read below
                     if cBlind.maxAbs < p6MinBlindGap { p6MinBlindGap = cBlind.maxAbs }
-                    if cBlind.maxAbs <= 1e-2 { p6BlindGapFails.append(d) }
+                    if cBlind.maxAbs <= p6BlindGapThreshold { p6BlindGapFails.append(d) }
                 }
             }
 
@@ -1070,10 +1177,10 @@ for dir in fixtureDirs {
                 failures.append(String(
                     format: "%@: P6(3) anti-no-op check failed for doc(s) %@ — the "
                     + "packing-BLIND forward is not provably different from the "
-                    + "standalone forward at the 1e-2 threshold (min observed gap = "
+                    + "standalone forward at the %.1e threshold (min observed gap = "
                     + "%.3e); this makes P6(2) unable to distinguish a real port from a "
                     + "no-op one on this fixture — see swift/engine/Fixtures/README.md",
-                    name, "\(p6BlindGapFails)", p6MinBlindGap))
+                    name, "\(p6BlindGapFails)", p6BlindGapThreshold, p6MinBlindGap))
             }
         }
 
@@ -1347,8 +1454,13 @@ if ProcessInfo.processInfo.environment["MONICA_ENGINE_CPU"] == "1" {
 if fixtureDirs.isEmpty { failures.append("no fixtures to check") }
 
 if failures.isEmpty {
-    print("OK — all \(fixtureDirs.count) fixtures pass forward + step parity "
-          + "at rtol=1e-4 / atol=1e-5")
+    // #266: report per-precision counts — a single hardcoded "at rtol=1e-4 / atol=1e-5"
+    // would lie now that fixtures run at different bands.
+    let perPrecision = precisionCounts.sorted(by: { $0.key < $1.key }).map { p, n in
+        let band = precisionBands[p].map { "rtol=\($0.rtol) atol=\($0.atol)" } ?? "?"
+        return "\(p): \(n) at \(band)"
+    }.joined(separator: ", ")
+    print("OK — all \(fixtureDirs.count) fixtures pass forward + step parity (\(perPrecision))")
 } else {
     print("\n\(failures.count) FAILURE(S):")
     for f in failures { print("  - \(f)") }

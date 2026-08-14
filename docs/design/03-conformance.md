@@ -79,7 +79,55 @@ bf16's machine epsilon is too coarse for a meaningful equivalence check. From
 > relative) is meaningful: within = correct port, beyond = a real math bug.
 
 So conformance always compares in fp32 regardless of the run precision — the goal is
-to catch *math* bugs, not measure numerical noise.
+to catch *math* bugs, not measure numerical noise. That claim stays true here: this
+section's contract is the fp32/portable Python one (`forward_step_parity`,
+`backend_parity`, `doc_boundary_parity`). What follows is a genuinely SEPARATE contract
+for the Swift port's low-precision fixtures, not a loosening of this one.
+
+## The low-precision contract (#266)
+
+`swift/engine/`'s `monica-parity` gate runs the same forward-vs-step (and prefill/state)
+comparisons this document describes, but at the model's ACTUAL serving precision — #167's
+fast decode path runs at exactly that precision, and nothing gated it before #266. Reusing
+the fp32 band there is not an option (the block quote above already explains why); this
+section is the derivation for what replaces it. Full numbers and the reproduction scripts
+live in `src/conformance/tolerances.py`'s module docstring and
+`tests/test_lowp_parity_band.py` — this is the summary.
+
+**Measurement, not a guess.** The elementwise band `atol(dtype) = 64u`, `rtol(dtype) = 8u`
+(`u` = the dtype's unit roundoff) comes from measuring Python's OWN forward-vs-step
+disagreement across three toy configs (plain Mamba, MoE, hybrid attention) at fp16/bf16:
+the disagreement normalises to the same 6-7 * u coefficient regardless of config depth or
+block mix, so a per-DTYPE constant (not per-fixture, not a function of layer count) is the
+right shape for the gate. The chosen band sits ~9-10x above that measured coefficient.
+
+**The elementwise band is nearly vacuous on its own.** At that headroom, the elementwise
+tier only catches a weight defect of >=33% (fp16) / >=330% (bf16) — an honest headroom
+over the dtype's noise floor is already comparable to the signal from a real defect. So it
+stays in the contract as a coarse/format check, and a SEPARATE distributional tier (mean
+KL between Python's reference and the Swift output, both `forward` and stacked `step`) is
+the load-bearing one: `mean_kl(dtype) <= LOWP_MEAN_KL_MAX[dtype]`, calibrated on the WORST
+of the three configs' own forward-vs-step KL noise floor (MoE routing and attention
+introduce coherent, not purely-random, low-precision divergence — a `toy.yaml`-only
+calibration undershot the real floor by 40-60x when first measured). At the corrected
+threshold the KL tier catches a weight defect of roughly >=2.8% (fp16) / >=3% (bf16) on
+the worst-case config — still ~12x/~110x more sensitive than the elementwise tier, so it
+augments the fp32 gate's guarantee rather than replacing it: the low-precision contract
+is real, but it is *weaker* than the fp32 one, on paths that only exist at low precision.
+
+**Two exactness guards scale with dtype, everything else stays exact.** `greedy_ids`
+(#167) and MoE `load.{i}` counts (#265) are compared EXACTLY at every precision, never
+with a tolerance — but the MARGIN that makes an exact comparison safe from a near-tie
+widens with the dtype's noise floor (`greedy_margin_floor`, `route_margin_min` in
+`tolerances.py`), or the guard becomes either vacuous or spuriously flaky.
+
+**Structurally prevented from leaking into the fp32 gate**, by construction, not by
+convention: the band is looked up by the fixture's own declared `precision` (unknown/
+missing is a hard failure, never a default); a per-fixture `rtol`/`atol` override is
+accepted only when the fixture also declares `quant_bits` (#168's mechanism); and an
+override can only loosen the dtype band, never tighten below it. `tests/
+test_lowp_parity_band.py`'s T5 walks every checked-in fixture and asserts this holds —
+portable, no MLX, runs on the Linux CI job.
 
 ## Status
 
