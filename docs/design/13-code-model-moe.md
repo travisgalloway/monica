@@ -394,11 +394,13 @@ as "the router is fine" — each case raises or is recorded as an explicit `None
 **secondary measurement-and-training-signal** axis riding on the MoE model, under a formal
 measurement contract:
 
-- **SSI-M — measurement contract** (#225): one variable per arm, ≥3 seeds + paired
+- **SSI-M — measurement contract** (#225, **done**): one variable per arm, ≥3 seeds + paired
   Wilcoxon/McNemar, repo-level contamination split, availability-vs-use null arms, and a shared
-  **escape-hatch lint gate** (extends `SUPPRESSION_RE` in `src/lsp/diagnostics.py` with
-  `as unknown as`, `@ts-nocheck`, non-null `!`, empty bodies, `throw …not implemented`, `declare`
-  stubs, deletion-of-target).
+  **escape-hatch lint gate** (extends `SUPPRESSION_RE`'s hatch set — the constant itself stays
+  byte-identical — with `as unknown as`, `@ts-nocheck`, non-null `!`, empty bodies, `throw …not
+  implemented`, `declare` stubs, deletion-of-target). See
+  [`15-ssi-measurement-contract.md`](15-ssi-measurement-contract.md) and
+  `src/eval/ssi_contract.py`.
 - **Surviving arms:** completion-list logit masking / constrained decode (#226), diagnostic
   supervision — rejection-sampled FT + contrastive hard negatives (#227), and **RLVR/GRPO with an
   LSP/opengrep verifier reward** (#230).

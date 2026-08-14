@@ -59,6 +59,10 @@ Every claim here is sourced from a docstring or config comment in the code, with
 14. [The native inference + training engine (Swift + MLX)](14-inference-engine.md) — the M13
     engine (#163): prefill-via-scan, quantization, speculative decoding, the Swift train step +
     checkpoint I/O, and the B1–B4 investigation behind **Swift/MLX, Mac-first**.
+15. [The SSI measurement contract](15-ssi-measurement-contract.md) — **done** (#225): the M1–M5
+    rules every SSI arm (#226/#227/#230) must satisfy — one variable per arm, ≥3 seeds + paired
+    McNemar/sign-test/Wilcoxon, repo-level contamination split with a logged manifest,
+    availability-vs-use null arms, and the ten-hatch shared escape-hatch lint gate.
 
 > **The live program is topic 13** (M12, [#198](https://github.com/travisgalloway/monica/issues/198)):
 > a from-scratch Mamba-2 hybrid **MoE code model** with the structural-signal (SSI) fold as a
@@ -92,6 +96,7 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Tokenizer (M12) | **own byte-level BPE — native Swift** (`swift/MonicaTokenizer`, #191/#245) | cross-platform (macOS + Linux/CUDA), bit-identical; own tiktoken-style format; o200k-style pretokenizer (digit-split ≤3, indentation merge); uint16; **MLX deliberately not used** (BPE is CPU/integer work). Python code-path retired | `docs/design/13-code-model-moe.md` (MHM-P1b) |
 | Model sizes (M12) | small ~120M-act/700M-tot; large "Large A" ~700M-act/3.5B-tot — **both at `d_model 768`** | large is **sparse-upcycled** from the small dense ckpt (#200); ablation sweep picks the layout (#219). **Resolved 2026-08-09 (#272):** Large A was re-shaped from `d_model 1536` to 768 (56 layers, `moe_every 3`, 64 experts top-8, `moe_d_ff = d_inner` → 3.88B/710M) so a single dense run seeds both rungs. **#271** (FSDP/expert-parallel) is still unbuilt and blocks the large run | `docs/design/13-code-model-moe.md` |
 | Structural signal (M12, secondary) | LSP/opengrep as measurement + training signal (SSI) | validated clean-rate tool, functional ceiling found; #225/#226/#227/#230 | `docs/design/13-code-model-moe.md` |
+| SSI measurement contract | M1–M5: one variable/arm, ≥3 seeds + paired stats, repo-level split, null arms, ten-hatch lint gate | prevents confounded arms and reward hacking from reading as a win (#225) | `src/eval/ssi_contract.py`, `docs/design/15-ssi-measurement-contract.md` |
 | Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data. For the M12 code corpus, Python **cleans** (→ `cleaned.jsonl`); the native Swift `monica-tokenize pack` **tokenizes+packs** | `docs/design/08-corpus-pipeline.md` |
 | Native engine (M13) | **Swift + MLX, Mac-first** (B1); ggml/llama.cpp port deferred | reuses our MLX numerics/weights/quant and the native `swift/MonicaTokenizer`; parity-checkable against the Python seam at fp32 ~1e-4. Not Mac-locked (mlx-swift#320 CUDA build) but Apple Silicon first; ggml is gated on arch freeze + MoE-Mamba support and has no training path | `docs/design/14-inference-engine.md` |
 | Build method (reserve) | **distillation** from a frozen teacher — Qwen3 vocab, `Qwen/Qwen3-4B-Thinking-2507`, ~1B student | M10 program, **dropped 2026-07-19**; machinery built then pruned from the tree (#189/#248), design record kept as history | `docs/reserve/10-distillation.md` |

@@ -584,7 +584,12 @@ for a metric that, on this evidence, would not even move.
   has a *higher* baseline clean-rate and a perfect `error_avoidance_rate` (see Ablations). The
   saturation is a property of the task, not of model capacity.
 - **Reward hacking**: `SUPPRESSION_RE` (`@ts-ignore`/`as any`) forces not-clean regardless of
-  `tsc`'s verdict; zero suppression hacks were observed in any table's transcript.
+  `tsc`'s verdict; zero suppression hacks were observed in any table's transcript. Note: the
+  clean-rate (0.887→0.962) and pass@1 (0.503) numbers above were measured under this **narrow**
+  three-hatch `SUPPRESSION_RE`, before the #225 ten-hatch escape-hatch gate
+  (`ESCAPE_HATCH_PATTERNS`, [`15-ssi-measurement-contract.md`](15-ssi-measurement-contract.md))
+  existed — a re-run under the extended gate has not been done and could in principle surface
+  suppression moves these numbers didn't catch.
 
 # Stage A — the real-analysis oracle: persistent TS-LSP + opengrep (#199 follow-up)
 
