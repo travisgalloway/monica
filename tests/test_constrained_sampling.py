@@ -49,6 +49,22 @@ def test_out_of_range_allowed_ids_are_dropped():
     assert tok == 1
 
 
+def test_all_finite_fallback_stays_within_allowed_ids_when_repetition_bans_the_rest():
+    # allowed_ids=[0, 1] is a valid, non-empty constraint set, but
+    # no_repeat_ngram_size=1 (bans every previously-seen token) bans both of them
+    # via previous_tokens=[0, 1] -- so every logit ends up -inf and the "all
+    # non-finite" fallback fires. It must draw from {0, 1} only, never token 2
+    # (which was never in allowed_ids), even though 2 has the highest raw logit.
+    logits = np.array([1.0, 2.0, 100.0], dtype=np.float32)
+    rng = np.random.default_rng(3)
+    seen = set()
+    for _ in range(50):
+        tok = sample(logits, temperature=1.0, rng=rng, allowed_ids=[0, 1],
+                     previous_tokens=[0, 1], no_repeat_ngram_size=1)
+        seen.add(tok)
+    assert seen <= {0, 1}
+
+
 # --------------------------------------------------------------------------- #
 # ordering: mask first, then repetition penalty, then temperature/top-k/top-p
 # --------------------------------------------------------------------------- #
@@ -65,7 +81,7 @@ def test_repetition_penalty_cannot_resurrect_a_masked_token():
 
 
 def test_top_p_renormalizes_over_survivors_only():
-    # Without masking, id 0 dominates the distribution so heavily that top_p=0.5
+    # Without masking, id 0 dominates the distribution so heavily that top_p=0.99
     # keeps only it. With id 0 masked out, the same top_p must be computed over
     # the SURVIVING mass (ids 1, 2), not the original full distribution.
     logits = np.array([100.0, 1.0, 1.0], dtype=np.float32)
