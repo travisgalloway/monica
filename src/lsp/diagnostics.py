@@ -453,7 +453,9 @@ def mask_strings_and_comments(text: str) -> str:
 
 # Directive hatches live inside comments by definition -> matched against RAW
 # text. `throw_not_implemented` is also matched raw (see `find_escape_hatches`'s
-# docstring for why) but is handled separately, not listed here.
+# docstring for why) but is handled separately in that function's own logic,
+# not added to THIS frozenset -- it is still one of the nine regex entries in
+# `ESCAPE_HATCH_PATTERNS` below.
 _RAW_HATCH_NAMES = frozenset({"ts_ignore", "ts_expect_error", "ts_nocheck"})
 
 #: The #225 M5 superset -- ten hatches total counting `deletion_of_target`
@@ -495,9 +497,11 @@ def find_escape_hatches(text: str) -> List[str]:
     contract.md` (M5).
 
     Directive hatches (`ts_ignore`/`ts_expect_error`/`ts_nocheck`) match RAW
-    text. The other five regex hatches match `mask_strings_and_comments(text)`
-    so prose ("// don't use as any here", a string literal containing "as any")
-    never counts.
+    text. Of the six remaining (non-directive) regex hatches, five --
+    `as_any`/`as_unknown_as`/`non_null_assertion`/`empty_body`/`declare_stub`
+    -- match `mask_strings_and_comments(text)` so prose ("// don't use as any
+    here", a string literal containing "as any") never counts. The sixth,
+    `throw_not_implemented`, is the raw-text exception described next.
 
     `throw_not_implemented` is the one hatch that must see real, unmasked string
     content (the error message it is checking is itself string content) -- it is
@@ -529,17 +533,20 @@ def has_escape_hatch(text: str) -> bool:
 def deletion_of_target(before: str, after: str, *, anchors: Sequence[str]) -> List[str]:
     """The tenth #225 escape hatch, structural rather than lexical: the model
     "fixes" a diagnostic by deleting the thing it was about. Returns the sorted
-    subset of `anchors` present in `before` and absent from
-    `mask_strings_and_comments(after)` -- masking `after` (not `before`) means
-    commenting the target out counts as deletion too, matching the "delete the
-    evidence" move this hatch exists to catch.
+    subset of `anchors` present in `mask_strings_and_comments(before)` and
+    absent from `mask_strings_and_comments(after)` -- masking `before` avoids a
+    false "was present" from an anchor that only ever appeared inside a
+    string/comment (never real code) in `before`; masking `after` means
+    commenting the target out there counts as deletion too, matching the
+    "delete the evidence" move this hatch exists to catch.
 
     `anchors` are injected by the CALLER (the symbol under test, its signature,
     the call site) -- never guessed from the text, because guessing is exactly
     the kind of silent mismatch this measurement contract exists to prevent.
     """
+    before_masked = mask_strings_and_comments(before)
     after_masked = mask_strings_and_comments(after)
-    return sorted(a for a in anchors if a in before and a not in after_masked)
+    return sorted(a for a in anchors if a in before_masked and a not in after_masked)
 
 
 def statement_boundary(text: str) -> Optional[int]:

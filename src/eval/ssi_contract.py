@@ -73,6 +73,14 @@ def validate_arms(arms: Sequence[ArmSpec]) -> None:
     if not arms:
         raise ContractViolation("empty arm set -- nothing was validated")
 
+    seen_names: set = set()
+    for a in arms:
+        if not a.name:
+            raise ContractViolation("arm declares an empty name")
+        if a.name in seen_names:
+            raise ContractViolation(f"duplicate arm name {a.name!r}")
+        seen_names.add(a.name)
+
     by_name = {a.name: a for a in arms}
 
     for a in arms:
@@ -165,8 +173,16 @@ def pooled_compare(baseline_by_seed: Mapping[int, Sequence[dict]],
     baseline_all: List[dict] = []
     other_all: List[dict] = []
     for seed in sorted(baseline_by_seed):
-        baseline_all.extend(baseline_by_seed[seed])
-        other_all.extend(other_by_seed[seed])
+        baseline_recs = baseline_by_seed[seed]
+        other_recs = other_by_seed[seed]
+        base_ids = [r["id"] for r in baseline_recs]
+        other_ids = [r["id"] for r in other_recs]
+        if base_ids != other_ids:
+            raise ContractViolation(
+                f"seed {seed}: record id order differs between baseline and "
+                f"other ({base_ids} vs {other_ids})")
+        baseline_all.extend(baseline_recs)
+        other_all.extend(other_recs)
     return compare(baseline_all, other_all, key=key)
 
 
@@ -244,7 +260,10 @@ def summarize_arm(per_seed: Mapping[int, dict], sign_p: float, pooled: dict) -> 
     mean_delta = (sum(deltas) / n) if n else float("nan")
     delta_spread = (max(deltas) - min(deltas)) if n else float("nan")
     signs = {(1 if d > 0 else (-1 if d < 0 else 0)) for d in deltas}
-    consistent_direction = bool(signs) and (signs - {0} in ({1}, {-1}, set()))
+    # All-zero deltas carry no direction to be consistent about -- exclude {0}
+    # from the "consistent" outcomes (an empty non-zero-sign set, e.g. n == 0
+    # or every delta exactly 0, is correctly `False` here).
+    consistent_direction = (signs - {0}) in ({1}, {-1})
 
     return {
         "n_seeds": n,
@@ -362,7 +381,8 @@ def split_manifest(split: RepoSplit) -> dict:
         "eval_repos_sha256": eval_repos_sha256,
     }
     manifest["manifest_sha256"] = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return manifest
 
 
