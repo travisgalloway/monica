@@ -103,19 +103,38 @@ def dp_mesh(mesh: DeviceMesh) -> DeviceMesh:
 # FSDP2 wrapping
 # --------------------------------------------------------------------------- #
 def wrap_backbone(model, mesh: DeviceMesh, *, reshard_after_forward: bool = True) -> Any:
-    """Wrap `model`'s layers + root with FSDP2 (`fully_shard`), per-layer then root —
+    """Wrap `model`'s layers + remaining top-level leaves with FSDP2 (`fully_shard`) —
     ZeRO-2 (`reshard_after_forward=False`, keep params materialized after forward, less
     comm — the small-rung default) or ZeRO-3-equivalent (`True` — Large A). `mesh` is
     ALWAYS passed explicitly (see module docstring).
 
-    The tied embedding (`model.embedding`, read again by `_head` via `.weight.t()`) is
-    wrapped as part of the root call along with everything not caught by a per-layer
-    unit, so its shard is consistent between the embedding lookup and the head matmul —
-    both read the SAME sharded parameter, not two independently-resharded copies.
+    Wraps `model.layers[i]` individually, then `model.embedding` (and `model.lm_head`
+    when untied) — NOT a final root `fully_shard(model, ...)` call. This differs from
+    the textbook "per-layer + root" FSDP2 recipe; the deviation is a REAL finding from
+    this host, not a simplification:
+
+    `fully_shard` implements itself by swapping `module.__class__` to a dynamically
+    injected `FSDP<Cls>` subclass. `CUDAMambaModel(ModelInterface, nn.Module)` inherits
+    from `ModelInterface(ABC)`; the ABC metaclass gives its instances a different
+    internal layout (`_abc_impl`) than a plain `nn.Module`, and that class-swap raises
+    `TypeError: __class__ assignment: ... object layout differs` — reproduced in-session
+    with a minimal `class M(ABC, nn.Module)` wrapped in `fully_shard`, independent of
+    anything else in this model. Per-layer blocks (`MambaBlock`/`AttentionBlock`/
+    `MoEBlock`) are plain `nn.Module` subclasses and wrap fine; only the ABC-rooted
+    top-level model cannot itself be a `fully_shard` target.
+
+    Wrapping `model.embedding` directly (rather than via a root call) still gives the
+    tied embedding (`_head` reads `self.embedding.weight.t()`) shard-consistency: both
+    reads hit the SAME sharded parameter object, not two independently-resharded
+    copies — the property the textbook root-wrap would have given for free.
+    `model.norm_f` (a handful of scalars) is deliberately left unsharded — there is
+    nothing to save there.
     """
     for layer in model.layers:
         fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward)
-    fully_shard(model, mesh=mesh, reshard_after_forward=reshard_after_forward)
+    fully_shard(model.embedding, mesh=mesh, reshard_after_forward=reshard_after_forward)
+    if not model._tie_embeddings:
+        fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=reshard_after_forward)
     return model
 
 

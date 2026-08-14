@@ -1195,11 +1195,45 @@ class CUDAMambaModel(ModelInterface, nn.Module):
                             ep_size=self._ep_size, ep_rank=self._ep_rank)
         return MambaBlock(self.config)
 
+    @staticmethod
+    def _fsdp_unshard(module) -> None:
+        """FSDP2 (#271) hazard, discovered on this host: `fully_shard` unshards a
+        wrapped module's params via a forward PRE-HOOK registered on `nn.Module.
+        __call__`. This model's block API (`forward_seq`/`step`/`forward_prefill`) is
+        invoked directly on the layer object, never through `layer(...)`/`__call__` —
+        by design, so `forward` and `step` can share the exact same underlying compute
+        without an nn.Module dispatch layer in between (see the module docstring's
+        SSD/train-infer-parity note). That means FSDP2's unshard hook never fires, and
+        a sharded DTensor param hits an op against a plain (unsharded) activation:
+        `RuntimeError: aten.mul.Tensor got mixed torch.Tensor and DTensor` — reproduced
+        in-session with a 2-rank gloo run (`tests/test_cuda_distributed.py`'s V6).
+
+        Calling `.unshard()` explicitly, right before any DIRECT (non-`__call__`)
+        access to a `fully_shard`-wrapped module's params, fixes it. Deliberately does
+        NOT call the matching `.reshard()` afterward — under `grad_checkpoint`, the
+        SAME direct call recomputes in backward, by which point a paired reshard would
+        have already re-sharded the params out from under that recompute. Leaving
+        params materialized (relying on the NEXT `unshard()` to be a cheap no-op, or on
+        FSDP2's own end-of-backward reshard) trades peak memory for correctness here —
+        the actual memory-reclaim timing under this codebase's direct-dispatch
+        convention is UNRESOLVED and left as a CUDA-host follow-up (see
+        `cuda_distributed.wrap_backbone`'s docstring), not claimed as solved by this
+        method. A plain (non-FSDP) module has no `.unshard` attribute, so this is a
+        strict no-op at world_size == 1 — unchanged from every pre-#271 call site.
+        """
+        unshard = getattr(module, "unshard", None)
+        if unshard is not None:
+            unshard()
+
     def _head(self, h: Array) -> Array:
         # Logits + cross-entropy run in fp32 (wide-vocab softmax stability); h is upcast
         # so the head matmul is fp32 regardless of compute dtype.
         h = _f32(h)
         if self._tie_embeddings:
+            # `self.embedding(ids)` (the LOOKUP, in `forward`/`prefill`/`step` below) goes
+            # through `__call__` and unshards itself fine; THIS raw `.weight` access does
+            # not — see `_fsdp_unshard`'s docstring.
+            self._fsdp_unshard(self.embedding)
             return h @ self.embedding.weight.t()
         return self.lm_head(h)
 
@@ -1208,6 +1242,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         # Gradient checkpointing: recompute the layer's forward in backward instead of
         # retaining its activations. Only meaningful under autograd; use_reentrant=False
         # runs normally in no-grad (eval/parity) contexts.
+        self._fsdp_unshard(layer)
         if self.config.grad_checkpoint and torch.is_grad_enabled():
             if self.config.fp8_experts and fp8_status() and isinstance(layer, MoEBlock):
                 # `transformer_engine.pytorch.checkpoint`, NOT `torch.utils.checkpoint`
@@ -1261,6 +1296,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         # logits only; compiling a state-returning traversal is deliberate follow-up work.
         # Grad checkpointing is skipped too — prefill is inference.
         for layer in self.layers:
+            self._fsdp_unshard(layer)     # see _fsdp_unshard's docstring (#271)
             h, st = layer.forward_prefill(h)
             state.append(st)
         h = self.norm_f(h)
@@ -1273,6 +1309,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         h = _cast(self.embedding(ids), self._cd)
         new_state = []
         for layer, st in zip(self.layers, state):
+            self._fsdp_unshard(layer)     # see _fsdp_unshard's docstring (#271)
             h, st2 = layer.step(h, st)
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
