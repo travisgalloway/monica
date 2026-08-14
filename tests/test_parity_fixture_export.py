@@ -59,6 +59,23 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
                 "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`.")
     np.testing.assert_array_equal(fresh_gen["prompt_ids"], gen_ref["prompt_ids"])
 
+    # #169: extend the staleness check to the prefill state-handoff oracle — the same
+    # rationale as the greedy-id extension above, applied to prefill.safetensors's logits
+    # AND its per-leaf state (a state leaf drifting silently is exactly the "generation
+    # subtly wrong after the prompt" bug #169 exists to catch).
+    pre_ref = load_file(str(FIXTURE / "prefill.safetensors"))
+    fresh_pre = load_file(str(tmp_path / "toy" / "prefill.safetensors"))
+    assert set(fresh_pre.keys()) == set(pre_ref.keys()), (
+        "prefill.safetensors keys drifted — the layer structure (Mamba/Attention/MoE state "
+        "slots) no longer matches the checked-in oracle.")
+    for key in pre_ref:
+        assert np.allclose(fresh_pre[key], pre_ref[key], rtol=RTOL, atol=ATOL), (
+            f"prefill.safetensors[{key!r}] drifted from the checked-in Swift-parity oracle "
+            f"(max|d| = {np.abs(fresh_pre[key] - pre_ref[key]).max():.3e}). If the backend "
+            "change is intended, regenerate the fixtures — see "
+            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+        )
+
 
 def test_checked_in_tokens_are_reproducible():
     """The token batch is derived from the seed, so a fixture's inputs must be

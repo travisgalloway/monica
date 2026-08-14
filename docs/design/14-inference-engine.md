@@ -308,7 +308,7 @@ The #163 dependency order:
 3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
    I/O) — in parallel once #166 lands.
 4. **#197** (LSP harness), **#168** (quantization — **done**), **#169** (Swift prefill —
-   needs #165), **#170** (Apple-Silicon benchmark harness).
+   **done**), **#170** (Apple-Silicon benchmark harness).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
@@ -379,13 +379,22 @@ DPO/GRPO step factories.
   stay exactly as coupled as before (`Sampler.swift`'s RNG is a deliberate ~10-line duplicate
   of `MonicaTokenizer.SplitMix64` rather than a shared type, precisely to keep the library's
   dependency shape unchanged).
-- **#167 prefills sequentially, pending #169.** `Generator.generate` prefills the prompt by
-  calling `model.step` once per prompt token (batch 1) — the pre-#165 Python shape
-  (`src/serve/generate.py` before its `SessionStore.prefill` one-shot parallel scan landed) —
-  and is numerically the same answer, gated the same way
-  `src/conformance/prefill_decode_parity.py` gates Python's prefill == stepping. The
-  parallel-scan prefill lever (`forward_prefill`, see the perf-levers table above) is **Swift
-  #169's job**; #167 deliberately does not reach for it.
+- **#169 shipped the parallel-scan prefill.** `MonicaModel.prefill(tokens, lastOnly:)` runs
+  one SSD chunked-matmul scan over the whole prompt (`SelectiveSSM.parallelWithState`,
+  `MambaBlock`/`AttentionBlock`/`MoEBlock.forwardPrefill`) and hands `Generator.generate`
+  (default `usePrefill: true`) the exact `[LayerState]` an `L`-step walk of `model.step`
+  would have left. The old per-token sequential prefill stays reachable as
+  `usePrefill: false` (`monica-generate --no-prefill`) — the AC3 baseline and the AC1 A/B
+  reference, not dead code. `monica-parity`'s P1-P5 checks (fp32 `rtol=1e-4`/`atol=1e-5`,
+  unchanged) gate: prefill logits vs the Python oracle and vs `forward`; `lastOnly`
+  honesty; **state handoff, element-wise, both cross-language (vs a new
+  `prefill.safetensors` oracle) and intra-Swift (vs `step`'s own recurrence)** — the
+  load-bearing check, since a wrong carry-out is silent in the prompt's own logits and only
+  corrupts tokens generated afterward; prefill-then-decode vs pure step-by-step; and exact
+  greedy-id equality through the prefill path. AC3 (`monica-generate --bench-prefill`,
+  wired into CI's `swift-engine` job as an informational, non-gating step) measures
+  sequential-vs-parallel prefill latency: *first green-CI numbers pending — update this
+  line and the #169 issue comment once `swift-engine` has run on the PR.*
 
 ## See also
 

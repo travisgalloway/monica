@@ -424,6 +424,18 @@ jobs:
             --temperature 0 --max-new-tokens 8)
           echo "$OUT"
           [ -n "$OUT" ]
+      - name: monica-generate AC3 — prefill bench (#169, informational)
+        # NOT a gate: hosted-runner timing is noisy, so no threshold assertion. It DOES
+        # assert the two prefill paths' argmax id AGREES (a correctness property, not a
+        # timing one) and that the output is non-empty — a bench that cannot observe its
+        # target must not read green. The printed ms/speedup feed
+        # docs/design/14-inference-engine.md and a comment on #169.
+        working-directory: swift/engine
+        run: |
+          OUT=$("$MONICA_GENERATE_BIN" --weights Fixtures/toy/weights.safetensors \
+            --bench-prefill --bench-prompt-len 128 --bench-iterations 5)
+          echo "$OUT"
+          [ -n "$OUT" ]
       - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
         # Cheap, and it fails loudly the day someone "simplifies" the two packages into one.
         # The engine -> tokenizer edge (Package.swift) must never become tokenizer -> engine.

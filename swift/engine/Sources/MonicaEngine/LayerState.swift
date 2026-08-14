@@ -43,6 +43,14 @@ open class Block: Module {
         fatalError("Block subclasses must override step")
     }
 
+    /// `forward_prefill` (#169, `mlx_backend.py:410-424`/`:539-557`/`:800-806`) — the same
+    /// function as `forwardSeq(x) -> x`, additionally returning the `LayerState` a `step`
+    /// walk over `x`'s tokens (from a fresh, zero-length state) would have left. Fresh-
+    /// session-only: no `seg_ids` counterpart, matching #165's seam contract.
+    open func forwardPrefill(_ x: MLXArray) -> (MLXArray, LayerState) {
+        fatalError("Block subclasses must override forwardPrefill")
+    }
+
     open func initState(batch: Int) -> LayerState {
         fatalError("Block subclasses must override initState")
     }

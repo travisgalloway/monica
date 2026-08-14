@@ -4,8 +4,8 @@
 // Scores and softmax run in fp32 regardless of `cd` (qkv/o_proj GEMMs in `cd`) so forward
 // and step agree at the fp32 ~1e-4 parity tolerance.
 //
-// Not ported (out of scope for #166): the `seg_ids` block-diagonal mask and
-// `forward_prefill` (#169).
+// Not ported (out of scope for #166): the `seg_ids` block-diagonal mask.
+// `forward_prefill` landed in #169 as `forwardPrefill`.
 
 import Foundation
 import MLX
@@ -86,5 +86,28 @@ public final class AttentionBlock: Block {
     public override func initState(batch: Int) -> LayerState {
         let z = MLXArray.zeros([batch, h, 0, dh])
         return .attention(k: z, v: z)
+    }
+
+    /// `forward_prefill` (`:539-557`) — `forwardSeq`'s body verbatim, additionally emitting
+    /// the (k, v) cache `step` would have built over the same tokens. `k` is POST-RoPE (the
+    /// same tensor that built `scores` here) and `v` is unchanged, both fp32 `(B, Ha, L,
+    /// Dh)`. RoPE positions run `0..<L`, matching `step`'s `t = kCache.dim(2)` seeding from
+    /// a zero-length cache — hence fresh-session-only, same as Python's `prefill`.
+    public override func forwardPrefill(_ x: MLXArray) -> (MLXArray, LayerState) {
+        let cd = config.cd
+        let l = x.dim(1)
+        let xn = norm(x)
+        var (q, k, v) = qkv(xn, cd)                                     // (B,H,L,Dh) fp32
+        let (cosv, sinv) = ropeCosSin(
+            positions: MLXArray(Array(0..<l).map { Int32($0) }), headDim: dh)
+        q = applyRope(q, cosv, sinv)
+        k = applyRope(k, cosv, sinv)
+        var scores = matmul(q, k.transposed(0, 1, 3, 2)) / MLXArray(Float(sqrt(Double(dh))))
+        scores = which(causalMask(l), scores,
+                       MLXArray(-Float.infinity).asType(scores.dtype))
+        var out = matmul(softmaxLastDim(scores), v)                     // (B,H,L,Dh)
+        out = out.transposed(0, 2, 1, 3).reshaped([x.dim(0), l, h * dh])
+        let result = x + linear(oProj, cast(out, cd), cd)
+        return (result, .attention(k: k, v: v))
     }
 }

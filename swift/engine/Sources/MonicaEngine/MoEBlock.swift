@@ -118,4 +118,11 @@ public final class MoEBlock: Block {
     }
 
     public override func initState(batch: Int) -> LayerState { .moe }
+
+    /// `forward_prefill` (`:800-806`) — stateless, so this is `forwardSeq` plus the same
+    /// `.moe` placeholder `initState`/`step` use. Python must emit a zero-sized tensor pair
+    /// to keep its tuple unpack valid; Swift's enum needs no such placeholder.
+    public override func forwardPrefill(_ x: MLXArray) -> (MLXArray, LayerState) {
+        (x + moe(norm(x)), .moe)
+    }
 }

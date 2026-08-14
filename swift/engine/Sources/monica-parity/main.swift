@@ -99,6 +99,16 @@ func evalTargets(_ s: LayerState) -> [MLXArray] {
     }
 }
 
+/// #169 P3: one `LayerState`'s stateful leaves, named by SLOT (not layer index — the
+/// caller prefixes that), matching `state.{i}.{slot}` in `prefill.safetensors`.
+func layerStateSlots(_ s: LayerState) -> [(String, MLXArray)] {
+    switch s {
+    case .mamba(let conv, let ssm): return [("conv", conv), ("ssm", ssm)]
+    case .attention(let k, let v): return [("k", k), ("v", v)]
+    case .moe: return []
+    }
+}
+
 /// numpy's `allclose` predicate, elementwise, with `ref` as the reference operand:
 /// `|a - ref| <= atol + rtol * |ref|`. Returns the max absolute difference and whether
 /// every element passed. `rtol`/`atol` default to the fp32 gate's constants; a
@@ -143,6 +153,7 @@ func resolveFixturesDir() -> URL? {
 let defaultFixtureNames = [
     "toy", "toy-hybrid", "toy-moe", "toy-moe-biased",
     "toy-moe-int8", "toy-moe-int4",  // #168
+    "toy-short",  // #169: L=2, gates the conv-window LEFT-PAD branch
 ]
 
 // --- argument parsing (hand-rolled; the runner takes one repeatable flag) ---
@@ -339,6 +350,177 @@ for dir in fixtureDirs {
                 failures.append(String(format: "%@: step logits differ (max|d| = %.3e)", name,
                                        stepCmp.maxAbs))
             }
+        }
+
+        // --- #169: prefill (parallel-scan) checks -------------------------------------
+        // A missing prefill.safetensors is a FAILURE, not a skip — same rule the file
+        // already applies to generation.safetensors.
+        let preURL = dir.appendingPathComponent("prefill.safetensors")
+        guard FileManager.default.fileExists(atPath: preURL.path) else {
+            failures.append("\(name): no prefill.safetensors at \(preURL.path) — "
+                            + "regenerate with scripts/export_parity_fixture.py")
+            continue
+        }
+        let preRef = try loadArrays(url: preURL)
+        guard let refPreLogits = preRef["prefill_logits"],
+              let refPreLast = preRef["prefill_last_logits"] else {
+            failures.append("\(name): prefill.safetensors is missing prefill_logits/"
+                            + "prefill_last_logits")
+            continue
+        }
+
+        // P1: prefill's full logits vs the Python oracle AND vs this fixture's own
+        // forward_logits (prefill must not have drifted from the training path).
+        let (preLogits, preState) = model.prefill(tokens)
+        MLX.eval([preLogits] + preState.flatMap(evalTargets))
+        let p1VsPython = compare(preLogits.asType(.float32).asArray(Float.self),
+                                 refPreLogits.asType(.float32).asArray(Float.self),
+                                 rtol: fxRtol, atol: fxAtol)
+        let p1VsForward = compare(preLogits.asType(.float32).asArray(Float.self),
+                                  refForward.asType(.float32).asArray(Float.self),
+                                  rtol: fxRtol, atol: fxAtol)
+        if !p1VsPython.ok {
+            failures.append(String(
+                format: "%@: P1 prefill logits vs Python oracle differ (max|d| = %.3e)",
+                name, p1VsPython.maxAbs))
+        }
+        if !p1VsForward.ok {
+            failures.append(String(
+                format: "%@: P1 prefill logits vs this fixture's own forward logits differ "
+                + "(max|d| = %.3e) — prefill has drifted from the training path",
+                name, p1VsForward.maxAbs))
+        }
+
+        // P2: lastOnly honesty — vs the Python oracle AND vs the last row of P1's own logits.
+        let (preLast, _) = model.prefill(tokens, lastOnly: true)
+        MLX.eval(preLast)
+        let lastOfFull = preLogits[0..., (seq - 1)..<seq, 0...].squeezed(axis: 1)
+        MLX.eval(lastOfFull)
+        let p2VsPython = compare(preLast.asType(.float32).asArray(Float.self),
+                                 refPreLast.asType(.float32).asArray(Float.self),
+                                 rtol: fxRtol, atol: fxAtol)
+        let p2VsSelf = compare(preLast.asType(.float32).asArray(Float.self),
+                               lastOfFull.asType(.float32).asArray(Float.self),
+                               rtol: fxRtol, atol: fxAtol)
+        if !p2VsPython.ok {
+            failures.append(String(
+                format: "%@: P2 lastOnly logits vs Python oracle differ (max|d| = %.3e)",
+                name, p2VsPython.maxAbs))
+        }
+        if !p2VsSelf.ok {
+            failures.append(String(
+                format: "%@: P2 lastOnly logits vs the last row of prefill's own full logits "
+                + "differ (max|d| = %.3e)", name, p2VsSelf.maxAbs))
+        }
+
+        // P3 — STATE HANDOFF, the load-bearing check. Two independent comparisons of the
+        // same Swift-prefilled state:
+        //   (a) cross-language: each leaf vs Python's exported state.{i}.{slot}.
+        //   (b) intra-Swift: `state` (this loop already stepped all `seq` tokens from
+        //       initState above, to build `stepped`) vs the prefilled state, element-wise.
+        var p3WorstCross = 0.0
+        var p3WorstIntra = 0.0
+        var p3FirstBadCross: String? = nil
+        var p3FirstBadIntra: String? = nil
+        for i in 0..<preState.count {
+            for (slot, arr) in layerStateSlots(preState[i]) {
+                let key = "state.\(i).\(slot)"
+                guard let ref = preRef[key] else {
+                    failures.append("\(name): P3(a) prefill.safetensors is missing '\(key)' "
+                                    + "— structural disagreement between Swift and Python "
+                                    + "layer \(i)")
+                    continue
+                }
+                MLX.eval(arr)
+                let c = compare(arr.asType(.float32).asArray(Float.self),
+                                ref.asType(.float32).asArray(Float.self),
+                                rtol: fxRtol, atol: fxAtol)
+                if c.maxAbs > p3WorstCross { p3WorstCross = c.maxAbs }
+                if !c.ok && p3FirstBadCross == nil { p3FirstBadCross = "layer \(i) \(slot)" }
+            }
+            switch (preState[i], state[i]) {
+            case (.mamba(let c1, let s1), .mamba(let c2, let s2)):
+                for (label, a, b) in [("conv", c1, c2), ("ssm", s1, s2)] {
+                    MLX.eval([a, b])
+                    let c = compare(a.asType(.float32).asArray(Float.self),
+                                    b.asType(.float32).asArray(Float.self),
+                                    rtol: fxRtol, atol: fxAtol)
+                    if c.maxAbs > p3WorstIntra { p3WorstIntra = c.maxAbs }
+                    if !c.ok && p3FirstBadIntra == nil { p3FirstBadIntra = "layer \(i) \(label)" }
+                }
+            case (.attention(let k1, let v1), .attention(let k2, let v2)):
+                for (label, a, b) in [("k", k1, k2), ("v", v1, v2)] {
+                    MLX.eval([a, b])
+                    let c = compare(a.asType(.float32).asArray(Float.self),
+                                    b.asType(.float32).asArray(Float.self),
+                                    rtol: fxRtol, atol: fxAtol)
+                    if c.maxAbs > p3WorstIntra { p3WorstIntra = c.maxAbs }
+                    if !c.ok && p3FirstBadIntra == nil { p3FirstBadIntra = "layer \(i) \(label)" }
+                }
+            case (.moe, .moe):
+                break
+            default:
+                failures.append("\(name): P3(b) layer \(i) prefilled and stepped state are "
+                                + "different LayerState cases — structural disagreement")
+            }
+        }
+        print(String(format: "%@: P3 state handoff — cross-lang max|d| = %.3e, "
+                     + "intra-Swift max|d| = %.3e  %@", name, p3WorstCross, p3WorstIntra,
+                     p3FirstBadCross == nil && p3FirstBadIntra == nil ? "OK" : "FAIL"))
+        if let bad = p3FirstBadCross {
+            failures.append("\(name): P3(a) state handoff FIRST DIVERGENCE (vs Python) at "
+                            + "\(bad) (max|d| = \(String(format: "%.3e", p3WorstCross)))")
+        }
+        if let bad = p3FirstBadIntra {
+            failures.append("\(name): P3(b) state handoff FIRST DIVERGENCE (vs Swift's own "
+                            + "step) at \(bad) (max|d| = \(String(format: "%.3e", p3WorstIntra)))")
+        }
+
+        // P4: prefill-then-decode vs pure step-by-step, anchored to the Python step_logits
+        // oracle (the end-to-end property serving depends on).
+        let nDecode = min(4, seq - 1)
+        let promptLen = seq - nDecode
+        let promptTok = tokens[0..<batch, 0..<promptLen]
+        let (_, stateA0) = model.prefill(promptTok)
+        var stateA = stateA0
+        var mixed: [MLXArray] = []
+        mixed.reserveCapacity(nDecode)
+        for t in 0..<nDecode {
+            let tok = tokens[0..<batch, (promptLen + t)..<(promptLen + t + 1)].reshaped([batch])
+            let (lg, st) = try model.step(tok, stateA)
+            MLX.eval([lg] + st.flatMap(evalTargets))
+            stateA = st
+            mixed.append(lg)
+        }
+        let mixedArr = stacked(mixed, axis: 1)                        // (B, nDecode, V)
+        let refTail = refStep[0..., promptLen..<seq, 0...]
+        MLX.eval([mixedArr, refTail])
+        let p4Cmp = compare(mixedArr.asType(.float32).asArray(Float.self),
+                            refTail.asType(.float32).asArray(Float.self),
+                            rtol: fxRtol, atol: fxAtol)
+        print(String(format: "%@: P4 prefill-then-decode vs pure step max|d| = %.3e  %@",
+                     name, p4Cmp.maxAbs, p4Cmp.ok ? "OK" : "FAIL"))
+        if !p4Cmp.ok {
+            failures.append(String(
+                format: "%@: P4 prefill-then-decode logits vs pure step-by-step differ "
+                + "(max|d| = %.3e)", name, p4Cmp.maxAbs))
+        }
+
+        // P5: greedy ids through the prefill path — exact id equality against the SAME
+        // generation.safetensors oracle the sequential AC1 check above used.
+        do {
+            let p5Sampler = Sampler(temperature: 0)
+            let genIds = try Generator.generate(
+                model: model, promptIds: promptIds, sampler: p5Sampler,
+                maxNewTokens: expectedGreedy.count, usePrefill: true)
+            if genIds != expectedGreedy {
+                failures.append("\(name): P5 greedy ids via the prefill path mismatch — "
+                                + "swift=\(genIds) python=\(expectedGreedy)")
+            } else {
+                print("\(name): P5 prefill-path greedy ids OK (\(genIds.count) steps)")
+            }
+        } catch {
+            failures.append("\(name): P5 threw — \(error)")
         }
 
         // --- #168: quantized-fixture-only checks -------------------------------------
