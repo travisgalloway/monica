@@ -39,6 +39,7 @@ let package = Package(
         .library(name: "MonicaEngine", targets: ["MonicaEngine"]),
         .executable(name: "monica-parity", targets: ["monica-parity"]),
         .executable(name: "monica-generate", targets: ["monica-generate"]),
+        .executable(name: "monica-bench", targets: ["monica-bench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
@@ -74,6 +75,20 @@ let package = Package(
                 // (see docs/design/14-inference-engine.md and .claude/plans/issue-167.md):
                 // the name form fails with "unknown package … valid packages are: 'swift'".
                 .product(name: "MonicaTokenizer", package: "swift"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The benchmark harness (#170). Deliberately depends on `MonicaEngine` + `MLX`
+        // ONLY — no tokenizer edge, unlike `monica-generate`. The bench modes (prefill/
+        // decode/memory) all operate on random token ids (see `Bench.swift`), so there
+        // is nothing here for a tokenizer to do; keeping the edge off means
+        // `monica-bench` never drags the `swift/` package's build graph in for a run
+        // that never calls it.
+        .executableTarget(
+            name: "monica-bench",
+            dependencies: [
+                "MonicaEngine",
+                .product(name: "MLX", package: "mlx-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
