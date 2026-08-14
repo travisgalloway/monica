@@ -20,6 +20,23 @@ function and a mismatch between them is exactly the bug this harness exists to c
   wrong carry-out is silent (the prompt's own logits still look right) and only corrupts
   tokens generated afterwards, so it is checked element-wise, not just via logits.
 
+## The checkpoint round trip (#196) adds NO fixture
+
+`monica-parity`'s round-trip section (`Checkpoint.save`/`portableStateDict`, #196) proves the
+Swift **writer** produces a checkpoint Swift can read back byte-for-byte, and
+`scripts/check_swift_checkpoint.py` proves Python can too — but neither check needed, or got,
+a new checked-in tensor. Every comparison is computed **in-process** from the fixture already
+loaded above: save the already-loaded model, reload it, and diff against the SAME model
+object's own tensors/config/logits, all in the same run. This is deliberate, not an oversight:
+#195 (the Swift train step) shipped a checked-in **gradient** oracle that turned out to
+diverge across macOS machines (`grad.0.layers.0.conv.weight` by `max|d|=1.226e-02` on the
+hosted CI runner vs. locally) — forward/step *logit* and *weight* fixtures have never shown
+that failure mode, but the safest fix is to not add another checked-in tensor of any kind. The
+round trip's two EXACT (no-tolerance) comparisons — save→load tensor bit-identity, and the
+mutation round trip's exact-preservation check — are therefore same-process, same-machine
+comparisons by construction, which makes them immune to the cross-machine drift that broke
+#195's fixture regardless of what hardware CI runs on next.
+
 ## Files in a fixture
 
 | File | What |

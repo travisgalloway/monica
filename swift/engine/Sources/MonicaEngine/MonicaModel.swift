@@ -13,8 +13,12 @@ public final class MonicaModel: Module {
     public let config: MambaConfig
 
     @ModuleInfo(key: "embedding") var embedding: Embedding
-    @ModuleInfo(key: "layers") var layers: [Block]
-    @ModuleInfo(key: "norm_f") var normF: RMSNorm
+    // `layers`/`normF` are `public` (unlike `embedding`, which no external caller needs)
+    // so #196's round-trip section in `monica-parity` — a separate module — can walk
+    // `MoEBlock`s for the route-bias check and mutate `normF.weight` for the
+    // anti-file-copy check, without adding new API surface to `MonicaModel` itself.
+    @ModuleInfo(key: "layers") public var layers: [Block]
+    @ModuleInfo(key: "norm_f") public var normF: RMSNorm
     /// Only present when `tie_embeddings` is false. Every config in scope ties, so the
     /// portable checkpoint carries no head tensor (see Checkpoint.swift).
     @ModuleInfo(key: "lm_head") var lmHead: Linear?

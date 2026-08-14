@@ -479,6 +479,46 @@ jobs:
             ${{ runner.temp }}/monica-bench-toy.json
             ${{ runner.temp }}/monica-bench-toy-moe-int8.json
           retention-days: 90
+      # ── #196: checkpoint I/O — the Swift WRITER round-trips into Python ──
+      # `monica-parity`'s own round-trip section (Checkpoint.swift's `save`, gated
+      # above as part of "Logit + greedy-id parity") only proves Swift can read back
+      # what Swift wrote. The issue's other acceptance direction — "a checkpoint
+      # written by Swift loads and runs in Python" — can only be proven by a Python
+      # process, hence the two steps below.
+      - name: Emit Swift-written checkpoints for the Python round-trip gate
+        # Cheap: the binary is already built and every fixture is tiny. Reruns the
+        # same binary rather than adding a second executable/target.
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-parity binary not found under .build-xcode/Build/Products" >&2
+            exit 1
+          fi
+          "$BIN" --roundtrip-out "$RUNNER_TEMP/swift-ckpt"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Python (mlx only — no data/torch needed for this check)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Swift -> Python checkpoint round trip (GATE)
+        # Closes the direction `monica-parity`'s own round trip cannot: sidecar
+        # dict equality, quant-block equality, key-set equality, and forward logits
+        # vs reference.safetensors, for every checkpoint the step above emitted. An
+        # empty --roundtrip-dir is a FAILURE in this script, not a silent pass — see
+        # scripts/check_swift_checkpoint.py's module docstring. If Python setup ever
+        # makes this job noticeably slower, the documented fallback (see that
+        # script's docstring and #196's plan) is to upload
+        # "$RUNNER_TEMP/swift-ckpt" as an artifact and run this check in a small
+        # separate `needs:`-gated macOS job instead of inline here.
+        run: |
+          python scripts/check_swift_checkpoint.py \
+            --roundtrip-dir "$RUNNER_TEMP/swift-ckpt" \
+            --fixtures swift/engine/Fixtures
       - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
         # Cheap, and it fails loudly the day someone "simplifies" the two packages into one.
         # The engine -> tokenizer edge (Package.swift) must never become tokenizer -> engine.

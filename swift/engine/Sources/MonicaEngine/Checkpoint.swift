@@ -22,7 +22,9 @@ import MLX
 import MLXNN
 
 public enum Checkpoint {
-    static let moeBiasPrefix = "moe_route_bias."
+    // `public` (not just `internal`) so `monica-parity`'s #196 round-trip section can
+    // check a saved file's raw key set for this prefix without duplicating the literal.
+    public static let moeBiasPrefix = "moe_route_bias."
 
     /// Load `<weightsURL>` (safetensors) plus `<weightsURL>.config.json` into a fresh model.
     /// Returns the model and the checkpoint's parameter key set (the caller asserts it
@@ -95,5 +97,65 @@ public enum Checkpoint {
         // rather than inside the first forward. (Nothing to do with code evaluation.)
         MLX.eval(model.parameters())
         return Set(params.map { $0.0 })
+    }
+
+    // --- writer (#196) ------------------------------------------------------------
+
+    /// The portable state dict for `model`: `model.parameters().flattened()` plus, for
+    /// each `MoEBlock` whose route bias is ACTIVE, `moe_route_bias.{i}` — the exact
+    /// mirror of `_portable_state_dict` (`mlx_backend.py:1043-1061`), including its
+    /// "emit only when active" rule. An unconditional key would break Python's
+    /// `num_parameters()` accounting (`tests/test_moe.py`, `tests/test_sizing_mlx.py`):
+    /// the bias genuinely is not a parameter (see `MoEBlock.routeBias`'s docstring for
+    /// why it is deliberately invisible to mlx-swift's parameter reflection), so it
+    /// can't ride the `parameters()` flatten and doesn't belong in that count either way.
+    public static func portableStateDict(_ model: MonicaModel) -> [String: MLXArray] {
+        var out = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        for (i, layer) in model.layers.enumerated() {
+            guard let moe = layer as? MoEBlock, let bias = moe.routeBias else { continue }
+            out["\(moeBiasPrefix)\(i)"] = MLXArray(bias)
+        }
+        return out
+    }
+
+    /// Write `model` as a portable checkpoint: `<weightsURL>` (safetensors) plus
+    /// `<weightsURL>.config.json` (the sidecar) — the Swift mirror of `save`
+    /// (`mlx_backend.py:1029-1032`). The sidecar path is built the same
+    /// `path + ".config.json"` way `load` above already does, so the writer and reader
+    /// cannot drift apart on the naming convention.
+    ///
+    /// Atomic: the safetensors file is written to a sibling temp path (kept
+    /// `.safetensors`-suffixed — mlx-swift's `save(arrays:...)` dispatches on the URL's
+    /// extension and rejects anything else) and moved/replaced into place, mirroring
+    /// `checkpoint.py`'s `_atomic_write_bytes` discipline: a reader must never observe a
+    /// half-written weights file. `MambaConfig.save(sidecar:)` does its own atomic write
+    /// for the sidecar.
+    public static func save(_ model: MonicaModel, to weightsURL: URL) throws {
+        let sd = portableStateDict(model)
+        for (k, v) in sd where v.dtype == .bfloat16 {
+            // `safetensors.numpy.load_file` (what `load_weights_dict` uses on the Python
+            // side) has no bf16 numpy dtype and would fail on the Python side, far from
+            // this call. float16 is fine and preserved as-is — upcasting it to fp32 here
+            // would double the file size and change the bytes Python reads back.
+            throw EngineError.badCheckpoint(
+                "cannot save bfloat16 tensor '\(k)' to the portable format — Python's "
+                + "safetensors reader has no bf16 numpy dtype")
+        }
+        // Realize the lazy graph before handing arrays to mlx-swift's `save`, which
+        // needs concrete (not lazily-graphed) arrays.
+        MLX.eval(Array(sd.values))
+
+        let fm = FileManager.default
+        let dir = weightsURL.deletingLastPathComponent()
+        let tmp = dir.appendingPathComponent(".tmp-\(UUID().uuidString).safetensors")
+        try MLX.save(arrays: sd, url: tmp)
+        if fm.fileExists(atPath: weightsURL.path) {
+            _ = try fm.replaceItemAt(weightsURL, withItemAt: tmp)
+        } else {
+            try fm.moveItem(at: tmp, to: weightsURL)
+        }
+
+        let sidecarURL = URL(fileURLWithPath: weightsURL.path + ".config.json")
+        try model.config.save(sidecar: sidecarURL)
     }
 }
