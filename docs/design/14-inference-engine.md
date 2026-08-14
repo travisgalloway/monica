@@ -287,14 +287,49 @@ destination URL, so a future optimizer serializer is an orthogonal file written 
 directory, not a refactor of this one. Swift resume (optimizer state + step) should be filed as
 its own issue once #195 lands, referencing this note.
 
-**The LSP fast loop (#197).** A native persistent `tsserver` client — the Python reference is
-`src/lsp/ts_lsp.py` plus `src/lsp/harness.py`, driven through the `LMAdapter` seam
-(`src/lsp/lm.py:29`), whose only implementation is `src/model/mlx_lm_adapter.py:73` — together
-with a per-step logit-mask hook analogous to the Python `sampler` wrapper (`src/serve/sampling.py:26`).
-That hook is what SSI's constrained decode (#226) needs. The **latency motive** comes straight
-from [12-lsp-in-the-loop.md](12-lsp-in-the-loop.md): the harness's cost is dominated by round-trips
-between the model and the language server, so a native fast loop is the lever that makes the
-experiment affordable.
+**The LSP fast loop (#197) — SHIPPED.** A native persistent `typescript-language-server` client
+plus a per-step completion-list logit-mask hook, ported from `src/lsp/ts_service.py` /
+`src/lsp/jsonrpc.py` / `src/serve/constrained.py` / `src/lsp/completion_mask.py`. The
+constrained-decode hook itself (`Generator.allowedIdsFor`) already existed from #167/#169 — #197
+built the native **producer** and wired it through `monica-generate`.
+
+*Package placement.* `MonicaLSP` is a new **target** in `swift/` (the zero-dependency
+`MonicaTokenizer` package), not a new package and not a new dependency edge —
+`swift/Package.swift` stays `dependencies: []`. It needs no MLX at all (`Process` + pipes + JSON
++ string scanning), so the framing/demux/trie/scanner majority of the code — the parts with real
+correctness risk — is built and self-checked (`swift run monica-lsp --self-test`, binary-free, no
+subprocess) on **both** `swift-macos` and `swift-linux`, with no mlx-swift build in the loop. Only
+the wiring lives in `swift/engine/`: `monica-generate` gains `--lsp-mask`/`--lsp-project`/
+`--lsp-file` flags that construct a `TsLspClient` + `CompletionMasker` and hand
+`allowedIdsFor:` to `Generator.generate` (`.product(name: "MonicaLSP", package: "swift")` — same
+path-dependency identity trap as the tokenizer edge, see #167's note two sections up). Absent the
+flags, `allowedIdsFor` stays `nil`: an exact no-op, so every existing `monica-generate`
+invocation is byte-identical in behavior to before this issue.
+
+*Why this doesn't reduce `diagnostics` latency* — and does not claim to. #278 diagnosed ~350ms of
+the measured `diagnostics` round trip as a **client-side debounce hardcoded inside
+`typescript-language-server` 5.3.0** (`cli.mjs:17868`/`:20516`), not type-checking; that debounce
+lives in the Node process on the far side of the pipe, so no Swift client can cut it. The fast
+loop instead runs on `completions` (debounce-free, 2,500+ calls/s on the Python reference,
+[12-lsp-in-the-loop.md](12-lsp-in-the-loop.md)'s #197 section has the Swift-vs-Python numbers),
+and the masker issues exactly **one completion query per identifier span, not per token** — the
+load-bearing amortization, reported as queries per 100 generated tokens in the bench output.
+
+*Reaping.* `ProcessSupervisor` (`swift/Sources/MonicaLSP/ProcessSupervisor.swift`) is the only
+type in the codebase allowed to own the child process: a scoped `withServer { }` entry point
+reaps on return/throw via `defer`, `shutdown()` is idempotent and follows the same
+terminate-then-bounded-wait-then-kill ladder as `src/lsp/ts_service.py:446`, and a process-wide
+`sig_atomic_t` + `SIGINT`/`SIGTERM`/`SIGHUP`/`atexit` backstop kills the last-spawned child even
+on a signal Swift's `defer` never runs for. `typescript-language-server` 5.3.0 also empirically
+honors the LSP `processId` parent-death watch (verified via `monica-lsp --probe-reap`'s SIGKILL
+scenario on this pin — the server exits on its own even when the parent is killed with no chance
+to run a handler), so a `SIGKILL`ed `monica-lsp` still leaves no orphan in practice.
+
+*Out of scope, filed as follow-ups rather than built here*: a Swift port of #279's raw-`tsserver`-
+protocol (`semanticDiagnosticsSync`) transport, if #279 lands and the bypass proves worth a second
+client; tree-sitter grammar masking for the fast loop (the Python extractor,
+`src/lsp/ts_boundaries.py`, is an optional `[eval]` extra with a C dependency the zero-dependency
+`swift/` package must not take).
 
 ## The native-engine investigation (B1–B4)
 
@@ -371,8 +406,8 @@ The #163 dependency order:
 2. **#166** — port the model to mlx-swift + the logit-parity harness. Everything else waits on it.
 3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
    I/O) — in parallel once #166 lands.
-4. **#197** (LSP harness), **#168** (quantization — **done**), **#169** (Swift prefill —
-   **done**), **#170** (Apple-Silicon benchmark harness — **done**).
+4. **#197** (LSP harness — **done**), **#168** (quantization — **done**), **#169** (Swift
+   prefill — **done**), **#170** (Apple-Silicon benchmark harness — **done**).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift

@@ -179,6 +179,22 @@ jobs:
       - name: Self-check
         working-directory: swift
         run: swift run monica-selfcheck
+      # ── #197: the native LSP harness's binary-free self-test (framing/demux/trie/
+      # scanner over pipe(2) — no subprocess, no node). Runs on both swift-macos and
+      # swift-linux; see the macOS-only live-server steps further down for the parts
+      # that actually need a typescript-language-server toolchain.
+      - name: MonicaLSP self-check (framing/demux/trie/scanner — no subprocess)
+        working-directory: swift
+        run: swift run monica-lsp --self-test
+      - name: Guard — swift/ (MonicaTokenizer + MonicaLSP) stays dependency-free (#167/#197)
+        # A new MonicaLSP TARGET adds no dependency edge; this is what proves it. Run here
+        # (not just once, at the bottom of swift-engine) so a regression on this specific
+        # job is caught directly rather than via a distant guard step.
+        working-directory: swift
+        run: |
+          OUT=$(swift package show-dependencies --format flatlist)
+          echo "output: '$OUT'"
+          [ -z "$OUT" ]
       - name: Train the parity corpus
         # Fixed corpus in, tokenizer.json out — compared byte-for-byte against
         # the Linux job's copy in swift-parity below. TokenizerFormat.save uses
@@ -217,6 +233,79 @@ jobs:
           name: fim-shards-macos
           path: ${{ runner.temp }}/fim-shards
           retention-days: 7
+      # ── #197: the parts of MonicaLSP that need a real typescript-language-server —
+      # macOS-only (this job has the pinned node_modules toolchain; swift-linux does not
+      # install node at all, matching how the rest of this job's fixture files are
+      # macOS-only too).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install the pinned typescript-language-server toolchain (#194's set)
+        working-directory: eval_sets/ts_error_injection
+        run: npm ci
+      - name: MonicaLSP --probe-reap — every ProcessSupervisor exit path, with the orphan check (V7)
+        # The gating check from the plan: a shell wrapper around the live-server run that
+        # asserts a child was actually observed (BLIND guard) and that nothing outlives it.
+        working-directory: swift
+        run: |
+          BEFORE=$(pgrep -f 'typescript-language-server|tsserver' | wc -l | tr -d ' ')
+          swift run monica-lsp --probe-reap | tee "$RUNNER_TEMP/probe.log"
+          grep -q '^spawned_pid=' "$RUNNER_TEMP/probe.log" || { echo "BLIND: no child was ever spawned"; exit 2; }
+          grep -q '^FAIL:' "$RUNNER_TEMP/probe.log" && { echo "probe-reap reported a FAIL line above"; exit 1; }
+          sleep 2
+          AFTER=$(pgrep -f 'typescript-language-server|tsserver' | wc -l | tr -d ' ')
+          [ "$AFTER" -le "$BEFORE" ] || { echo "ORPHAN: $BEFORE -> $AFTER"; pgrep -afl 'tsserver'; exit 1; }
+      - name: MonicaLSP --bench — Swift fast-loop latency vs the Python reference (V8)
+        working-directory: swift
+        run: |
+          swift run monica-lsp --bench --n-files 500 --iters 100 \
+            --out "$RUNNER_TEMP/swift_lsp_bench.json"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Python (stdlib-only src/lsp — no data/mlx/torch needed for this check)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Python fast-loop bench, same synthetic project shape, for comparison
+        run: |
+          python scripts/bench_ts_lsp.py --n-files 500 --warmup 10 --iters 100 \
+            --out "$RUNNER_TEMP/ts_lsp_bench.json"
+          echo "--- Swift ---"; cat "$RUNNER_TEMP/swift_lsp_bench.json"
+          echo "--- Python ---"; cat "$RUNNER_TEMP/ts_lsp_bench.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsp-bench-records
+          path: |
+            ${{ runner.temp }}/swift_lsp_bench.json
+            ${{ runner.temp }}/ts_lsp_bench.json
+          retention-days: 90
+      - name: Mask-set parity, no checked-in oracle (V5)
+        # Both sides compute the SAME fixed synthetic vocab/label/prefix cases from
+        # scratch and are compared with a byte cmp — no numeric oracle checked in (#195's
+        # lesson). The Python side is generated at run time from src/serve/constrained.py,
+        # NOT imported from monica-lsp's own logic, so this is a real cross-language check.
+        run: |
+          swift run --package-path swift monica-lsp --emit-mask-parity "$RUNNER_TEMP/swift-mask-parity.json"
+          python3 - "$RUNNER_TEMP/py-mask-parity.json" <<'PYEOF'
+          import json, sys
+          sys.path.insert(0, ".")
+          from src.serve.constrained import VocabTrie, allowed_extensions
+          VOCAB = ["x", "y", "length", "len", "toString", "to", "String", ".", " ",
+                   "toLowerCase", "toUpperCase", "foo", "fooBar", "_bar", "1", "2",
+                   "a", "ab", "abc", "!"]
+          LABELS = ["length", "toString", "toLowerCase", "toUpperCase", "x", "y", "abc"]
+          EXIT_IDS = [7, 8, 19]
+          PREFIXES = ["", "to", "len", "x", "abc", "ab", "zzz"]
+          trie = VocabTrie(VOCAB)
+          cases = [{"prefix": p, "allowed": sorted(allowed_extensions(trie, LABELS, p, exit_ids=EXIT_IDS))}
+                   for p in PREFIXES]
+          with open(sys.argv[1], "w") as f:
+              f.write(json.dumps({"cases": cases}, separators=(",", ":")) + "\n")
+          PYEOF
+          diff "$RUNNER_TEMP/swift-mask-parity.json" "$RUNNER_TEMP/py-mask-parity.json"
 
   # ── Job 6: native Swift toolchain, Linux (#246) ───────────────────────────
   # The official swift image (Ubuntu 24.04, glibc 2.39) — the same toolchain the
@@ -242,6 +331,12 @@ jobs:
       - name: Self-check
         working-directory: swift
         run: swift run monica-selfcheck
+      # #197: binary-free (no subprocess, no node) — must pass on Linux too, since
+      # MonicaLSP lives inside `swift/` and this job compiles/runs it like everything else
+      # here. The live-server steps (npm-installed toolchain) are macOS-only, in swift-macos.
+      - name: MonicaLSP self-check (framing/demux/trie/scanner — no subprocess)
+        working-directory: swift
+        run: swift run monica-lsp --self-test
       - name: Train the parity corpus
         working-directory: swift
         run: |
@@ -423,6 +518,32 @@ jobs:
             --tokenizer "$RUNNER_TEMP/gen-tokenizer.json" --prompt 'function ' \
             --temperature 0 --max-new-tokens 8)
           echo "$OUT"
+          [ -n "$OUT" ]
+      # ── #197: end-to-end native masked decode (V9) — the one item that is CI-only on
+      # this host (mlx-swift needs Metal, which needs Xcode's compiled metallib; this job
+      # gets that via the xcodebuild step above, unlike a plain `swift build`).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install the pinned typescript-language-server toolchain (#194's set)
+        working-directory: eval_sets/ts_error_injection
+        run: npm ci
+      - name: monica-generate --lsp-mask end to end (V9)
+        run: |
+          cd swift
+          swift run monica-tokenize train --in Fixtures/parity-corpus.jsonl \
+            --out "$RUNNER_TEMP/gen-tokenizer.json" --vocab-size 512
+          cd engine
+          OUT=$("$MONICA_GENERATE_BIN" --weights Fixtures/toy-gen/weights.safetensors \
+            --tokenizer "$RUNNER_TEMP/gen-tokenizer.json" --prompt 'function foo() { return 1; }' \
+            --temperature 0 --max-new-tokens 8 --lsp-mask \
+            --lsp-eval-set-dir "$GITHUB_WORKSPACE/eval_sets/ts_error_injection")
+          echo "$OUT"
+          # A masked run that silently fell back to unconstrained (e.g. the toolchain
+          # resolving to nil and the flag being ignored) would print the SAME thing as the
+          # unmasked step above and read as a false pass — so this asserts non-empty output
+          # AND that the process didn't fail() on toolchain resolution (fail() exits 1,
+          # which the command substitution above would have already surfaced).
           [ -n "$OUT" ]
       - name: monica-generate AC3 — prefill bench (#169, informational)
         # NOT a gate: hosted-runner timing is noisy, so no threshold assertion. It DOES

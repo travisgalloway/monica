@@ -12,6 +12,10 @@ let package = Package(
         .library(name: "MonicaTokenizer", targets: ["MonicaTokenizer"]),
         .executable(name: "monica-tokenize", targets: ["monica-tokenize"]),
         .executable(name: "monica-selfcheck", targets: ["monica-selfcheck"]),
+        // #197 (M13 #163): the native tsserver/LSP harness + completion-mask trie. Pure
+        // Foundation (Process/pipes/JSON/string scanning) — no MLX, no new dependency edge.
+        // See MonicaLSP's own file headers for the port-of-what mapping.
+        .library(name: "MonicaLSP", targets: ["MonicaLSP"]),
     ],
     targets: [
         .target(name: "MonicaTokenizer"),
@@ -19,5 +23,14 @@ let package = Package(
         // Dependency-free test runner. Runs on macOS (Command Line Tools — no Xcode/XCTest
         // needed) AND Linux, so cross-platform parity is verified the same way on both.
         .executableTarget(name: "monica-selfcheck", dependencies: ["MonicaTokenizer"]),
+        // A new TARGET, not a new package dependency — `dependencies: []` above is
+        // untouched, so `swift package show-dependencies` stays empty and swift-linux keeps
+        // needing no network. No MonicaTokenizer edge either: MonicaLSP's decode/encode
+        // closures are supplied by the caller, so this target has no tokenizer dependency.
+        .target(name: "MonicaLSP"),
+        // Dependency-free-runner CLI (mirrors monica-selfcheck): --self-test (binary-free,
+        // both platforms), --emit-mask-parity, --probe-reap, --bench (macOS CI only, need
+        // node_modules/typescript-language-server).
+        .executableTarget(name: "monica-lsp", dependencies: ["MonicaLSP"]),
     ]
 )
