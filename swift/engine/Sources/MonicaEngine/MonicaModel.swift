@@ -40,10 +40,19 @@ public final class MonicaModel: Module {
 
     /// `_head` (`:778-784`) — logits run in fp32 (wide-vocab softmax stability) regardless
     /// of the compute dtype.
+    ///
+    /// Uses `embedding.asLinear(h)` rather than `matmul(h, embedding.weight.transposed(1,
+    /// 0))` (#168). For the plain `Embedding` base class `asLinear` IS exactly that
+    /// matmul, so this is a no-op for the fp32 path — but under `MLXNN.quantize`,
+    /// `embedding` becomes a `QuantizedEmbedding` whose `weight` is the PACKED uint32
+    /// codes, not float weights; the old matmul would silently compute nonsense on that
+    /// tensor, while `asLinear` dispatches to `QuantizedEmbedding`'s override
+    /// (`quantizedMM`) automatically. Since the tied head shares `embedding`'s weight,
+    /// quantizing the embedding quantizes the head too — this is what makes that work.
     func head(_ hIn: MLXArray) -> MLXArray {
         let h = f32(hIn)
         if let lm = lmHead { return lm(h) }
-        return matmul(h, embedding.weight.transposed(1, 0))
+        return embedding.asLinear(h)
     }
 
     /// `forward` (`:787-796`), the `seg_ids == nil` arm. `tokens` is `(B, L)` int32.
