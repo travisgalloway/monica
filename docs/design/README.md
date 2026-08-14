@@ -58,7 +58,8 @@ Every claim here is sourced from a docstring or config comment in the code, with
     and #272**) and the secondary SSI structural-signal fold (#225/#226/#227/#230).
 14. [The native inference + training engine (Swift + MLX)](14-inference-engine.md) — the M13
     engine (#163): prefill-via-scan, quantization, speculative decoding, the Swift train step +
-    checkpoint I/O, and the B1–B4 investigation behind **Swift/MLX, Mac-first**.
+    checkpoint I/O, and the B1–B4 investigation behind **Swift/MLX, Mac-first**. Results ledger:
+    [docs/benchmarks.md](../benchmarks.md) (#170).
 15. [The SSI measurement contract](15-ssi-measurement-contract.md) — **done** (#225): the M1–M5
     rules every SSI arm (#226/#227/#230) must satisfy — one variable per arm, ≥3 seeds + paired
     McNemar/sign-test/Wilcoxon, repo-level contamination split with a logged manifest,

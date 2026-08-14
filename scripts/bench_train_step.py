@@ -16,7 +16,12 @@ Two modes:
     separately (it will capture compile latency once #32 lands).
   * `--mode decode`: batch-1 `init_state` + `model.step` loop — a tokens/s BASELINE
     RECORD for future M7 only. Do not optimize the decode path in this spike
-    (see the rejected levers in #30).
+    (see the rejected levers in #30). This exact protocol (32 warmup, 256 measured
+    tokens) is the 94.7 tok/s M7 record cited in CLAUDE.md and
+    `docs/design/14-inference-engine.md`; #170's `swift/engine`'s `monica-bench --mode
+    decode` reproduces the SAME protocol so the two are directly comparable, and
+    `scripts/bench_context.py` generalizes this single-arm loop across context lengths
+    and prefill modes. This function's semantics are unchanged by #170.
 
 `--chunk-size` overrides the SSD scan chunk length Q (config default 64) via
 `dataclasses.replace` on the loaded config — a free experiment, no model change.

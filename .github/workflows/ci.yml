@@ -436,6 +436,49 @@ jobs:
             --bench-prefill --bench-prompt-len 128 --bench-iterations 5)
           echo "$OUT"
           [ -n "$OUT" ]
+      # ── #170: monica-bench — the benchmark harness ──
+      - name: monica-bench --self-test (deterministic, hardware-independent — GATE)
+        # Unlike the timing steps below, this one DOES gate: analytic byte arithmetic,
+        # the quant target-selection filter, and baseline-comparison logic are all
+        # pure/deterministic, so there is no noisy-hosted-runner excuse for this to fail.
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-bench -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-bench binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          echo "MONICA_BENCH_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" --self-test
+      - name: monica-bench --mode all on Fixtures/toy (informational timing, gated correctness)
+        # NOT a timing gate — hosted-runner numbers are noisy (see docs/benchmarks.md).
+        # It DOES gate the prefill argmax-agreement assertion (Bench.prefill fails loud
+        # on disagreement) and non-empty/finite output — a bench that cannot observe its
+        # target must not read green.
+        working-directory: swift/engine
+        run: |
+          OUT=$("$MONICA_BENCH_BIN" --weights Fixtures/toy/weights.safetensors --mode all \
+            --json "$RUNNER_TEMP/monica-bench-toy.json")
+          echo "$OUT"
+          [ -n "$OUT" ]
+      - name: monica-bench --mode decode on Fixtures/toy-moe-int8 (quantized path, informational)
+        # Exercises the quantized checkpoint path (Checkpoint.load applies the `quant`
+        # sidecar automatically) — informational for the same reason as the step above.
+        working-directory: swift/engine
+        run: |
+          OUT=$("$MONICA_BENCH_BIN" --weights Fixtures/toy-moe-int8/weights.safetensors \
+            --mode decode --json "$RUNNER_TEMP/monica-bench-toy-moe-int8.json")
+          echo "$OUT"
+          [ -n "$OUT" ]
+      - name: Upload monica-bench JSON records
+        uses: actions/upload-artifact@v4
+        with:
+          name: monica-bench-records
+          path: |
+            ${{ runner.temp }}/monica-bench-toy.json
+            ${{ runner.temp }}/monica-bench-toy-moe-int8.json
+          retention-days: 90
       - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
         # Cheap, and it fails loudly the day someone "simplifies" the two packages into one.
         # The engine -> tokenizer edge (Package.swift) must never become tokenizer -> engine.

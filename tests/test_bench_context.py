@@ -3,6 +3,7 @@
 MLX-gated (skips cleanly where mlx is unavailable), mirroring tests/test_mlx_parity.py.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -15,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.model.blocks import load_config
 from src.model.mlx_backend import MLXMambaModel
 from src.serve.sessions import per_session_state_bytes
-from scripts.bench_context import analytic_state_bytes, arm_config, measure, run_sweep
+from scripts.bench_context import (
+    _parse_arms, _write_json, analytic_state_bytes, arm_config, measure, run_sweep,
+)
 
 
 CFG = "config/toy.yaml"
@@ -91,3 +94,88 @@ def test_max_attn_length_skips_over_cap_lengths(capsys):
     assert len(ssm_rows) == len(LENGTHS)
     out = capsys.readouterr().out
     assert "skip" in out and str(LENGTHS[1]) in out
+
+
+# --- #170: --prefill-mode / --arms / --json ---
+
+def test_parse_arms_valid_and_invalid():
+    assert _parse_arms("ssm") == ("ssm",)
+    assert _parse_arms("ssm,attn") == ("ssm", "attn")
+    assert _parse_arms(" ssm , attn ") == ("ssm", "attn")
+    with pytest.raises(ValueError):
+        _parse_arms("")
+    with pytest.raises(ValueError):
+        _parse_arms("bogus")
+
+
+def test_measure_prefill_mode_sequential_is_unchanged_default():
+    """Default prefill_mode='sequential' must report the same key measure() always
+    has — a regression here would silently break every existing caller of measure()."""
+    cfg = load_config(CFG)
+    model = MLXMambaModel(cfg)
+    mx.eval(model.parameters())
+    m = measure(model, mx, LENGTHS[0], DECODE_TOKENS, seed=0, warmup_steps=2)
+    assert m["prefill_tok_s"] > 0
+    assert m["sequential_prefill_tok_s"] == m["prefill_tok_s"]
+    assert m.get("parallel_prefill_tok_s") is None
+    assert m.get("prefill_speedup") is None
+
+
+def test_measure_prefill_mode_parallel_uses_model_prefill():
+    cfg = load_config(CFG)
+    model = MLXMambaModel(cfg)
+    mx.eval(model.parameters())
+    m = measure(model, mx, LENGTHS[0], DECODE_TOKENS, seed=0, warmup_steps=2,
+               prefill_mode="parallel")
+    assert m["parallel_prefill_tok_s"] > 0
+    assert m["prefill_tok_s"] == m["parallel_prefill_tok_s"]
+    assert m.get("sequential_prefill_tok_s") is None
+
+
+def test_measure_prefill_mode_both_reports_speedup():
+    cfg = load_config(CFG)
+    model = MLXMambaModel(cfg)
+    mx.eval(model.parameters())
+    m = measure(model, mx, LENGTHS[0], DECODE_TOKENS, seed=0, warmup_steps=2,
+               prefill_mode="both")
+    assert m["sequential_prefill_tok_s"] > 0
+    assert m["parallel_prefill_tok_s"] > 0
+    assert m["prefill_speedup"] == pytest.approx(
+        m["parallel_prefill_tok_s"] / m["sequential_prefill_tok_s"])
+    # Backward-compatible single figure stays the sequential arm's, matching the
+    # pre-#170 default behavior when both ran.
+    assert m["prefill_tok_s"] == m["sequential_prefill_tok_s"]
+
+
+def test_measure_invalid_prefill_mode_raises():
+    cfg = load_config(CFG)
+    model = MLXMambaModel(cfg)
+    mx.eval(model.parameters())
+    with pytest.raises(ValueError):
+        measure(model, mx, LENGTHS[0], DECODE_TOKENS, seed=0, warmup_steps=2,
+               prefill_mode="bogus")
+
+
+def test_run_sweep_arms_filter_restricts_to_ssm_only():
+    cfg = load_config(CFG)
+    rows = run_sweep(MLXMambaModel, mx, cfg, LENGTHS, DECODE_TOKENS, seed=0, warmup_steps=2,
+                     arms=("ssm",))
+    assert rows and all(r["arm"] == "ssm" for r in rows)
+    assert len(rows) == len(LENGTHS)
+
+
+def test_write_json_schema_matches_monica_bench_source_field(tmp_path):
+    """Not a byte-identical Swift Codable match (different languages/ecosystems) — the
+    'same record schema' the plan asks for is a `source` field distinguishing the two
+    harnesses plus directly comparable per-row prefill/decode numbers, so the two
+    outputs can be diffed by a human or a script."""
+    cfg = load_config(CFG)
+    rows = run_sweep(MLXMambaModel, mx, cfg, [LENGTHS[0]], DECODE_TOKENS, seed=0, warmup_steps=2,
+                     arms=("ssm",), prefill_mode="both")
+    out = tmp_path / "py-bench.json"
+    _write_json(rows, out, config_path=CFG, mlx_version=mx.__version__)
+    record = json.loads(out.read_text())
+    assert record["source"] == "python-mlx"
+    assert record["config"] == CFG
+    assert len(record["rows"]) == 1
+    assert record["rows"][0]["prefill_speedup"] > 0
