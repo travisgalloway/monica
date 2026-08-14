@@ -197,7 +197,8 @@ func runSelfTest() -> Never {
          "dt_rank":"auto","vocab_size":%d,"seq_len":64,"tie_embeddings":true,
          "precision":"fp32","chunk_size":null,"long_ctx_factor":1.0,
          "attn_every":%@,"n_attn_heads":null,"moe_every":null,"n_experts":0,"top_k":2,
-         "moe_d_ff":null,"dt_min":0.001,"dt_max":0.1,"dt_init_floor":0.0001}
+         "moe_d_ff":null,"dt_min":0.001,"dt_max":0.1,"dt_init_floor":0.0001,
+         "optimizer":"adamw","optimizer_8bit":false}
         """#
     func testConfig(dModel: Int, nLayers: Int, headDim: Int, vocabSize: Int,
                     attnEvery: Int?) -> MambaConfig {
