@@ -347,6 +347,62 @@ builds dropless grouped-gather MoE with a shared expert and a sparse-upcycle ini
 remains before a real RunPod run is FSDP/ZeRO-2 + expert parallel (#271, blocking #223 but not
 #222) — the `d_model` conflict above (#272) is resolved.
 
+### #271 — FSDP2 + in-node expert parallel: decisions and open gaps
+
+Built (`src/model/cuda_distributed.py`, `src/train/parallel.py`, `scripts/train_dist.py`) and
+gloo/CPU-provable (`tests/test_cuda_distributed.py`); NCCL/real-GPU verification is still open —
+see `docs/infrastructure.md`'s "Multi-GPU training pod" checklist, which this record feeds.
+
+- **ZeRO-2 by default, ZeRO-3 (`--reshard-after-forward`) for Large A.** `reshard_after_forward`
+  is the dial (`cuda_distributed.wrap_backbone`): keeping params materialized after forward
+  (ZeRO-2) costs more peak memory but less communication than resharding every layer (ZeRO-3).
+  #222 (small, one card, doesn't even need #271) never exercises this; #223 (Large A) is the
+  first real user and should default to ZeRO-3 given the memory pressure that motivated #271 in
+  the first place — #219's sweep / the actual #223 bring-up should confirm.
+- **Expert-parallel degree is a run-time flag, not a config field.** `--ep-size` (must divide
+  both `--nproc_per_node` and the config's `n_experts` — `ParallelConfig` raises loudly
+  otherwise) rather than a `MambaConfig` field: EP shard layout is a *deployment* decision (how
+  many GPUs, how they're grouped), not a model-architecture one, and the portable weight format
+  (`experts.<global_id>.*`, unchanged from pre-#271) is identical regardless of `ep_size`.
+- **`fully_shard` cannot wrap `CUDAMambaModel` itself.** Discovered on the planning/exec host,
+  not anticipated by the original plan: `CUDAMambaModel(ModelInterface, nn.Module)` inherits
+  `ModelInterface(ABC)`, and `fully_shard`'s dynamic `module.__class__` swap raises
+  `TypeError: ... object layout differs` on any ABC-rooted class. `wrap_backbone` works around it
+  by wrapping each layer plus the top-level leaves (`embedding`, and `lm_head` when untied)
+  individually rather than a final root `fully_shard(model, ...)` call — same practical
+  parameter coverage, no root wrap.
+- **`fully_shard`'s auto-unshard hooks never fire — a second, deeper finding.** FSDP2 unshards a
+  wrapped module's params via a forward pre-hook on `nn.Module.__call__`. This codebase's block
+  API (`forward_seq`/`step`/`forward_prefill`, the whole train/infer-parity design — see "The
+  SSM" in `CLAUDE.md`) is invoked by DIRECT method call, never through `layer(...)`, specifically
+  so `forward` and `step` share identical compute without an `nn.Module` dispatch layer between
+  them. That design choice means FSDP2's hook never fires, and a sharded `DTensor` param hits an
+  op against a plain activation tensor (`mixed torch.Tensor and DTensor`). Fixed with an explicit
+  `CUDAMambaModel._fsdp_unshard(layer)` call before every direct block invocation — see its
+  docstring for the tradeoff this forces: no paired `reshard()` call (so the actual per-layer
+  memory-reclaim timing is UNVERIFIED — a CUDA-host follow-up), and **`grad_checkpoint` does not
+  yet compose with this workaround at all** (the checkpointed recompute in backward calls
+  `layer.forward_seq` directly, bypassing `_layer_forward`'s unshard entirely) — `grad_checkpoint`
+  must stay `false` under FSDP2 until that gap is closed.
+- **Muon under FSDP2: one explicit gather, not ~10 implicit ones.** `Muon.step` orthogonalizes a
+  `DTensor` momentum buffer by gathering it to a full tensor ONCE (`buf.full_tensor()`),
+  Newton-Schulz in fp32 on the full matrix (bit-identical math to the single-process path), then
+  redistributing back to the local shard — see `cuda_muon.py`'s module docstring. Without this,
+  `X @ X.T` etc. inside Newton-Schulz silently redistribute on every one of the 5 iterations
+  (~10 hidden collectives per Muon param per step) instead of crashing, which is the more
+  dangerous failure mode (correct-looking, invisible cost).
+- **The load-reduce fix is the correctness-critical piece, not an optimization.**
+  `MoEBalancer.update` must see per-expert counts summed across every rank BEFORE it runs — see
+  `src/train/moe_balance.py`'s module docstring and `cuda_train_step.py`'s `load_reduce` hook.
+  Un-reduced, N ranks silently train N divergent routers, and rank 0's copy is the one that ships
+  in the checkpoint.
+- **EP-sharded expert state cannot reshard across a changed `ep_size`.** Unlike FSDP2's
+  DTensor-backed state (which `torch.distributed.checkpoint` reshards across a world-size change
+  for free — V8 in the plan's Verification section), each EP rank's local experts are DISTINCT
+  parameters, not shards of one tensor. `cuda_distributed.load_resume_dcp` checks a small
+  `dcp_meta.json` sidecar and raises before touching any collective if `ep_size` changed, rather
+  than silently dropping or duplicating expert state.
+
 ### #217 — routing diagnostics + kill-criterion
 
 Before #217 the only routing signal reaching `metrics.jsonl` was `moe_util_var` (a single scalar,

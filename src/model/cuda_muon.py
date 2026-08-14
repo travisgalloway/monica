@@ -12,11 +12,24 @@ The two-LR hazard: `_accumulate_and_step` writes `group["lr"] = lr` on EVERY par
 every step (a schedule value), so Muon cannot store its own learning rate in `group["lr"]`
 — it would be clobbered. Instead Muon stores a constant `lr_scale = muon_lr / base_lr` in
 its defaults and computes `group["lr"] * lr_scale` fresh inside `step()`.
+
+The FSDP2 hazard (#271, see `.claude/plans/issue-271.md`'s "Muon hazard" note): under
+`fully_shard`, `p` and `p.grad` are `DTensor`s. Newton-Schulz's `X @ X.T` etc. do NOT
+crash on a DTensor — they "work" via IMPLICIT redistribute, which is worse than a crash:
+5 NS iterations x 2 matmuls each is ~10 hidden all-gather/reduce-scatter round-trips per
+Muon param per step, invisible in a profile unless you know to look. `Muon.step` below
+gathers the momentum buffer to a full tensor ONCE (one explicit collective),
+orthogonalizes in fp32 on the full matrix (mathematically identical to the
+single-process path — the whole point, since it makes this a *correctness* fix, testable
+against the non-distributed oracle, not just an optimization), then redistributes the
+result back to the local shard before applying. `p.shape` on a DTensor is already the
+GLOBAL shape, so the non-square rescale below needed no change.
 """
 
 from __future__ import annotations
 
 import torch
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 
 def _newton_schulz5(G: torch.Tensor, steps: int) -> torch.Tensor:
@@ -70,9 +83,18 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p)
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(p.grad)
-                update = _newton_schulz5(buf, ns_steps)
+                if isinstance(buf, DTensor):
+                    # One EXPLICIT gather (see the module docstring's FSDP2 hazard note),
+                    # not ~10 implicit ones: orthogonalize the FULL matrix in fp32 —
+                    # bit-identical math to the non-distributed path — then reshard the
+                    # result back onto buf's mesh/placement before applying.
+                    full_update = _newton_schulz5(buf.full_tensor(), ns_steps)
+                    update = distribute_tensor(full_update, buf.device_mesh, buf.placements)
+                else:
+                    update = _newton_schulz5(buf, ns_steps)
                 # Non-square rescale (standard Muon): keeps the update norm comparable
-                # across matrix aspect ratios.
+                # across matrix aspect ratios. p.shape is the GLOBAL shape even when p
+                # is a DTensor, so this needs no branch.
                 scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
                 p.add_(update, alpha=-eff_lr * scale)
         return loss
@@ -131,3 +153,15 @@ class HybridOptimizer:
             self.adam.load_state_dict(sd["adam"])
         if self.muon is not None and sd.get("muon") is not None:
             self.muon.load_state_dict(sd["muon"])
+
+    # --- DCP bridge (#271) -------------------------------------------------
+    # torch.distributed.checkpoint's state_dict helpers (`get_state_dict`/
+    # `set_state_dict`, used by `cuda_distributed.save_resume_dcp`/`load_resume_dcp` for
+    # world-size-resharding resume) expect a real `torch.optim.Optimizer`, correlated to
+    # `model` to resolve DTensor sharding info — a plain `sub.state_dict()` call has no
+    # such correlation. `HybridOptimizer` is deliberately NOT an `Optimizer` subclass
+    # (see the class docstring), so it cannot be handed to those helpers directly; this
+    # unwraps it into its real sub-optimizers instead. `Muon` and `torch.optim.AdamW`
+    # both ARE real `Optimizer`s, so each can be DCP-bridged independently.
+    def real_optimizers(self) -> list:
+        return [o for o in (self.adam, self.muon) if o is not None]

@@ -1,0 +1,43 @@
+# Toy MoE config for the #271 torchrun end-to-end check (Acceptance #3 / M1 in
+# .claude/plans/issue-271.md): a toy Mamba-2 hybrid with `n_experts` divisible by 2, so
+# `scripts/train_dist.py --ep-size 2` can shard it across a 2-rank CPU/gloo run:
+#
+#   torchrun --standalone --nproc_per_node=2 scripts/train_dist.py \
+#       --config config/toy-moe-dist.yaml --ep-size 2 --total-steps 20 \
+#       --data <fresh toy split> --out runs/toy-moe-dist
+#
+# Otherwise identical to config/toy-moe.yaml (fp32, offline byte-fallback vocab) — this
+# is a MECHANISM check, not a convergence one. `moe_impl: gather` (not "auto") because
+# expert parallel REQUIRES the gather/all-to-all dispatch path (CUDAMambaModel raises at
+# construction if ep_size > 1 with moe_impl="dense").
+d_model: 64
+n_layers: 4
+d_state: 16
+expand: 2
+d_conv: 4
+head_dim: 16
+dt_rank: auto
+
+moe_every: 2            # layers 1 and 3 are MoE
+n_experts: 4             # divisible by ep_size 2 (and 4, for a future --ep-size 4 check)
+top_k: 2                 # < n_experts, required for expert parallel (#271)
+moe_d_ff: null
+moe_impl: gather         # required at ep_size > 1 — see CUDAMambaModel.MoEBlock.__init__
+moe_balance_rate: 0.001  # ON here (unlike toy-moe.yaml) so the run also exercises the
+                         # #271 correctness fix: MoEBalancer.update sees load counts
+                         # all-reduced across every rank, not a per-rank-divergent count.
+
+vocab_size: 256
+seq_len: 64
+tie_embeddings: true
+
+precision: fp32
+chunk_size: null
+grad_checkpoint: false   # #271: the direct forward_seq/step dispatch (see
+                         # cuda_backend.py's _fsdp_unshard docstring) does not yet
+                         # compose with grad_checkpoint's recompute under FSDP2 —
+                         # CUDA-host follow-up, keep off here.
+
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

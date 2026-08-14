@@ -187,8 +187,11 @@ RunPod provides the on-demand compute. Two roles, kept separate:
 
 - **CPU pod** — the data stages (ingest / clean / dedup / tokenize). Install `datatrove` +
   `s3fs` + tokenizer deps; its S3 reader/writer point at R2.
-- **GPU pod** — training only. Pull the tokenized subset + teacher outputs from R2 to a network
-  volume, train, checkpoint back to R2.
+- **GPU pod** — single-card training. Pull the tokenized subset + teacher outputs from R2 to a
+  network volume, train, checkpoint back to R2.
+- **Multi-GPU training pod (#271)** — FSDP2 + in-node expert-parallel training, the only pod role
+  that needs `torch.distributed`/NCCL. See "Multi-GPU training pod" below; this is what unblocks
+  **#223** (Large A does not fit one card — see the single-GPU warning below).
 
 ### Region pin — a one-way decision
 
@@ -346,18 +349,78 @@ A40); the fused kernels auto-detect at runtime and degrade gracefully when absen
 predates the M12 MoE work — the CUDA MoE block, fp8 experts and the 8-bit optimizer have **not**
 been exercised on that or any other GPU; see the manual-verification checklist below.
 
-> **⚠️ Every pod recipe in this document is single-GPU, and that is a real ceiling, not an
-> omission.** Multi-GPU sharding (FSDP/ZeRO-2 + in-node expert parallel) is **#271 — not built**.
-> Nothing in the tree imports `torch.distributed`. Practically:
-> - **#222** (small MoE, ~700M total) fits one card and is runnable on these recipes today.
-> - **#223** (Large A, ~700M-active/3.5B-total) does **not**. Model + optimizer state alone
->   exceeds one 80GB card before activations. Renting an H100 for #223 today buys a pod that
->   cannot run the job.
+> **⚠️ Every OTHER pod recipe in this document is single-GPU, and that is a real ceiling, not an
+> omission.** Multi-GPU sharding (FSDP2/ZeRO-2 + in-node expert parallel, **#271**) is now
+> *built and gloo/CPU-provable* (`src/model/cuda_distributed.py`, `scripts/train_dist.py`,
+> `tests/test_cuda_distributed.py`) — but **NCCL, real multi-GPU memory savings, and throughput
+> are still unverified on any host this repo has touched**; see "Multi-GPU training pod" below
+> for the checklist that closes that gap. Practically, until that checklist is run:
+> - **#222** (small MoE, ~700M total) fits one card and is runnable on the single-GPU recipes
+>   above today — it does not need #271 at all.
+> - **#223** (Large A, ~700M-active/3.5B-total) does **not** fit one card. Model + optimizer
+>   state alone exceeds one 80GB card before activations. Renting an H100 for #223 before running
+>   the checklist below buys a pod that might not actually save the memory #271 claims.
 >
 > #272 (the `d_model` conflict) is **resolved** — Large A is now `d_model 768`, 56 layers,
-> 3.88B total / 710M active, so one dense run (#200) seeds both rungs. That removes a blocker but
-> not this one: **#271 is still the gate on #223**. Settle it before committing to a region or a
-> reservation.
+> 3.88B total / 710M active, so one dense run (#200) seeds both rungs. #271's mechanism is now
+> built; **its multi-GPU verification checklist below is still the gate on #223** — a green CI
+> run alone (CPU-only everywhere in this repo's CI) is not sufficient evidence to schedule it.
+
+### Multi-GPU training pod (#271)
+
+The only pod role that needs real NCCL — everything else in this document runs on a single card
+or no GPU at all. `scripts/train_dist.py` is the `torchrun` entry point; `docs/design/
+13-code-model-moe.md` records the ZeRO-2-vs-3 and expert-parallel-degree decisions this recipe
+implements.
+
+```bash
+# 1. Same backend install as the single-GPU recipe above ([cuda] or [cuda-fast]).
+
+# 2. Multi-GPU gloo/CPU sanity check FIRST (cheap, catches config mistakes before NCCL):
+#    the exact command tests/test_cuda_distributed.py's spawn-based tests exercise
+#    piece-by-piece, run end-to-end here as the real torchrun launcher.
+torchrun --standalone --nproc_per_node=2 scripts/train_dist.py \
+    --config config/toy-moe-dist.yaml --ep-size 2 --total-steps 20 \
+    --data <fresh toy split> --out runs/toy-moe-dist-check
+#    Expect: [dist] world_size=2 dp_size=1 ep_size=2 ... then a normal training log, ending
+#    in a committed checkpoint under runs/toy-moe-dist-check/resume.
+
+# 3. Real multi-GPU run. --nproc_per_node = number of GPUs on the pod; --ep-size must divide
+#    both --nproc_per_node and the config's n_experts (ParallelConfig raises loudly if not).
+#    dp_size = nproc_per_node // ep_size is the FSDP2 replica count.
+torchrun --standalone --nproc_per_node=<N> scripts/train_dist.py \
+    --config config/poc-moe-large.yaml --ep-size <E> \
+    --data <local-volume-split> --out <run-dir> --total-tokens <N>
+```
+
+**Manual verification (#271's CUDA-DEFERRED items — see `.claude/plans/issue-271.md`'s
+Verification section for the full state table; none of this is CI-testable):**
+
+- [ ] **NCCL path** — process-group init, `all_to_all_single` EP dispatch, and FSDP2 param
+      sharding all succeed over real GPUs (not just gloo/CPU). The gloo-sim tests prove the
+      COLLECTIVE ALGORITHM; they cannot prove NCCL itself works on this hardware/driver/NIC combo.
+- [ ] **Actual memory savings** — peak per-GPU bytes at 1 GPU vs `--nproc_per_node=N`, at the
+      Large A (#223) shape. This is the entire point of the issue; nothing on a CPU host measures
+      it. Compare against the single-GPU OOM this checklist exists to fix.
+- [ ] **Throughput / scaling efficiency** — s/step at N GPUs vs N x (s/step at 1 GPU), and
+      whether the per-step host syncs (`bincount(...).tolist()` in `_moe_gather`/
+      `_moe_gather_ep`) and the EP count `all_gather`/`all_to_all_single` round trips dominate.
+- [ ] **`torch.compile` x FSDP2 x data-dependent all-to-all shapes** — graph breaks and
+      recompile storms are a known risk (compiled regions + FSDP2 hooks + EP's per-step varying
+      split sizes); not resolvable off a CPU host.
+- [ ] **fp8 experts (#240) x expert parallel** — TE amax bookkeeping is per-process; EP adds a
+      second unverified layer on top of fp8's own already-unverified status (see the fp8
+      checklist above).
+- [ ] **Bit-exact resume at a FIXED world size > 1 under NCCL** — the smoke gate's multi-GPU
+      analogue; `tests/test_cuda_distributed.py`'s V8 proves the DCP reshard mechanism works on
+      gloo/CPU, not that it is bit-exact under real NCCL collectives.
+- [ ] **The `fully_shard`-bypasses-`__call__` workaround** (`CUDAMambaModel._fsdp_unshard`, see
+      its docstring) under `grad_checkpoint: true` — the gloo-sim tests deliberately run with
+      `grad_checkpoint: false` (the recompute-in-backward path is a documented, UNRESOLVED gap:
+      the checkpointed recompute calls `layer.forward_seq` directly, bypassing the `unshard()`
+      call `_layer_forward` does on the FIRST pass). Do not enable `grad_checkpoint` with FSDP2
+      until this is fixed and verified — it will crash with the same "mixed Tensor and DTensor"
+      error V6 originally hit.
 
 ### Manual verification: 8-bit optimizer + fp8 experts (#214)
 

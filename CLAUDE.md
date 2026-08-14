@@ -69,13 +69,17 @@ a `tokenizer.json` artifact; `swift-parity` downloads both artifacts and `cmp`s 
 All hardware-specific code lives behind `src/model/interface.py`
 (`ModelInterface`). Everything above the seam — `src/data/`, `src/train/`,
 `src/serve/`, `src/eval/`, `src/conformance/`, `src/lsp/` — is **portable Python that
-must never import `mlx` or `torch`/CUDA**. Exactly six modules may touch a hardware
+must never import `mlx` or `torch`/CUDA**. Exactly seven modules may touch a hardware
 library: `src/model/mlx_backend.py`, `src/model/mlx_train_step.py`,
 `src/model/cuda_backend.py`, `src/model/cuda_train_step.py`, `src/model/cuda_muon.py`
-(#237's Muon/AdamW hybrid), and the LSP-harness's model adapter
-`src/model/mlx_lm_adapter.py`. Note `src/model/backend.py` is **not** one of them — it is
-the portable backend-factory registry and keeps its backend imports inside the factory
-closures.
+(#237's Muon/AdamW hybrid), `src/model/cuda_distributed.py` (#271's FSDP2 + expert-
+parallel process-group/mesh/collective plumbing for the CUDA backend), and the
+LSP-harness's model adapter `src/model/mlx_lm_adapter.py`. Note `src/model/backend.py` is
+**not** one of them — it is the portable backend-factory registry and keeps its backend
+imports inside the factory closures. `src/train/parallel.py` (#271's dp/ep sizing +
+expert-partition policy math) is likewise portable — it computes WHO owns which expert,
+never touches a process group, and lives in `tests/test_import_guard.py`'s
+`PORTABLE_MODULES` alongside `moe_balance.py`, the precedent it mirrors.
 
 This is enforced by `tests/test_import_guard.py`, which imports every portable module
 and asserts no backend leaked into `sys.modules`. **When adding code above the seam,

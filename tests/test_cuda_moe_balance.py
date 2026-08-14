@@ -156,7 +156,7 @@ def _reference_moe(block, xn, bias=None):
 def _combine(block, xn, gate):
     cd = torch.float32
     with torch.no_grad():
-        outs = np.stack([_np(e(xn, cd)) for e in block.experts], axis=-2)
+        outs = np.stack([_np(e(xn, cd)) for e in block.experts.values()], axis=-2)
     return (np.asarray(gate)[..., None] * outs).sum(-2)
 
 

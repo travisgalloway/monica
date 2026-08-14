@@ -178,7 +178,7 @@ def test_empty_expert_group_yields_zero_finite_grad_not_none():
     loss = out.float().sum()
     loss.backward()
 
-    empty_expert = block.experts[3]      # never selected: top_k=2 keeps [0, 1] on every tie
+    empty_expert = block.experts["3"]    # never selected: top_k=2 keeps [0, 1] on every tie
     for p in empty_expert.parameters():
         assert p.grad is not None
         assert torch.all(p.grad == 0.0)

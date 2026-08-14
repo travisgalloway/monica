@@ -265,7 +265,10 @@ class CheckpointStore:
     def save(self, *, step: int, loss_scale_state: Any,
              weights_serializer: Callable[[str], None],
              optimizer_serializer: Callable[[str], None],
-             data_state: Any = None) -> str:
+             data_state: Any = None,
+             is_primary: bool = True,
+             barrier: Optional[Callable[[], None]] = None,
+             rank: int = 0) -> str:
         """Write a full checkpoint to the inactive slot, then atomically make it live.
 
         `weights_serializer(path)` writes portable weights (e.g. `model.save`) and
@@ -273,18 +276,55 @@ class CheckpointStore:
         caller so this stays backend-free. `data_state` is the dataloader position
         (`MicroBatchStream.state_dict()`, #216); it rides in `resume_meta.json` rather
         than a file of its own, so it adds no entry to the slot and inherits the slot's
-        crash-atomicity for free. Returns the slot that was committed.
+        crash-atomicity for free. Returns the slot that was committed (or, on a
+        non-primary rank, the slot it WOULD have committed — see below).
+
+        `is_primary`/`barrier` (#271): under FSDP/expert-parallel, N ranks share this
+        store's directory. Every rank calls `optimizer_serializer` (each rank's optimizer
+        shard is distinct and must land in the slot), but ONLY the primary rank (rank 0)
+        writes the weights, the `resume_meta.json`, and flips `LATEST` — otherwise every
+        rank races on the same paths and the same rename. `barrier` (a real collective,
+        e.g. `torch.distributed.barrier`) is REQUIRED whenever `is_primary=False` is ever
+        passed (i.e. whenever this is called from more than one rank): it separates "all
+        ranks have finished writing their optimizer shard" from "the primary may now fsync
+        and flip LATEST" — without it a non-primary rank's shard could still be mid-write
+        when the primary commits, and a reader would see a materially incomplete slot.
+        `is_primary=True` with `barrier=None` (the default, and every pre-#271 call site)
+        is the original single-process behavior, byte-for-byte. `rank` (only meaningful
+        when `barrier` is given) qualifies the optimizer-shard filename so N ranks don't
+        clobber one another's write.
         """
         slot = self._inactive_slot()
         slot_dir = self.root / slot
-        # Start the inactive slot fresh — safe because LATEST still names the other slot,
-        # so destroying a stale/partial inactive slot never touches the live checkpoint.
-        if slot_dir.exists():
-            shutil.rmtree(slot_dir)
-        slot_dir.mkdir(parents=True, exist_ok=True)
+        if is_primary:
+            # Start the inactive slot fresh — safe because LATEST still names the other
+            # slot, so destroying a stale/partial inactive slot never touches the live
+            # checkpoint. Only the primary clears it: a non-primary rmtree-ing the slot
+            # out from under a concurrently-writing peer would be a race, not a cleanup.
+            if slot_dir.exists():
+                shutil.rmtree(slot_dir)
+            slot_dir.mkdir(parents=True, exist_ok=True)
+        elif barrier is None:
+            raise ValueError(
+                "CheckpointStore.save(is_primary=False) requires a real `barrier` "
+                "callable — without one, a non-primary rank's optimizer shard write can "
+                "race the primary's slot-directory creation/clear above."
+            )
+        if barrier is not None:
+            barrier()   # every rank waits for the primary's mkdir/rmtree before writing
 
-        weights_serializer(str(slot_dir / "weights.safetensors"))   # + .config.json sidecar
-        optimizer_serializer(str(slot_dir / "optimizer.state"))     # backend owns the extension
+        if is_primary:
+            weights_serializer(str(slot_dir / "weights.safetensors"))  # + .config.json
+        opt_path = (slot_dir / f"optimizer.state.rank{rank}" if barrier is not None
+                   else slot_dir / "optimizer.state")
+        optimizer_serializer(str(opt_path))
+
+        if barrier is not None:
+            barrier()   # every rank's optimizer shard is now on disk
+
+        if not is_primary:
+            return slot   # non-primary ranks never touch resume_meta.json or LATEST
+
         meta = {"step": int(step), "loss_scale_state": _jsonable(loss_scale_state),
                 "data_state": _jsonable(data_state)}
         _atomic_write_text(slot_dir / "resume_meta.json", json.dumps(meta))
@@ -301,18 +341,27 @@ class CheckpointStore:
         return slot
 
     def load(self, *, weights_deserializer: Callable[[str], None],
-             optimizer_deserializer: Callable[[str], Any]) -> dict:
+             optimizer_deserializer: Callable[[str], Any],
+             rank: Optional[int] = None) -> dict:
         """Load the live checkpoint into the model + optimizer. Returns
         {step, loss_scale_state, data_state, optimizer, slot}. Raises if no checkpoint is
         committed. Read `data_state` with `meta.get("data_state")` — it is absent in
-        pre-#216 bundles, and `None` for runs that persisted no dataloader position."""
+        pre-#216 bundles, and `None` for runs that persisted no dataloader position.
+
+        `rank` (#271): read this rank's own `optimizer.state.rank{rank}` shard (written
+        by a multi-rank `save(..., barrier=...)`) instead of the single-process
+        `optimizer.state`. `None` (the default) is the original single-process path,
+        unchanged. EVERY rank must load weights (the same unsharded
+        `weights.safetensors`), regardless of `rank`."""
         slot = self.latest_slot()
         if slot is None:
             raise RuntimeError(f"no committed checkpoint under {str(self.root)!r}")
         slot_dir = self.root / slot
         weights_deserializer(str(slot_dir / "weights.safetensors"))
         meta = json.loads((slot_dir / "resume_meta.json").read_text())
-        meta["optimizer"] = optimizer_deserializer(str(slot_dir / "optimizer.state"))
+        opt_path = (slot_dir / f"optimizer.state.rank{rank}" if rank is not None
+                   else slot_dir / "optimizer.state")
+        meta["optimizer"] = optimizer_deserializer(str(opt_path))
         meta["slot"] = slot
         return meta
 

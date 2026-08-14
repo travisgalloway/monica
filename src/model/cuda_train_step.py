@@ -30,7 +30,7 @@ def _global_grad_norm(params) -> torch.Tensor:
 
 
 def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
-                         grad_clip, scaler, balancer=None) -> dict:
+                         grad_clip, scaler, balancer=None, load_reduce=None) -> dict:
     """Shared accumulate -> (unscale) -> clip -> optimizer-step tail.
 
     `loss_fn(micro_batch) -> scalar torch loss` is the only objective-specific piece;
@@ -47,6 +47,14 @@ def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
     (`update` — no aux loss ever touches the objective above), and pushes the new biases
     back into the model's MoE blocks (`set_moe_biases`) for the next forward. `None`
     (dense/hybrid models, or MoE without balancing) is a no-op.
+
+    `load_reduce` (#271) is `loads -> loads`, applied BEFORE `balancer.update` — under
+    data/expert parallel each rank's `pop_moe_routing_stats()` sees only its own token
+    shard, so an un-reduced `update()` would give each rank a DIFFERENT bias vector (and
+    that bias rides in the portable weights, changing routing at inference — see
+    `src/train/moe_balance.py`'s module docstring). `None` (the default, and every
+    single-process call site today) is the identity — see `src.train.parallel.
+    reduce_loads`, whose seam this mirrors.
     """
     n = len(micro_batches)
     s = scaler.scale if scaler else 1.0
@@ -103,6 +111,8 @@ def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
         stats = pop()
         if stats:
             loads = [s["load"] for s in stats]
+            if load_reduce is not None:
+                loads = load_reduce(loads)      # global counts BEFORE the policy sees them
             if balancer is not None:
                 balancer.update(loads)
                 model.set_moe_biases(balancer.biases())
@@ -111,7 +121,7 @@ def _accumulate_and_step(model, optimizer, params, loss_fn, micro_batches, lr,
 
 
 def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                    scaler=None, balancer=None) -> Callable:
+                    scaler=None, balancer=None, load_reduce=None) -> Callable:
     """Build a `train_step(model, micro_batches, lr) -> dict` (pretraining CE).
 
     `micro_batches` is a list of `(inputs, targets)` numpy pairs; the step averages
@@ -124,6 +134,8 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
     Pass None for fp32 (toy/smoke) — numerically identical to a plain unscaled step.
     `balancer` (a `MoEBalancer`, #213/#214) is the Loss-Free-Balancing policy; None (the
     default) for dense/hybrid models and for MoE configs with `moe_balance_rate` unset.
+    `load_reduce` (#271) — see `_accumulate_and_step`'s docstring; None (the default) for
+    non-distributed runs.
     """
     params = list(model.parameters())
 
@@ -138,7 +150,7 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler, balancer)
+                                    grad_clip, scaler, balancer, load_reduce)
 
     return train_step
 
@@ -151,13 +163,13 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
 # against. All four objectives share `_accumulate_and_step`.
 # --------------------------------------------------------------------------- #
 def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                        scaler=None, balancer=None) -> Callable:
+                        scaler=None, balancer=None, load_reduce=None) -> Callable:
     """Build an SFT `train_step(model, micro_batches, lr) -> dict` (masked CE).
 
     `micro_batches` is a list of `(inputs, targets, mask)` (the `SFTLoader` 3-tuple). The
     loss is the per-token cross-entropy averaged over the *response* tokens only:
     `sum(mask * CE) / sum(mask)`, so prompt/padding positions (mask 0) never contribute.
-    `balancer` (#213/#214) as in `make_train_step`.
+    `balancer` (#213/#214) and `load_reduce` (#271) as in `make_train_step`.
     """
     params = list(model.parameters())
 
@@ -173,7 +185,7 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler, balancer)
+                                    grad_clip, scaler, balancer, load_reduce)
 
     return train_step
 
@@ -194,7 +206,8 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> torch.Tensor:
 
 
 def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1,
-                        grad_clip: float = 1.0, scaler=None, balancer=None) -> Callable:
+                        grad_clip: float = 1.0, scaler=None, balancer=None,
+                        load_reduce=None) -> Callable:
     """Build a DPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of the `DPOLoader` 6-tuple `(c_in, c_tgt, c_mask, r_in,
@@ -205,6 +218,7 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
     (#213/#214) as in `make_train_step` — its `pop_moe_load`/`set_moe_biases` calls MUST
     target `policy_model`, never `ref_model`: the reference is frozen and keeps whatever
     bias its checkpoint carried (see `src/train/moe_balance.py`'s driver-wiring note).
+    `load_reduce` (#271) as in `make_train_step`.
     """
     params = list(policy_model.parameters())
 
@@ -220,20 +234,20 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(policy_model, optimizer, params, _loss, micro_batches,
-                                    lr, grad_clip, scaler, balancer)
+                                    lr, grad_clip, scaler, balancer, load_reduce)
 
     return train_step
 
 
 def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                         scaler=None, balancer=None) -> Callable:
+                         scaler=None, balancer=None, load_reduce=None) -> Callable:
     """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
 
     `micro_batches` is a list of `(inputs, targets, mask, advantages)`: sampled rollouts
     (mask = 1 on the completion tokens) and their group-standardized advantages (one per
     sequence, precomputed via `train.grpo.group_advantages`). The loss is
     `-mean(advantage * logpθ(completion))` — REINFORCE with the GRPO group baseline.
-    `balancer` (#213/#214) as in `make_train_step`.
+    `balancer` (#213/#214) and `load_reduce` (#271) as in `make_train_step`.
     """
     params = list(model.parameters())
 
@@ -246,7 +260,7 @@ def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
-                                    grad_clip, scaler, balancer)
+                                    grad_clip, scaler, balancer, load_reduce)
 
     return train_step
 
