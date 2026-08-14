@@ -1,13 +1,16 @@
-"""Export a Swift/MLX logit-parity fixture (#166).
+"""Export a Swift/MLX logit-parity fixture (#166 / #167).
 
 Writes a self-contained fixture directory that `swift/engine`'s `monica-parity` runner
 consumes: the portable weights, the exact token batch, and the Python MLX backend's
 reference logits for BOTH code paths (`forward` and stacked per-token `step`), plus each
 layer's output so a Swift mismatch can be localized to a single block instead of a
-whole-model logit diff.
+whole-model logit diff. Also writes `generation.safetensors` (#167 AC1): a greedy-decode id
+oracle (`prompt_ids`, `greedy_ids`, `margins`) that `monica-parity` compares its own greedy
+decode against, exactly.
 
     python scripts/export_parity_fixture.py --config config/toy.yaml \\
-        --out swift/engine/Fixtures/toy --batch 2 --seq 129 [--precision fp32] [--moe-bias]
+        --out swift/engine/Fixtures/toy --batch 2 --seq 129 \\
+        [--precision fp32] [--vocab-size N] [--gen-steps 16] [--moe-bias]
 
 The checked-in fixtures under `swift/engine/Fixtures/` ARE the Swift contract, so this
 script is also the regeneration command recorded there — and
@@ -23,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +37,16 @@ from src.model.blocks import load_config
 
 def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                   precision: str | None = None, moe_bias: bool = False,
-                  seed: int = 0) -> dict:
+                  seed: int = 0, vocab_size: int | None = None,
+                  gen_steps: int = 16) -> dict:
     """Build and write one fixture directory. Returns the `meta.json` contents."""
     import mlx.core as mx  # local import: this script is MLX-only, like scripts/smoke_test.py
     from safetensors.numpy import save_file
 
     from src.model.mlx_backend import MLXMambaModel
+    from src.serve import sampling
+    from src.serve.generate import generate as py_generate
+    from src.serve.sessions import SessionStore
 
     mx.random.seed(seed)
     cfg = load_config(config_path)
@@ -47,6 +55,14 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         # emitted sidecar is self-describing and the Swift loader needs no override of
         # its own.
         cfg.precision = precision
+        cfg.validate()
+    if vocab_size is not None:
+        # Alongside --precision: override BEFORE `model.save` so the sidecar stays
+        # self-describing and the Swift loader needs no override of its own. `toy-gen`
+        # (#167) uses this — a `monica-tokenize`-trained tokenizer's vocab (256 base bytes +
+        # specials) cannot fit `toy.yaml`'s 256-wide model, so the fixture widens the model
+        # instead of shrinking the tokenizer.
+        cfg.vocab_size = vocab_size
         cfg.validate()
 
     model = MLXMambaModel(cfg)
@@ -99,15 +115,81 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
     save_file(ref, str(out / "reference.safetensors"))
 
+    # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
+    # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
+    # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
+    # `monica-parity` reproduces in Swift) with temperature=0 (argmax, first-max-on-tie).
+    rtol_gen, atol_gen = 1e-4, 1e-5
+    prompt_len = min(8, seq)
+    prompt_ids = [int(t) for t in tokens[0, :prompt_len].tolist()]
+
+    state = model.init_state(1)
+    logits = None
+    for t in prompt_ids:
+        logits, state = model.step(np.array([t], dtype=np.int64), state)
+
+    greedy_ids: list[int] = []
+    margins: list[float] = []
+    top1s: list[float] = []
+    for _ in range(gen_steps):
+        row = np.array(logits, dtype=np.float32).reshape(-1)
+        nxt = int(np.argmax(row))
+        top1 = float(row[nxt])
+        row2 = row.copy()
+        row2[nxt] = -np.inf
+        top2 = float(row2.max())
+        margins.append(top1 - top2)
+        top1s.append(top1)
+        greedy_ids.append(nxt)
+        logits, state = model.step(np.array([nxt], dtype=np.int64), state)
+
+    # A near-tie greedy argmax makes cross-implementation id equality ill-posed: two fp32
+    # implementations that agree to 1e-4 relative can still cross a near-zero margin and pick
+    # different tokens. Refusing to write a flaky fixture is the point — see the module
+    # docstring's rationale and swift/engine/Fixtures/README.md.
+    bad_steps = [i for i, (m, t1) in enumerate(zip(margins, top1s))
+                if m < atol_gen + rtol_gen * abs(t1)]
+    if bad_steps:
+        raise SystemExit(
+            f"refusing to write {out_dir}: greedy margin at step(s) {bad_steps} is inside the "
+            f"parity band (atol={atol_gen} + rtol={rtol_gen}*|top1|) — a near-tie argmax makes "
+            "cross-implementation id equality flaky. Bump --seed or --gen-steps and retry "
+            f"(margins={margins})")
+
+    # --- prefill parity: assert the SessionStore/generate.py path agrees, id-for-id ---------
+    # Ties the fixture to "the same token ids as scripts/generate.py greedy", not to an
+    # exporter-private step loop.
+    store = SessionStore(model, max_concurrent=1)
+    store.create("fixture")
+    greedy_sampler = partial(sampling.sample, temperature=0.0)
+    via_generate = py_generate(store, "fixture", prompt_ids, sampler=greedy_sampler,
+                               to_numpy=np.array, max_new_tokens=gen_steps)
+    store.remove("fixture")
+    if via_generate != greedy_ids:
+        raise SystemExit(
+            f"refusing to write {out_dir}: step-driven greedy_ids {greedy_ids} disagree with "
+            f"src.serve.generate's prefill-based path {via_generate} — the two Python code "
+            "paths (step-by-step vs one-shot prefill) must produce identical greedy ids "
+            "(src/conformance/prefill_decode_parity.py's contract)")
+
+    save_file({
+        "prompt_ids": np.array(prompt_ids, dtype=np.int32),
+        "greedy_ids": np.array(greedy_ids, dtype=np.int32),
+        "margins": np.array(margins, dtype=np.float32),
+    }, str(out / "generation.safetensors"))
+
     meta = {
         "config": os.path.basename(config_path),
         "batch": batch,
         "seq": seq,
         "seed": seed,
         "precision": cfg.precision,
+        "vocab_size": cfg.vocab_size,
+        "gen_steps": gen_steps,
         "mlx_version": getattr(mx, "__version__", "unknown"),
         "moe_bias": moe_bias,
         "forward_step_max_abs_diff": verdict["max_abs_diff"],
+        "greedy_margin_min": min(margins) if margins else None,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
@@ -122,6 +204,12 @@ def main() -> None:
     p.add_argument("--seq", type=int, default=40)
     p.add_argument("--precision", default=None, choices=["fp32", "fp16", "bf16"],
                    help="override the config's precision (the harness gates fp32)")
+    p.add_argument("--vocab-size", type=int, default=None,
+                   help="override the config's vocab_size (#167's toy-gen: a "
+                        "monica-tokenize-trained tokenizer's vocab needs a wider model than "
+                        "toy.yaml's default 256)")
+    p.add_argument("--gen-steps", type=int, default=16,
+                   help="greedy-decode steps written to generation.safetensors (#167 AC1)")
     p.add_argument("--moe-bias", action="store_true",
                    help="activate a per-expert route bias (#213) so the fixture carries "
                         "moe_route_bias.* keys and exercises the biased-ranking branch")
@@ -129,7 +217,8 @@ def main() -> None:
     args = p.parse_args()
 
     meta = build_fixture(args.config, args.out, batch=args.batch, seq=args.seq,
-                         precision=args.precision, moe_bias=args.moe_bias, seed=args.seed)
+                         precision=args.precision, moe_bias=args.moe_bias, seed=args.seed,
+                         vocab_size=args.vocab_size, gen_steps=args.gen_steps)
     print(f"wrote {args.out}: {json.dumps(meta)}")
 
 

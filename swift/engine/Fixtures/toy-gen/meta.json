@@ -1,13 +1,13 @@
 {
-  "config": "toy-moe.yaml",
-  "batch": 2,
-  "seq": 40,
+  "config": "toy.yaml",
+  "batch": 1,
+  "seq": 8,
   "seed": 0,
   "precision": "fp32",
-  "vocab_size": 256,
+  "vocab_size": 512,
   "gen_steps": 16,
   "mlx_version": "0.31.2",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.430511474609375e-06,
-  "greedy_margin_min": 4.339304208755493
+  "greedy_margin_min": 3.7032454013824463
 }

@@ -46,6 +46,19 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
         )
 
+    # #167: extend the staleness check to the greedy-id oracle. Unlike the logits above,
+    # this is EXACT int equality, not a tolerance — `monica-parity`'s AC1 check is exact too,
+    # so a fixture that silently drifted here would rot just as quietly as a logit fixture
+    # would without the check above.
+    gen_ref = load_file(str(FIXTURE / "generation.safetensors"))
+    fresh_gen = load_file(str(tmp_path / "toy" / "generation.safetensors"))
+    np.testing.assert_array_equal(
+        fresh_gen["greedy_ids"], gen_ref["greedy_ids"],
+        err_msg="greedy_ids drifted from the checked-in Swift-parity oracle. If the backend "
+                "change is intended, regenerate the fixtures — see "
+                "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`.")
+    np.testing.assert_array_equal(fresh_gen["prompt_ids"], gen_ref["prompt_ids"])
+
 
 def test_checked_in_tokens_are_reproducible():
     """The token batch is derived from the seed, so a fixture's inputs must be

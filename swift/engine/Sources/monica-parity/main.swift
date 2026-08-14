@@ -23,6 +23,17 @@ let atol: Double = 1e-5
 
 var failures: [String] = []
 
+/// The arrays inside one layer's state, mirroring `Generator`'s private helper of the same
+/// name — lets the AC1 greedy-id loop below `MLX.eval` the recurrent state alongside logits
+/// each step, the same way `Generator.generate` keeps its lazy graph from growing unbounded.
+func evalTargets(_ s: LayerState) -> [MLXArray] {
+    switch s {
+    case .mamba(let conv, let ssm): return [conv, ssm]
+    case .attention(let k, let v): return [k, v]
+    case .moe: return []
+    }
+}
+
 /// numpy's `allclose` predicate, elementwise, with `ref` as the reference operand:
 /// `|a - ref| <= atol + rtol * |ref|`. Returns the max absolute difference and whether
 /// every element passed.
@@ -130,6 +141,66 @@ for dir in fixtureDirs {
         }
         let batch = tokens.dim(0)
         let seq = tokens.dim(1)
+
+        // --- AC1: greedy-decode id parity (#167) ---
+        // A gate that cannot see its fixtures must never read green: a missing
+        // generation.safetensors is a FAILURE, not a skip.
+        let genPath = dir.appendingPathComponent("generation.safetensors")
+        guard FileManager.default.fileExists(atPath: genPath.path) else {
+            failures.append("\(name): no generation.safetensors at \(genPath.path) — "
+                            + "regenerate with scripts/export_parity_fixture.py")
+            continue
+        }
+        let genRef = try loadArrays(url: genPath)
+        guard let refPromptIds = genRef["prompt_ids"], let refGreedyIds = genRef["greedy_ids"]
+        else {
+            failures.append("\(name): generation.safetensors is missing prompt_ids/greedy_ids")
+            continue
+        }
+        let promptIds = refPromptIds.asType(.int32).asArray(Int32.self).map { Int($0) }
+        let expectedGreedy = refGreedyIds.asType(.int32).asArray(Int32.self).map { Int($0) }
+        do {
+            var genState = model.initState(batch: 1)
+            var genLogits: MLXArray? = nil
+            for t in promptIds {
+                let (lg, st) = try model.step(MLXArray([Int32(t)]), genState)
+                // Eval logits AND state together, same as `Generator.generate` — leaving the
+                // recurrent state arrays lazy lets the mlx graph grow unbounded across this
+                // prompt+decode loop.
+                MLX.eval([lg] + st.flatMap(evalTargets))
+                genState = st
+                genLogits = lg
+            }
+            var sampler = Sampler(temperature: 0)
+            var actualGreedy: [Int] = []
+            actualGreedy.reserveCapacity(expectedGreedy.count)
+            for _ in 0..<expectedGreedy.count {
+                guard let lg = genLogits else { break }
+                let row = lg.asType(.float32).reshaped([-1]).asArray(Float.self)
+                let nxt = try sampler.sample(row)
+                actualGreedy.append(nxt)
+                let (lg2, st2) = try model.step(MLXArray([Int32(nxt)]), genState)
+                MLX.eval([lg2] + st2.flatMap(evalTargets))
+                genState = st2
+                genLogits = lg2
+            }
+            if actualGreedy != expectedGreedy {
+                var firstDiff = -1
+                for i in 0..<min(actualGreedy.count, expectedGreedy.count)
+                where actualGreedy[i] != expectedGreedy[i] { firstDiff = i; break }
+                if firstDiff == -1 { firstDiff = min(actualGreedy.count, expectedGreedy.count) }
+                failures.append(String(
+                    format: "%@: greedy id mismatch at index %d — swift=%d python=%d "
+                    + "(swift=%@ python=%@)", name, firstDiff,
+                    firstDiff < actualGreedy.count ? actualGreedy[firstDiff] : -1,
+                    firstDiff < expectedGreedy.count ? expectedGreedy[firstDiff] : -1,
+                    "\(actualGreedy)", "\(expectedGreedy)"))
+            } else {
+                print("\(name): greedy ids OK (\(expectedGreedy.count) steps): \(actualGreedy)")
+            }
+        } catch {
+            failures.append("\(name): greedy-id check threw — \(error)")
+        }
 
         // --- forward (the SSD chunked-matmul scan) ---
         let fwd = model.forward(tokens)
