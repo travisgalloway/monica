@@ -12,6 +12,15 @@ logits *before* temperature, given the caller-supplied running context
 generation loop passes the accumulated context each step. The defaults (penalty 1.0, no
 ngram limit) are an exact no-op, so existing callers are unaffected.
 
+`allowed_ids` (#226) restricts the draw to a caller-supplied id set — the constrained-
+decode seam `src/lsp/masked_decode.py` builds on. `None` (the default) is an exact no-op:
+no copy, no cost. Applied to the raw logits, before repetition control and before
+temperature/top-k/top-p, so a repetition penalty can never resurrect a masked token and
+top-p renormalizes over survivors only. An *empty* `allowed_ids` is a caller bug, not a
+"nothing is valid" signal — it raises `ValueError` rather than being laundered into the
+`no_repeat_ngram_size` uniform-draw fallback below, which would inject a random token
+into what is supposed to be a constrained arm.
+
 Above the seam: pure numpy, no backend. The caller converts backend logits to numpy
 at the boundary (as `src/eval/val_loss.py` does), so this never touches mlx/torch.
 """
@@ -33,6 +42,7 @@ def sample(
     previous_tokens: Optional[Sequence[int]] = None,
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: Optional[int] = None,
+    allowed_ids: Optional[Sequence[int]] = None,
 ) -> int:
     """Return one token id sampled from a 1-D logits vector.
 
@@ -48,8 +58,38 @@ def sample(
       * `no_repeat_ngram_size = n` — hard-ban (logit -> -inf) any token that would
         complete an n-gram already present in `previous_tokens` (the standard HF rule).
     Both require `previous_tokens`; without it they are skipped.
+
+    `allowed_ids` (constrained decode, #226): restrict the draw to exactly this id set.
+    `None` is a no-op. An empty sequence raises `ValueError` — see the module docstring.
+    Ids outside `[0, vocab)` are dropped, mirroring the repetition block's own
+    out-of-range guard — but if that drops every id (all of `allowed_ids` was
+    out-of-range), the result is the same as an empty `allowed_ids` and raises
+    `ValueError` too, rather than falling through to the uniform-draw fallback below.
+    If repetition control (not the mask itself) later bans every remaining allowed
+    id, the "all logits non-finite" fallback draws uniformly from `allowed_ids`
+    only, never from the full vocab — constrained decode must never escape its
+    constraint set even on that fallback path.
     """
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+
+    if allowed_ids is not None:
+        if len(allowed_ids) == 0:
+            raise ValueError(
+                "allowed_ids is empty — the caller must never hand sample() an empty "
+                "constraint set (that is a masker bug, not 'nothing is valid'; the "
+                "caller should bypass the mask for this step instead)")
+        ids = np.asarray(list(allowed_ids), dtype=np.int64)
+        ids = ids[(ids >= 0) & (ids < logits.size)]
+        if ids.size == 0:
+            raise ValueError(
+                "allowed_ids contained no ids within [0, vocab) after dropping "
+                "out-of-range entries — treated the same as an empty constraint set "
+                "(a masker bug, not 'nothing is valid'): raising rather than falling "
+                "through to the no_repeat_ngram_size uniform-draw fallback below, which "
+                "would silently return a token outside the caller's constraint set")
+        mask = np.full(logits.shape, -np.inf)
+        mask[ids] = 0.0
+        logits = logits + mask  # mask BEFORE repetition control / temperature / top-k / top-p
 
     if previous_tokens is not None and len(previous_tokens) and (
             repetition_penalty != 1.0 or no_repeat_ngram_size):
@@ -72,11 +112,19 @@ def sample(
                 logits[banned] = -np.inf
 
     if not np.any(np.isfinite(logits)):
-        # Every token was banned (e.g. no_repeat_ngram_size covering the whole vocab):
-        # there is no valid next token. Fall back to a uniform draw rather than the
-        # greedy path returning a banned argmax or `_softmax` producing NaN probs that
-        # crash `rng.choice` mid-generation.
+        # Every token was banned (e.g. no_repeat_ngram_size covering the whole vocab,
+        # or -- with allowed_ids set -- repetition control banning every remaining
+        # allowed id): there is no valid next token. Fall back to a uniform draw
+        # rather than the greedy path returning a banned argmax or `_softmax`
+        # producing NaN probs that crash `rng.choice` mid-generation.
         rng = rng or np.random.default_rng()
+        if allowed_ids is not None:
+            # `ids` (built above) is the validated, in-range allowed set -- never
+            # empty here (an empty/all-out-of-range allowed_ids already raised).
+            # Drawing from the full vocab instead would silently return a token
+            # outside the caller's constraint set, breaking constrained decode's
+            # guarantee that sampling never escapes allowed_ids.
+            return int(rng.choice(ids))
         return int(rng.integers(logits.size))
 
     if temperature == 0:

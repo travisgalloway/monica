@@ -50,6 +50,11 @@ def _flag_gorblak(source: str) -> List[Diagnostic]:
     return [Diagnostic(code="TS2339", line=1, col=idx + 1, message="msg", offset=idx)]
 
 
+def _flag_unused(source: str) -> List[Diagnostic]:
+    # A real diagnostic, but not a name-resolution one -- resolved must stay True.
+    return [Diagnostic(code="TS6133", line=1, col=1, message="unused var", offset=0)]
+
+
 # --------------------------------------------------------------------------- #
 # score_record
 # --------------------------------------------------------------------------- #
@@ -127,6 +132,25 @@ def test_score_record_no_suggestion_leak_without_did_you_mean():
     assert scored["suggestion_leak"] is False
 
 
+def test_score_record_resolved_true_when_no_resolution_code():
+    result = _result("name);")
+    scored = score_record(_MEMBER_ACCESS_REC, result, _no_diags)
+    assert scored["resolved"] is True
+
+
+def test_score_record_resolved_false_on_resolution_code():
+    result = _result("gorblak);")
+    scored = score_record(_MEMBER_ACCESS_REC, result, _flag_gorblak)
+    assert scored["resolved"] is False
+
+
+def test_score_record_resolved_true_despite_non_resolution_diagnostic():
+    result = _result("name);")
+    scored = score_record(_MEMBER_ACCESS_REC, result, _flag_unused)
+    assert scored["clean"] is False    # a real diagnostic exists...
+    assert scored["resolved"] is True  # ...but it isn't a name-resolution failure
+
+
 def test_score_record_cost_fields_carried_through():
     result = _result("name);", n_forward_tokens=10, n_forward_tokens_nocache=15,
                       n_generated_tokens=3, n_tsc_calls=2, wall_s=0.5)
@@ -161,6 +185,19 @@ def test_summarize_rates():
     assert summary["error_avoidance_rate"] == pytest.approx(0.5)
     assert summary["over_repair_rate"] == pytest.approx(1.0)  # the 1 clean_control row rolled back
     assert summary["diagnostic_clean_rate"] == pytest.approx(2 / 3)
+
+
+def test_summarize_resolve_rate():
+    scored = [
+        score_record(_MEMBER_ACCESS_REC, _result("name);"), _no_diags),
+        score_record(dict(_MEMBER_ACCESS_REC, id="member-access-002"),
+                     _result("gorblak);"), _flag_gorblak),
+        score_record(dict(_MEMBER_ACCESS_REC, id="member-access-003"),
+                     _result("name);"), _flag_unused),
+    ]
+    summary = summarize(scored)
+    # rows 1 and 3 resolved (no resolution-code diagnostic), row 2 not -> 2/3
+    assert summary["resolve_rate"] == pytest.approx(2 / 3)
 
 
 def test_summarize_empty_is_nan_not_crash():

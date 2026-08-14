@@ -94,6 +94,12 @@ class GenResult:
     n_forward_tokens: int = 0
     n_forward_tokens_nocache: int = 0
     wall_s: float = 0.0
+    # #226 constrained-decode (masked/masked-oracle arms only; 0 for every other
+    # strategy). Additive fields — no existing field, function, or behavior changes.
+    n_mask_steps: int = 0
+    n_mask_bypass: int = 0
+    n_completion_calls: int = 0
+    mask_wall_s: float = 0.0
 
     @property
     def artifact(self) -> str:
