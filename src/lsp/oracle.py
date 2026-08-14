@@ -119,6 +119,23 @@ class CompositeOracle:
             "n_stall_recoveries": og.n_stall_recoveries,
         }
 
+    @property
+    def ts_stats(self) -> Optional[dict]:
+        """The TS-LSP arm's reliability/cost counters, or `None` when that arm
+        isn't active (`kind="opengrep"`). Symmetric with `opengrep_stats` above --
+        a caller (e.g. #230's `LspVerifier` telemetry) never has to reach into
+        `self._ts` directly to learn whether the persistent server restarted or
+        timed out mid-run."""
+        if self._ts is None:
+            return None
+        ts = self._ts
+        return {
+            "n_calls": ts.n_calls,
+            "wall_s": ts.wall_s,
+            "n_timeouts": ts.n_timeouts,
+            "n_restarts": ts.n_restarts,
+        }
+
     def diagnostics(self, source: str) -> List[Diagnostic]:
         """Every arm's findings, UNFILTERED (the caller applies
         `diagnostics.filter_diagnostics`, same as `TscRunner`/`TsLspOracle`),
