@@ -24,6 +24,7 @@ MLX-only (it builds the MLX backend), so it does not run on a Linux/CUDA host.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 from functools import partial
@@ -36,18 +37,52 @@ from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.model.blocks import load_config
 
 
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div)
+
+
+def _eval_doc_length_expr(node: ast.expr, q: int) -> int:
+    """Evaluate one AST node of a `--packed-doc-lengths` expression against a whitelist:
+    integer literals, the single name `Q`, unary +/-, and +-*/ binary ops. Anything else
+    (calls, attribute access, subscripts, comprehensions, ...) raises — this is arithmetic
+    parsing, not a general expression evaluator, so there is no path to attacker-controlled
+    code execution regardless of who supplies `spec`."""
+    if isinstance(node, ast.Expression):
+        return _eval_doc_length_expr(node.body, q)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.Name) and node.id == "Q":
+        return q
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        val = _eval_doc_length_expr(node.operand, q)
+        return val if isinstance(node.op, ast.UAdd) else -val
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        left = _eval_doc_length_expr(node.left, q)
+        right = _eval_doc_length_expr(node.right, q)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.FloorDiv):
+            return left // right
+        return left // right if right and left % right == 0 else left / right  # ast.Div
+    raise ValueError(f"unsupported expression in --packed-doc-lengths: {ast.dump(node)}")
+
+
 def _resolve_packed_doc_lengths(spec: str, q: int) -> list[int]:
     """Parse a comma-separated list of chunk-length-relative expressions (e.g.
     `"Q,2*Q,5"`) into concrete doc lengths. `Q` is the only name in scope, so this is
     just enough to express "a chunk multiple, several chunks, and a short/ragged doc" —
     the exact shapes `tests/test_doc_boundary_parity.py` already gates, so the Swift P6
-    gate and the Python doc-boundary gate stress the same geometry (#68/#263)."""
-    # `eval` here is safe: `spec` is a --packed-doc-lengths CLI argument this maintainer-run
-    # export script's own caller supplies (never untrusted/network input), `__builtins__`
-    # is stripped, and the only name in scope is `Q` — this is arithmetic-expression
-    # parsing, not code execution over attacker-controlled data.
-    ns = {"Q": q}
-    return [int(eval(tok.strip(), {"__builtins__": {}}, ns)) for tok in spec.split(",")]
+    gate and the Python doc-boundary gate stress the same geometry (#68/#263).
+
+    Parsed via a small AST whitelist (`_eval_doc_length_expr`), not `eval` — `spec` is a
+    `--packed-doc-lengths` CLI argument this maintainer-run export script's own caller
+    supplies (never untrusted/network input), but a whitelisted parser is strictly safer
+    than `eval` with stripped builtins and costs nothing here."""
+    return [int(_eval_doc_length_expr(ast.parse(tok.strip(), mode="eval"), q))
+            for tok in spec.split(",")]
 
 
 def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
