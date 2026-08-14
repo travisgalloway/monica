@@ -376,7 +376,9 @@ jobs:
           # "Validate plug-in \"CudaBuild\" in package \"mlx-swift\"").
           xcodebuild build -scheme MonicaEngine-Package -destination 'platform=macOS' \
             -derivedDataPath .build-xcode -skipPackagePluginValidation
-      - name: Logit parity vs the Python MLX oracle
+      - name: Logit + greedy-id parity vs the Python MLX oracle
+        # As of #167, monica-parity also gates AC1: greedy-decode ids exactly match
+        # generation.safetensors (exported alongside the logit reference) for every fixture.
         working-directory: swift/engine
         run: |
           BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
@@ -386,3 +388,47 @@ jobs:
             exit 1
           fi
           "$BIN"
+      # ── #167: the generation CLI, self-test + tokenizer-free + native-tokenizer paths ──
+      - name: monica-generate self-test (sampler semantics, no weights/MLX needed)
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-generate -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-generate binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          echo "MONICA_GENERATE_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" --self-test
+      - name: monica-generate AC2 — tokenizer-free debug path (--prompt-ids)
+        working-directory: swift/engine
+        run: |
+          OUT=$("$MONICA_GENERATE_BIN" --weights Fixtures/toy/weights.safetensors \
+            --prompt-ids 3,1,4,1,5 --temperature 0 --max-new-tokens 8)
+          echo "$OUT"
+          # A check that cannot observe its target must never read green: assert non-empty
+          # output, not just a zero exit code.
+          [ -n "$OUT" ]
+      - name: monica-generate AC2 — native MonicaTokenizer end to end
+        # This is the step that makes "encode/decode go through the native MonicaTokenizer"
+        # a gate rather than a comment. `toy-gen` (vocab 512) exists precisely because a
+        # monica-tokenize-trained tokenizer's vocab (256 base bytes + specials) cannot fit
+        # toy.yaml's default 256-wide model.
+        run: |
+          cd swift
+          swift run monica-tokenize train --in Fixtures/parity-corpus.jsonl \
+            --out "$RUNNER_TEMP/gen-tokenizer.json" --vocab-size 512
+          cd ../engine
+          OUT=$("$MONICA_GENERATE_BIN" --weights Fixtures/toy-gen/weights.safetensors \
+            --tokenizer "$RUNNER_TEMP/gen-tokenizer.json" --prompt 'function ' \
+            --temperature 0 --max-new-tokens 8)
+          echo "$OUT"
+          [ -n "$OUT" ]
+      - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
+        # Cheap, and it fails loudly the day someone "simplifies" the two packages into one.
+        # The engine -> tokenizer edge (Package.swift) must never become tokenizer -> engine.
+        run: |
+          cd swift
+          OUT=$(swift package show-dependencies --format flatlist)
+          echo "output: '$OUT'"
+          [ -z "$OUT" ]

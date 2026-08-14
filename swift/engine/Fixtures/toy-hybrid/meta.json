@@ -4,7 +4,10 @@
   "seq": 40,
   "seed": 0,
   "precision": "fp32",
+  "vocab_size": 256,
+  "gen_steps": 16,
   "mlx_version": "0.31.2",
   "moe_bias": false,
-  "forward_step_max_abs_diff": 1.430511474609375e-06
+  "forward_step_max_abs_diff": 1.430511474609375e-06,
+  "greedy_margin_min": 1.4541618824005127
 }

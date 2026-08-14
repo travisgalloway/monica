@@ -204,8 +204,8 @@ Risks below.
 |---|---|---|---|---|
 | **`swift/MonicaTokenizer` (ours)** | tokenize / detokenize; the corpus packer | ✅ | ✅ | #191/#245. Own byte-level BPE, **no external deps** (`swift/Package.swift`), bit-identical across platforms, CI-gated by `swift-macos` / `swift-linux` / `swift-parity` (#246). **Displaces swift-transformers entirely** |
 | `mlx-swift` | tensors, autodiff, the model port | ✅ | ✅ (build) | The core dependency. CUDA build via ml-explore/mlx-swift#320 (merged 2025-12-18) — available, deferred |
-| `mlx-swift-lm` | generation loop, sampling, KV cache, quantized loading | ✅ | untested | Saves writing the decode scaffolding by hand |
-| `mlx-swift-examples` (`llm-tool`) | CLI shell to fork for #167 | ✅ | untested | Example code, not a runtime dependency |
+| `mlx-swift-lm` | generation loop, sampling, KV cache, quantized loading | ✅ | untested | **NOT used — a deliberate deviation, #167.** `mlx-swift-lm`'s `LanguageModel`/`KVCache` protocols assume a transformer whose state *is* a KV cache; `MonicaModel`'s state is a `[LayerState]` enum carrying Mamba conv windows + SSM state, so the adapter would be larger than the ~200-line native port it replaces (`Sampler.swift`, `Generator.swift`). It would also pull `swift-transformers` + Hub into the `swift-engine` CI job for a tokenizer we deliberately do not use, and its MLX-RNG samplers cannot reproduce `src/serve/sampling.py`'s numpy draws — porting the sampler directly is what makes "matches `src/serve/sampling.py`'s semantics" a checkable claim (AC1: greedy ids are bit-for-bit; sampled draws are semantically but not id-identical, since numpy's `Generator` stream cannot be reproduced in Swift) |
+| `mlx-swift-examples` (`llm-tool`) | CLI shell to fork for #167 | ✅ | untested | **Not forked** — `monica-generate` is a new executable target in `swift/engine/`, written against `scripts/generate.py`'s flag surface (the design doc's own table already called this example code, not a dependency) |
 | `swift-transformers` | — | — | — | **Not used.** Superseded by our own tokenizer (#163's tokenizer note, #167) |
 | `mlx-c` | the B2 C++ path | ✅ | ✅ | Only if an embeddable C-ABI library becomes a requirement |
 | `mx.fast.metal_kernel` | fused SSD-scan/conv kernel (#171) | ✅ | ❌ | **Metal-only.** A CUDA sibling kernel would be separate work (#171) |
@@ -219,8 +219,8 @@ The #163 dependency order:
 1. **#164** (this document) and **#165** (`prefill` on the seam, both Python backends) — no
    dependencies, start immediately.
 2. **#166** — port the model to mlx-swift + the logit-parity harness. Everything else waits on it.
-3. **#167** (generation CLI), **#195** (train step + optimizer), **#196** (checkpoint I/O) — in
-   parallel once #166 lands.
+3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
+   I/O) — in parallel once #166 lands.
 4. **#197** (LSP harness), **#168** (quantization), **#169** (Swift prefill — needs #165),
    **#170** (Apple-Silicon benchmark harness).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
@@ -277,6 +277,29 @@ DPO/GRPO step factories.
   bit-identity gate cheap and credible. `swift/engine/` is not inside any target path declared by
   `swift/Package.swift`, so `cd swift && swift build` ignores it exactly the way it already ignores
   `Fixtures/`. CI gains one job, `swift-engine` (macOS only); jobs 4/5/6 are unchanged.
+- **Cross-package dependency direction — RESOLVED (#167): engine -> tokenizer, never the
+  reverse.** `monica-generate` needs `swift/MonicaTokenizer` for encode/decode, so
+  `swift/engine/Package.swift` gained a **path** dependency, `.package(path: "..")`, and the
+  `monica-generate` executable target references
+  `.product(name: "MonicaTokenizer", package: "swift")` — the product's `package:` argument is
+  the path dependency's **directory basename** (`"swift"`), *not* its `Package(name:)`
+  (`"MonicaTokenizer"`); the wrong form fails with `unknown package … valid packages are:
+  'swift'`, verified empirically on Swift 6.3.3. `swift/Package.swift` is untouched — it still
+  declares `dependencies: []`, so `cd swift && swift build` on Linux still resolves nothing,
+  and `swift package show-dependencies --format flatlist` from `swift/` still prints nothing
+  (CI-guarded, `swift-engine` job). Path dependencies are not recorded in `Package.resolved`,
+  so this does not perturb the `swift-engine` cache key. Only the `monica-generate`
+  **executable** gained the tokenizer edge — the `MonicaEngine` library and `monica-parity`
+  stay exactly as coupled as before (`Sampler.swift`'s RNG is a deliberate ~10-line duplicate
+  of `MonicaTokenizer.SplitMix64` rather than a shared type, precisely to keep the library's
+  dependency shape unchanged).
+- **#167 prefills sequentially, pending #169.** `Generator.generate` prefills the prompt by
+  calling `model.step` once per prompt token (batch 1) — the pre-#165 Python shape
+  (`src/serve/generate.py` before its `SessionStore.prefill` one-shot parallel scan landed) —
+  and is numerically the same answer, gated the same way
+  `src/conformance/prefill_decode_parity.py` gates Python's prefill == stepping. The
+  parallel-scan prefill lever (`forward_prefill`, see the perf-levers table above) is **Swift
+  #169's job**; #167 deliberately does not reach for it.
 
 ## See also
 

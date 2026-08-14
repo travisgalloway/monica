@@ -21,6 +21,15 @@
 // on Apple Swift 6.3.3). If a CI image ever ships an older Xcode and resolution fails on the
 // manifest version, the fallback is to pin mlx-swift `0.30.6` (tools-version 5.12) here and
 // record the reason — not to vendor or work around it.
+//
+// CROSS-PACKAGE DEPENDENCY DIRECTION (#167). `monica-generate` (below) needs the native code
+// tokenizer, so this package gains a PATH dependency on `swift/` (`.package(path: "..")`).
+// The edge points engine -> tokenizer, NEVER the reverse: `swift/Package.swift` is untouched
+// and stays `dependencies: []`, so `cd swift && swift build` on Linux still resolves nothing.
+// Path dependencies are not recorded in `Package.resolved`, so this does not perturb the
+// `swift-engine` cache key. Only the `monica-generate` EXECUTABLE gains the tokenizer
+// dependency — the `MonicaEngine` library and `monica-parity` stay exactly as coupled as
+// before.
 import PackageDescription
 
 let package = Package(
@@ -29,9 +38,11 @@ let package = Package(
     products: [
         .library(name: "MonicaEngine", targets: ["MonicaEngine"]),
         .executable(name: "monica-parity", targets: ["monica-parity"]),
+        .executable(name: "monica-generate", targets: ["monica-generate"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
+        .package(path: ".."),   // the zero-dependency tokenizer package (#191/#245)
     ],
     targets: [
         .target(
@@ -49,6 +60,20 @@ let package = Package(
             dependencies: [
                 "MonicaEngine",
                 .product(name: "MLX", package: "mlx-swift"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The generation CLI (#167). Same dependency-free-runner style as monica-parity.
+        .executableTarget(
+            name: "monica-generate",
+            dependencies: [
+                "MonicaEngine",
+                .product(name: "MLX", package: "mlx-swift"),
+                // `package:` is the path dependency's IDENTITY = the directory basename
+                // ("swift"), NOT its Package(name:) ("MonicaTokenizer"). Verified empirically
+                // (see docs/design/14-inference-engine.md and .claude/plans/issue-167.md):
+                // the name form fails with "unknown package … valid packages are: 'swift'".
+                .product(name: "MonicaTokenizer", package: "swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
