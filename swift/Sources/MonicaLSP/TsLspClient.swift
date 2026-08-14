@@ -93,7 +93,7 @@ enum LspText {
         let lineEnd = (line0 + 1 < starts.count) ? starts[line0 + 1] - 1 : chars.count
         var units = 0
         for i in lineStart..<offset where i < lineEnd {
-            units += (chars[i].unicodeScalars.first.map { $0.value > 0xFFFF } ?? false) ? 2 : 1
+            units += String(chars[i]).utf16.count
         }
         return ["line": line0, "character": units]
     }
@@ -109,7 +109,7 @@ enum LspText {
         var idx = lineStart
         while idx < lineEnd {
             if units >= col - 1 { break }
-            units += (chars[idx].unicodeScalars.first.map { $0.value > 0xFFFF } ?? false) ? 2 : 1
+            units += String(chars[idx]).utf16.count
             idx += 1
         }
         return idx
@@ -431,6 +431,15 @@ public final class TsLspClient {
         opWallS[opName, default: 0] += elapsed
     }
 
+    /// `restart()` swallows a failed `startServer()` (`try?`) so `ensureAlive()` never
+    /// throws; that leaves `supervisor` nil, and a request helper force-unwrapping it would
+    /// crash instead of taking the `.closed` timeout path `timedRequest` already handles.
+    /// Throwing `JsonRpcError.closed` here routes that same nil straight into that path.
+    private func requireSupervisor() throws -> ProcessSupervisor {
+        guard let sup = supervisor else { throw JsonRpcError.closed }
+        return sup
+    }
+
     /// `ensureAlive`, run `fn`, record cost. `.timeout`/`.closed` are counted (`nTimeouts`)
     /// and return `empty` — never propagate. `.rpcError` (the server rejected our params) IS
     /// re-thrown: hiding a real protocol bug as "no completions" would be exactly the BLIND
@@ -457,7 +466,7 @@ public final class TsLspClient {
             ensureOpen(path)
             let u = uri(for: path)
             let pos = try LspText.offsetToPosition(Array(files[path] ?? ""), offset: offset)
-            let raw = try supervisor!.endpoint.request(
+            let raw = try requireSupervisor().endpoint.request(
                 "textDocument/definition",
                 params: ["textDocument": ["uri": u], "position": pos], timeout: timeoutS)
             return Self.mapLocations(raw, root: scratchDir)
@@ -469,7 +478,7 @@ public final class TsLspClient {
             ensureOpen(path)
             let u = uri(for: path)
             let pos = try LspText.offsetToPosition(Array(files[path] ?? ""), offset: offset)
-            let raw = try supervisor!.endpoint.request(
+            let raw = try requireSupervisor().endpoint.request(
                 "textDocument/references",
                 params: ["textDocument": ["uri": u], "position": pos,
                          "context": ["includeDeclaration": includeDeclaration]], timeout: timeoutS)
@@ -482,7 +491,7 @@ public final class TsLspClient {
             ensureOpen(path)
             let u = uri(for: path)
             let pos = try LspText.offsetToPosition(Array(files[path] ?? ""), offset: offset)
-            let raw = try supervisor!.endpoint.request(
+            let raw = try requireSupervisor().endpoint.request(
                 "textDocument/completion",
                 params: ["textDocument": ["uri": u], "position": pos], timeout: timeoutS)
             let dict = raw as? [String: Any]
@@ -503,7 +512,7 @@ public final class TsLspClient {
             ensureOpen(path)
             let u = uri(for: path)
             let pos = try LspText.offsetToPosition(Array(files[path] ?? ""), offset: offset)
-            let raw = try supervisor!.endpoint.request(
+            let raw = try requireSupervisor().endpoint.request(
                 "textDocument/hover",
                 params: ["textDocument": ["uri": u], "position": pos], timeout: timeoutS)
             guard let dict = raw as? [String: Any], let contents = dict["contents"] else { return nil }
@@ -517,7 +526,7 @@ public final class TsLspClient {
         try timedRequest("document_symbols", empty: []) {
             ensureOpen(path)
             let u = uri(for: path)
-            let raw = try supervisor!.endpoint.request(
+            let raw = try requireSupervisor().endpoint.request(
                 "textDocument/documentSymbol", params: ["textDocument": ["uri": u]], timeout: timeoutS)
             return Self.mapSymbols(raw)
         }

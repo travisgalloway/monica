@@ -394,7 +394,16 @@ func buildLspMaskSession(flags: [String: String], tok: Tokenizer, promptText: St
     if let projectDir = flags["lsp-project"] {
         let base = URL(fileURLWithPath: projectDir)
         if let enumerator = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator where fileURL.pathExtension == "ts" {
+            for case let fileURL as URL in enumerator {
+                // The toolchain's own `node_modules` is already provided via `scratchParent`
+                // (see `TsLspClient`'s doc comment); walking into a project-root
+                // `node_modules` here too would read every `.d.ts`/`.ts` in every dependency,
+                // exploding startup time and memory for no benefit.
+                if fileURL.lastPathComponent == "node_modules" {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                guard fileURL.pathExtension == "ts" else { continue }
                 let rel = fileURL.path.replacingOccurrences(of: base.path + "/", with: "")
                 projectFiles[rel] = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
             }

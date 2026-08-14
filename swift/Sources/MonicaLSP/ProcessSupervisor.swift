@@ -71,23 +71,25 @@ public final class ProcessSupervisor {
         guard !handlersInstalled else { return }
         handlersInstalled = true
 
+        // `signal()`/`raise()` are NOT on POSIX's async-signal-safe list (only `kill(2)` and
+        // `_exit(2)` are, of the operations relevant here) — re-arming the default disposition
+        // and re-raising from inside the handler was itself a violation of the safety this
+        // block's own doc comment claims. `_exit` after the `kill(2)` backstop keeps every
+        // operation in the handler signal-safe while still terminating the process.
         signal(SIGINT) { sig in
             let p = ProcessSupervisor.currentPID
             if p > 0 { kill(pid_t(p), SIGKILL) }
-            signal(sig, SIG_DFL)
-            raise(sig)
+            _exit(128 + sig)
         }
         signal(SIGTERM) { sig in
             let p = ProcessSupervisor.currentPID
             if p > 0 { kill(pid_t(p), SIGKILL) }
-            signal(sig, SIG_DFL)
-            raise(sig)
+            _exit(128 + sig)
         }
         signal(SIGHUP) { sig in
             let p = ProcessSupervisor.currentPID
             if p > 0 { kill(pid_t(p), SIGKILL) }
-            signal(sig, SIG_DFL)
-            raise(sig)
+            _exit(128 + sig)
         }
         atexit {
             let p = ProcessSupervisor.currentPID
@@ -211,8 +213,12 @@ public final class ProcessSupervisor {
             _ = try? endpoint.request("shutdown", timeout: timeouts.lspShutdown)
             endpoint.notify("exit")
         }
+        // `endpoint.close()` already closes the write side via `stream.closeWrite()`
+        // (`PipeTransport.closeWrite()` -> raw `close(writeFD)`). Closing
+        // `stdinPipe.fileHandleForWriting` again here would be a second `close(2)` on that
+        // same fd number, which the OS may have already reassigned to something unrelated —
+        // a real double-close, not a harmless idempotent no-op.
         endpoint.close()
-        try? stdinPipe.fileHandleForWriting.close()
 
         if waitUntilExit(timeout: 0.3) { Self.clearCurrent(pid); return }
 

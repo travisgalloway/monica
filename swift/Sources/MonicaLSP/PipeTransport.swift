@@ -77,8 +77,12 @@ public final class PipeTransport: ByteStream {
     public static func pipePair() -> (a: PipeTransport, b: PipeTransport) {
         var fds1: [Int32] = [0, 0]
         var fds2: [Int32] = [0, 0]
-        _ = fds1.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
-        _ = fds2.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
+        let r1 = fds1.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
+        let r2 = fds2.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
+        // A failed `pipe(2)` leaves the fds at their initialized 0/0, which would silently
+        // alias stdin — assert instead of building a `PipeTransport` fixture that can
+        // accidentally read/write stdio and make the self-test non-deterministic.
+        precondition(r1 == 0 && r2 == 0, "PipeTransport.pipePair: pipe(2) failed")
         // a reads fds1's read end (fed by b's write end fds1[1]); a writes to fds2's write
         // end (read by b's read end fds2[0]).
         let a = PipeTransport(readFD: fds1[0], writeFD: fds2[1])
@@ -106,10 +110,14 @@ public final class PipeTransport: ByteStream {
     }
 
     public func write(_ data: Data) -> Bool {
+        // Held for the ENTIRE write, not just the `writeClosed` check — otherwise
+        // `closeWrite()` can interleave between this check and the `write(2)` loop below (or
+        // between individual `write(2)` calls) and close the fd mid-message, putting a
+        // partial JSON-RPC frame on the wire. Making `write`/`closeWrite` share one
+        // lock-for-the-duration critical section is what makes them mutually exclusive.
         lock.lock()
-        let closed = writeClosed
-        lock.unlock()
-        if closed { return false }
+        defer { lock.unlock() }
+        if writeClosed { return false }
         var written = 0
         let bytes = [UInt8](data)
         let total = bytes.count
