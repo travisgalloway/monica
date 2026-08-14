@@ -148,7 +148,7 @@ def test_router_top_k_one_equals_argmax_expert():
         logits = _np(block.router(xn))
         chosen = logits.argmax(axis=-1)
         combined = _np(block._moe(xn))
-        expert_outs = np.stack([_np(e(xn, cd)) for e in block.experts], axis=1)  # (5,E,d)
+        expert_outs = np.stack([_np(e(xn, cd)) for e in block.experts.values()], axis=1)  # (5,E,d)
     for i, e in enumerate(chosen):
         assert np.allclose(combined[i], expert_outs[i, e], atol=1e-5)
 
@@ -169,7 +169,7 @@ def test_router_keeps_exactly_k_on_ties(impl):
     cd = torch.float32
     with torch.no_grad():
         combined = _np(block._moe(xn))
-        expert_outs = np.stack([_np(e(xn, cd)) for e in block.experts], axis=1)  # (3,E,d)
+        expert_outs = np.stack([_np(e(xn, cd)) for e in block.experts.values()], axis=1)  # (3,E,d)
     mean_first_k = expert_outs[:, :cfg.top_k, :].mean(axis=1)   # ranks break ties by index
     assert np.allclose(combined, mean_first_k, atol=1e-5)
     assert not np.allclose(combined, expert_outs.mean(axis=1), atol=1e-5)   # NOT all E
@@ -186,7 +186,7 @@ def test_moe_degenerate_single_expert_equals_hand_computed_swiglu():
     xn = torch.randn(4, cfg.d_model)
     with torch.no_grad():
         combined = block._moe(xn)
-        e = block.experts[0]
+        e = block.experts["0"]
         g = xn @ e.gate.weight.t()
         u = xn @ e.up.weight.t()
         expected = (F.silu(g) * u) @ e.down.weight.t()

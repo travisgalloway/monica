@@ -70,6 +70,7 @@ PORTABLE_MODULES = [
     "src.train.checkpoint",
     "src.train.loss_scale",
     "src.train.moe_balance",
+    "src.train.parallel",
     "src.train.upcycle",
     "src.train.loop",
     "src.train.curriculum",

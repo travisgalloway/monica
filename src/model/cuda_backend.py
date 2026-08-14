@@ -779,23 +779,54 @@ class MoEBlock(nn.Module):
 
     _MOE_BIAS_PREFIX = "moe_route_bias."   # kept for symmetry with the model-level prefix
 
-    def __init__(self, config: MambaConfig, device):
+    def __init__(self, config: MambaConfig, device, ep_size: int = 1, ep_rank: int = 0):
         super().__init__()
         self.config = config
         self.norm = RMSNorm(config.d_model)
         self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
         d_ff = config.moe_d_ff_resolved
-        self.experts = nn.ModuleList(
-            [_Expert(config.d_model, d_ff, config, device) for _ in range(config.n_experts)])
+
+        # Expert parallel (#271): each rank builds ONLY its shard of the global expert
+        # set. `ep_size == 1` (the default, and every config before #271) gives every
+        # rank the full `range(n_experts)` shard, in order — a ModuleDict keyed by the
+        # STRINGIFIED global expert index produces the exact same `named_parameters()`
+        # prefixes (`experts.0.gate.weight`, ...) a `ModuleList` did, so the portable
+        # weight keys, `check_weight_keys`, `upcycle.py`, and the Swift parity fixtures
+        # are all untouched at ep_size == 1.
+        from ..train.parallel import expert_partition
+        self.ep_size = int(ep_size)
+        self.ep_rank = int(ep_rank)
+        self.ep_group = None    # set post-construction by cuda_distributed once a PG exists
+        self._local_expert_ids = expert_partition(config.n_experts, self.ep_size)[self.ep_rank]
+        self.experts = nn.ModuleDict(
+            {str(i): _Expert(config.d_model, d_ff, config, device)
+             for i in self._local_expert_ids})
         # Shared experts (#214, DeepSeek-V2/V3 form): every token goes through every
         # shared expert unconditionally; combined ADDITIVELY in `_moe`, outside the
         # router softmax/top-k renormalization. Empty ModuleList for n_shared_experts=0.
+        # NOT sharded by EP: every rank runs the full set on its own token shard, same
+        # as the pre-#271 behavior (dispatch is only for the top-k ROUTED experts).
         self.shared_experts = nn.ModuleList(
             [_Expert(config.d_model, d_ff, config, device)
              for _ in range(config.n_shared_experts)])
 
         E = config.n_experts
-        if config.moe_impl == "dense":
+        if self.ep_size > 1:
+            if config.moe_impl == "dense":
+                raise ValueError(
+                    "expert parallel (ep_size > 1) requires moe_impl='gather' or "
+                    "'auto' — 'dense' evaluates every expert locally, which is "
+                    "incompatible with a partitioned expert set."
+                )
+            if config.top_k >= E:
+                raise ValueError(
+                    f"expert parallel (ep_size > 1) requires top_k ({config.top_k}) < "
+                    f"n_experts ({E}) — top_k >= n_experts routes every token to every "
+                    "expert (the dense path), which is incompatible with a partitioned "
+                    "expert set."
+                )
+            self._use_gather = True     # EP dispatch IS the gather path (all-to-all)
+        elif config.moe_impl == "dense":
             self._use_gather = False
         elif config.moe_impl == "gather":
             self._use_gather = True
@@ -876,7 +907,9 @@ class MoEBlock(nn.Module):
         return te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling())
 
     def _moe_dense(self, xn: Array, cd, gate: Array) -> Array:
-        outs = torch.stack([e(xn, cd) for e in self.experts], dim=-2)   # (...,E,d_model)
+        # `self.experts` is a ModuleDict (see __init__) — `.values()` in insertion
+        # (== ascending global-id) order, matching `gate`'s expert axis.
+        outs = torch.stack([e(xn, cd) for e in self.experts.values()], dim=-2)  # (...,E,d_model)
         return torch.sum(gate.unsqueeze(-1) * _f32(outs), dim=-2)       # combine in fp32
 
     def _moe_gather(self, xn: Array, cd, topk_ids: Array, gate_kept: Array) -> Array:
@@ -921,13 +954,94 @@ class MoEBlock(nn.Module):
         offset = 0
         for e in range(E):                     # ALL experts — see the no-`continue` note above
             c = counts[e]
-            chunks.append(self.experts[e](sorted_x[offset:offset + c], cd))
+            chunks.append(self.experts[str(e)](sorted_x[offset:offset + c], cd))
             offset += c
         out_sorted = torch.cat(chunks, dim=0)                 # (N*k, D)
 
         inv_perm = torch.argsort(perm)                        # undo the grouping sort
         out_dispatch = out_sorted.index_select(0, inv_perm).reshape(N, k, D)
         combined = torch.sum(_f32(out_dispatch) * flat_gate.unsqueeze(-1), dim=1)   # (N,D)
+        return combined.reshape(*lead_shape, D)
+
+    def _moe_gather_ep(self, xn: Array, cd, topk_ids: Array, gate_kept: Array) -> Array:
+        """Expert-parallel twin of `_moe_gather` (#271): each token's top_k dispatch
+        rows are routed via TWO `all_to_all_single` round trips through `self.ep_group`
+        — once out to the rank that owns each chosen expert, once back with the
+        result — instead of a purely-local grouped-gather. Both hops are permutations
+        (index_select-based, same discipline as `_moe_gather`'s determinism note): the
+        backward of an all_to_all is the transposed all_to_all, not an atomic
+        scatter-add, so bit-exact resume still holds AT A FIXED world_size (not across
+        a world_size change — that is a separate, documented limitation, see
+        `cuda_distributed.load_resume_dcp`).
+
+        `expert_partition` makes global expert ids CONTIGUOUS per EP rank, so sorting
+        dispatch slots by expert id ascending (as `_moe_gather` already does) also
+        groups them by destination rank — the existing `perm`/`sorted_expert` sort is
+        reused as-is; only the per-expert local loop becomes a cross-rank exchange.
+        """
+        import torch.distributed as dist
+
+        E, k = self.config.n_experts, self.config.top_k
+        ep_size = self.ep_size
+        per_rank = E // ep_size
+        D = xn.shape[-1]
+        lead_shape = xn.shape[:-1]
+        flat_x = xn.reshape(-1, D)
+        N = flat_x.shape[0]
+        flat_ids = topk_ids.reshape(N, k)
+        flat_gate = gate_kept.reshape(N, k)
+
+        dispatch = flat_x.unsqueeze(1).expand(N, k, D).reshape(N * k, D)
+        dispatch_expert = flat_ids.reshape(-1)
+
+        perm = torch.argsort(dispatch_expert, stable=True)
+        sorted_expert = dispatch_expert[perm]
+        sorted_x = dispatch.index_select(0, perm)
+
+        # How many dispatch slots go to each EP rank (contiguous blocks of `per_rank`
+        # experts per rank — see `src.train.parallel.expert_partition`).
+        counts_per_expert = torch.bincount(sorted_expert, minlength=E)
+        send_counts = counts_per_expert.reshape(ep_size, per_rank).sum(dim=1).to(torch.long)
+        recv_counts = torch.zeros_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
+        send_list, recv_list = send_counts.tolist(), recv_counts.tolist()
+
+        recv_x = sorted_x.new_zeros((sum(recv_list), D))
+        dist.all_to_all_single(recv_x, sorted_x, output_split_sizes=recv_list,
+                               input_split_sizes=send_list, group=self.ep_group)
+        recv_expert = sorted_expert.new_zeros(sum(recv_list))
+        dist.all_to_all_single(recv_expert, sorted_expert, output_split_sizes=recv_list,
+                               input_split_sizes=send_list, group=self.ep_group)
+
+        # Group received rows by LOCAL expert (every received row's global id is one of
+        # THIS rank's local ids by construction of the count exchange above).
+        local_ids = self._local_expert_ids
+        lo = local_ids[0] if local_ids else 0
+        n_local = len(local_ids)
+        local_perm = torch.argsort(recv_expert, stable=True)
+        recv_expert_sorted = recv_expert[local_perm]
+        recv_x_sorted = recv_x.index_select(0, local_perm)
+        local_counts = (torch.bincount(recv_expert_sorted - lo, minlength=n_local)
+                        if recv_expert_sorted.numel() else torch.zeros(n_local, dtype=torch.long))
+        chunks = []
+        offset = 0
+        for i, gid in enumerate(local_ids):    # no `continue` on c==0 — see _moe_gather's note
+            c = int(local_counts[i])
+            chunks.append(self.experts[str(gid)](recv_x_sorted[offset:offset + c], cd))
+            offset += c
+        out_local_sorted = (torch.cat(chunks, dim=0) if chunks
+                            else recv_x_sorted.new_zeros((0, D)))
+
+        inv_local_perm = torch.argsort(local_perm)
+        out_recv_order = out_local_sorted.index_select(0, inv_local_perm)
+
+        out_sorted = sorted_x.new_zeros((sum(send_list), D))
+        dist.all_to_all_single(out_sorted, out_recv_order, output_split_sizes=send_list,
+                               input_split_sizes=recv_list, group=self.ep_group)
+
+        inv_perm = torch.argsort(perm)
+        out_dispatch = out_sorted.index_select(0, inv_perm).reshape(N, k, D)
+        combined = torch.sum(_f32(out_dispatch) * flat_gate.unsqueeze(-1), dim=1)
         return combined.reshape(*lead_shape, D)
 
     def _moe(self, xn: Array) -> Array:
@@ -975,7 +1089,10 @@ class MoEBlock(nn.Module):
                 if self._use_gather:
                     gate_kept = torch.gather(probs, -1, topk_ids)
                     gate_kept = gate_kept / gate_kept.sum(-1, keepdim=True)
-                    y = self._moe_gather(xn, cd, topk_ids, gate_kept)
+                    if self.ep_size > 1:
+                        y = self._moe_gather_ep(xn, cd, topk_ids, gate_kept)
+                    else:
+                        y = self._moe_gather(xn, cd, topk_ids, gate_kept)
                 else:
                     mask = torch.zeros_like(probs, dtype=torch.bool)
                     mask.scatter_(-1, topk_ids, True)
@@ -1022,12 +1139,19 @@ class CUDAMambaModel(ModelInterface, nn.Module):
     # explicitly around the state_dict path rather than riding it.
     _MOE_BIAS_PREFIX = "moe_route_bias."
 
-    def __init__(self, config: MambaConfig, device: str = "cpu"):
+    def __init__(self, config: MambaConfig, device: str = "cpu",
+                ep_size: int = 1, ep_rank: int = 0):
         nn.Module.__init__(self)
         config.validate()
         self.config = config
         self._cd = _DTYPES[config.precision]         # compute dtype for the heavy GEMMs
         self._device = torch.device(device)
+        # Expert parallel (#271): threaded into every MoEBlock via `_make_layer`. Not a
+        # `ModelInterface`/config concept — `scripts/train_dist.py` constructs the model
+        # directly with these, bypassing `src.model.backend.get_backend`'s single-rank
+        # factory closures (which have no notion of a process group).
+        self._ep_size = int(ep_size)
+        self._ep_rank = int(ep_rank)
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         # Hybrid (#67): attention blocks replace Mamba blocks at the gated positions;
         # MoE (#53/#214): sparse-FFN blocks replace Mamba blocks at their gated positions
@@ -1067,7 +1191,8 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         if self.config.is_attention_layer(i):
             return AttentionBlock(self.config)
         if self.config.is_moe_layer(i):
-            return MoEBlock(self.config, self._device)
+            return MoEBlock(self.config, self._device,
+                            ep_size=self._ep_size, ep_rank=self._ep_rank)
         return MambaBlock(self.config)
 
     def _head(self, h: Array) -> Array:
@@ -1210,6 +1335,14 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         not also be called for the same step."""
         return [block.pop_routing_stats() for block in self.moe_blocks()]
 
+    def set_ep_group(self, group) -> None:
+        """Give every MoE block the expert-parallel process group its all-to-all
+        dispatch (`MoEBlock._moe_gather_ep`, #271) uses. Called once by
+        `cuda_distributed`/`scripts/train_dist.py` after the process group exists —
+        model construction happens before that, so this can't be a constructor arg."""
+        for block in self.moe_blocks():
+            block.ep_group = group
+
     def init_state(self, batch_size: int) -> State:
         c = self.config
         di, k = c.d_inner, c.d_conv
@@ -1253,12 +1386,29 @@ class CUDAMambaModel(ModelInterface, nn.Module):
     def _portable_state_dict(self) -> dict:
         # {name: numpy}. The only layout difference vs MLX is the depthwise conv weight:
         # torch is (out, in/groups, k); MLX is (out, k, in/groups). Emit MLX layout.
+        #
+        # Under FSDP2 (#271) `v` is a DTensor (a per-rank SHARD, global shape). Calling
+        # `.full_tensor()` is a COLLECTIVE gather back to the full tensor — EVERY rank
+        # must reach this line (see `cuda_distributed.gather_portable_state_dict`'s
+        # docstring); a rank-0-only call here would deadlock the others. Plain
+        # `nn.Parameter`s (the non-distributed / world_size==1 path) have no
+        # `full_tensor` attribute and are untouched, so this is a strict no-op there.
         out = {}
         for k, v in self.named_parameters():
-            arr = v.detach().to("cpu")
+            arr = v.detach()
+            if hasattr(arr, "full_tensor"):
+                arr = arr.full_tensor()
+            arr = arr.to("cpu")
             if k.endswith(".conv.weight"):
                 arr = arr.transpose(1, 2)            # (out,1,k) -> (out,k,1)
             out[k] = arr.numpy()
+        # Expert parallel (#271): this rank's `named_parameters()` above only yields ITS
+        # OWN local expert shard (see MoEBlock.__init__'s ModuleDict). Merging every
+        # rank's shard into one unsharded dict is `cuda_distributed.
+        # gather_portable_state_dict`'s job (an `all_gather_object` over the EP group,
+        # called from the checkpoint-save path) — NOT this method's, so a plain
+        # single-rank call here still returns exactly this rank's params, matching
+        # every pre-#271 caller (sizing tests, `--init`, non-distributed saves).
         # Loss-Free-Balancing bias (#213 D3): rides in the PORTABLE weights, not the
         # resume bundle — it is routing state that changes the model's function at
         # inference. `_route_bias` is a non-persistent buffer (see MoEBlock.__init__),
@@ -1287,8 +1437,29 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             if k.endswith(".conv.weight"):
                 t = t.transpose(1, 2)                # (out,k,1) -> (out,1,k)
             tensors[k] = t
+        if self._ep_size > 1:
+            # Expert parallel (#271): a merged checkpoint carries EVERY rank's experts,
+            # but this rank's module only declares its own shard (see
+            # MoEBlock.__init__'s ModuleDict). Keep only the keys this rank's
+            # state_dict actually has — silently dropping the rest is safe (every OTHER
+            # rank keeps the keys IT needs); a genuinely missing local key still raises
+            # via strict=True below, so this can't hide a real problem.
+            local_keys = set(self.state_dict().keys())
+            tensors = {k: v for k, v in tensors.items() if k in local_keys}
+        # FSDP2 (#271): a DTensor parameter can't accept a plain full tensor via the
+        # ordinary in-place copy `load_state_dict` does — reshard the incoming full
+        # tensor to match each param's mesh/placement first, the inverse of
+        # `_portable_state_dict`'s `.full_tensor()` gather. Plain (non-distributed)
+        # params have no `device_mesh` and are untouched.
+        current = dict(self.named_parameters())
+        for k, t in list(tensors.items()):
+            p = current.get(k)
+            if p is not None and hasattr(p, "device_mesh"):
+                from torch.distributed.tensor import distribute_tensor
+                tensors[k] = distribute_tensor(t.to(p.dtype), p.device_mesh, p.placements)
         self.load_state_dict(tensors, strict=True)
-        self.to(self._device)
+        if not any(hasattr(p, "device_mesh") for p in self.parameters()):
+            self.to(self._device)   # FSDP2 params already live on their mesh's device
         for i, vec in biases.items():
             # Check the key names a real MoE layer before indexing: a balanced checkpoint
             # loaded into a dense or differently-interleaved config would otherwise die on

@@ -167,7 +167,7 @@ def test_fp8_expert_checkpoint_backward_finite_grads(_hopper, monkeypatch):
 
     block = next(l for l in model.layers if isinstance(l, MoEBlock))
     any_nonzero = False
-    for expert in block.experts:
+    for expert in block.experts.values():
         for p in expert.parameters():
             assert p.grad is not None, "expert param has no grad (no-continue invariant broken)"
             assert torch.isfinite(p.grad).all()
