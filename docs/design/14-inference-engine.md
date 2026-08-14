@@ -308,7 +308,7 @@ The #163 dependency order:
 3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
    I/O) — in parallel once #166 lands.
 4. **#197** (LSP harness), **#168** (quantization — **done**), **#169** (Swift prefill —
-   **done**), **#170** (Apple-Silicon benchmark harness).
+   **done**), **#170** (Apple-Silicon benchmark harness — **done**).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
@@ -393,8 +393,42 @@ DPO/GRPO step factories.
   corrupts tokens generated afterward; prefill-then-decode vs pure step-by-step; and exact
   greedy-id equality through the prefill path. AC3 (`monica-generate --bench-prefill`,
   wired into CI's `swift-engine` job as an informational, non-gating step) measures
-  sequential-vs-parallel prefill latency: *first green-CI numbers pending — update this
-  line and the #169 issue comment once `swift-engine` has run on the PR.*
+  sequential-vs-parallel prefill latency. First green-CI numbers, from run
+  **31777284815 on `main`** (`Fixtures/toy`, prompt_len=128, iterations=5), on the
+  **hosted macOS CI runner** — NOT a local-hardware measurement, see #170 below:
+
+  ```
+  bench-prefill: prompt_len=128 iterations=5  sequential=332.62ms  parallel-scan=6.01ms  speedup=55.30x
+  bench-prefill: sequential argmax=186  parallel-scan argmax=186
+  ```
+
+- **#170 — the benchmark harness.** `swift/engine/Sources/MonicaEngine/Bench.swift` +
+  the `monica-bench` executable (`Package.swift`; deps `MonicaEngine` + `MLX` only, no
+  tokenizer edge — `swift/Package.swift` is untouched) generalize the AC3 measurement
+  into a reusable harness: `--mode prefill/decode/memory/all`, `--weights` (a real
+  checkpoint, quantized automatically via its `quant` sidecar) or `--config` (a
+  shapes-only random-init sidecar for poc-scale runs, `swift/engine/Benchmarks/
+  configs/*.json`, exported by `scripts/export_bench_config.py` and kept honest by
+  `tests/test_bench_config_export.py`), `--quantize 8|4` for an in-engine
+  throughput/footprint approximation of `quant_targets` on a `--config` model, a
+  machine-identified `--json` record, and `--baseline` regression flagging that
+  **refuses to compare across machine ids** (`SKIPPED`, never a false-green `OK`).
+  `monica-generate --bench-prefill` now delegates to the same `Bench.prefill`, so the
+  55.30x figure above stays the comparable historical baseline rather than being
+  orphaned. `monica-bench --self-test` (deterministic: analytic byte arithmetic, the
+  quant filter, baseline-comparison logic, arg validation — no weights, no timing) is a
+  CI **gate**; the timing modes are informational, per the same noisy-hosted-runner
+  reasoning as AC3 above. Python side: `scripts/bench_context.py` gained
+  `--prefill-mode {sequential,parallel,both}` (the `parallel` arm calls `model.prefill`,
+  matching the Swift default) and `--json` emitting the same `source`-tagged record
+  shape as `monica-bench --json`, so the two harnesses' output is diffable directly.
+  Results ledger, machine-keyed tables, and the CI-vs-developer-machine provenance
+  split: `docs/benchmarks.md`. **No acceptance criterion in #170 depends on a number
+  this repo cannot produce on the box that authored it** — mlx-swift cannot execute
+  without Xcode's Metal toolchain (`swift build` compiles; running needs
+  `default.metallib`), so every genuinely local-hardware Swift-engine number in
+  `docs/benchmarks.md` is recorded as "not yet measured" with the exact command to fill
+  it in. Python-MLX numbers (no such constraint) are measured locally where noted.
 
 ## See also
 

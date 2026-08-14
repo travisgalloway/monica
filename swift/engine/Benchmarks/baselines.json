@@ -1,0 +1,34 @@
+[
+  {
+    "mode": "prefill",
+    "machine": {
+      "architecture": "unknown (GitHub-hosted macos-latest runner, no device access)",
+      "memorySizeBytes": 0,
+      "hwModel": "github-actions-macos-latest",
+      "cpuCores": 0,
+      "osVersion": "unknown",
+      "swiftVersion": "unknown",
+      "device": "metal"
+    },
+    "ci": true,
+    "gitSha": null,
+    "source": "Fixtures/toy",
+    "randomInit": false,
+    "quantized": false,
+    "quantBits": null,
+    "timestamp": "2026-08-13T00:00:00Z",
+    "prefill": {
+      "promptLen": 128,
+      "iterations": 5,
+      "sequentialMs": 332.62,
+      "parallelMs": 6.01,
+      "speedup": 55.30,
+      "sequentialArgmax": 186,
+      "parallelArgmax": 186,
+      "sequentialTokPerSec": 384.82,
+      "parallelTokPerSec": 21297.84
+    },
+    "decode": null,
+    "memory": null
+  }
+]

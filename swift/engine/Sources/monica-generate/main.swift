@@ -258,81 +258,25 @@ func runSelfTest(tokenizerPath: String?) -> Never {
 
 // MARK: - AC3: prefill latency bench (#169)
 
-/// The arrays inside one layer's state, so the bench's `MLX.eval` calls can force the state
-/// alongside logits — the same helper `Generator`/`monica-parity` use, duplicated here (not
-/// exported by `MonicaEngine`) so lazy evaluation cannot move work outside the timer, the
-/// single most likely way to measure nothing at all.
-func benchEvalTargets(_ s: LayerState) -> [MLXArray] {
-    switch s {
-    case .mamba(let conv, let ssm): return [conv, ssm]
-    case .attention(let k, let v): return [k, v]
-    case .moe: return []
-    }
-}
-
-/// `--bench-prefill`: sequential per-token `step` prefill vs the one-shot parallel-scan
-/// `model.prefill`, timed over N iterations after a warm-up (lazy MLX graphs otherwise let
-/// the first call's compile/dispatch cost leak into the measurement). Asserts the two
-/// paths' argmax id AGREES — a correctness property that is not timing-sensitive — and
-/// prints per-path ms plus the speedup. Informational: CI wires this as a non-gating step
-/// (hosted-runner timing is noisy), so this function never calls `exit(1)` on timing alone.
+/// `--bench-prefill`: a thin printer over `Bench.prefill` (#170 moved the actual
+/// sequential-vs-parallel-scan measurement into `MonicaEngine/Bench.swift` so
+/// `monica-bench` and this CLI share one implementation). Prints the SAME two lines in
+/// the SAME format as before #170, so the recorded 55.30x figure
+/// (docs/design/14-inference-engine.md) stays comparable. Asserts the two paths' argmax
+/// id AGREES — a correctness property, not a timing one. Informational: CI wires this as
+/// a non-gating step (hosted-runner timing is noisy), so this never calls `exit(1)` on
+/// timing alone.
 func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
-    let vocab = model.config.vocabSize
-    // Prompt length is independent of vocab size — do not clamp it against `vocab`, or long
-    // prompts silently get truncated on small-vocab fixtures. Only guard against non-positive
-    // input; token ids themselves are drawn from `0..<vocab` below.
-    let clampedLen = max(1, promptLen)
-    let clampedIterations = max(1, iterations)
-    var rng = SystemRandomNumberGenerator()
-    let promptIds = (0..<clampedLen).map { _ in Int.random(in: 0..<vocab, using: &rng) }
-    let promptArr = MLXArray(promptIds.map { Int32($0) }).reshaped([1, promptIds.count])
-
-    func sequentialPrefill() -> (MLXArray, [LayerState]) {
-        var state = model.initState(batch: 1)
-        var logits = MLXArray.zeros([1])
-        for tok in promptIds {
-            let (lg, st) = try! model.step(MLXArray([Int32(tok)]), state)
-            MLX.eval([lg] + st.flatMap(benchEvalTargets))
-            logits = lg
-            state = st
-        }
-        return (logits, state)
-    }
-    func parallelPrefill() -> (MLXArray, [LayerState]) {
-        let (lg, st) = model.prefill(promptArr, lastOnly: true)
-        MLX.eval([lg] + st.flatMap(benchEvalTargets))
-        return (lg, st)
-    }
-
-    // Warm-up (once each) so the first call's graph compile/dispatch is not in the timing.
-    _ = sequentialPrefill()
-    _ = parallelPrefill()
-
-    func timeMs(_ body: () -> (MLXArray, [LayerState])) -> (ms: Double, argmax: Int) {
-        var lastLogits = MLXArray.zeros([1])
-        let start = Date()
-        for _ in 0..<clampedIterations {
-            let (lg, _) = body()
-            lastLogits = lg
-        }
-        let elapsedMs = Date().timeIntervalSince(start) * 1000.0 / Double(clampedIterations)
-        let row = lastLogits.asType(.float32).reshaped([-1]).asArray(Float.self)
-        var bestI = 0
-        var bestV = -Float.infinity
-        for (i, v) in row.enumerated() where v > bestV { bestV = v; bestI = i }
-        return (elapsedMs, bestI)
-    }
-
-    let seq = timeMs(sequentialPrefill)
-    let par = timeMs(parallelPrefill)
-    let speedup = par.ms > 0 ? seq.ms / par.ms : Double.infinity
+    let r = Bench.prefill(model: model, promptLen: promptLen, iterations: iterations)
     print(String(format: "bench-prefill: prompt_len=%d iterations=%d  "
                  + "sequential=%.2fms  parallel-scan=%.2fms  speedup=%.2fx",
-                 clampedLen, clampedIterations, seq.ms, par.ms, speedup))
-    print("bench-prefill: sequential argmax=\(seq.argmax)  parallel-scan argmax=\(par.argmax)")
-    if seq.argmax != par.argmax {
+                 r.promptLen, r.iterations, r.sequentialMs, r.parallelMs, r.speedup))
+    print("bench-prefill: sequential argmax=\(r.sequentialArgmax)  "
+        + "parallel-scan argmax=\(r.parallelArgmax)")
+    if r.sequentialArgmax != r.parallelArgmax {
         fail("bench-prefill: argmax DISAGREES between sequential and parallel-scan prefill "
-            + "(\(seq.argmax) vs \(par.argmax)) — this is a correctness failure, not noise")
+            + "(\(r.sequentialArgmax) vs \(r.parallelArgmax)) — this is a correctness "
+            + "failure, not noise")
     }
 }
 

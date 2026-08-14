@@ -25,6 +25,16 @@ loop, exactly the constant-memory decode path `scripts/bench_train_step.py --mod
 decode` already benchmarks for a single arm; this script generalizes that loop across
 context lengths and a second (attention) arm.
 
+#170 (the Apple-Silicon bench harness, `monica-bench` on the Swift side) extended
+prefill here to be apples-to-apples with the Swift engine's default: `--prefill-mode
+{sequential,parallel,both}` selects the old per-token `model.step` loop
+("sequential" — this script's original behavior, kept as the default), the one-shot
+`model.prefill(tokens_2d, last_only=True)` scan ("parallel" — #165, the Swift default),
+or both (reporting the speedup). `--arms ssm,attn` restricts the sweep so a poc-scale
+ssm-only run (heavy at full 2-arm cost) is possible. `--json <path>` writes the same
+record schema `monica-bench --json` writes (`source: "python-mlx"` vs `"swift-mlx"`),
+so the two harnesses' output can be diffed directly.
+
 RoPE positions are computed fresh each step from ``mx.arange(t, t+1)`` (no fixed-size
 table — see ``_rope_cos_sin`` in ``src/model/mlx_backend.py``), so stepping past
 ``cfg.seq_len`` does not index out of bounds; the sweep is free to exceed the
@@ -43,11 +53,23 @@ from __future__ import annotations
 import argparse
 import csv as csv_module
 import dataclasses
+import json as json_module
 import platform
 import time
 from pathlib import Path
 
 ARMS = ("ssm", "attn")
+PREFILL_MODES = ("sequential", "parallel", "both")
+
+
+def _parse_arms(s: str) -> tuple[str, ...]:
+    arms = tuple(x.strip() for x in s.split(",") if x.strip())
+    if not arms:
+        raise ValueError("--arms must contain at least one arm")
+    bad = [a for a in arms if a not in ARMS]
+    if bad:
+        raise ValueError(f"--arms has unknown arm(s) {bad}, expected a subset of {ARMS}")
+    return arms
 
 
 def _parse_lengths(s: str) -> list[int]:
@@ -78,9 +100,20 @@ def _parse_args() -> argparse.Namespace:
                     help="skip the attn arm above this length (guards against a slow/OOM "
                          "quadratic-KV-cache run); unset = no cap")
     ap.add_argument("--csv", type=Path, default=None, help="optional path to write CSV rows")
+    ap.add_argument("--json", type=Path, default=None,
+                    help="optional path to write JSON records (source: 'python-mlx'), "
+                         "the same record shape monica-bench --json writes (source: "
+                         "'swift-mlx') so the two harnesses can be diffed directly")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--warmup-steps", type=int, default=4,
                     help="untimed steps run first to prime compilation (default 4)")
+    ap.add_argument("--prefill-mode", choices=PREFILL_MODES, default="sequential",
+                    help="'sequential' (default, this script's original per-token "
+                         "model.step loop), 'parallel' (#165's one-shot model.prefill "
+                         "scan — the Swift engine's default), or 'both' (reports the "
+                         "speedup)")
+    ap.add_argument("--arms", type=_parse_arms, default=ARMS,
+                    help=f"comma-separated subset of {ARMS} (default: both)")
     args = ap.parse_args()
     if args.decode_tokens < 1:
         ap.error("--decode-tokens must be >= 1")
@@ -122,15 +155,65 @@ def analytic_state_bytes(cfg, length: int) -> int:
     return n_attn_layers * 2 * cfg.n_attn_heads_resolved * cfg.attn_head_dim * length * 4
 
 
+def _prefill_sequential(model, mx, tokens, length: int, state):
+    """The original per-token `model.step` prefill loop. Returns `(tok_s, last, state)`."""
+    t0 = time.perf_counter()
+    last = None
+    for i in range(length):
+        last, state = model.step(tokens[i:i + 1], state)
+        mx.eval(last, state)
+    elapsed = time.perf_counter() - t0
+    return length / elapsed, last, state
+
+
+def _warmup_parallel(model, mx, tokens, length: int) -> None:
+    """Untimed warmup for `_prefill_parallel` on a throwaway short prefix, run BEFORE
+    `mx.reset_peak_memory()` so the compile/allocation it triggers is excluded from the
+    measured `peak_gb` (#170 review — see `_prefill_parallel`)."""
+    tokens_2d = tokens[:length].reshape(1, -1)
+    warm_len = min(4, length)
+    warm_last, warm_state = model.prefill(tokens_2d[:, :warm_len], last_only=True)
+    mx.eval(warm_last, warm_state)
+
+
+def _prefill_parallel(model, mx, tokens, length: int):
+    """The one-shot `model.prefill(tokens_2d, last_only=True)` scan (#165) — the Swift
+    engine's default arm. Fresh-session-only (mirrors #165's seam contract), so this
+    takes no incoming state. Callers must run `_warmup_parallel` first, before
+    `mx.reset_peak_memory()` — see that function's docstring. Returns
+    `(tok_s, last, state)`.
+    """
+    tokens_2d = tokens[:length].reshape(1, -1)
+
+    t0 = time.perf_counter()
+    last, state = model.prefill(tokens_2d, last_only=True)
+    mx.eval(last, state)
+    elapsed = time.perf_counter() - t0
+    return length / elapsed, last, state
+
+
 def measure(model, mx, length: int, decode_tokens: int, *, seed: int = 0,
-            warmup_steps: int = 4) -> dict:
+            warmup_steps: int = 4, prefill_mode: str = "sequential") -> dict:
     """Prefill `length` tokens then sustain-decode `decode_tokens` more, one token at a
     time through the `model.step` recurrence (constant-mem decode primitive). A short
     untimed warmup on a throwaway state runs first to prime MLX's compiled graphs
-    (mirrors `bench_train_step.py`'s separated first-call timing). Returns
-    `{prefill_tok_s, decode_tok_s, peak_gb}`.
+    (mirrors `bench_train_step.py`'s separated first-call timing).
+
+    `prefill_mode` selects which prefill arm(s) run (see module docstring / #170):
+    'sequential' (default, unchanged from before #170), 'parallel' (#165's
+    `model.prefill`), or 'both' (also reports the speedup). Decode always continues
+    from whichever prefill arm ran LAST — when both ran, that is the parallel arm's
+    state, mirroring `Generator`'s default `usePrefill: true`.
+
+    Returns a dict always containing `prefill_tok_s` (the backward-compatible single
+    figure — the sequential arm's, or the parallel arm's if sequential did not run),
+    `decode_tok_s`, `peak_gb`, plus `sequential_prefill_tok_s`/`parallel_prefill_tok_s`/
+    `prefill_speedup` for whichever arm(s) actually ran.
     """
     import numpy as np
+
+    if prefill_mode not in PREFILL_MODES:
+        raise ValueError(f"prefill_mode must be one of {PREFILL_MODES}, got {prefill_mode!r}")
 
     vocab = model.config.vocab_size
     rng = np.random.default_rng(seed)
@@ -139,19 +222,33 @@ def measure(model, mx, length: int, decode_tokens: int, *, seed: int = 0,
     warm_state = model.init_state(1)
     n_warm = min(warmup_steps, length + decode_tokens)
     warm_tokens = rng.integers(0, vocab, size=n_warm).astype(np.int64)
-    last = None
     for i in range(n_warm):
         last, warm_state = model.step(warm_tokens[i:i + 1], warm_state)
         mx.eval(last, warm_state)
 
-    mx.reset_peak_memory()
-    state = model.init_state(1)
+    if prefill_mode in ("parallel", "both"):
+        _warmup_parallel(model, mx, tokens, length)
 
-    t0 = time.perf_counter()
-    for i in range(length):
-        last, state = model.step(tokens[i:i + 1], state)
-        mx.eval(last, state)
-    prefill_s = time.perf_counter() - t0
+    mx.reset_peak_memory()
+    result: dict = {}
+    state = model.init_state(1)
+    last = None
+
+    if prefill_mode in ("sequential", "both"):
+        tok_s, last, state = _prefill_sequential(model, mx, tokens, length, state)
+        result["sequential_prefill_tok_s"] = tok_s
+
+    if prefill_mode in ("parallel", "both"):
+        tok_s, last, state = _prefill_parallel(model, mx, tokens, length)
+        result["parallel_prefill_tok_s"] = tok_s
+
+    if prefill_mode == "both":
+        seq_tok_s = result["sequential_prefill_tok_s"]
+        result["prefill_speedup"] = (
+            result["parallel_prefill_tok_s"] / seq_tok_s if seq_tok_s > 0 else float("inf"))
+
+    result["prefill_tok_s"] = result.get(
+        "sequential_prefill_tok_s", result.get("parallel_prefill_tok_s"))
 
     t0 = time.perf_counter()
     for i in range(length, length + decode_tokens):
@@ -164,20 +261,19 @@ def measure(model, mx, length: int, decode_tokens: int, *, seed: int = 0,
     if not bool(mx.all(mx.isfinite(last)).item()):
         raise RuntimeError(f"non-finite logits at length={length} — run is degenerate")
 
-    return {
-        "prefill_tok_s": length / prefill_s,
-        "decode_tok_s": decode_tokens / decode_s,
-        "peak_gb": peak_gb,
-    }
+    result["decode_tok_s"] = decode_tokens / decode_s
+    result["peak_gb"] = peak_gb
+    return result
 
 
 def run_sweep(model_cls, mx, cfg, lengths, decode_tokens, *, weights=None,
-              max_attn_length=None, seed=0, warmup_steps=4) -> list[dict]:
-    """Run both arms across `lengths`; returns a list of result-row dicts. `model_cls`
-    is the model constructor (`MLXMambaModel`), injected so this stays testable without
-    a top-level mlx import."""
+              max_attn_length=None, seed=0, warmup_steps=4, arms=ARMS,
+              prefill_mode="sequential") -> list[dict]:
+    """Run `arms` (default: both) across `lengths`; returns a list of result-row dicts.
+    `model_cls` is the model constructor (`MLXMambaModel`), injected so this stays
+    testable without a top-level mlx import."""
     rows = []
-    for arm in ARMS:
+    for arm in arms:
         acfg = arm_config(cfg, arm)
         model = model_cls(acfg)
         if weights is not None and arm == "ssm":
@@ -189,11 +285,16 @@ def run_sweep(model_cls, mx, cfg, lengths, decode_tokens, *, weights=None,
                       f"--max-attn-length={max_attn_length} (would risk a slow/OOM run "
                       "growing the KV cache) — not measured")
                 continue
-            m = measure(model, mx, length, decode_tokens, seed=seed, warmup_steps=warmup_steps)
+            m = measure(model, mx, length, decode_tokens, seed=seed, warmup_steps=warmup_steps,
+                       prefill_mode=prefill_mode)
             rows.append({
                 "arm": arm,
                 "length": length,
+                "prefill_mode": prefill_mode,
                 "prefill_tok_s": m["prefill_tok_s"],
+                "sequential_prefill_tok_s": m.get("sequential_prefill_tok_s"),
+                "parallel_prefill_tok_s": m.get("parallel_prefill_tok_s"),
+                "prefill_speedup": m.get("prefill_speedup"),
                 "decode_tok_s": m["decode_tok_s"],
                 "peak_gb": m["peak_gb"],
                 "state_bytes": analytic_state_bytes(acfg, length),
@@ -209,6 +310,13 @@ def _print_table(rows: list[dict]) -> None:
         print(f"{r['arm']:<6} {r['length']:>8} {r['prefill_tok_s']:>14,.1f} "
               f"{r['decode_tok_s']:>13,.1f} {r['peak_gb']:>9.3f} "
               f"{r['state_bytes'] / 2**20:>10.3f}")
+        # #170: when --prefill-mode both ran, print the sequential-vs-parallel speedup
+        # alongside the row it belongs to (this script's analogue of monica-bench's
+        # prefill speedup line).
+        if r.get("prefill_speedup") is not None:
+            print(f"       [prefill] sequential={r['sequential_prefill_tok_s']:,.1f} tok/s  "
+                  f"parallel={r['parallel_prefill_tok_s']:,.1f} tok/s  "
+                  f"speedup={r['prefill_speedup']:.2f}x")
 
     ssm_rows = [r for r in rows if r["arm"] == "ssm"]
     attn_rows = [r for r in rows if r["arm"] == "attn"]
@@ -237,11 +345,27 @@ def _print_table(rows: list[dict]) -> None:
 
 def _write_csv(rows: list[dict], path: Path) -> None:
     with open(path, "w", newline="") as f:
-        writer = csv_module.DictWriter(f, fieldnames=["arm", "length", "prefill_tok_s",
-                                                       "decode_tok_s", "peak_gb", "state_bytes"])
+        writer = csv_module.DictWriter(f, fieldnames=[
+            "arm", "length", "prefill_mode", "prefill_tok_s", "sequential_prefill_tok_s",
+            "parallel_prefill_tok_s", "prefill_speedup", "decode_tok_s", "peak_gb", "state_bytes"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"[csv] wrote {len(rows)} rows to {path}")
+
+
+def _write_json(rows: list[dict], path: Path, *, config_path: str, mlx_version: str) -> None:
+    """The same record schema `monica-bench --json` writes (`source: "python-mlx"` vs
+    `"swift-mlx"`), so the two harnesses' output can be diffed directly (#170)."""
+    record = {
+        "source": "python-mlx",
+        "config": config_path,
+        "mlx_version": mlx_version,
+        "platform": platform.platform(),
+        "rows": rows,
+    }
+    with open(path, "w") as f:
+        json_module.dump(record, f, indent=2)
+    print(f"[json] wrote {len(rows)} row(s) to {path}")
 
 
 def main() -> None:
@@ -269,14 +393,18 @@ def main() -> None:
     print(f"[bench_context] mlx {mx.__version__}  {platform.platform()}")
     print(f"[bench_context] config={args.config}  d_model={cfg.d_model}  n_layers={cfg.n_layers}  "
           f"vocab={cfg.vocab_size}  lengths={args.lengths}  decode_tokens={args.decode_tokens}  "
-          f"weights={args.weights or '(random init)'}\n")
+          f"weights={args.weights or '(random init)'}  arms={args.arms}  "
+          f"prefill_mode={args.prefill_mode}\n")
 
     rows = run_sweep(MLXMambaModel, mx, cfg, args.lengths, args.decode_tokens,
                      weights=args.weights, max_attn_length=args.max_attn_length,
-                     seed=args.seed, warmup_steps=args.warmup_steps)
+                     seed=args.seed, warmup_steps=args.warmup_steps, arms=args.arms,
+                     prefill_mode=args.prefill_mode)
     _print_table(rows)
     if args.csv:
         _write_csv(rows, args.csv)
+    if args.json:
+        _write_json(rows, args.json, config_path=str(args.config), mlx_version=mx.__version__)
 
 
 if __name__ == "__main__":
