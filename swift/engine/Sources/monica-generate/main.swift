@@ -82,11 +82,21 @@ func uint64Flag(_ flags: [String: String], _ name: String, default def: UInt64) 
 
 let INSTRUCTION_MARKER = "### Instruction:"
 let RESPONSE_MARKER = "### Response:"
+let SYSTEM_MARKER = "### System:"
 
 struct ChatTurn { let role: String; let content: String }
 
+/// Marker per role — mirrors `src/data/instruct_format.py`'s `ROLE_MARKERS` dict exactly
+/// (system/user/assistant), rather than collapsing every non-assistant role onto
+/// `INSTRUCTION_MARKER`. An unrecognized role is a caller bug, not a silent instruction turn.
 func renderTurn(_ t: ChatTurn) -> String {
-    let marker = t.role == "assistant" ? RESPONSE_MARKER : INSTRUCTION_MARKER
+    let marker: String
+    switch t.role {
+    case "system": marker = SYSTEM_MARKER
+    case "user": marker = INSTRUCTION_MARKER
+    case "assistant": marker = RESPONSE_MARKER
+    default: fail("renderTurn: unknown role '\(t.role)' (expected system/user/assistant)")
+    }
     let c = t.content.trimmingCharacters(in: .whitespacesAndNewlines)
     return c.isEmpty ? marker : "\(marker) \(c)"
 }

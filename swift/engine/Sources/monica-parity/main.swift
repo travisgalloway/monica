@@ -23,6 +23,17 @@ let atol: Double = 1e-5
 
 var failures: [String] = []
 
+/// The arrays inside one layer's state, mirroring `Generator`'s private helper of the same
+/// name — lets the AC1 greedy-id loop below `MLX.eval` the recurrent state alongside logits
+/// each step, the same way `Generator.generate` keeps its lazy graph from growing unbounded.
+func evalTargets(_ s: LayerState) -> [MLXArray] {
+    switch s {
+    case .mamba(let conv, let ssm): return [conv, ssm]
+    case .attention(let k, let v): return [k, v]
+    case .moe: return []
+    }
+}
+
 /// numpy's `allclose` predicate, elementwise, with `ref` as the reference operand:
 /// `|a - ref| <= atol + rtol * |ref|`. Returns the max absolute difference and whether
 /// every element passed.
@@ -153,6 +164,10 @@ for dir in fixtureDirs {
             var genLogits: MLXArray? = nil
             for t in promptIds {
                 let (lg, st) = try model.step(MLXArray([Int32(t)]), genState)
+                // Eval logits AND state together, same as `Generator.generate` — leaving the
+                // recurrent state arrays lazy lets the mlx graph grow unbounded across this
+                // prompt+decode loop.
+                MLX.eval([lg] + st.flatMap(evalTargets))
                 genState = st
                 genLogits = lg
             }
@@ -161,11 +176,11 @@ for dir in fixtureDirs {
             actualGreedy.reserveCapacity(expectedGreedy.count)
             for _ in 0..<expectedGreedy.count {
                 guard let lg = genLogits else { break }
-                MLX.eval(lg)
                 let row = lg.asType(.float32).reshaped([-1]).asArray(Float.self)
                 let nxt = try sampler.sample(row)
                 actualGreedy.append(nxt)
                 let (lg2, st2) = try model.step(MLXArray([Int32(nxt)]), genState)
+                MLX.eval([lg2] + st2.flatMap(evalTargets))
                 genState = st2
                 genLogits = lg2
             }

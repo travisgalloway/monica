@@ -211,9 +211,43 @@ func argmaxFirstTie(_ v: [Double]) -> Int {
 
 /// The k-th largest value (1-indexed: `k=1` is the max), matching
 /// `np.partition(logits, -top_k)[-top_k]`. Tie-inclusive top-k then keeps every logit >= this.
+///
+/// Quickselect (Lomuto partition, average O(V)) rather than a full O(V log V) sort — `sample`
+/// calls this every decode step at vocab-sized inputs (50k-150k), so this matches the Python
+/// reference's `np.partition` complexity class instead of paying for a full ordering nobody
+/// needs. The median-of-three pivot only changes runtime, never the returned value, which is
+/// exactly what a full sort would produce.
 func kthLargest(_ v: [Double], _ k: Int) -> Double {
-    let sorted = v.sorted(by: >)
-    return sorted[k - 1]
+    var a = v
+    let target = a.count - k   // k-th largest == (count - k)-th smallest, 0-indexed ascending
+    var lo = 0
+    var hi = a.count - 1
+    while lo < hi {
+        let p = quickselectPartition(&a, lo, hi)
+        if p == target { return a[p] }
+        if p < target { lo = p + 1 } else { hi = p - 1 }
+    }
+    return a[lo]
+}
+
+/// Lomuto partition of `a[lo...hi]` around a median-of-three pivot; returns the pivot's final
+/// index once every element left of it is `< pivot` and every element right is `>= pivot`.
+/// Median-of-three keeps quickselect off its O(V^2) worst case on already-sorted or
+/// reverse-sorted logits (a plain last-element pivot degrades exactly there).
+private func quickselectPartition(_ a: inout [Double], _ lo: Int, _ hi: Int) -> Int {
+    let mid = lo + (hi - lo) / 2
+    if a[mid] < a[lo] { a.swapAt(mid, lo) }
+    if a[hi] < a[lo] { a.swapAt(hi, lo) }
+    if a[hi] < a[mid] { a.swapAt(hi, mid) }
+    a.swapAt(mid, hi)   // move the median (now at `mid`) into the pivot slot
+    let pivot = a[hi]
+    var i = lo
+    for j in lo..<hi where a[j] < pivot {
+        a.swapAt(i, j)
+        i += 1
+    }
+    a.swapAt(i, hi)
+    return i
 }
 
 /// Stable softmax (max-subtracted, `-inf`-safe).
