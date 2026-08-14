@@ -91,7 +91,7 @@ this section — three of the four are further along than they look.
 | Lever | Seam method | Status today | Gate |
 |---|---|---|---|
 | **Prefill via parallel scan** (#165 → Swift #169) | `prefill(token_batch, seg_ids=None, *, last_only=False) -> (logits, State)` — **genuinely new** to `ModelInterface` | The scan **already computes the carry-out state and throws it away**: `new_states` is `(B, nc+1, H, P, N)` at `src/model/mlx_backend.py:252`, and `S_enter = new_states[:, :-1]` at `:253` drops the last entry. CUDA does exactly the same. **Shipped in #165**: `parallel(..., return_state=True)` surfaces the carry-out (the CUDA fused path passes `return_final_states=True`), `forward_prefill` on each block class pairs it with the conv window and the attention KV, and `prefill` is on the seam in both backends. `seg_ids` and continuing a non-fresh session are explicit non-goals in v1 (the packing-aware scan masks the carry-out row to zeros; RoPE positions are seeded from 0). `src/serve/generate.py` now prefills the prompt in one call | `src/conformance/prefill_decode_parity.py` (shipped): prefill-then-decode logits == pure step-by-step decode, **and** the extracted `State` == the step-produced state, element-wise, fp32 ~1e-4 |
-| **Quantization** (#168) | quantized `load` — `load` itself exists (`src/model/interface.py:87`); what is new is a **`quant` block in the `.config.json` sidecar** (`bits`, `group_size`, `symmetric`, `targets`). Absence of the block = an fp checkpoint, byte-identical to today | Portable numeric core already shipped: `src/eval/quantize.py` (group-wise affine, `mx.quantize`-compatible — `quantize_dequantize:41`, `is_quantizable:119`, `quantize_state_dict:131`) plus the `scripts/quantize.py` driver (#51), weight-only W8/W4 | new `src/conformance/quant_parity.py`: top-1 agreement + KL vs the fp model on a fixed prompt, with bits-dependent thresholds. The fp32 gates stay on the fp model |
+| **Quantization** (#168 — **done**, see below) | quantized `load` — `Checkpoint.load` decodes an optional `quant` block from the `.config.json` sidecar (`mode`, `group_size`, `targets: {module_path: bits}`) and applies `MLXNN.quantize` before loading. Absence of the block = an fp checkpoint, byte-identical to before | `src/eval/quantize.py`'s `mlx_affine_quantize`/`mlx_affine_dequantize` (the ACTUAL `mx.quantize`-compatible format — see below; `quantize_dequantize` is a DIFFERENT, older variant, #51's measurement contract only) + `scripts/quantize_checkpoint.py` driver, weight-only W8/W4/W2 | `src/conformance/quant_parity.py`: top-1 agreement + KL vs the fp model, bits-dependent thresholds. The fp32 gates stay on the fp model, unchanged |
 | **Speculative decoding** (#172) | `verify_block(tokens, state) -> (logits_list, state_list)` — **already implemented, on MLX only** (`src/model/mlx_backend.py:626`). It is **not** on `ModelInterface` and CUDA has no equivalent; promoting it to the seam is the open work | Drafter + accept rule are already portable: `src/serve/spec_decode.py` (`propose:27`, a prompt-lookup drafter needing no second model; `first_mismatch:53`). Driver: `scripts/spec_decode.py`, which calls `verify_block` at `:127`. **Greedy-only by construction** — `first_mismatch` compares against the verifier's *argmax*, stated in the module docstring | output **byte-identical to greedy decode** — what `tests/test_spec_decode.py:85` already asserts on MLX — plus accept-rate and speedup reported by the bench (#170) |
 | **Continuous batching** (**deferred**, per #163) | `step_batch` | `step` already takes a `(B,)` token array against a `(B, …)` state (`init_state(batch_size)`, `src/model/mlx_backend.py:681`), so **uniform** batching works today. What is missing is per-sequence admission / eviction / ragged lengths layered on `SessionStore`'s LRU (`src/serve/sessions.py:65`) | batched decode == per-sequence decode for the same inputs, fp32 ~1e-4. Specify the gate now; the lever stays **deferred** until the single-stream Mac path works |
 
@@ -107,6 +107,92 @@ RoPE'd K/V produced by the sequence forward; MoE layers contribute the stateless
 > cache, and turn-boundary snapshot/undo rides the same opaque blob — `RewindTree`
 > (`src/serve/rewind.py:42`) snapshots a **fixed-size** `State`, not a cache that grows with the
 > conversation.
+
+## Quantization (#168)
+
+**The premise the issue stated turned out to be wrong, and the fix was found empirically.**
+The issue described `src/eval/quantize.py`'s existing `quantize_dequantize` as "group-wise
+affine, the same scheme as `mx.quantize`". It is not: `quantize_dequantize` is classic
+min/max affine (`scale = (hi-lo)/(2**bits-1) >= 0`, `bias = lo`) — #51's fake-quant
+MEASUREMENT contract, and it stays exactly as it is. `mx.quantize`'s affine mode is a
+different, zero-preserving, edge-exact variant, verified against `mx.quantize` 0.31.2 for
+bits ∈ {2,4,8} × group_size ∈ {32,64,128}:
+
+```
+n     = 2**bits - 1
+mn,mx = group min, group max
+mask  = |mn| > |mx|
+s0    = max(mx - mn, 1e-7) / n ;  s0 = mask ? s0 : -s0
+edge  = mask ? mn : mx
+q0    = round(edge / s0)
+scale = (q0 == 0) ? s0   : edge / q0      # scale may be NEGATIVE
+bias  = (q0 == 0) ? 0.0  : edge
+codes = clip(round((w - bias) / scale), 0, n)
+```
+
+With this, numpy reproduces `mx.dequantize(mx.quantize(w))` to <1e-5 and `scales`/`biases` to
+`rtol=1e-5`, and the packed `uint32` layout (little-endian within each word, `32/bits` codes
+per word, groups along the last axis) is byte-identical to `mx.quantize`'s own output. This
+is `src/eval/quantize.py`'s `mlx_affine_quantize`/`mlx_affine_dequantize`/
+`pack_uint32_codes`, gated by `tests/test_quantize_mlx_format.py` — the load-bearing test
+the rest of #168 trusts.
+
+**Format.** `quantize_portable_state_dict` replaces each targeted module's `{path}.weight`
+with the packed `uint32` codes and adds `{path}.scales`/`{path}.biases` (both fp32 — what
+`mx.quantize` returns, and what mlx-swift's `update(parameters:verify: .all)` expects; MLX
+has no symmetric mode, so the on-disk format always carries both). `quant_targets` narrows
+`is_quantizable`'s 2-D-float floor by excluding `dt_proj`/`router` by name (load-bearing dt
+path; tiny argmax router) and any tensor whose last axis doesn't evenly divide `group_size`
+(MLX has no ragged-group fallback, unlike `_effective_group_size`'s whole-row fallback for
+the OTHER quant scheme). `save_weights(..., quant=quant_block)` merges `{"mode": "affine",
+"group_size": ..., "targets": {module_path: bits}}` into the `.config.json` sidecar; absence
+leaves the sidecar byte-identical to before, and `load_config_sidecar` drops the `quant` key
+silently (no "unknown field" note) rather than raising.
+
+**Validation is three DIFFERENT comparisons, deliberately not conflated.** The fp32 gate
+(`rtol=1e-4/atol=1e-5`) stays exactly as it is and protects the unquantized path only; a
+quantized path cannot meet it by definition.
+
+1. **Format correctness (exact, 1e-6).** The weights Swift dequantizes from the packed
+   checkpoint (`MLX.dequantized` on its loaded `.weight`/`.scales`/`.biases`) must equal what
+   Python packed (`dequant_ref.safetensors`) — a tight gate on the packing/scale/bias
+   contract, not involving the quantized kernel at all.
+2. **Kernel/logit agreement (loose, fixture-carried tolerance).** The Python reference for
+   `forward_logits`/`step_logits`/`hidden.*` is a **fake-quant** model (dequantized weights
+   loaded into the unmodified `MLXMambaModel` — no change to `mlx_backend.py`), while Swift
+   runs the TRUE quantized GEMM (`quantizedMM`). The weights are numerically identical; the
+   only divergence is accumulation order/precision. This gets its own `rtol`/`atol`, carried
+   per-fixture in `meta.json` (`2e-2`/`2e-2` for the checked-in fixtures — a deliberate
+   *sanity* bound, not a precision claim).
+3. **Quality vs the fp model (statistical, never `allclose`).** `src/conformance/
+   quant_parity.py`'s `check_quant_parity` — top-1 agreement + mean KL vs the ORIGINAL fp
+   model's logits, bits-dependent thresholds (`QUANT_THRESHOLDS`: int8 top1≥0.99/KL≤1e-3,
+   int4 top1≥0.95/KL≤5e-2). This is the statistical acceptance criterion the issue asks for.
+
+`monica-parity` reads a fixture's optional `rtol`/`atol` from `meta.json`, defaulting to the
+fp32 constants when absent (**this is the ONLY piece of #266's general precision→tolerance
+contract #168 needed** — a minimal per-fixture hook, not a general table or an fp16/bf16
+fixture family; #266 builds the general contract on top of this hook rather than duplicating
+it), and runs all three checks above for any fixture whose `meta.json` declares
+`quant_bits`.
+
+**The tied head.** `MonicaModel.head` was changed to call `embedding.asLinear(h)` instead of
+`matmul(h, embedding.weight.transposed(1, 0))` — semantically identical for the fp `Embedding`
+base class (a no-op for the existing fp32 gate, landed and verified as its own commit), but
+load-bearing under quantization: `QuantizedEmbedding.weight` is the packed codes, so the old
+matmul would silently compute nonsense on it, while `asLinear` dispatches to
+`QuantizedEmbedding`'s `quantizedMM` override. Since the tied head shares the embedding's
+weight, quantizing the embedding quantizes the head too — the accuracy risk the issue flags.
+`quant_targets(..., head_bits=...)` is the lever: a `--quant-head-bits` override (default 8
+whenever `--bits 4`) is a data change, not a code branch. The checked-in `toy-moe-int4`
+fixture needed it — plain int4-on-embedding pushed this random-init toy model's KL past the
+int4 threshold; `toy-moe-int8`/`toy-moe-int4` both needed `--seed 1` for the same underlying
+reason (a toy model's near-uniform random-init logits amplify KL disproportionately vs a
+trained model — see `swift/engine/Fixtures/README.md`).
+
+**Not measured by #168.** Decode-speed and real memory-footprint wins need a real trained
+checkpoint, not a toy fixture — `scripts/quantize_checkpoint.py` reports the packed/original
+byte ratio as the footprint evidence, and throughput is left to a future bench issue.
 
 ## Training on the Swift engine (#195/#196/#197)
 
@@ -221,8 +307,8 @@ The #163 dependency order:
 2. **#166** — port the model to mlx-swift + the logit-parity harness. Everything else waits on it.
 3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
    I/O) — in parallel once #166 lands.
-4. **#197** (LSP harness), **#168** (quantization), **#169** (Swift prefill — needs #165),
-   **#170** (Apple-Silicon benchmark harness).
+4. **#197** (LSP harness), **#168** (quantization — **done**), **#169** (Swift prefill —
+   needs #165), **#170** (Apple-Silicon benchmark harness).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift

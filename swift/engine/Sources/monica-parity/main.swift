@@ -18,10 +18,75 @@ import Foundation
 import MLX
 import MonicaEngine
 
+// The fp32 gate's constants — UNCHANGED by #168. A fixture's `meta.json` MAY carry its
+// own `rtol`/`atol` (the #168/#266 hook); absent, every comparison below defaults to
+// these exact values, so the four pre-#168 fixtures behave byte-for-byte as before.
 let rtol: Double = 1e-4
 let atol: Double = 1e-5
 
+// #168: the quantized-vs-fp statistical gate, mirroring
+// `src/conformance/quant_parity.QUANT_THRESHOLDS` exactly (int8 nearly lossless, int4
+// tolerates real but bounded drift).
+let quantThresholds: [Int: (top1: Double, kl: Double)] = [8: (0.99, 1e-3), 4: (0.95, 5e-2)]
+
 var failures: [String] = []
+
+/// A fixture's optional `meta.json` overrides — just the #168/#266 fields this runner
+/// reads. Every field is optional so a pre-#168 `meta.json` (no `rtol`/`atol`/
+/// `quant_bits`) decodes fine and changes nothing.
+struct FixtureMeta: Decodable {
+    let rtol: Double?
+    let atol: Double?
+    let quant_bits: Int?
+}
+
+func loadFixtureMeta(_ dir: URL) -> FixtureMeta {
+    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil)
+    guard let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else {
+        return empty
+    }
+    return (try? JSONDecoder().decode(FixtureMeta.self, from: data)) ?? empty
+}
+
+/// Top-1 agreement + mean KL(fp || q) over every flattened `(B, T)` position — the
+/// Swift mirror of `src/conformance/quant_parity.check_quant_parity`'s numerics (log-
+/// softmax in float64 for KL stability, same as the Python reference).
+func quantParity(fp: [Float], q: [Float], vocab: Int) -> (top1: Double, kl: Double) {
+    let n = fp.count / vocab
+    guard n > 0 else { return (0, .infinity) }
+    var agree = 0
+    var klSum = 0.0
+    for i in 0..<n {
+        let base = i * vocab
+        var fpMax = -Double.infinity
+        var fpArg = 0
+        var qMax = -Double.infinity
+        var qArg = 0
+        for j in 0..<vocab {
+            let fv = Double(fp[base + j])
+            let qv = Double(q[base + j])
+            if fv > fpMax { fpMax = fv; fpArg = j }
+            if qv > qMax { qMax = qv; qArg = j }
+        }
+        if fpArg == qArg { agree += 1 }
+        var fpSum = 0.0
+        var qSum = 0.0
+        for j in 0..<vocab {
+            fpSum += exp(Double(fp[base + j]) - fpMax)
+            qSum += exp(Double(q[base + j]) - qMax)
+        }
+        let fpLogZ = fpMax + log(fpSum)
+        let qLogZ = qMax + log(qSum)
+        var kl = 0.0
+        for j in 0..<vocab {
+            let fpLogp = Double(fp[base + j]) - fpLogZ
+            let qLogp = Double(q[base + j]) - qLogZ
+            kl += exp(fpLogp) * (fpLogp - qLogp)
+        }
+        klSum += kl
+    }
+    return (Double(agree) / Double(n), klSum / Double(n))
+}
 
 /// The arrays inside one layer's state, mirroring `Generator`'s private helper of the same
 /// name — lets the AC1 greedy-id loop below `MLX.eval` the recurrent state alongside logits
@@ -36,8 +101,11 @@ func evalTargets(_ s: LayerState) -> [MLXArray] {
 
 /// numpy's `allclose` predicate, elementwise, with `ref` as the reference operand:
 /// `|a - ref| <= atol + rtol * |ref|`. Returns the max absolute difference and whether
-/// every element passed.
-func compare(_ a: [Float], _ ref: [Float]) -> (maxAbs: Double, ok: Bool) {
+/// every element passed. `rtol`/`atol` default to the fp32 gate's constants; a
+/// quantized fixture's loose comparison passes its own (#168/#266).
+func compare(_ a: [Float], _ ref: [Float], rtol: Double = rtol, atol: Double = atol)
+    -> (maxAbs: Double, ok: Bool)
+{
     guard a.count == ref.count else { return (.infinity, false) }
     var maxAbs = 0.0
     var ok = true
@@ -72,7 +140,10 @@ func resolveFixturesDir() -> URL? {
     return nil
 }
 
-let defaultFixtureNames = ["toy", "toy-hybrid", "toy-moe", "toy-moe-biased"]
+let defaultFixtureNames = [
+    "toy", "toy-hybrid", "toy-moe", "toy-moe-biased",
+    "toy-moe-int8", "toy-moe-int4",  // #168
+]
 
 // --- argument parsing (hand-rolled; the runner takes one repeatable flag) ---
 var explicitFixtures: [URL] = []
@@ -107,6 +178,9 @@ if fixtureDirs.isEmpty {
 func runGate() {
 for dir in fixtureDirs {
     let name = dir.lastPathComponent
+    let meta = loadFixtureMeta(dir)
+    let fxRtol = meta.rtol ?? rtol
+    let fxAtol = meta.atol ?? atol
     do {
         let weights = dir.appendingPathComponent("weights.safetensors")
         guard FileManager.default.fileExists(atPath: weights.path) else {
@@ -206,7 +280,8 @@ for dir in fixtureDirs {
         let fwd = model.forward(tokens)
         MLX.eval(fwd)
         let fwdCmp = compare(fwd.asType(.float32).asArray(Float.self),
-                             refForward.asType(.float32).asArray(Float.self))
+                             refForward.asType(.float32).asArray(Float.self),
+                             rtol: fxRtol, atol: fxAtol)
 
         // --- stacked per-token step (the one-step recurrence) ---
         var state = model.initState(batch: batch)
@@ -221,12 +296,14 @@ for dir in fixtureDirs {
         let stepped = stacked(stepLogits, axis: 1)
         MLX.eval(stepped)
         let stepCmp = compare(stepped.asType(.float32).asArray(Float.self),
-                              refStep.asType(.float32).asArray(Float.self))
+                              refStep.asType(.float32).asArray(Float.self),
+                              rtol: fxRtol, atol: fxAtol)
 
         // Always print the numbers, on success too (the smoke gate's habit): a max-abs-diff
         // drifting from 1e-6 to 9e-5 is the early warning that something moved.
-        print(String(format: "%@: forward max|d| = %.3e  step max|d| = %.3e  (B=%d, L=%d) %@",
-                     name, fwdCmp.maxAbs, stepCmp.maxAbs, batch, seq,
+        print(String(format: "%@: forward max|d| = %.3e  step max|d| = %.3e  (B=%d, L=%d, "
+                     + "rtol=%.1e atol=%.1e) %@",
+                     name, fwdCmp.maxAbs, stepCmp.maxAbs, batch, seq, fxRtol, fxAtol,
                      fwdCmp.ok && stepCmp.ok ? "OK" : "FAIL"))
 
         if !fwdCmp.ok || !stepCmp.ok {
@@ -239,7 +316,8 @@ for dir in fixtureDirs {
             for i in 0..<hs.count {
                 guard let refH = reference["hidden.\(i)"] else { continue }
                 let c = compare(hs[i].asType(.float32).asArray(Float.self),
-                                refH.asType(.float32).asArray(Float.self))
+                                refH.asType(.float32).asArray(Float.self),
+                                rtol: fxRtol, atol: fxAtol)
                 if !c.ok {
                     failures.append(String(
                         format: "%@: FIRST DIVERGENCE at hidden state %d (max|d| = %.3e) — "
@@ -260,6 +338,82 @@ for dir in fixtureDirs {
             if !stepCmp.ok {
                 failures.append(String(format: "%@: step logits differ (max|d| = %.3e)", name,
                                        stepCmp.maxAbs))
+            }
+        }
+
+        // --- #168: quantized-fixture-only checks -------------------------------------
+        // A fixture whose meta.json declares `quant_bits` MUST carry dequant_ref.safetensors
+        // and reference.safetensors's `fp_forward_logits` — a missing artifact here is a
+        // FAILURE, never a silently-skipped check (same rule the file already applies to
+        // generation.safetensors).
+        if let bits = meta.quant_bits {
+            let sidecar = URL(fileURLWithPath: weights.path + ".config.json")
+            guard let spec = try QuantSpec.load(sidecar: sidecar) else {
+                failures.append("\(name): meta.json declares quant_bits=\(bits) but the "
+                                + "weights sidecar has no quant block")
+                continue
+            }
+
+            // (a) EXACT dequant check: what Swift's quantized modules dequantize to must
+            // equal what Python packed, at 1e-6 — the tight format-correctness gate, and
+            // does not involve the quantized GEMM kernel at all.
+            let dequantPath = dir.appendingPathComponent("dequant_ref.safetensors")
+            guard FileManager.default.fileExists(atPath: dequantPath.path) else {
+                failures.append("\(name): quant_bits set but no dequant_ref.safetensors at "
+                                + "\(dequantPath.path)")
+                continue
+            }
+            let dequantRef = try loadArrays(url: dequantPath)
+            let flatParams = Dictionary(
+                model.parameters().flattened(), uniquingKeysWith: { a, _ in a })
+            var worstDequant = 0.0
+            for (path, targetBits) in spec.targets.sorted(by: { $0.key < $1.key }) {
+                guard let w = flatParams["\(path).weight"],
+                      let s = flatParams["\(path).scales"],
+                      let b = flatParams["\(path).biases"],
+                      let ref = dequantRef["\(path).weight"] else {
+                    failures.append("\(name): quantized module '\(path)' missing packed "
+                                    + "weight/scales/biases, or dequant_ref has no entry for it")
+                    continue
+                }
+                let deq = dequantized(w, scales: s, biases: b,
+                                      groupSize: spec.groupSize, bits: targetBits)
+                MLX.eval(deq)
+                let c = compare(deq.asType(.float32).asArray(Float.self),
+                                ref.asType(.float32).asArray(Float.self),
+                                rtol: 1e-6, atol: 1e-6)
+                worstDequant = max(worstDequant, c.maxAbs)
+                if !c.ok {
+                    failures.append(String(
+                        format: "%@: dequant mismatch for '%@' (max|d| = %.3e, want <= 1e-6)",
+                        name, path, c.maxAbs))
+                }
+            }
+
+            // (c) top-1 agreement + KL vs the ORIGINAL fp model's logits — the statistical
+            // quality gate #168's acceptance criteria ask for.
+            guard let fpRef = reference["fp_forward_logits"] else {
+                failures.append("\(name): quant_bits set but reference.safetensors has no "
+                                + "fp_forward_logits")
+                continue
+            }
+            guard let thr = quantThresholds[bits] else {
+                failures.append("\(name): no quantThresholds entry for bits=\(bits)")
+                continue
+            }
+            let vocab = fwd.dim(-1)
+            let (top1, kl) = quantParity(
+                fp: fpRef.asType(.float32).asArray(Float.self),
+                q: fwd.asType(.float32).asArray(Float.self), vocab: vocab)
+            let quantOk = top1 >= thr.top1 && kl <= thr.kl
+            print(String(
+                format: "%@: quant bits=%d top1=%.4f (>=%.2f) kl=%.4f (<=%.1e) dequant "
+                + "max|d|=%.3e  %@",
+                name, bits, top1, thr.top1, kl, thr.kl, worstDequant, quantOk ? "OK" : "FAIL"))
+            if !quantOk {
+                failures.append(String(
+                    format: "%@: quantized quality gate failed — top1=%.4f (want >= %.2f) "
+                    + "kl=%.4f (want <= %.1e)", name, top1, thr.top1, kl, thr.kl))
             }
         }
     } catch {

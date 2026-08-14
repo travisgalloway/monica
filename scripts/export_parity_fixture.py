@@ -38,15 +38,32 @@ from src.model.blocks import load_config
 def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                   precision: str | None = None, moe_bias: bool = False,
                   seed: int = 0, vocab_size: int | None = None,
-                  gen_steps: int = 16) -> dict:
-    """Build and write one fixture directory. Returns the `meta.json` contents."""
+                  gen_steps: int = 16, quant_bits: int | None = None,
+                  quant_group_size: int = 64, quant_head_bits: int | None = None) -> dict:
+    """Build and write one fixture directory. Returns the `meta.json` contents.
+
+    `quant_bits` (#168), if given, makes this a QUANTIZED fixture: `weights.safetensors`
+    holds the packed checkpoint (+ `quant` sidecar block) instead of plain fp32 weights,
+    and `forward_logits`/`step_logits`/`hidden.*`/`generation.safetensors` are computed
+    from the FAKE-QUANT reference model (dequantized weights loaded into the unmodified
+    `MLXMambaModel`) rather than the fp model — the "Python quantized logits" Swift's
+    true quantized kernel is compared against at a looser, fixture-carried tolerance
+    (see `.claude/plans/issue-168.md`'s "validation problem" section). Two extra files
+    ride along: `fp_forward_logits` (in `reference.safetensors`, the ORIGINAL fp model's
+    logits — the top-1/KL statistical gate's reference) and `dequant_ref.safetensors`
+    (the exact dequantized weight for each targeted module — the tight 1e-6 format-
+    correctness gate).
+    """
     import mlx.core as mx  # local import: this script is MLX-only, like scripts/smoke_test.py
     from safetensors.numpy import save_file
 
+    from src.eval.quantize import (
+        dequantize_portable_state_dict, quant_targets, quantize_portable_state_dict)
     from src.model.mlx_backend import MLXMambaModel
     from src.serve import sampling
     from src.serve.generate import generate as py_generate
     from src.serve.sessions import SessionStore
+    from src.train.checkpoint import save_weights
 
     mx.random.seed(seed)
     cfg = load_config(config_path)
@@ -83,9 +100,38 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     tokens = np.random.default_rng(seed).integers(
         0, cfg.vocab_size, size=(batch, seq)).astype(np.int32)
 
+    # --- #168: quantize, and point the rest of the export at the FAKE-QUANT reference ---
+    quant_block = None
+    fp_forward_logits = None
+    dequant_ref = {}
+    # `ref_model` is what forward_logits/step_logits/hidden.*/generation.safetensors get
+    # computed from — the fp model normally, or the fake-quant (dequantized) reference
+    # for a quantized fixture. `weights_sd`/`weights_quant` are what actually gets
+    # written to weights.safetensors: the fp portable state dict normally, or the REAL
+    # packed checkpoint for a quantized fixture (never the fake-quant float weights).
+    ref_model = model
+    weights_sd = None   # None => use ref_model.save() (fp path, unchanged from before)
+    if quant_bits is not None:
+        fp_forward_logits = np.array(model.forward(tokens), dtype=np.float32)
+        sd = model._portable_state_dict()
+        targets = quant_targets(sd, group_size=quant_group_size, bits=quant_bits,
+                                head_bits=quant_head_bits)
+        if not targets:
+            raise SystemExit(
+                f"--quant-bits {quant_bits}: no quantizable tensors for "
+                f"group_size={quant_group_size} against config {config_path}")
+        qsd, quant_block = quantize_portable_state_dict(sd, targets, group_size=quant_group_size)
+        deq_sd = dequantize_portable_state_dict(qsd, quant_block)
+        for path in targets:
+            dequant_ref[f"{path}.weight"] = np.asarray(deq_sd[f"{path}.weight"], dtype=np.float32)
+        qmodel = MLXMambaModel(cfg)
+        qmodel._load_portable(deq_sd)
+        ref_model = qmodel
+        weights_sd = qsd
+
     # A fixture that fails PYTHON's own forward/step gate must never reach disk — it would
     # make the Swift gate compare against a reference that is itself internally inconsistent.
-    verdict = check_forward_step_parity(model, tokens, to_numpy=np.array)
+    verdict = check_forward_step_parity(ref_model, tokens, to_numpy=np.array)
     if not verdict["ok"]:
         raise SystemExit(
             f"refusing to write {out_dir}: the Python model fails its own forward/step "
@@ -95,38 +141,52 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     out.mkdir(parents=True, exist_ok=True)
 
     weights_path = str(out / "weights.safetensors")
-    model.save(weights_path)            # weights.safetensors + .config.json sidecar
+    if weights_sd is None:
+        ref_model.save(weights_path)        # weights.safetensors + .config.json sidecar
+    else:
+        save_weights(weights_sd, weights_path, config=cfg, quant=quant_block)
 
     save_file({"tokens": tokens}, str(out / "inputs.safetensors"))
 
-    forward_logits = np.array(model.forward(tokens), dtype=np.float32)
-    state = model.init_state(batch)
+    forward_logits = np.array(ref_model.forward(tokens), dtype=np.float32)
+    state = ref_model.init_state(batch)
     steps = []
     for t in range(seq):
-        logits_t, state = model.step(tokens[:, t], state)
+        logits_t, state = ref_model.step(tokens[:, t], state)
         steps.append(np.array(logits_t, dtype=np.float32))
     step_logits = np.stack(steps, axis=1)
 
     ref = {"forward_logits": forward_logits, "step_logits": step_logits}
+    if fp_forward_logits is not None:
+        ref["fp_forward_logits"] = fp_forward_logits
     # Per-layer hidden states: a deliberate debugging investment. A whole-model logit
     # mismatch is nearly impossible to localize by hand across 24 layers; "first divergence
     # at layer 7" is the difference between an afternoon and a week. ~200 KB at toy scale.
-    for i, h in enumerate(model.hidden_states(tokens)):
+    for i, h in enumerate(ref_model.hidden_states(tokens)):
         ref[f"hidden.{i}"] = np.array(h, dtype=np.float32)
     save_file(ref, str(out / "reference.safetensors"))
+    if dequant_ref:
+        save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
 
     # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
     # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
     # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
     # `monica-parity` reproduces in Swift) with temperature=0 (argmax, first-max-on-tie).
     rtol_gen, atol_gen = 1e-4, 1e-5
+    if quant_bits is not None:
+        # Quantization shrinks logit margins, and Swift will decode this fixture through
+        # the TRUE quantized kernel (not the dequantized fake-quant reference this
+        # margin check runs against) — accumulation-order differences can plausibly flip
+        # a near-tie argmax even where fp32-vs-fp32 would not. Require a much wider
+        # margin here than the base fp32 parity band demands.
+        atol_gen = max(atol_gen, 0.25)
     prompt_len = min(8, seq)
     prompt_ids = [int(t) for t in tokens[0, :prompt_len].tolist()]
 
-    state = model.init_state(1)
+    state = ref_model.init_state(1)
     logits = None
     for t in prompt_ids:
-        logits, state = model.step(np.array([t], dtype=np.int64), state)
+        logits, state = ref_model.step(np.array([t], dtype=np.int64), state)
 
     greedy_ids: list[int] = []
     margins: list[float] = []
@@ -141,7 +201,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         margins.append(top1 - top2)
         top1s.append(top1)
         greedy_ids.append(nxt)
-        logits, state = model.step(np.array([nxt], dtype=np.int64), state)
+        logits, state = ref_model.step(np.array([nxt], dtype=np.int64), state)
 
     # A near-tie greedy argmax makes cross-implementation id equality ill-posed: two fp32
     # implementations that agree to 1e-4 relative can still cross a near-zero margin and pick
@@ -159,7 +219,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     # --- prefill parity: assert the SessionStore/generate.py path agrees, id-for-id ---------
     # Ties the fixture to "the same token ids as scripts/generate.py greedy", not to an
     # exporter-private step loop.
-    store = SessionStore(model, max_concurrent=1)
+    store = SessionStore(ref_model, max_concurrent=1)
     store.create("fixture")
     greedy_sampler = partial(sampling.sample, temperature=0.0)
     via_generate = py_generate(store, "fixture", prompt_ids, sampler=greedy_sampler,
@@ -191,6 +251,27 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         "forward_step_max_abs_diff": verdict["max_abs_diff"],
         "greedy_margin_min": min(margins) if margins else None,
     }
+    if quant_bits is not None:
+        from src.conformance.quant_parity import check_quant_parity
+        q = check_quant_parity(fp_forward_logits, forward_logits, bits=quant_bits)
+        # A quantized fixture carries its OWN rtol/atol (#168's minimal #266 hook) —
+        # deliberately looser than the fp32 gate's 1e-4/1e-5, and never applied to a
+        # fixture that omits them (monica-parity defaults absent rtol/atol to the fp32
+        # constants unchanged).
+        meta["rtol"] = 2e-2
+        meta["atol"] = 2e-2
+        meta["quant_bits"] = quant_bits
+        meta["quant_group_size"] = quant_group_size
+        meta["quant_targets"] = sorted(targets)
+        meta["quant_top1_agreement"] = q["top1_agreement"]
+        meta["quant_mean_kl"] = q["mean_kl"]
+        meta["quant_max_abs_drift"] = q["max_abs_drift"]
+        meta["quant_ok_vs_thresholds"] = q["ok"]
+        if not q["ok"]:
+            raise SystemExit(
+                f"refusing to write {out_dir}: quantized-vs-fp quality gate failed "
+                f"(top1={q['top1_agreement']:.4f} kl={q['mean_kl']:.4f}) — try "
+                "--quant-head-bits 8, a larger --quant-group-size, or a different seed")
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
 
@@ -214,11 +295,26 @@ def main() -> None:
                    help="activate a per-expert route bias (#213) so the fixture carries "
                         "moe_route_bias.* keys and exercises the biased-ranking branch")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--quant-bits", type=int, default=None, choices=(2, 4, 8),
+                   help="#168: write a QUANTIZED fixture — weights.safetensors holds the "
+                        "packed checkpoint + quant sidecar, and the logit/hidden/"
+                        "generation references come from the fake-quant (dequantized) "
+                        "model rather than the fp one")
+    p.add_argument("--quant-group-size", type=int, default=64)
+    p.add_argument("--quant-head-bits", type=int, default=None,
+                   help="override bits for the tied embedding/head; defaults to 8 "
+                        "automatically when --quant-bits 4 (see quant_targets)")
     args = p.parse_args()
+
+    quant_head_bits = args.quant_head_bits
+    if quant_head_bits is None and args.quant_bits == 4:
+        quant_head_bits = 8
 
     meta = build_fixture(args.config, args.out, batch=args.batch, seq=args.seq,
                          precision=args.precision, moe_bias=args.moe_bias, seed=args.seed,
-                         vocab_size=args.vocab_size, gen_steps=args.gen_steps)
+                         vocab_size=args.vocab_size, gen_steps=args.gen_steps,
+                         quant_bits=args.quant_bits, quant_group_size=args.quant_group_size,
+                         quant_head_bits=quant_head_bits)
     print(f"wrote {args.out}: {json.dumps(meta)}")
 
 

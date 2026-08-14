@@ -27,17 +27,35 @@ public enum Checkpoint {
     /// Load `<weightsURL>` (safetensors) plus `<weightsURL>.config.json` into a fresh model.
     /// Returns the model and the checkpoint's parameter key set (the caller asserts it
     /// against `model.parameters()` — belt and braces on the highest-risk step).
+    ///
+    /// Reads the sidecar's optional `quant` block (#168) and, when present, applies
+    /// `Quantization.apply` to reshape the fresh model's `Linear`/`Embedding` leaves
+    /// into their quantized counterparts BEFORE `loadInto` — see that function's
+    /// docstring for why the ordering is load-bearing.
     public static func load(weights weightsURL: URL) throws -> (MonicaModel, Set<String>) {
         let sidecar = URL(fileURLWithPath: weightsURL.path + ".config.json")
         let config = try MambaConfig.load(sidecar: sidecar)
         let model = try MonicaModel(config)
-        let keys = try loadInto(model, weights: weightsURL)
+        let spec = try QuantSpec.load(sidecar: sidecar)
+        let keys = try loadInto(model, weights: weightsURL, spec: spec)
         return (model, keys)
     }
 
     /// Load portable weights into an already-built model. Returns the parameter key set.
+    ///
+    /// `spec`, if given, is applied via `Quantization.apply` BEFORE the weights are read
+    /// — reshaping `model`'s `Linear`/`Embedding` leaves into their quantized
+    /// counterparts so the checkpoint's packed `.weight`/`.scales`/`.biases` keys have
+    /// somewhere real to land. `Quantization.apply` is idempotent (mlx-swift's
+    /// `quantizeSingle` is a no-op on an already-`Quantized` module), so it is always
+    /// safe to pass `spec` here even if the caller already applied it — e.g. via
+    /// `load(weights:)` above, which never applies quantization itself, only decodes
+    /// the spec and forwards it.
     @discardableResult
-    public static func loadInto(_ model: MonicaModel, weights weightsURL: URL) throws -> Set<String> {
+    public static func loadInto(
+        _ model: MonicaModel, weights weightsURL: URL, spec: QuantSpec? = nil
+    ) throws -> Set<String> {
+        if let spec { try Quantization.apply(spec, to: model) }
         let arrays = try loadArrays(url: weightsURL)
 
         var biases: [Int: MLXArray] = [:]
