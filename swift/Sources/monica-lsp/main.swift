@@ -121,15 +121,23 @@ func runSelfTest() -> Never {
             r2Result = try? endpoint.request("methodTwo", timeout: 5.0)
             r2Done.signal()
         }
-        // Drain both requests off the fake-server side, then reply id=2 BEFORE id=1.
+        // Drain both requests off the fake-server side. Which one hits the wire first is a
+        // race between the two DispatchQueue.global() closures above (both contend for
+        // stateLock to grab `nextId`) — Darwin's libdispatch happens to run them roughly
+        // submission-ordered under low contention, but that is not guaranteed, and Linux's
+        // scheduler does not preserve it. So identify each request by its `method`, not by
+        // which one was read off the wire first, and key the (still out-of-order) replies
+        // off that — this keeps the "out-of-order response" property (whichever request
+        // resolves second gets its reply written first) without depending on send order.
         let req1 = JsonRpcEndpoint.readMessage(fakeServer)
         let req2 = JsonRpcEndpoint.readMessage(fakeServer)
-        let id1 = (req1?["id"] as? NSNumber)?.intValue ?? -1
-        let id2 = (req2?["id"] as? NSNumber)?.intValue ?? -1
+        let reqs = [req1, req2].compactMap { $0 }
+        let idOne = reqs.first { ($0["method"] as? String) == "methodOne" }?["id"] as? NSNumber
+        let idTwo = reqs.first { ($0["method"] as? String) == "methodTwo" }?["id"] as? NSNumber
         _ = fakeServer.write(try! JsonRpcEndpoint.encodeMessage(
-            ["jsonrpc": "2.0", "id": id2, "result": "second"]))
+            ["jsonrpc": "2.0", "id": idTwo?.intValue ?? -1, "result": "second"]))
         _ = fakeServer.write(try! JsonRpcEndpoint.encodeMessage(
-            ["jsonrpc": "2.0", "id": id1, "result": "first"]))
+            ["jsonrpc": "2.0", "id": idOne?.intValue ?? -1, "result": "first"]))
         _ = r1Done.wait(timeout: .now() + 5)
         _ = r2Done.wait(timeout: .now() + 5)
         eq(r1Result as? String, "first", "demux: out-of-order response resolves the right waiter (1)")
