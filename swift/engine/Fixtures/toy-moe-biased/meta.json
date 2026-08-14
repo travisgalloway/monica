@@ -15,5 +15,10 @@
   "mixing_layers": [
     0,
     2
-  ]
+  ],
+  "moe_load_layers": [
+    1,
+    3
+  ],
+  "moe_route_margin_min": 0.06686663627624512
 }

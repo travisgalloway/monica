@@ -44,10 +44,21 @@ struct FixtureMeta: Decodable {
     // the mixing oracle there (a lossy path must not drag the loose #168 tolerance hook
     // into this strict gate).
     let mixing_layers: [Int]?
+    // #265: the ABSOLUTE layer indices `load.{i}` was exported for. Present only when the
+    // fixture has unquantized MoE layers with `top_k < n_experts` — absent for a dense/
+    // hybrid fixture (no MoE layers to count) or a quantized one (same carve-out as
+    // `mixing_layers`). Its absence is legitimate ONLY in those two cases; see the #265
+    // gate section below for the anti-BLIND skip-discipline check.
+    let moe_load_layers: [Int]?
+    /// #265: the smallest k-th/(k+1)-th selection-score gap over every MoE layer/token —
+    /// the `greedy_margin_min` analogue that makes `load.{i}`'s EXACT comparison safe.
+    /// Printed alongside a count mismatch so a near-tie flake is diagnosed in one read.
+    let moe_route_margin_min: Double?
 }
 
 func loadFixtureMeta(_ dir: URL) -> FixtureMeta {
-    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil, mixing_layers: nil)
+    let empty = FixtureMeta(rtol: nil, atol: nil, quant_bits: nil, mixing_layers: nil,
+                            moe_load_layers: nil, moe_route_margin_min: nil)
     guard let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else {
         return empty
     }
@@ -510,6 +521,186 @@ for dir in fixtureDirs {
             }
         } else {
             print("\(name): mixing matrices — SKIP (no mixing oracle: quantized fixture)")
+        }
+
+        // --- #265: MoE load counting + route-bias write-back --------------------------
+        // Placed right after mixing matrices, so a count failure is reported with the
+        // logit/hidden numbers already printed above it.
+        //
+        // Skip discipline (the anti-BLIND rule): absence of `moe_load_layers` is only
+        // legitimate for a fixture with no MoE layers or a quantized one. Anything else
+        // missing it is a stale-fixture FAILURE, not a silent skip.
+        let hasMoeBlocks = !model.moeBlocks().isEmpty
+        if let loadLayers = meta.moe_load_layers {
+            // (1) Drain, forward, pop — the pinned pass this fixture's counts describe.
+            model.setMoeLoadCounting(true)
+            _ = model.popMoeLoad()
+            let loadFwd = model.forward(tokens)
+            MLX.eval(loadFwd)
+            let loads = model.popMoeLoad()
+            model.setMoeLoadCounting(false)
+
+            // (2) Layer-index list — a diverged MoE interleave fails here first.
+            let swiftLoadIndices = model.layers.enumerated().compactMap { i, l in
+                l is MoEBlock ? i : nil
+            }
+            if swiftLoadIndices != loadLayers {
+                failures.append("\(name): MoE load-count layer index list "
+                                + "\(swiftLoadIndices) != checked-in moe_load_layers "
+                                + "\(loadLayers) — layer classification has diverged "
+                                + "from Python")
+            }
+
+            let margin = meta.moe_route_margin_min.map { String(format: "%.3e", $0) } ?? "nil"
+            var countsBad = false
+            var totalsBad = false
+            var anyNonZero = false
+            var anyNonUniform = false
+            let expectedTotal = Float(batch * seq * model.config.topK)
+            for (i, counts) in zip(swiftLoadIndices, loads) {
+                guard let ref = reference["load.\(i)"] else {
+                    failures.append("\(name): reference.safetensors is missing load.\(i)")
+                    continue
+                }
+                let refCounts = ref.asType(.float32).asArray(Float.self)
+                // (3) EXACT equality — counts are exact integers, never rtol/atol.
+                if counts != refCounts {
+                    countsBad = true
+                    failures.append("\(name): load.\(i) drifted from the checked-in "
+                                    + "Swift-parity oracle (exact match required) — got "
+                                    + "\(counts), want \(refCounts), "
+                                    + "moe_route_margin_min=\(margin)")
+                }
+                // (4) Independent anti-degenerate invariants, asserted even when (3) passes.
+                let total = counts.reduce(0, +)
+                if abs(total - expectedTotal) > 1e-3 {
+                    totalsBad = true
+                    failures.append(String(
+                        format: "%@: load.%d counts sum to %.1f, expected B*L*top_k = %.1f",
+                        name, i, total, expectedTotal))
+                }
+                if counts.contains(where: { $0 != 0 }) { anyNonZero = true }
+                if Set(counts).count > 1 { anyNonUniform = true }
+            }
+            if !anyNonZero {
+                failures.append("\(name): every MoE load count is exactly zero across all "
+                                + "layers — the counter looks like a no-op")
+            }
+            if !anyNonUniform {
+                failures.append("\(name): every MoE load count is identical across every "
+                                + "layer and expert — the counter looks like a no-op")
+            }
+            // (7) Print on success too — a distribution drifting toward uniform is the
+            // early warning that routing changed, the smoke gate's habit.
+            print("\(name): MoE load counts \(loads) "
+                 + "\(countsBad || totalsBad ? "FAIL" : "OK") (moe_route_margin_min=\(margin))")
+
+            // (5) Counting OFF -> forward -> pop returns all-zero. Catches an accumulator
+            // that ignores its own gate — a leak that would grow the lazy graph for a
+            // whole run.
+            let offFwd = model.forward(tokens)
+            MLX.eval(offFwd)
+            let offLoads = model.popMoeLoad()
+            if offLoads.contains(where: { $0.contains(where: { $0 != 0 }) }) {
+                failures.append("\(name): MoE load counts are non-zero after "
+                                + "setMoeLoadCounting(false) — the accumulator ignored "
+                                + "its own gate (got \(offLoads))")
+            }
+
+            // (6) Route-bias WRITE-BACK, on a FRESHLY Checkpoint.load-ed second model from
+            // the same weights (never the pristine `model` used above/below) — same
+            // pattern the #196 round-trip section uses. No checked-in tensor of its own:
+            // the saturating bias makes the outcome analytically known.
+            do {
+                let (modelW, _) = try Checkpoint.load(weights: weights)
+                let nExperts = modelW.config.nExperts
+                var saturating: [Float] = [1e4]
+                saturating.append(contentsOf: Array(repeating: Float(0), count: nExperts - 1))
+                let biases = loadLayers.map { _ in saturating }
+                try modelW.setMoeBiases(biases)
+                modelW.setMoeLoadCounting(true)
+                _ = modelW.popMoeLoad()
+                let biasedFwd = modelW.forward(tokens)
+                MLX.eval(biasedFwd)
+                let biasedLoads = modelW.popMoeLoad()
+                modelW.setMoeLoadCounting(false)
+                let expectedExpert0 = Float(batch * seq)
+                for (i, counts) in zip(loadLayers, biasedLoads) {
+                    if counts.first != expectedExpert0 {
+                        failures.append(String(
+                            format: "%@: round trip (e) saturating bias at layer %d did not "
+                            + "drive expert 0's count to B*L=%.1f (got %@) — the "
+                            + "route-bias WRITE path did not land",
+                            name, i, expectedExpert0, "\(counts)"))
+                    }
+                    let total = counts.reduce(0, +)
+                    if abs(total - expectedTotal) > 1e-3 {
+                        failures.append(String(
+                            format: "%@: round trip (e) layer %d counts sum to %.1f under a "
+                            + "saturating bias, expected B*L*top_k=%.1f", name, i, total,
+                            expectedTotal))
+                    }
+                }
+
+                // moeBiases() reads back exactly what was written.
+                let readBack = modelW.moeBiases()
+                if readBack != biases {
+                    failures.append("\(name): round trip (e) moeBiases() read-back "
+                                    + "\(readBack) != what was written \(biases)")
+                }
+
+                // A wrong layer count, and a wrong-length vector, both throw.
+                var threwOnLayerCount = false
+                do { try modelW.setMoeBiases([saturating]) } catch { threwOnLayerCount = true }
+                if !threwOnLayerCount && loadLayers.count != 1 {
+                    failures.append("\(name): round trip (e) setMoeBiases with the wrong "
+                                    + "layer count did not throw")
+                }
+                var threwOnVectorLength = false
+                do {
+                    try modelW.setMoeBiases(loadLayers.map { _ in [Float(0), Float(1)] })
+                } catch { threwOnVectorLength = true }
+                if !threwOnVectorLength {
+                    failures.append("\(name): round trip (e) setMoeBiases with a "
+                                    + "wrong-length vector did not throw")
+                }
+
+                // Restore and recompare — the write path must be reversible and must not
+                // have corrupted anything else in the model. The ORIGINAL bias state for
+                // this fixture is either "inactive" (toy-moe: `routeBias == nil`) or the
+                // fixture's own checked-in bias (toy-moe-biased), read off the pristine
+                // `model` used throughout this fixture's other checks. A zero vector is
+                // the WRITE-PATH-representable equivalent of "inactive" — Python's own
+                // comment on this: "ranking by logits is order-identical to ranking by
+                // probs... a zero bias does not perturb routing" — so this restores
+                // `forward_logits`-equivalence even though `setMoeBiases` has no
+                // "deactivate" call of its own.
+                let restoreBiases = loadLayers.map { i -> [Float] in
+                    (model.layers[i] as? MoEBlock)?.routeBias
+                        ?? [Float](repeating: 0, count: nExperts)
+                }
+                try modelW.setMoeBiases(restoreBiases)
+                let restoredFwd = modelW.forward(tokens)
+                MLX.eval(restoredFwd)
+                let restoredCmp = compare(
+                    restoredFwd.asType(.float32).asArray(Float.self),
+                    refForward.asType(.float32).asArray(Float.self), rtol: fxRtol, atol: fxAtol)
+                if !restoredCmp.ok {
+                    failures.append(String(
+                        format: "%@: round trip (e) forward logits after restoring the "
+                        + "original bias do not match forward_logits (max|d| = %.3e) — the "
+                        + "write path left the model corrupted", name, restoredCmp.maxAbs))
+                }
+            } catch {
+                failures.append("\(name): round trip (e) route-bias write-back check "
+                                + "threw: \(error)")
+            }
+        } else if hasMoeBlocks && meta.quant_bits == nil {
+            failures.append("\(name): stale fixture — model has MoE layers and is not "
+                            + "quantized, but meta.json has no moe_load_layers — "
+                            + "regenerate with scripts/export_parity_fixture.py")
+        } else {
+            print("\(name): MoE load counts — SKIP (\(hasMoeBlocks ? "quantized fixture" : "no MoE layers"))")
         }
 
         // --- #169: prefill (parallel-scan) checks -------------------------------------

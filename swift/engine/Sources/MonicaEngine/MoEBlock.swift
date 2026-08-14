@@ -5,9 +5,13 @@
 // residual. POINTWISE over the sequence, so forward and step compute the same function by
 // construction and no recurrent state is carried.
 //
-// Not ported (out of scope for #166): load counting (`_count_loads`/`pop_load`) and the
-// `set_route_bias` write path — both are training-side surfaces with no effect on logits
-// (#195). The bias READ path is here, because it changes routing and therefore the logits.
+// #265 ports the two training-side surfaces #166 deliberately left out and #195 deferred
+// again: load counting (`_count_loads`/`pop_load`) and the `set_route_bias`/`set_moe_biases`
+// WRITE path (model-level plumbing in `MonicaModel.swift`). Load counting does not depend on
+// the balancer being active — `set_moe_load_counting` is an independent switch from
+// `moe_balance_rate` (`mlx_backend.py:992-996`) — so it is exercised directly by the parity
+// harness, not gated behind any config. #217's entropy diagnostic (`pop_routing_stats`/
+// `_entropy_sum`) is gated by the SAME Python flag but remains out of scope here.
 
 import MLX
 import MLXNN
@@ -30,6 +34,21 @@ public final class Expert: Module {
     }
 }
 
+/// Per-expert load-count accumulator (#213 D4 / #265), boxed in a plain (non-`Module`,
+/// non-`MLXArray`) reference type — deliberately NOT a stored `MLXArray` property on
+/// `MoEBlock` itself. mlx-swift discovers parameters by reflecting over stored properties:
+/// `ModuleItem.build` maps ANY bare `MLXArray` — including `Optional<MLXArray>` and
+/// `[MLXArray]` — to `.value(.parameters)`, which `parameters()`/`update(verify: .all)` then
+/// walks; anything else falls through to `.value(.other)` and is invisible to both. That is
+/// the same reflection rule that already forces `routeBias` below to be `[Float]?` rather
+/// than an `MLXArray?`. A plain class holding the counts sidesteps it without giving up the
+/// lazy-graph accumulation Python's `mx.array` gets for free.
+final class LoadCounter {
+    var counts: MLXArray
+    var enabled = false
+    init(_ nExperts: Int) { counts = MLXArray.zeros([nExperts]) }
+}
+
 public final class MoEBlock: Block {
     let config: MambaConfig
 
@@ -47,6 +66,9 @@ public final class MoEBlock: Block {
     /// the ORIGINAL pre-#213 ranking path verbatim.
     public private(set) var routeBias: [Float]?
 
+    /// See `LoadCounter` above for why this is boxed rather than a stored `MLXArray`.
+    let loadCounter: LoadCounter
+
     public init(_ config: MambaConfig) {
         self.config = config
         self._norm.wrappedValue = RMSNorm(config.dModel)
@@ -55,6 +77,7 @@ public final class MoEBlock: Block {
         self._experts.wrappedValue = (0..<config.nExperts).map { _ in
             Expert(dModel: config.dModel, dFF: dFF)
         }
+        self.loadCounter = LoadCounter(config.nExperts)
         super.init()
     }
 
@@ -67,6 +90,24 @@ public final class MoEBlock: Block {
                 "route bias has \(vec.count) entries, expected n_experts=\(config.nExperts)")
         }
         routeBias = vec
+    }
+
+    /// `set_load_counting`/`_count_loads` (`mlx_backend.py:689-691`, `:651-655`). Loads
+    /// ONLY — #217's entropy diagnostic (`pop_routing_stats`/`_entropy_sum`) is gated by the
+    /// same Python flag but is not ported here (out of scope for #265).
+    public func setLoadCounting(_ flag: Bool) {
+        loadCounter.enabled = flag
+    }
+
+    /// `pop_load` (`:693-700`). Unconditional, exactly like Python: returns all-zeros when
+    /// counting is off, never `nil`/throws. `MLX.eval` forces the accumulator to a concrete
+    /// value first, so the lazy graph never outlives one step — the point of the gate below —
+    /// then it is reset to zeros.
+    public func popLoad() -> [Float] {
+        MLX.eval(loadCounter.counts)
+        let out = loadCounter.counts.asType(.float32).asArray(Float.self)
+        loadCounter.counts = MLXArray.zeros([config.nExperts])
+        return out
     }
 
     /// `_moe` (`:676-726`).
@@ -96,6 +137,27 @@ public final class MoEBlock: Block {
             let mask = ranks .< MLXArray(Int32(k))
             gate = which(mask, probs, MLXArray(Float(0)).asType(probs.dtype))
             gate = gate / MLX.sum(gate, axis: -1, keepDims: true)   // renormalize the kept gates
+            if loadCounter.enabled {
+                // Per-expert load bookkeeping for the balancer (`:765-784`): how many tokens
+                // (summed over every non-expert axis) this forward routed to each expert,
+                // detached from the graph (`stopGradient` — a count must never become a
+                // training signal) and accumulated; `popLoad()` reads + resets it. Counted
+                // only here, in the `k < E` branch: at `k == E` every expert takes every
+                // token and balancing is vacuous (no mask exists).
+                //
+                // Two known, benign inexactnesses carried over from Python unchanged (there
+                // is no `grad_checkpoint`/training step in this engine to exercise them, but
+                // the reasoning is recorded so a future port does not "fix" a divergence that
+                // isn't one):
+                //  * With `grad_checkpoint: true` each layer's forward is RECOMPUTED in
+                //    backward, so every count doubles (#213 D5). Both consumers are invariant
+                //    to a uniform positive scale, so this is harmless.
+                //  * On an fp16 overflow-skipped training step the counts are not popped, so
+                //    they carry into the next pop. Harmless: the routing really did happen.
+                let axes = Array(0..<(mask.ndim - 1))
+                loadCounter.counts = loadCounter.counts + stopGradient(
+                    MLX.sum(mask.asType(.float32), axes: axes))
+            }
         } else {
             gate = probs                                    // softmax already sums to 1
         }

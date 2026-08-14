@@ -26,6 +26,9 @@ function and a mismatch between them is exactly the bug this harness exists to c
 * `hidden.{i}` (#264) — per-layer hidden states, checked UNCONDITIONALLY (not only on a
   forward/step failure, as before #264) and `mixing.{i}` (#264/#100) — each Mamba layer's
   head-averaged mixing matrix. See "Interpretability accessors (#264)" below.
+* `load.{i}` (#265) — each MoE layer's per-expert token counts from `set_moe_load_counting`,
+  compared **exactly** (never a tolerance), plus a route-bias WRITE-BACK check that has no
+  checked-in tensor of its own. See "MoE load counting + route-bias write-back (#265)" below.
 
 ## The checkpoint round trip (#196) adds NO fixture
 
@@ -51,11 +54,11 @@ comparisons by construction, which makes them immune to the cross-machine drift 
 | `weights.safetensors` | Portable weights, written by `MLXMambaModel.save` |
 | `weights.safetensors.config.json` | The `MambaConfig` sidecar — self-describing, so Swift needs no config override |
 | `inputs.safetensors` | `tokens` `int32 (B, L)` |
-| `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers` and (non-quantized fixtures only) `mixing.{i}` for each Mamba layer's absolute index (#264) |
+| `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers`, (non-quantized fixtures only) `mixing.{i}` for each Mamba layer's absolute index (#264), and (when `moe_load_layers` is present) `load.{i}` `fp32 (n_experts,)` for each MoE layer's absolute index (#265) — exact integer counts stored as fp32 |
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
 | `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. Also #264's `verifyBlock` oracle — see below; it adds no new tensor. |
 | `packed.safetensors` (OPTIONAL) | `packed_tokens`/`packed_seg_ids` `int32 (1, Lp)`, `doc_lengths` `int32 (D,)` (real, pre-pad token count per doc), `packed_logits` `fp32 (1, Lp, V)` — #68/#263's packing-aware `seg_ids` oracle. Present only for `toy`/`toy-hybrid`/`toy-moe`; see "The packed (`seg_ids`) oracle" below. |
-| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, and (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264) |
+| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264), and (when the fixture has unquantized MoE layers with `top_k < n_experts`) `moe_load_layers` — the ABSOLUTE layer indices `load.{i}` was exported for — and `moe_route_margin_min` — the exactness-hazard guard for `load.{i}`'s exact comparison (#265) |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). As of #264 `monica-parity` checks it UNCONDITIONALLY on
@@ -102,6 +105,71 @@ a lossy path, so neither uses the #168/#266 per-fixture `rtol`/`atol` hook.
   `tokens[0...k]` at `k=0` and mid-sequence — proving the per-token state list is not
   simply the final state repeated. `verify_block` is MLX-only per
   `docs/design/14-inference-engine.md`: not on `ModelInterface`, no CUDA port.
+
+## MoE load counting + route-bias write-back (#265)
+
+Two training-side surfaces #166 deliberately left out and #195 deferred again: per-expert
+load counting (`set_moe_load_counting`/`pop_moe_load`) and the `set_moe_biases` WRITE path
+(the bias READ path — `moe_route_bias.*` in `weights.safetensors` — was already ported for
+`toy-moe-biased`, #196). Load counting does **not** depend on the balancer: every config in
+the tree has `moe_balance_rate: null` (#217), but `set_moe_load_counting` is an independent
+switch (`mlx_backend.py:992-996`), so `toy-moe`/`toy-moe-biased` exercise it directly rather
+than waiting on a train step or a config change.
+
+* **Why counts are compared exactly.** `load.{i}` is per-token routing bookkeeping — an
+  integer count stored as fp32 — so it is compared with `==`, never `rtol`/`atol` (the
+  #168/#266 tolerance hook does not apply here, and never will: a "close" count is not a
+  meaningful concept). That makes it exactness-hazard-prone the same way `greedy_ids` is:
+  a near-tie in the router's ranking could make two correct fp32 implementations pick a
+  different top-`k` set and produce different (but both "valid") counts. `meta.json`'s
+  `moe_route_margin_min` is the `greedy_margin_min` analogue — the smallest gap, over every
+  token and every MoE layer, between the k-th and (k+1)-th largest SELECTION score
+  (`logits + route_bias` when the bias is active, else `logits`) — and the exporter refuses
+  to write a fixture below `1e-5`, printing a warning below `1e-3`. `toy-moe`'s margin
+  (`~9.2e-5`) intentionally trips that warning; it is ~65x clear of the fixture's own
+  `forward_step_max_abs_diff` (`~1.4e-6`), so it is not a live flake risk today, but the
+  warning text is what a future one gets diagnosed from — do not raise the refusal
+  threshold to silence it, and do not lower `1e-5` to make a future fixture fit; regenerate
+  with a different `--seed` instead.
+* **Why the sum-identity check exists.** An unexercised load counter that always returns
+  zero would pass every comparison against a fixture that ALSO happened to be all-zero —
+  the exporter refuses to write a `load.{i}` oracle unless `moe_load_layers` is non-empty,
+  not every count is zero, and each layer's counts sum to exactly `tokens.size * top_k` (the
+  cheapest possible proof the counter observed the real routing, not a no-op).
+* **`monica-parity`'s gate**, run on `toy-moe`/`toy-moe-biased` after the mixing-matrix
+  section: (1) exact per-layer equality against `load.{i}`; (2) the same sum-identity check,
+  independent of (1); (3) counting OFF → forward → pop returns all-zero (catches a counter
+  that ignores its own gate — a leak that would otherwise grow the lazy MLX graph for a
+  whole run); (4) a route-bias WRITE-BACK check with **no checked-in tensor of its own**
+  (same "adds no fixture" pattern as the #196 checkpoint round trip and #264's `verifyBlock`
+  above): a saturating bias (`[1e4, 0, 0, ...]`) pushed via `setMoeBiases` on a freshly
+  reloaded model must drive expert 0's count to exactly `B*L`, `moeBiases()` must read back
+  what was written, an out-of-range layer/vector count must throw, and restoring the
+  original bias must reproduce `forward_logits` again (proving the write path is reversible
+  and corrupts nothing). A fixture with no MoE layers, or a quantized one (`toy-moe-int8`/
+  `toy-moe-int4` — a lossy path must not feed this strict exact gate, same carve-out
+  `packed.safetensors`/`mixing.{i}` already take), gets an explicit `SKIP` line rather than
+  silently doing nothing; a fixture WITH unquantized MoE layers but no `moe_load_layers` in
+  `meta.json` is a stale-fixture FAILURE, not a skip.
+* **The parameter-tree canary.** `monica-parity`'s existing checkpoint key-set equality
+  check fires on every fixture if the Swift load-count accumulator ever leaks into
+  `parameters()` — no new assertion needed; the failure would be immediate and total.
+
+Python-side, `tests/test_parity_fixture_export.py` carries the same two rules the `toy`
+staleness test already established for logits: `test_checked_in_toy_moe_fixture_load_counts_match_todays_backend`
+re-exports `toy-moe` and asserts `load.{i}` matches exactly (plus the reference key set and
+`moe_route_margin_min`'s presence/threshold), and
+`test_route_bias_write_lands_in_the_logits_and_the_counts` pushes `toy-moe-biased`'s own
+checked-in bias into a freshly-loaded `toy-moe` model and asserts both the logits AND the
+counts reproduce `toy-moe-biased`'s checked-in oracle — the strongest available proof the
+write path lands, runnable locally (mlx-swift cannot execute on this host).
+
+Carried over from Python unchanged, as comments rather than behaviour to reproduce (neither
+can fire in this inference-only engine): `grad_checkpoint: true` doubles every count
+uniformly (both consumers are scale-invariant), and counts survive an fp16
+overflow-skipped training step (harmless — the routing really happened). #217's routing-
+entropy diagnostic (`pop_routing_stats`/`_entropy_sum`), gated by the same Python flag, is
+explicitly NOT ported — out of scope for #265.
 
 `hiddenStates`/`mixingMatrices` under `seg_ids` are out of scope for #264: the packed
 (`seg_ids`) oracle above only carries `packed_logits`, and per-layer hidden states or
