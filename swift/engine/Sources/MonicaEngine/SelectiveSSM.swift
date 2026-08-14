@@ -169,7 +169,10 @@ public final class SelectiveSSM: Module {
              acumLastKeep.squeezed(axis: -1)], axis: -1)                 // (B,H,nc+1)
         let decayChunk = exp(segsum(chunkTot))                           // (B,H,nc+1,nc+1)
         let newStates = einsum("bhzc,bchpn->bzhpn", decayChunk, states)
-        let sEnter = split(newStates, indices: [nc], axis: 1)[0]         // (B,nc,H,P,N)
+        // Split once and reuse both halves: [0] is the entering state per chunk (`sEnter`),
+        // [1] is the state one chunk past the end — the carry-out returned below.
+        let newStatesSplit = split(newStates, indices: [nc], axis: 1)
+        let sEnter = newStatesSplit[0]                                   // (B,nc,H,P,N)
 
         // 4) off-diagonal output: entering state decayed to each position
         let outDecay = exp(acum)                                         // (B,H,nc,Q)
@@ -180,7 +183,7 @@ public final class SelectiveSSM: Module {
         // The carry-out is the OTHER half of the split that produced sEnter above: the
         // entering state one chunk past the end, i.e. newStates[:, -1] — fp32, never cast
         // to cd (state stays fp32, matching `recurrence`).
-        let carry = split(newStates, indices: [nc], axis: 1)[1].squeezed(axis: 1)   // (B,H,P,N)
+        let carry = newStatesSplit[1].squeezed(axis: 1)   // (B,H,P,N)
         return (cast(y.reshaped([bSize, l, dInner]), cd), carry)
     }
 

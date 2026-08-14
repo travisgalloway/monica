@@ -110,6 +110,9 @@ public final class MonicaModel: Module {
     /// grad-checkpoint closure — that is a training concern; prefill is inference, matching
     /// Python's `prefill` which also bypasses `_layer_fns`).
     public func prefill(_ tokens: MLXArray, lastOnly: Bool = false) -> (MLXArray, [LayerState]) {
+        precondition(
+            tokens.ndim == 2 && tokens.dim(1) > 0,
+            "prefill: tokens must be rank-2 (B, L) with L > 0, got shape \(tokens.shape)")
         var h = cast(embedding(tokens), config.cd)
         var state: [LayerState] = []
         state.reserveCapacity(layers.count)

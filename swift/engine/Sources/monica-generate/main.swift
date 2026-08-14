@@ -278,7 +278,11 @@ func benchEvalTargets(_ s: LayerState) -> [MLXArray] {
 /// (hosted-runner timing is noisy), so this function never calls `exit(1)` on timing alone.
 func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
     let vocab = model.config.vocabSize
-    let clampedLen = max(1, min(promptLen, vocab))
+    // Prompt length is independent of vocab size — do not clamp it against `vocab`, or long
+    // prompts silently get truncated on small-vocab fixtures. Only guard against non-positive
+    // input; token ids themselves are drawn from `0..<vocab` below.
+    let clampedLen = max(1, promptLen)
+    let clampedIterations = max(1, iterations)
     var rng = SystemRandomNumberGenerator()
     let promptIds = (0..<clampedLen).map { _ in Int.random(in: 0..<vocab, using: &rng) }
     let promptArr = MLXArray(promptIds.map { Int32($0) }).reshaped([1, promptIds.count])
@@ -307,11 +311,11 @@ func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
     func timeMs(_ body: () -> (MLXArray, [LayerState])) -> (ms: Double, argmax: Int) {
         var lastLogits = MLXArray.zeros([1])
         let start = Date()
-        for _ in 0..<iterations {
+        for _ in 0..<clampedIterations {
             let (lg, _) = body()
             lastLogits = lg
         }
-        let elapsedMs = Date().timeIntervalSince(start) * 1000.0 / Double(iterations)
+        let elapsedMs = Date().timeIntervalSince(start) * 1000.0 / Double(clampedIterations)
         let row = lastLogits.asType(.float32).reshaped([-1]).asArray(Float.self)
         var bestI = 0
         var bestV = -Float.infinity
@@ -324,7 +328,7 @@ func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
     let speedup = par.ms > 0 ? seq.ms / par.ms : Double.infinity
     print(String(format: "bench-prefill: prompt_len=%d iterations=%d  "
                  + "sequential=%.2fms  parallel-scan=%.2fms  speedup=%.2fx",
-                 clampedLen, iterations, seq.ms, par.ms, speedup))
+                 clampedLen, clampedIterations, seq.ms, par.ms, speedup))
     print("bench-prefill: sequential argmax=\(seq.argmax)  parallel-scan argmax=\(par.argmax)")
     if seq.argmax != par.argmax {
         fail("bench-prefill: argmax DISAGREES between sequential and parallel-scan prefill "
