@@ -409,6 +409,29 @@ The #163 dependency order:
 4. **#197** (LSP harness — **done**), **#168** (quantization — **done**), **#169** (Swift
    prefill — **done**), **#170** (Apple-Silicon benchmark harness — **done**).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
+6. **#267 — done: the poc-scale Swift parity gate, generate-on-runner (CI, dispatch/schedule
+   only).** #166 gated `swift-engine` against four checked-in *toy*-scale fixtures and
+   verified `config/poc.yaml` (d_model 768, 24 layers, vocab 50280) manually, once, locally.
+   #267 turns that into a standing gate without checking the 571 MB poc fixture into git:
+   two new jobs, `poc-fixture-oracle` (macOS, Python+MLX, no Swift toolchain — generates the
+   fixture, hashes it, uploads a ~2 KB sha256 manifest + `meta.json`) and `poc-parity`
+   (macOS, `needs: [swift-engine, poc-fixture-oracle]` so it restores swift-engine's warm
+   xcodebuild cache — regenerates its own independent copy, `cmp`s the two manifests, THEN
+   runs `monica-parity --fixtures` against the verified fixture). Measured on an M1 Pro
+   during planning: **5.2-5.8 s wall, ~2 GB peak RSS, 571 MB output**, and the two
+   independent generations were **bit-identical, 7/7 files** — which is what makes the
+   manifest `diff` a real guard against **#298** (MLX 0.32.0's deterministic-per-process
+   buffer-reuse corruption) rather than a coin flip: two fresh processes on two runners would
+   have to corrupt identically to pass it. Both jobs are gated
+   `if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'` (a new
+   weekly Monday `schedule:` trigger) — **never `pull_request`/`push`** — because poc adds
+   zero new *code-path* coverage over `toy` (pure Mamba, no attention/MoE/quant); what it adds
+   is *scale* coverage of the tolerance contract (R2 below), which does not change PR to PR,
+   so per-PR cost (a second macOS mlx-swift build) isn't worth paying. `swift-engine` gains
+   no `needs:` and no existing job's cache key/`if:` changed. No change to
+   `src/conformance/tolerances.py`, `scripts/export_parity_fixture.py`, or any checked-in
+   fixture. See `swift/engine/Fixtures/README.md` §poc for the operator-facing version and
+   the local reproduction command.
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
 DPO/GRPO step factories.
@@ -539,6 +562,24 @@ DPO/GRPO step factories.
   `default.metallib`), so every genuinely local-hardware Swift-engine number in
   `docs/benchmarks.md` is recorded as "not yet measured" with the exact command to fill
   it in. Python-MLX numbers (no such constraint) are measured locally where noted.
+- **R2 (#267) — the fp32 parity band is relative-dominated at poc scale, not
+  absolute-dominated like it was derived to be.** `src/conformance/tolerances.py`'s Step 2
+  designs the fp32 band (`rtol=1e-4/atol=1e-5`) to be absolute-dominated for `|logit| ~ 8`
+  ("`rtol = atol / 8` so the relative term contributes at most one `atol` at the largest
+  logit"), calibrated on the `toy*.yaml` configs only. At `config/poc.yaml` scale
+  (d_model 768, 24 layers, vocab 50280), measured `forward_step_max_abs_diff = 3.62e-05` is
+  already 3.6x `atol` on its own, and `greedy_margin_min = 23.94` — logits ~3x larger than
+  toy's — mean the check only passes because the relative term (`rtol * |logit| ~= 2.4e-3`)
+  carries it: the band has flipped to relative-dominated. Net headroom is still ~66x (vs
+  toy's ~70x), so the contract holds *today*, and #267's `poc-parity` CI job (dispatch/
+  schedule-only, above) is what keeps that a monitored fact instead of a one-off measurement
+  that silently goes stale. **If a future mlx-swift version introduces a benign op-order
+  difference, this gate could trip at poc scale while every toy fixture stays green — that
+  is a finding to triage (is the drift real, or just the relative term catching up), not a
+  number to widen.** The only sanctioned escape hatch, if one is ever needed, is a *measured*
+  poc-scale row added to `src/conformance/tolerances.py` with its derivation recorded the
+  same way the existing toy-derived bands are — never an ad-hoc `rtol`/`atol` literal in the
+  CI workflow YAML.
 
 ## See also
 

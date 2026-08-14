@@ -62,7 +62,15 @@ suite entirely: `swift-macos` and `swift-linux` (the official `swift:latest` con
 build the package and run `monica-selfcheck` — `swift test` is still a no-op, there is no
 `.testTarget` — then train a fixed fixture corpus (`swift/Fixtures/parity-corpus.jsonl`) into
 a `tokenizer.json` artifact; `swift-parity` downloads both artifacts and `cmp`s them, turning
-#191/#245's bit-identical-output claim into an enforced gate rather than a comment.
+#191/#245's bit-identical-output claim into an enforced gate rather than a comment. Two more
+jobs (#267), `poc-fixture-oracle` and `poc-parity`, gate the Swift/MLX model port at
+**poc scale** (`config/poc.yaml`, d_model 768/24 layers/vocab 50280) rather than only the
+checked-in toy fixtures `swift-engine` uses — the first job generates the 571 MB fixture on a
+macOS runner and uploads a ~2 KB sha256 manifest, the second regenerates it independently on a
+second runner and `cmp`s the two manifests (the #298 cross-process corruption guard) before
+running `monica-parity` against it. Both are **dispatch/schedule-only**
+(`workflow_dispatch` or a weekly `schedule:`) — **never `pull_request`/`push`** — so a green
+PR run never implies poc scale was exercised; see `swift/engine/Fixtures/README.md` §poc.
 
 ## The seam — the most important architectural rule
 
