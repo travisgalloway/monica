@@ -9,7 +9,8 @@
 //   * `recurrence(x, h)` — the matching one-step recurrence (inference path)
 //
 // Not ported (out of scope for #166, see the plan): the `seg_ids` packing-aware arms
-// (`_chunk_seg_mask`), `return_state` (prefill — #169), and `mixing_matrix`.
+// (`_chunk_seg_mask`) and `mixing_matrix`. `return_state` (prefill) landed in #169 as
+// `parallelWithState`.
 
 import Foundation
 import MLX
@@ -98,7 +99,24 @@ public final class SelectiveSSM: Module {
     /// `x: (B, L, dInner) -> (B, L, dInner)`. Pads L up to a multiple of the chunk length Q
     /// (padded steps carry zero input and are trimmed). Every decay is `exp` of a
     /// non-positive sum, so the scan is overflow-safe by construction.
-    public func parallel(_ x: MLXArray) -> MLXArray {
+    public func parallel(_ x: MLXArray) -> MLXArray { scan(x).y }
+
+    /// `parallel(..., return_state=True)` (`:198-278`, `:267-268`). Same scan, additionally
+    /// returning the END-OF-SEQUENCE SSM state `(B, H, P, N)` fp32 — the entering-state row
+    /// `scan` normally discards when it slices `sEnter = newStates[:, :-1]`. Exact even when
+    /// `L` is padded to a chunk multiple: a padded step has `delta = 0`, so its log-decay
+    /// `g = delta * a` is 0 (decay `exp(0) = 1`, identity) and its input `Xin = delta * X` is
+    /// 0 — padded tail steps neither contribute nor decay, so the carry-out is the state at
+    /// position `L-1` regardless of `L % Q`. Every decay is `exp` of a non-positive cumulative
+    /// sum, so this stays overflow-safe by construction, same as `parallel`.
+    public func parallelWithState(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        let (y, carry) = scan(x)
+        return (y, carry)
+    }
+
+    /// The shared scan body. Costs nothing extra when the caller only wants `y`: MLX is
+    /// lazy, so an un-eval'd `carry` is never materialized.
+    private func scan(_ x: MLXArray) -> (y: MLXArray, carry: MLXArray) {
         let bSize = x.dim(0)
         let l = x.dim(1)
         let dInner = x.dim(2)
@@ -159,7 +177,11 @@ public final class SelectiveSSM: Module {
 
         var y = split((ydiag + yoff).reshaped([bSize, lp, h, p]), indices: [l], axis: 1)[0]
         y = y + split(xh, indices: [l], axis: 1)[0] * d.reshaped([1, 1, h, 1])   // skip
-        return cast(y.reshaped([bSize, l, dInner]), cd)
+        // The carry-out is the OTHER half of the split that produced sEnter above: the
+        // entering state one chunk past the end, i.e. newStates[:, -1] — fp32, never cast
+        // to cd (state stays fp32, matching `recurrence`).
+        let carry = split(newStates, indices: [nc], axis: 1)[1].squeezed(axis: 1)   // (B,H,P,N)
+        return (cast(y.reshaped([bSize, l, dInner]), cd), carry)
     }
 
     // MARK: - one-step recurrence (`recurrence`, :300-311)

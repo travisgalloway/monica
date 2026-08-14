@@ -3,11 +3,43 @@
 // pre-norm -> input proj -> split main+gate -> causal depthwise conv -> SiLU
 // -> selective SSM -> * SiLU(gate) -> output proj, with a residual.
 //
-// Not ported (out of scope for #166): `_conv_seq_seg` (the packing-aware conv),
-// `_conv_window`/`forward_prefill` (#169), and `mixing_matrix`.
+// Not ported (out of scope for #166): `_conv_seq_seg` (the packing-aware conv) and
+// `mixing_matrix`. `_conv_window`/`forward_prefill` landed in #169 as `convWindow`/
+// `forwardPrefill`.
 
 import MLX
 import MLXNN
+
+/// `_conv_window` (`mlx_backend.py:314-336`) — the conv state left after consuming `xMain`
+/// (B, L, dInner), prefill's mirror of what `MambaBlock.step` leaves behind.
+///
+/// `step` keeps `window[:, 1:]` where `window = concat([convState, xMain[:, None]])`, so
+/// after `L` tokens the state is the LAST `k-1` rows of `xMain` — post-`in_proj`, PRE-conv,
+/// pre-SiLU. Two edge cases, both live footguns (mirrored from Python, not reinvented):
+///   * `L < k-1`: LEFT-zero-pad to `(B, k-1, dInner)` — exactly what an initially-zeroed
+///     window plus `L` real steps leaves behind. A right-pad would compile, produce the
+///     right shape, and misalign every conv tap.
+///   * `k == 1`: width 0. Guarded explicitly rather than relying on `split`'s empty-slice
+///     behavior, matching Python's own explicit guard (its comment warns `x[:, -0:]` is the
+///     WHOLE array, not empty).
+/// Emitted in fp32 so it is dtype-identical to a stepped window (`initState` allocates fp32
+/// and `concat([fp32, cd])` promotes).
+public func convWindow(_ xMain: MLXArray, _ k: Int) -> MLXArray {
+    let bSize = xMain.dim(0)
+    let l = xMain.dim(1)
+    let di = xMain.dim(2)
+    let w = k - 1
+    if w <= 0 {
+        return MLXArray.zeros([bSize, 0, di], dtype: .float32)
+    }
+    let tail = f32(split(xMain, indices: [max(0, l - w)], axis: 1)[1])   // (B, min(L,w), di)
+    let missing = w - tail.dim(1)
+    if missing > 0 {
+        return concatenated(
+            [MLXArray.zeros([bSize, missing, di], dtype: tail.dtype), tail], axis: 1)
+    }
+    return tail
+}
 
 public final class MambaBlock: Block {
     let config: MambaConfig
@@ -89,5 +121,24 @@ public final class MambaBlock: Block {
     public override func initState(batch: Int) -> LayerState {
         .mamba(conv: MLXArray.zeros([batch, config.dConv - 1, config.dInner]),
                ssm: MLXArray.zeros([batch, config.nHeads, config.headDim, config.dState]))
+    }
+
+    /// `forward_prefill` (`:410-424`) — `forwardSeq`'s body verbatim (deliberately
+    /// duplicated, not shared, so the hot training/scan path `forwardSeq` stays free of a
+    /// state-collection branch), additionally emitting the (conv_window, ssm_carry_out)
+    /// pair `step` would have left after L tokens from a fresh state.
+    public override func forwardPrefill(_ x: MLXArray) -> (MLXArray, LayerState) {
+        let l = x.dim(1)
+        let cd = config.cd
+        let xn = norm(x)
+        let proj = split(linear(inProj, xn, cd), parts: 2, axis: -1)   // (B,L,di) each
+        let xMain = proj[0]
+        let z = proj[1]
+        let xc = silu(split(convSeq(xMain, cd), indices: [l], axis: 1)[0])
+        let (yRaw, ssmState) = ssm.parallelWithState(xc)
+        let y = yRaw * silu(z)
+        let out = x + linear(outProj, y, cd)
+        // convWindow reads xMain (pre-conv, post-in_proj), NOT xc.
+        return (out, .mamba(conv: convWindow(xMain, config.dConv), ssm: ssmState))
     }
 }

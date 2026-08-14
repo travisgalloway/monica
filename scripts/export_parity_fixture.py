@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from src.conformance.forward_step_parity import check_forward_step_parity
+from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.model.blocks import load_config
 
 
@@ -59,7 +60,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
 
     from src.eval.quantize import (
         dequantize_portable_state_dict, quant_targets, quantize_portable_state_dict)
-    from src.model.mlx_backend import MLXMambaModel
+    from src.model.mlx_backend import AttentionBlock, MambaBlock, MLXMambaModel, MoEBlock
     from src.serve import sampling
     from src.serve.generate import generate as py_generate
     from src.serve.sessions import SessionStore
@@ -137,6 +138,17 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
             f"refusing to write {out_dir}: the Python model fails its own forward/step "
             f"parity check (max_abs_diff={verdict['max_abs_diff']:.3e})")
 
+    # Same rule for #169's state handoff: a fixture whose own Python prefill state
+    # disagrees with its stepped state (or whose prefill logits disagree with forward, or
+    # whose prefill-then-decode disagrees with pure step-by-step) can never reach disk —
+    # it would make the Swift gate compare against an internally-inconsistent oracle.
+    prefill_verdict = check_prefill_decode_parity(
+        ref_model, tokens, to_numpy=np.array, n_decode=min(4, seq - 1))
+    if not prefill_verdict["ok"]:
+        raise SystemExit(
+            f"refusing to write {out_dir}: the Python model fails its own prefill/decode "
+            f"parity check ({prefill_verdict})")
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -167,6 +179,35 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     save_file(ref, str(out / "reference.safetensors"))
     if dequant_ref:
         save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
+
+    # --- prefill.safetensors: the state-handoff oracle (#169) -----------------------------
+    # One entry per STATEFUL leaf, keyed by layer index and slot, derived from the layer's
+    # CLASS (not tensor shapes) — so Swift, which iterates its OWN layers and demands
+    # exactly the keys its own LayerState case implies, fails loudly on a missing key if the
+    # two sides ever disagree about layer structure, instead of silently skipping a check.
+    pre_logits, pre_state = ref_model.prefill(tokens)
+    pre_last, _ = ref_model.prefill(tokens, last_only=True)
+    prefill_out = {
+        "prefill_logits": np.array(pre_logits, dtype=np.float32),
+        "prefill_last_logits": np.array(pre_last, dtype=np.float32),
+    }
+    for i, (layer, st) in enumerate(zip(ref_model.layers, pre_state)):
+        if isinstance(layer, MambaBlock):
+            conv, ssm = st
+            prefill_out[f"state.{i}.conv"] = np.array(conv, dtype=np.float32)
+            prefill_out[f"state.{i}.ssm"] = np.array(ssm, dtype=np.float32)
+        elif isinstance(layer, AttentionBlock):
+            k, v = st
+            prefill_out[f"state.{i}.k"] = np.array(k, dtype=np.float32)
+            prefill_out[f"state.{i}.v"] = np.array(v, dtype=np.float32)
+        elif isinstance(layer, MoEBlock):
+            pass   # stateless — emitting a zero-sized placeholder would only add a
+                   # round-tripping risk for no coverage; Swift's .moe case carries nothing.
+        else:
+            raise SystemExit(
+                f"refusing to write {out_dir}: layer {i} has unrecognized type "
+                f"{type(layer).__name__} — teach the exporter its state slot names")
+    save_file(prefill_out, str(out / "prefill.safetensors"))
 
     # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
     # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
@@ -249,6 +290,8 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         "mlx_version": getattr(mx, "__version__", "unknown"),
         "moe_bias": moe_bias,
         "forward_step_max_abs_diff": verdict["max_abs_diff"],
+        "prefill_decode_max_abs_diff": prefill_verdict["max_abs_diff"],
+        "prefill_decode_max_abs_state_diff": prefill_verdict["max_abs_state_diff"],
         "greedy_margin_min": min(margins) if margins else None,
     }
     if quant_bits is not None:

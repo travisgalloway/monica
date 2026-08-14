@@ -97,6 +97,35 @@ public final class MonicaModel: Module {
         layers.map { $0.initState(batch: batch) }
     }
 
+    /// `prefill` (#169, `:867-887`) — one parallel scan over the whole prompt, returning
+    /// `(logits, state)` where `state` is exactly what `nLayers` walks of `step` over
+    /// `tokens` would have left from a fresh `initState`. `lastOnly` slices the head input
+    /// to the final position BEFORE the vocab projection, skipping the (B, L, V) logits
+    /// materialization for positions 1..<L-1 — the point at poc scale (V >= 50k).
+    ///
+    /// Fresh-session-only and no `seg_ids`, mirroring #165's seam contract
+    /// (`src/model/interface.py:81-95`): the attention RoPE positions are seeded from 0, so
+    /// a prompt may not be appended to a session that has already consumed tokens, and there
+    /// is no packing-aware carry-masking here. Walks `layers` directly (not through any
+    /// grad-checkpoint closure — that is a training concern; prefill is inference, matching
+    /// Python's `prefill` which also bypasses `_layer_fns`).
+    public func prefill(_ tokens: MLXArray, lastOnly: Bool = false) -> (MLXArray, [LayerState]) {
+        var h = cast(embedding(tokens), config.cd)
+        var state: [LayerState] = []
+        state.reserveCapacity(layers.count)
+        for layer in layers {
+            let (h2, st) = layer.forwardPrefill(h)
+            h = h2
+            state.append(st)
+        }
+        h = normF(h)
+        if lastOnly {
+            let l = h.dim(1)
+            h = h[0..., (l - 1)..<l, 0...].squeezed(axis: 1)   // (B, dModel)
+        }
+        return (head(h), state)
+    }
+
     /// This model's MoE layers, in layer order (`moe_blocks`, `:884-887`).
     public func moeBlocks() -> [MoEBlock] {
         layers.compactMap { $0 as? MoEBlock }

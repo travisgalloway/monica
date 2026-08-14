@@ -1,4 +1,4 @@
-# Swift/MLX logit-parity fixtures (#166 / #167)
+# Swift/MLX logit-parity fixtures (#166 / #167 / #169)
 
 Each directory here is one **frozen oracle** for `monica-parity`: the Python MLX backend's
 answer for a fixed config, a fixed token batch, and a fixed seed. The Swift port passes iff
@@ -6,7 +6,7 @@ it reproduces those numbers in **fp32** at **`rtol = 1e-4`, `atol = 1e-5`** — 
 contract `src/conformance/forward_step_parity.py` uses, with the Python array as the
 reference operand (numpy's `allclose` formula is asymmetric).
 
-Three code paths are gated, because each is a separate implementation of the same
+Four code paths are gated, because each is a separate implementation of the same
 function and a mismatch between them is exactly the bug this harness exists to catch:
 
 * `forward_logits` — the SSD chunked-matmul scan
@@ -14,6 +14,11 @@ function and a mismatch between them is exactly the bug this harness exists to c
 * `greedy_ids` (#167 AC1) — greedy (`temperature=0`) decode ids from `monica-generate`'s
   `Sampler`/`Generator`, compared **exactly** (not at a tolerance) against Python's
   step-driven argmax
+* `prefill_logits`/`prefill_last_logits` + per-layer `state.{i}.{slot}` (#169) — one
+  parallel scan over the whole prompt, and the exact recurrent state that scan must hand
+  off to `step` for generation to continue correctly. State is the load-bearing part: a
+  wrong carry-out is silent (the prompt's own logits still look right) and only corrupts
+  tokens generated afterwards, so it is checked element-wise, not just via logits.
 
 ## Files in a fixture
 
@@ -24,7 +29,8 @@ function and a mismatch between them is exactly the bug this harness exists to c
 | `inputs.safetensors` | `tokens` `int32 (B, L)` |
 | `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers` |
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
-| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, and the minimum greedy margin |
+| `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. |
+| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, and the minimum greedy margin |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). `monica-parity` only reads it on failure, to report
@@ -47,7 +53,8 @@ exporter-private step loop.
 
 | Fixture | Config | B × L | Why it exists |
 | --- | --- | --- | --- |
-| `toy/` | `config/toy.yaml` | 2 × 129 | Pure Mamba, **3 chunks** (`2*64 + 1`) — exercises the inter-chunk state handoff AND a ragged final chunk. At a single chunk the scan degenerates and the likeliest train/infer divergence is never hit. |
+| `toy/` | `config/toy.yaml` | 2 × 129 | Pure Mamba, **3 chunks** (`2*64 + 1`) — exercises the inter-chunk state handoff AND a ragged final chunk. At a single chunk the scan degenerates and the likeliest train/infer divergence is never hit. Also `monica-parity`'s primary #169 P3 fixture, for the same reason. |
+| `toy-short/` | `config/toy.yaml` | 1 × 2 | #169: `L=2 < d_conv-1=3` — the ONLY fixture that exercises `convWindow`'s LEFT-PAD branch (`toy` at L=129 and `toy-gen` at L=8 never reach it). Mirrors `tests/test_mlx_parity.py::test_prefill_short_sequence_conv_window`. |
 | `toy-hybrid/` | `config/toy-hybrid.yaml` | 2 × 40 | RoPE + KV-cache growth (attention at layers 1 and 3) |
 | `toy-moe/` | `config/toy-moe.yaml` | 2 × 40 | Router top-2-of-4, bias inactive — the pre-#213 ranking path |
 | `toy-moe-biased/` | `config/toy-moe.yaml` | 2 × 40 | Loss-Free-Balancing biased ranking (#213) + the `moe_route_bias.*` load path |
@@ -113,6 +120,8 @@ well-posed rather than flaky.
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
     --out swift/engine/Fixtures/toy-moe-int4 --batch 2 --seq 40 \
     --quant-bits 4 --quant-group-size 64 --quant-head-bits 8 --seed 1
+.venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
+    --out swift/engine/Fixtures/toy-short --batch 1 --seq 2 --gen-steps 8
 ```
 
 `--seed 1` is pinned for the quantized fixtures because the toy model's RANDOM-INIT
@@ -124,14 +133,23 @@ fail that check for this config at int8; `--seed 1` passes comfortably at both b
 This is a toy-scale artifact of near-uniform random logits, not evidence the thresholds are
 wrong for a trained model.
 
+`toy-short` uses `--gen-steps 8` (down from the default 16) — at `L=2` on random-init toy
+weights, the greedy-margin guard (below) has less room before a longer decode run drifts
+into a near-tie; 8 steps clears it comfortably at `--seed 0`. If a future regeneration
+trips the margin guard here, the documented fallback ladder is: bump `--seed`, then reduce
+`--gen-steps` further; if neither works, drop the fixture and cover the conv-window
+left-pad branch with a synthetic shape/zero-row assertion in `monica-parity` instead.
+
 The exporter refuses to write a fixture whose Python model fails its own forward/step
-check (or whose greedy margins are inside the parity band, or whose prefill-based
-`generate()` path disagrees with the step-driven `greedy_ids` — see above), so a reference
+check (or its own prefill/decode-state check — `src/conformance/prefill_decode_parity.py`,
+#169), or whose greedy margins are inside the parity band, or whose prefill-based
+`generate()` path disagrees with the step-driven `greedy_ids` — see above — so a reference
 that is internally inconsistent can never reach disk.
 
 `tests/test_parity_fixture_export.py` re-exports `toy` into a tmpdir and compares it to the
-checked-in reference (logits AND `greedy_ids`). That is what stops a future change to
-`mlx_backend.py`'s math from silently leaving the Swift gate testing a stale oracle.
+checked-in reference (logits, `greedy_ids`, AND `prefill.safetensors`'s logits/state). That
+is what stops a future change to `mlx_backend.py`'s math from silently leaving the Swift
+gate testing a stale oracle.
 
 ## `poc` is deliberately NOT checked in
 

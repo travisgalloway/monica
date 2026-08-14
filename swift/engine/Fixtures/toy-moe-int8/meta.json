@@ -9,6 +9,8 @@
   "mlx_version": "0.31.2",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.9073486328125e-06,
+  "prefill_decode_max_abs_diff": 9.5367431640625e-07,
+  "prefill_decode_max_abs_state_diff": 4.172325134277344e-07,
   "greedy_margin_min": 4.5923192501068115,
   "rtol": 0.02,
   "atol": 0.02,

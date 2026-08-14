@@ -220,6 +220,20 @@ func runSelfTest(tokenizerPath: String?) -> Never {
         eq(seqA, seqB, "same seed reproduces the same draw sequence")
     }
 
+    // --- #169: flag parsing for the new prefill-related flags (no MLX involved, so this
+    // runs fully outside CI's mlx-swift gate too) ---
+    do {
+        let f = parseFlags(["--weights", "w.safetensors", "--no-prefill"])
+        check(f["no-prefill"] != nil, "--no-prefill parses as a present (valueless) flag")
+        let f2 = parseFlags(["--bench-prefill", "--bench-prompt-len", "256",
+                             "--bench-iterations", "3"])
+        check(f2["bench-prefill"] != nil, "--bench-prefill parses as a present flag")
+        eq(intFlag(f2, "bench-prompt-len", default: 512), 256,
+           "--bench-prompt-len parses as an int")
+        eq(intFlag(f2, "bench-iterations", default: 5), 3,
+           "--bench-iterations parses as an int")
+    }
+
     // --- optional tokenizer round-trip ---
     if let path = tokenizerPath {
         do {
@@ -242,6 +256,82 @@ func runSelfTest(tokenizerPath: String?) -> Never {
     }
 }
 
+// MARK: - AC3: prefill latency bench (#169)
+
+/// The arrays inside one layer's state, so the bench's `MLX.eval` calls can force the state
+/// alongside logits — the same helper `Generator`/`monica-parity` use, duplicated here (not
+/// exported by `MonicaEngine`) so lazy evaluation cannot move work outside the timer, the
+/// single most likely way to measure nothing at all.
+func benchEvalTargets(_ s: LayerState) -> [MLXArray] {
+    switch s {
+    case .mamba(let conv, let ssm): return [conv, ssm]
+    case .attention(let k, let v): return [k, v]
+    case .moe: return []
+    }
+}
+
+/// `--bench-prefill`: sequential per-token `step` prefill vs the one-shot parallel-scan
+/// `model.prefill`, timed over N iterations after a warm-up (lazy MLX graphs otherwise let
+/// the first call's compile/dispatch cost leak into the measurement). Asserts the two
+/// paths' argmax id AGREES — a correctness property that is not timing-sensitive — and
+/// prints per-path ms plus the speedup. Informational: CI wires this as a non-gating step
+/// (hosted-runner timing is noisy), so this function never calls `exit(1)` on timing alone.
+func runBenchPrefill(model: MonicaModel, promptLen: Int, iterations: Int) {
+    let vocab = model.config.vocabSize
+    let clampedLen = max(1, min(promptLen, vocab))
+    var rng = SystemRandomNumberGenerator()
+    let promptIds = (0..<clampedLen).map { _ in Int.random(in: 0..<vocab, using: &rng) }
+    let promptArr = MLXArray(promptIds.map { Int32($0) }).reshaped([1, promptIds.count])
+
+    func sequentialPrefill() -> (MLXArray, [LayerState]) {
+        var state = model.initState(batch: 1)
+        var logits = MLXArray.zeros([1])
+        for tok in promptIds {
+            let (lg, st) = try! model.step(MLXArray([Int32(tok)]), state)
+            MLX.eval([lg] + st.flatMap(benchEvalTargets))
+            logits = lg
+            state = st
+        }
+        return (logits, state)
+    }
+    func parallelPrefill() -> (MLXArray, [LayerState]) {
+        let (lg, st) = model.prefill(promptArr, lastOnly: true)
+        MLX.eval([lg] + st.flatMap(benchEvalTargets))
+        return (lg, st)
+    }
+
+    // Warm-up (once each) so the first call's graph compile/dispatch is not in the timing.
+    _ = sequentialPrefill()
+    _ = parallelPrefill()
+
+    func timeMs(_ body: () -> (MLXArray, [LayerState])) -> (ms: Double, argmax: Int) {
+        var lastLogits = MLXArray.zeros([1])
+        let start = Date()
+        for _ in 0..<iterations {
+            let (lg, _) = body()
+            lastLogits = lg
+        }
+        let elapsedMs = Date().timeIntervalSince(start) * 1000.0 / Double(iterations)
+        let row = lastLogits.asType(.float32).reshaped([-1]).asArray(Float.self)
+        var bestI = 0
+        var bestV = -Float.infinity
+        for (i, v) in row.enumerated() where v > bestV { bestV = v; bestI = i }
+        return (elapsedMs, bestI)
+    }
+
+    let seq = timeMs(sequentialPrefill)
+    let par = timeMs(parallelPrefill)
+    let speedup = par.ms > 0 ? seq.ms / par.ms : Double.infinity
+    print(String(format: "bench-prefill: prompt_len=%d iterations=%d  "
+                 + "sequential=%.2fms  parallel-scan=%.2fms  speedup=%.2fx",
+                 clampedLen, iterations, seq.ms, par.ms, speedup))
+    print("bench-prefill: sequential argmax=\(seq.argmax)  parallel-scan argmax=\(par.argmax)")
+    if seq.argmax != par.argmax {
+        fail("bench-prefill: argmax DISAGREES between sequential and parallel-scan prefill "
+            + "(\(seq.argmax) vs \(par.argmax)) — this is a correctness failure, not noise")
+    }
+}
+
 // MARK: - generation drivers
 
 /// Streams a completion: incremental delta-decoding (decode the growing id array and emit
@@ -249,7 +339,7 @@ func runSelfTest(tokenizerPath: String?) -> Never {
 /// per-token decoding would emit replacement characters mid-multibyte. A real improvement
 /// over `scripts/generate.py`'s per-token `tok.decode([t])`.
 func streamCompletion(model: MonicaModel, tok: Tokenizer?, promptIds: [Int], sampler: Sampler,
-                      maxNewTokens: Int, eosId: Int?) throws {
+                      maxNewTokens: Int, eosId: Int?, usePrefill: Bool = true) throws {
     var generatedIds: [Int] = []
     var prevDecoded = ""
     _ = try Generator.generate(
@@ -268,7 +358,7 @@ func streamCompletion(model: MonicaModel, tok: Tokenizer?, promptIds: [Int], sam
             prevDecoded = full
             FileHandle.standardOutput.write(Data(delta.utf8))
             fflush(stdout)
-        })
+        }, usePrefill: usePrefill)
     print()
 }
 
@@ -277,7 +367,7 @@ func streamCompletion(model: MonicaModel, tok: Tokenizer?, promptIds: [Int], sam
 /// `scripts/generate.py` documents. The M12 code model has no instruction SFT yet, so this is
 /// a shell mirroring the Python CLI's shape, not a claim about the model's actual format.
 func runChat(model: MonicaModel, tok: Tokenizer, sampler: Sampler, maxNewTokens: Int,
-            eosId: Int?) {
+            eosId: Int?, usePrefill: Bool = true) {
     print("chat mode — type a message (Ctrl-D to exit).", to: &standardError)
     var history: [ChatTurn] = []
     while true {
@@ -294,7 +384,8 @@ func runChat(model: MonicaModel, tok: Tokenizer, sampler: Sampler, maxNewTokens:
             let outIds = try Generator.generate(
                 model: model, promptIds: promptIds, sampler: sampler, maxNewTokens: maxNewTokens,
                 eosId: eosId,
-                stopFn: { gen in tok.decode(gen).contains(INSTRUCTION_MARKER) })
+                stopFn: { gen in tok.decode(gen).contains(INSTRUCTION_MARKER) },
+                usePrefill: usePrefill)
             let out = tok.decode(outIds)
             if let range = out.range(of: INSTRUCTION_MARKER) {
                 reply = String(out[out.startIndex..<range.lowerBound])
@@ -336,6 +427,17 @@ func runMain(_ flags: [String: String]) {
         fail("failed to load weights \(weightsPath): \(error)")
     }
 
+    if flags["bench-prefill"] != nil {
+        let promptLen = intFlag(flags, "bench-prompt-len", default: 512)
+        let iterations = intFlag(flags, "bench-iterations", default: 5)
+        runBenchPrefill(model: model, promptLen: promptLen, iterations: iterations)
+        return
+    }
+
+    // #169: `--no-prefill` forces the OLD per-token sequential prefill (the AC3 baseline
+    // and the AC1 A/B reference); default is the new one-shot parallel-scan prefill.
+    let usePrefill = flags["no-prefill"] == nil
+
     var tokenizer: Tokenizer? = nil
     if let tp = flags["tokenizer"] {
         do {
@@ -363,7 +465,8 @@ func runMain(_ flags: [String: String]) {
 
     if flags["chat"] != nil {
         guard let tok = tokenizer else { fail("--chat requires --tokenizer <tokenizer.json>") }
-        runChat(model: model, tok: tok, sampler: sampler, maxNewTokens: maxNewTokens, eosId: eosId)
+        runChat(model: model, tok: tok, sampler: sampler, maxNewTokens: maxNewTokens,
+               eosId: eosId, usePrefill: usePrefill)
     } else if let idsRaw = flags["prompt-ids"] {
         let promptIds = idsRaw.split(separator: ",").map { s -> Int in
             guard let v = Int(s.trimmingCharacters(in: .whitespaces)) else {
@@ -374,7 +477,8 @@ func runMain(_ flags: [String: String]) {
         if promptIds.isEmpty { fail("--prompt-ids must be non-empty") }
         do {
             try streamCompletion(model: model, tok: tokenizer, promptIds: promptIds,
-                                 sampler: sampler, maxNewTokens: maxNewTokens, eosId: eosId)
+                                 sampler: sampler, maxNewTokens: maxNewTokens, eosId: eosId,
+                                 usePrefill: usePrefill)
         } catch { fail("generation failed: \(error)") }
     } else if let prompt = flags["prompt"] {
         guard let tok = tokenizer else { fail("--prompt requires --tokenizer <tokenizer.json>") }
@@ -383,7 +487,7 @@ func runMain(_ flags: [String: String]) {
         FileHandle.standardOutput.write(Data(prompt.utf8))
         do {
             try streamCompletion(model: model, tok: tok, promptIds: promptIds, sampler: sampler,
-                                 maxNewTokens: maxNewTokens, eosId: eosId)
+                                 maxNewTokens: maxNewTokens, eosId: eosId, usePrefill: usePrefill)
         } catch { fail("generation failed: \(error)") }
     } else {
         fail("provide --prompt <text>, --prompt-ids 1,2,3, --chat, or --self-test")

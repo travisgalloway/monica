@@ -1,11 +1,12 @@
 // Generator — the Swift port of `src/serve/generate.py`'s `generate()` (#167).
 //
-// Prefill = stepping every prompt token through `model.step`, batch 1, keeping the last
-// logits. This is the PRE-#165 Python shape (before `SessionStore.prefill`'s one-shot
-// parallel scan) and is numerically the same answer — `src/conformance/
-// prefill_decode_parity.py` gates prefill == stepping in Python. The parallel-scan prefill
-// is Swift #169's job; this file's sequential prefill is a deliberate, temporary shape, not
-// an oversight — do not "optimize" it here.
+// Prefill (#169): the whole prompt is consumed in ONE parallel scan via `model.prefill`,
+// which hands back the exact `State` an `L`-step walk of `model.step` would have left —
+// `monica-parity`'s P3 check (and `src/conformance/prefill_decode_parity.py` on the Python
+// side this mirrors) gates that equivalence element-wise. `usePrefill: Bool = true` keeps
+// the OLD sequential per-token prefill reachable (`usePrefill: false`): it is the AC3 speed
+// baseline, the AC1 A/B reference, and the one-flag rollback if the parallel path ever
+// regresses generation output.
 //
 // Per decode step: sample, stop BEFORE appending on eos, append, `onToken`, feed back through
 // `model.step`, then `stopFn` — feeding back before the stop check matches
@@ -13,7 +14,7 @@
 //
 // `MLX.eval` is called on each step's logits+state so the lazy graph does not accumulate
 // across the loop — the single most likely performance/memory trap in an mlx-swift decode
-// loop.
+// loop. The prefill call gets the same treatment, for the same reason.
 
 import MLX
 
@@ -37,24 +38,39 @@ public enum Generator {
     /// - `allowedIdsFor`: per-step constrained-decode hook (#226's surface) — called with the
     ///   generated-ids-so-far, returning the allowed id set for the NEXT token (`nil` = no
     ///   constraint). No LSP client is wired here; this only exposes the seam.
+    /// - `usePrefill`: `true` (default) consumes the prompt in one `model.prefill` scan;
+    ///   `false` falls back to the old per-token `model.step` loop. Both must produce the
+    ///   same generated ids (`monica-parity`'s P5) — the flag exists for the AC3 timing
+    ///   comparison and as a rollback if the parallel path ever misbehaves.
     public static func generate(
         model: MonicaModel, promptIds: [Int], sampler: Sampler, maxNewTokens: Int = 128,
         eosId: Int? = nil, onToken: ((Int) -> Void)? = nil,
-        stopFn: (([Int]) -> Bool)? = nil, allowedIdsFor: (([Int]) -> [Int]?)? = nil
+        stopFn: (([Int]) -> Bool)? = nil, allowedIdsFor: (([Int]) -> [Int]?)? = nil,
+        usePrefill: Bool = true
     ) throws -> [Int] {
         if promptIds.isEmpty { throw GeneratorError.emptyPrompt }
 
         var sampler = sampler
-        var state = model.initState(batch: 1)
-        var logits: MLXArray = MLXArray.zeros([1])   // overwritten before first use
+        var state: [LayerState]
+        var logits: MLXArray
 
-        // Sequential prefill: step every prompt token, keeping only the last logits.
-        for tok in promptIds {
-            let tokArr = MLXArray([Int32(tok)])
-            let (lg, st) = try model.step(tokArr, state)
+        if usePrefill {
+            let promptArr = MLXArray(promptIds.map { Int32($0) }).reshaped([1, promptIds.count])
+            let (lg, st) = model.prefill(promptArr, lastOnly: true)
             MLX.eval([lg] + st.flatMap(evalTargets))
             logits = lg
             state = st
+        } else {
+            state = model.initState(batch: 1)
+            logits = MLXArray.zeros([1])   // overwritten before first use
+            // Sequential prefill: step every prompt token, keeping only the last logits.
+            for tok in promptIds {
+                let tokArr = MLXArray([Int32(tok)])
+                let (lg, st) = try model.step(tokArr, state)
+                MLX.eval([lg] + st.flatMap(evalTargets))
+                logits = lg
+                state = st
+            }
         }
 
         var generated: [Int] = []
