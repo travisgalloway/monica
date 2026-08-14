@@ -59,21 +59,25 @@ public final class MonicaModel: Module {
         return embedding.asLinear(h)
     }
 
-    /// `forward` (`:787-796`), the `seg_ids == nil` arm. `tokens` is `(B, L)` int32.
-    public func forward(_ tokens: MLXArray) -> MLXArray {
+    /// `forward` (`:787-796`). `segIds` (B, L) document ids, `nil` by default, packs
+    /// multiple documents into one sequence and masks each block's recurrent/attention
+    /// state so it can't bleed across a boundary (#68/#263). `tokens` is `(B, L)` int32.
+    /// These are plain `final`-in-effect concrete methods (not the overridable `Block`
+    /// seam), so a default-nil parameter is safe here — see `LayerState.swift`.
+    public func forward(_ tokens: MLXArray, segIds: MLXArray? = nil) -> MLXArray {
         var h = cast(embedding(tokens), config.cd)
-        for layer in layers { h = layer.forwardSeq(h) }
+        for layer in layers { h = layer.forwardSeq(h, segIds) }
         return head(normF(h))
     }
 
     /// Per-layer hidden states — the embedding output followed by each layer's output
     /// (length `nLayers + 1`), the HF convention. Mirrors `hidden_states` (`:855-867`);
     /// `monica-parity` uses it to localize a divergence to a single block.
-    public func hiddenStates(_ tokens: MLXArray) -> [MLXArray] {
+    public func hiddenStates(_ tokens: MLXArray, segIds: MLXArray? = nil) -> [MLXArray] {
         var h = cast(embedding(tokens), config.cd)
         var hs = [h]
         for layer in layers {
-            h = layer.forwardSeq(h)
+            h = layer.forwardSeq(h, segIds)
             hs.append(h)
         }
         return hs

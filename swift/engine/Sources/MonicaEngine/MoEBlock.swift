@@ -107,8 +107,10 @@ public final class MoEBlock: Block {
         return cast(y, cd)
     }
 
-    /// `forward_seq` (`:728-729`) — pointwise, so `seg_ids` would be irrelevant anyway.
-    public override func forwardSeq(_ x: MLXArray) -> MLXArray {
+    /// `forward_seq` (`:728-729`) — pointwise, so `segIds` is accepted (the `Block` seam
+    /// requires it, #263) and ignored: nothing here is recurrent or attends across
+    /// positions, so packing can't perturb it.
+    public override func forwardSeq(_ x: MLXArray, _ segIds: MLXArray?) -> MLXArray {
         x + moe(norm(x))
     }
 

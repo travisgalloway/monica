@@ -6,7 +6,7 @@ it reproduces those numbers in **fp32** at **`rtol = 1e-4`, `atol = 1e-5`** — 
 contract `src/conformance/forward_step_parity.py` uses, with the Python array as the
 reference operand (numpy's `allclose` formula is asymmetric).
 
-Four code paths are gated, because each is a separate implementation of the same
+Five code paths are gated, because each is a separate implementation of the same
 function and a mismatch between them is exactly the bug this harness exists to catch:
 
 * `forward_logits` — the SSD chunked-matmul scan
@@ -19,6 +19,10 @@ function and a mismatch between them is exactly the bug this harness exists to c
   off to `step` for generation to continue correctly. State is the load-bearing part: a
   wrong carry-out is silent (the prompt's own logits still look right) and only corrupts
   tokens generated afterwards, so it is checked element-wise, not just via logits.
+* `packed_logits` (#68/#263, `monica-parity`'s P6) — multiple documents packed into one
+  sequence with `seg_ids`, exercising the packing-aware forward path (chunk-boundary SSM
+  mask, boundary-aware conv, block-diagonal attention). See "The packed (`seg_ids`) oracle"
+  below.
 
 ## The checkpoint round trip (#196) adds NO fixture
 
@@ -47,7 +51,8 @@ comparisons by construction, which makes them immune to the cross-machine drift 
 | `reference.safetensors` | `forward_logits`, `step_logits` `fp32 (B, L, V)`, plus `hidden.{i}` for `i in 0..n_layers` |
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
 | `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. |
-| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, and the minimum greedy margin |
+| `packed.safetensors` (OPTIONAL) | `packed_tokens`/`packed_seg_ids` `int32 (1, Lp)`, `doc_lengths` `int32 (D,)` (real, pre-pad token count per doc), `packed_logits` `fp32 (1, Lp, V)` — #68/#263's packing-aware `seg_ids` oracle. Present only for `toy`/`toy-hybrid`/`toy-moe`; see "The packed (`seg_ids`) oracle" below. |
+| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, and (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len` |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). `monica-parity` only reads it on failure, to report
@@ -78,6 +83,53 @@ exporter-private step loop.
 | `toy-gen/` | `config/toy.yaml`, `--vocab-size 512` | 1 × 8 | #167: exercises `monica-generate`'s real `--prompt` path (tokenizer → ids → model) end to end in CI. A `monica-tokenize`-trained tokenizer's vocab (256 base bytes + specials) cannot fit `toy.yaml`'s default 256-wide model, so this fixture widens the model instead of shrinking the tokenizer. Not in `monica-parity`'s default fixture list — it is consumed directly by `monica-generate` in the `swift-engine` CI job. |
 | `toy-moe-int8/` | `config/toy-moe.yaml`, `--quant-bits 8` | 2 × 40 | #168: int8 weight-only quantization (group 64, affine, `mx.quantize`-compatible). Exercises the MoE experts, Mamba projections, AND the tied embedding/head in one artifact. |
 | `toy-moe-int4/` | `config/toy-moe.yaml`, `--quant-bits 4 --quant-head-bits 8` | 2 × 40 | #168: int4, with the tied head kept at int8 — plain int4-on-embedding pushed this particular random-init toy model's KL past the int4 threshold (an accuracy risk the design doc flags), so `--quant-head-bits 8` is the recorded default for int4 fixtures. |
+
+## The packed (`seg_ids`) oracle (#68/#263)
+
+`monica-parity`'s P6 section gates the three packing-aware forward-path arms (`chunkSegMask`
+in `SelectiveSSM.swift`, `convSeqSeg` in `MambaBlock.swift`, the block-diagonal mask in
+`AttentionBlock.swift`) against `packed.safetensors`, present on `toy`/`toy-hybrid`/`toy-moe`
+only. Regenerated with `--packed-doc-lengths` (a comma-separated, chunk-length-relative doc
+length spec, e.g. `"Q,2*Q,5"` — `Q` resolves to the config's `chunk_size`, default 64),
+which builds the SAME chunk-aligned multi-document packing
+`src/conformance/doc_boundary_parity.py::check_doc_boundary_parity` uses — that function is
+the contract, not reinvented in the exporter.
+
+P6 runs three assertions per fixture, deliberately in this order so a failure is easy to
+place:
+
+1. **Cross-language.** `model.forward(packedTokens, segIds: packedSegIds)` vs
+   `packed_logits`, at the file-level strict fp32 gate (`rtol=1e-4/atol=1e-5` — never a
+   per-fixture override, unlike the #168 quantized fixtures).
+2. **Self-consistency**, the real correctness claim: each document's logit slice from the
+   packed-aware forward vs that SAME document's standalone Swift forward, computed
+   in-process. This needs no checked-in numbers, so it is immune to the cross-machine
+   drift that blocked #195/PR #293's checked-in gradient oracle (`grad.0.layers.0.
+   conv.weight` diverging `max|d|=1.226e-02` between the hosted CI runner and a local Mac).
+3. **Anti-no-op.** The packing-BLIND forward (`model.forward(packedTokens)`, no `segIds`)
+   vs each document's standalone forward (doc 0 excluded — it never leaks a PRIOR
+   document's state, so it proves nothing about packing-awareness). This must exceed
+   `1e-2` for every later document, or the fixture cannot distinguish a real port from one
+   that silently discards `seg_ids` — see "Why the threshold is checked, not assumed"
+   below.
+
+A missing `packed.safetensors` SKIPS P6 for that fixture (packing is not exercised by
+every fixture); a present-but-unreadable one is a FAILURE, the same rule this file already
+applies to `generation.safetensors`/`prefill.safetensors`.
+
+### Why the threshold is checked, not assumed
+
+If assertion 3's gap were ever comfortably inside `1e-2` on a real fixture, the FIXTURE
+GEOMETRY is wrong (a boundary too near the end, or a document too short for state to
+accumulate) — never the threshold. The exporter itself refuses to write a `packed.
+safetensors` whose packed sequence carries fewer than 2 distinct document ids (a
+single-document fixture is vacuous by construction), and `monica-parity` re-asserts
+`spans.count >= 2` on the Swift side for the same reason. On the three checked-in
+fixtures, computing the blind-vs-standalone gap directly (`.venv/bin/python` against the
+Python oracle, the exact numbers a silently no-op Swift port would reproduce) gives, per
+non-first document: `toy` 9.1e-2/8.3e-2, `toy-hybrid` 3.36/4.74, `toy-moe` 1.1e-1/1.0e-1 —
+all far clear of `1e-2`, and doc 0 in every fixture sits at ~1e-6 (floating-point noise),
+confirming the "doc 0 proves nothing" exclusion is itself correct.
 
 ## Two tolerance regimes (#168)
 
@@ -122,11 +174,14 @@ well-posed rather than flaky.
 
 ```bash
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
-    --out swift/engine/Fixtures/toy --batch 2 --seq 129
+    --out swift/engine/Fixtures/toy --batch 2 --seq 129 \
+    --packed-doc-lengths "Q,2*Q,5"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
-    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40
+    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40 \
+    --packed-doc-lengths "Q,7,Q+3"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
-    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40
+    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40 \
+    --packed-doc-lengths "Q,7,Q+3"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
     --out swift/engine/Fixtures/toy-moe-biased --batch 2 --seq 40 --moe-bias
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
@@ -164,9 +219,10 @@ check (or its own prefill/decode-state check — `src/conformance/prefill_decode
 that is internally inconsistent can never reach disk.
 
 `tests/test_parity_fixture_export.py` re-exports `toy` into a tmpdir and compares it to the
-checked-in reference (logits, `greedy_ids`, AND `prefill.safetensors`'s logits/state). That
-is what stops a future change to `mlx_backend.py`'s math from silently leaving the Swift
-gate testing a stale oracle.
+checked-in reference (logits, `greedy_ids`, `prefill.safetensors`'s logits/state, AND
+`packed.safetensors`'s tokens/seg_ids/doc_lengths (exact) and `packed_logits` (tolerance)).
+That is what stops a future change to `mlx_backend.py`'s math from silently leaving the
+Swift gate testing a stale oracle.
 
 ## `poc` is deliberately NOT checked in
 

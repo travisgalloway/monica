@@ -24,6 +24,7 @@ MLX-only (it builds the MLX backend), so it does not run on a Linux/CUDA host.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 from functools import partial
@@ -36,11 +37,60 @@ from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.model.blocks import load_config
 
 
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div)
+
+
+def _eval_doc_length_expr(node: ast.expr, q: int) -> int:
+    """Evaluate one AST node of a `--packed-doc-lengths` expression against a whitelist:
+    integer literals, the single name `Q`, unary +/-, and +-*/ binary ops. Anything else
+    (calls, attribute access, subscripts, comprehensions, ...) raises — this is arithmetic
+    parsing, not a general expression evaluator, so there is no path to attacker-controlled
+    code execution regardless of who supplies `spec`."""
+    if isinstance(node, ast.Expression):
+        return _eval_doc_length_expr(node.body, q)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.Name) and node.id == "Q":
+        return q
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        val = _eval_doc_length_expr(node.operand, q)
+        return val if isinstance(node.op, ast.UAdd) else -val
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        left = _eval_doc_length_expr(node.left, q)
+        right = _eval_doc_length_expr(node.right, q)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.FloorDiv):
+            return left // right
+        return left // right if right and left % right == 0 else left / right  # ast.Div
+    raise ValueError(f"unsupported expression in --packed-doc-lengths: {ast.dump(node)}")
+
+
+def _resolve_packed_doc_lengths(spec: str, q: int) -> list[int]:
+    """Parse a comma-separated list of chunk-length-relative expressions (e.g.
+    `"Q,2*Q,5"`) into concrete doc lengths. `Q` is the only name in scope, so this is
+    just enough to express "a chunk multiple, several chunks, and a short/ragged doc" —
+    the exact shapes `tests/test_doc_boundary_parity.py` already gates, so the Swift P6
+    gate and the Python doc-boundary gate stress the same geometry (#68/#263).
+
+    Parsed via a small AST whitelist (`_eval_doc_length_expr`), not `eval` — `spec` is a
+    `--packed-doc-lengths` CLI argument this maintainer-run export script's own caller
+    supplies (never untrusted/network input), but a whitelisted parser is strictly safer
+    than `eval` with stripped builtins and costs nothing here."""
+    return [int(_eval_doc_length_expr(ast.parse(tok.strip(), mode="eval"), q))
+            for tok in spec.split(",")]
+
+
 def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                   precision: str | None = None, moe_bias: bool = False,
                   seed: int = 0, vocab_size: int | None = None,
                   gen_steps: int = 16, quant_bits: int | None = None,
-                  quant_group_size: int = 64, quant_head_bits: int | None = None) -> dict:
+                  quant_group_size: int = 64, quant_head_bits: int | None = None,
+                  packed_doc_lengths: str | None = None) -> dict:
     """Build and write one fixture directory. Returns the `meta.json` contents.
 
     `quant_bits` (#168), if given, makes this a QUANTIZED fixture: `weights.safetensors`
@@ -209,6 +259,57 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                 f"{type(layer).__name__} — teach the exporter its state slot names")
     save_file(prefill_out, str(out / "prefill.safetensors"))
 
+    # --- packed.safetensors: the packing-aware seg_ids oracle (#68/#263) -------------------
+    # Only for non-quantized fixtures (`quant_bits is None`): quantized packing is a
+    # separate concern and would drag the loose #168/#266 tolerance hook into a gate this
+    # issue keeps STRICT (fp32 rtol=1e-4/atol=1e-5, same as the other fixture arrays).
+    # Uses the SAME packing rule `check_doc_boundary_parity` uses — that function is the
+    # contract, not reinvented here — so this artifact is a Swift-consumable snapshot of
+    # exactly what the Python conformance gate already checks.
+    packed_meta_doc_lengths = None
+    packed_meta_seq_len = None
+    if packed_doc_lengths is not None and quant_bits is None:
+        Q = cfg.chunk_size or 64
+        doc_lens = _resolve_packed_doc_lengths(packed_doc_lengths, Q)
+        rng = np.random.default_rng(seed)
+        docs = [rng.integers(0, cfg.vocab_size, size=n).tolist() for n in doc_lens]
+
+        packed: list[int] = []
+        seg: list[int] = []
+        for d, doc in enumerate(docs):
+            n = len(doc)
+            plen = ((n + Q - 1) // Q) * Q
+            packed.extend(doc + [0] * (plen - n))   # pad_id=0, following the real tokens
+            seg.extend([d] * plen)
+
+        packed_arr = np.asarray(packed, dtype=np.int32)[None]      # (1, Lp)
+        seg_arr = np.asarray(seg, dtype=np.int32)[None]            # (1, Lp)
+
+        # A single-document (or otherwise degenerate) fixture would make the whole Swift
+        # P6 gate vacuous — assert this in the export path, not only by eye (the plan's
+        # "Verification" step 5 rule).
+        if len(set(seg)) < 2:
+            raise SystemExit(
+                f"refusing to write {out_dir}/packed.safetensors: packed_doc_lengths="
+                f"{doc_lens!r} produced only {len(set(seg))} distinct document id(s) — "
+                "the anti-no-op gate would be vacuous")
+        expected_len = sum(((n + Q - 1) // Q) * Q for n in doc_lens)
+        assert seg_arr.shape[1] == expected_len, (
+            f"packed sequence length {seg_arr.shape[1]} != expected {expected_len} for "
+            f"doc_lengths={doc_lens!r}, chunk_size={Q}")
+
+        packed_logits = np.asarray(
+            ref_model.forward(packed_arr, seg_arr), dtype=np.float32)   # (1, Lp, V)
+
+        save_file({
+            "packed_tokens": packed_arr,
+            "packed_seg_ids": seg_arr,
+            "doc_lengths": np.asarray(doc_lens, dtype=np.int32),
+            "packed_logits": packed_logits,
+        }, str(out / "packed.safetensors"))
+        packed_meta_doc_lengths = doc_lens
+        packed_meta_seq_len = int(seg_arr.shape[1])
+
     # --- generation.safetensors: the greedy-id parity oracle (#167 AC1) --------------------
     # `prompt_ids` is the first `min(8, L)` ids of the token batch's first row; `greedy_ids`
     # are `gen_steps` ids produced by driving `model.step` token-by-token (the same shape
@@ -294,6 +395,12 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         "prefill_decode_max_abs_state_diff": prefill_verdict["max_abs_state_diff"],
         "greedy_margin_min": min(margins) if margins else None,
     }
+    if packed_meta_doc_lengths is not None:
+        # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
+        # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded
+        # model config, not from here.
+        meta["packed_doc_lengths"] = packed_meta_doc_lengths
+        meta["packed_seq_len"] = packed_meta_seq_len
     if quant_bits is not None:
         from src.conformance.quant_parity import check_quant_parity
         q = check_quant_parity(fp_forward_logits, forward_logits, bits=quant_bits)
@@ -347,6 +454,12 @@ def main() -> None:
     p.add_argument("--quant-head-bits", type=int, default=None,
                    help="override bits for the tied embedding/head; defaults to 8 "
                         "automatically when --quant-bits 4 (see quant_targets)")
+    p.add_argument("--packed-doc-lengths", default=None,
+                   help="#68/#263: write packed.safetensors (the Swift monica-parity P6 "
+                        "packing-aware seg_ids oracle) with these comma-separated, "
+                        "chunk-length-relative doc lengths, e.g. 'Q,2*Q,5' — 'Q' resolves "
+                        "to the config's chunk_size (default 64). Ignored for quantized "
+                        "fixtures (--quant-bits set)")
     args = p.parse_args()
 
     quant_head_bits = args.quant_head_bits
@@ -357,7 +470,8 @@ def main() -> None:
                          precision=args.precision, moe_bias=args.moe_bias, seed=args.seed,
                          vocab_size=args.vocab_size, gen_steps=args.gen_steps,
                          quant_bits=args.quant_bits, quant_group_size=args.quant_group_size,
-                         quant_head_bits=quant_head_bits)
+                         quant_head_bits=quant_head_bits,
+                         packed_doc_lengths=args.packed_doc_lengths)
     print(f"wrote {args.out}: {json.dumps(meta)}")
 
 
