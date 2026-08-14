@@ -61,8 +61,10 @@ def sample(
 
     `allowed_ids` (constrained decode, #226): restrict the draw to exactly this id set.
     `None` is a no-op. An empty sequence raises `ValueError` — see the module docstring.
-    Ids outside `[0, vocab)` are silently dropped, mirroring the repetition block's own
-    out-of-range guard.
+    Ids outside `[0, vocab)` are dropped, mirroring the repetition block's own
+    out-of-range guard — but if that drops every id (all of `allowed_ids` was
+    out-of-range), the result is the same as an empty `allowed_ids` and raises
+    `ValueError` too, rather than falling through to the uniform-draw fallback below.
     """
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
 
@@ -74,6 +76,13 @@ def sample(
                 "caller should bypass the mask for this step instead)")
         ids = np.asarray(list(allowed_ids), dtype=np.int64)
         ids = ids[(ids >= 0) & (ids < logits.size)]
+        if ids.size == 0:
+            raise ValueError(
+                "allowed_ids contained no ids within [0, vocab) after dropping "
+                "out-of-range entries — treated the same as an empty constraint set "
+                "(a masker bug, not 'nothing is valid'): raising rather than falling "
+                "through to the no_repeat_ngram_size uniform-draw fallback below, which "
+                "would silently return a token outside the caller's constraint set")
         mask = np.full(logits.shape, -np.inf)
         mask[ids] = 0.0
         logits = logits + mask  # mask BEFORE repetition control / temperature / top-k / top-p

@@ -141,7 +141,16 @@ def main() -> None:
     if transcript_f:
         args.transcript.parent.mkdir(parents=True, exist_ok=True)
 
-    n_oracle_unavailable = 0
+    # #226's OracleLabels exclusion (a blank reference) must apply IDENTICALLY across
+    # every arm for `per_seed_compare`/`pooled_compare`'s id-order check to hold (it
+    # raises ContractViolation on any mismatch) -- computed ONCE here, before any
+    # arm/seed loop, so the same record set is skipped everywhere and
+    # `n_oracle_unavailable` counts each unavailable record exactly once (not once
+    # per seed per oracle arm).
+    unavailable_ids = {rec["id"] for rec in records
+                       if not oracle_refs.get(rec["id"], "").strip()}
+    n_oracle_unavailable = len(unavailable_ids)
+
     scored_by_arm_seed: Dict[str, Dict[int, List[dict]]] = {a.name: {} for a in arms}
 
     t_run = time.monotonic()
@@ -150,20 +159,19 @@ def main() -> None:
         for arm in arms:
             scored: List[dict] = []
             for i, rec in enumerate(records):
+                if rec["id"] in unavailable_ids:
+                    continue  # excluded from EVERY arm's paired comparison, uniformly
                 path = f"rec_{i}.ts"
                 masker = None
                 if arm.name != "unconstrained":
                     if arm.variable == "mask":
                         source = LspLabels(service, path)
                     else:  # mask-oracle
-                        ref = oracle_refs.get(rec["id"], "")
-                        if not ref.strip():
-                            n_oracle_unavailable += 1
-                            continue  # excluded from EVERY arm's paired comparison
-                        source = OracleLabels(ref)
+                        source = OracleLabels(oracle_refs[rec["id"]])
                     if not arm.signal_used:
                         source = NullLabels(source)
-                    masker = CompletionMasker(source, path, lm.decode, mask_scope=args.mask_scope)
+                    masker = CompletionMasker(source, path, lm.decode, mask_scope=args.mask_scope,
+                                              encode=lm.encode)
 
                 result = generate_masked(lm, masker, rec["prompt"], budget="stmt",
                                          max_gen_tokens=args.max_gen_tokens,
@@ -187,12 +195,6 @@ def main() -> None:
 
     if transcript_f:
         transcript_f.close()
-
-    # #226's OracleLabels exclusion (R -- a blank reference) must apply IDENTICALLY
-    # across every arm for `per_seed_compare` to stay paired; the driver skips the
-    # SAME records in every arm above (the `continue` fires per-arm per-record, and
-    # every arm walks the same `records` in the same order), so the resulting
-    # per-seed lists are already aligned.
 
     summaries = {
         arm.name: {seed: summarize(recs) for seed, recs in by_seed.items()}

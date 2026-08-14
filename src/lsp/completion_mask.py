@@ -130,12 +130,14 @@ class CompletionMasker:
     """
 
     def __init__(self, label_source: LabelSource, path: str, decode: Callable[[Sequence[int]], str],
-                 *, mask_scope: str = "member") -> None:
+                 *, mask_scope: str = "member",
+                 encode: Optional[Callable[[str], Sequence[int]]] = None) -> None:
         if mask_scope not in ("member", "identifier"):
             raise ValueError(f"unknown mask_scope {mask_scope!r}")
         self.label_source = label_source
         self.path = path
         self.decode = decode
+        self.encode = encode
         self.mask_scope = mask_scope
 
         self._vocab: Optional[VocabTable] = None
@@ -159,7 +161,15 @@ class CompletionMasker:
     def _ensure_vocab(self, vocab_size: int) -> None:
         if self._trie is not None:
             return
-        self._vocab = build_vocab_table(self.decode, vocab_size, anchor_ids=())
+        # `build_vocab_table` probes token text IN CONTEXT (`decode(anchor_ids + [i])`)
+        # specifically because `decode([i])` alone can be unsound for byte-level BPE (see
+        # `src/lsp/lm.py::offset_map`). An empty `anchor_ids` collapses back to that unsafe
+        # start-of-text case, so anchor on a short realistic member-access snippet instead --
+        # every probe then happens mid-text, like the spans this masker actually opens on.
+        # `encode` is optional (decode-only test doubles omit it): without it, fall back to
+        # the empty anchor -- a known-degraded probe, not a crash.
+        anchor_ids = tuple(self.encode("x.")) if self.encode is not None else ()
+        self._vocab = build_vocab_table(self.decode, vocab_size, anchor_ids=anchor_ids)
         self._trie = VocabTrie(self._vocab)
         self._exit_ids = [i for i, piece in enumerate(self._vocab)
                           if piece and not _IDENT_CHAR_RE.match(piece[0])]
