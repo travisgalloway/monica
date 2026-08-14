@@ -1,10 +1,15 @@
 # Swift/MLX logit-parity fixtures (#166 / #167 / #169)
 
 Each directory here is one **frozen oracle** for `monica-parity`: the Python MLX backend's
-answer for a fixed config, a fixed token batch, and a fixed seed. The Swift port passes iff
-it reproduces those numbers in **fp32** at **`rtol = 1e-4`, `atol = 1e-5`** — the same
-contract `src/conformance/forward_step_parity.py` uses, with the Python array as the
-reference operand (numpy's `allclose` formula is asymmetric).
+answer for a fixed config, a fixed token batch, and a fixed seed. Every fixture declares
+its `precision` in `meta.json`; `monica-parity` looks up that precision's band from
+`src/conformance/tolerances.py` (hand-mirrored in `main.swift`'s `precisionBands`) and
+compares against it, with the Python array as the reference operand (numpy's `allclose`
+formula is asymmetric). fp32 fixtures — everything below `toy-fp16`/`toy-bf16`/
+`toy-moe-fp16`/`toy-hybrid-fp16` in the table — get **`rtol = 1e-4`, `atol = 1e-5`**, the
+same contract `src/conformance/forward_step_parity.py` uses; the four low-precision
+fixtures get a DIFFERENT, looser, dtype-derived contract — see "Three tolerance regimes"
+below and `docs/design/03-conformance.md`'s "The low-precision contract (#266)".
 
 Five code paths are gated, because each is a separate implementation of the same
 function and a mismatch between them is exactly the bug this harness exists to catch:
@@ -58,7 +63,7 @@ comparisons by construction, which makes them immune to the cross-machine drift 
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
 | `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. Also #264's `verifyBlock` oracle — see below; it adds no new tensor. |
 | `packed.safetensors` (OPTIONAL) | `packed_tokens`/`packed_seg_ids` `int32 (1, Lp)`, `doc_lengths` `int32 (D,)` (real, pre-pad token count per doc), `packed_logits` `fp32 (1, Lp, V)` — #68/#263's packing-aware `seg_ids` oracle. Present only for `toy`/`toy-hybrid`/`toy-moe`; see "The packed (`seg_ids`) oracle" below. |
-| `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264), and (when the fixture has unquantized MoE layers with `top_k < n_experts`) `moe_load_layers` — the ABSOLUTE layer indices `load.{i}` was exported for — and `moe_route_margin_min` — the exactness-hazard guard for `load.{i}`'s exact comparison (#265) |
+| `meta.json` | config name, B/L, seed, precision (#266: REQUIRED — `monica-parity`'s band lookup key, missing/unrecognised is a hard failure), vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264), (when the fixture has unquantized MoE layers with `top_k < n_experts`) `moe_load_layers` — the ABSOLUTE layer indices `load.{i}` was exported for — and `moe_route_margin_min` — the exactness-hazard guard for `load.{i}`'s exact comparison (#265), (low-precision fixtures only) `lowp_self_mean_kl` — a MEASUREMENT, never a threshold (`monica-parity` reads thresholds only from its own table), and (only if the #266 `--allow-moe-load-omit` fallback fired) `moe_load_omitted_reason` — a DECLARED skip of the load-count oracle, never a silent one |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). As of #264 `monica-parity` checks it UNCONDITIONALLY on
@@ -205,6 +210,10 @@ exporter-private step loop.
 | `toy-gen/` | `config/toy.yaml`, `--vocab-size 512` | 1 × 8 | #167: exercises `monica-generate`'s real `--prompt` path (tokenizer → ids → model) end to end in CI. A `monica-tokenize`-trained tokenizer's vocab (256 base bytes + specials) cannot fit `toy.yaml`'s default 256-wide model, so this fixture widens the model instead of shrinking the tokenizer. Not in `monica-parity`'s default fixture list — it is consumed directly by `monica-generate` in the `swift-engine` CI job. |
 | `toy-moe-int8/` | `config/toy-moe.yaml`, `--quant-bits 8` | 2 × 40 | #168: int8 weight-only quantization (group 64, affine, `mx.quantize`-compatible). Exercises the MoE experts, Mamba projections, AND the tied embedding/head in one artifact. |
 | `toy-moe-int4/` | `config/toy-moe.yaml`, `--quant-bits 4 --quant-head-bits 8` | 2 × 40 | #168: int4, with the tied head kept at int8 — plain int4-on-embedding pushed this particular random-init toy model's KL past the int4 threshold (an accuracy risk the design doc flags), so `--quant-head-bits 8` is the recorded default for int4 fixtures. |
+| `toy-fp16/` | `config/toy.yaml`, `--precision fp16` | 2 × 40 | #266: the fp16 elementwise-band + KL-tier contract, plain Mamba. fp16 is poc's native compute precision and #167's fast-decode target. |
+| `toy-bf16/` | `config/toy.yaml`, `--precision bf16` | 2 × 40 | #266: the bf16 contract. One dense fixture only — no config in the tree trains at bf16 today, and `toy.yaml` has no MoE layers, sidestepping the wider bf16 route-margin requirement (`128 * u_bf16 = 0.5`) a MoE bf16 fixture would impose. |
+| `toy-moe-fp16/` | `config/toy-moe.yaml`, `--precision fp16 --seed 15 --moe-bias` | 2 × 40 | #266: fp16 + MoE routing. `--seed 15 --moe-bias` — no seed in `0..59` at the DEFAULT (unbiased) ranking cleared the fp16 route-margin guard (`128 * u_fp16 = 6.25e-2`; the toy model's near-uniform random-init router logits produce margins an order of magnitude too small), so this fixture uses the same `--moe-bias` fallback `toy-moe-biased` already established, then a short seed sweep among biased seeds (margin 0.371 at `--seed 15`, ~6x clear of the guard). |
+| `toy-hybrid-fp16/` | `config/toy-hybrid.yaml`, `--precision fp16` | 2 × 40 | #266: fp16 + RoPE/attention — a distinct numeric path from plain Mamba (attention softmax and the KV cache round differently at low precision) worth its own fixture. |
 
 ## The packed (`seg_ids`) oracle (#68/#263)
 
@@ -253,15 +262,26 @@ non-first document: `toy` 9.1e-2/8.3e-2, `toy-hybrid` 3.36/4.74, `toy-moe` 1.1e-
 all far clear of `1e-2`, and doc 0 in every fixture sits at ~1e-6 (floating-point noise),
 confirming the "doc 0 proves nothing" exclusion is itself correct.
 
-## Two tolerance regimes (#168)
+## Three tolerance regimes (#168 / #266)
 
-Every fixture above `toy-moe-int8`/`toy-moe-int4` is gated at the SAME fp32 contract
-(`rtol=1e-4`/`atol=1e-5`) described above — quantization does not touch that gate. The two
-quantized fixtures instead carry their OWN `rtol`/`atol` in `meta.json` (currently
-`2e-2`/`2e-2`, deliberately a *sanity* bound rather than a precision claim), which
-`monica-parity` reads and defaults to the fp32 constants when absent — this is also the
-minimal hook #266's general precision→tolerance contract builds on; do not build a second
-one there.
+Every fp32 fixture (`toy` through `toy-moe-int4` in the table above, minus the two
+quantized ones' own override) is gated at the SAME fp32 contract (`rtol=1e-4`/`atol=1e-5`)
+described above. Three regimes share the same lookup-by-`precision` machinery:
+
+1. **fp32, strict.** `meta.precision == "fp32"`, no override — the historical contract,
+   unchanged.
+2. **fp32 + quantized (#168).** The two quantized fixtures carry their OWN `rtol`/`atol`
+   in `meta.json` (currently `2e-2`/`2e-2`, deliberately a *sanity* bound rather than a
+   precision claim) — accepted ONLY because they also declare `quant_bits`, and only ever
+   LOOSENING the fp32 band (`resolved = max(band, override)`), never tightening it. This
+   is the minimal hook #266's general precision→tolerance contract builds on top of; #266
+   does not build a second one.
+3. **Low precision (#266).** `meta.precision == "fp16"`/`"bf16"`, no override — a
+   DIFFERENT contract entirely (elementwise band + a load-bearing KL tier), derived in
+   `docs/design/03-conformance.md`'s "The low-precision contract (#266)" and
+   `src/conformance/tolerances.py`. Never combined with the quantized override: a
+   low-precision fixture carrying `rtol`/`atol` without `quant_bits` is a hard FAILURE in
+   `monica-parity`, not a silently-honoured loosening.
 
 A quantized fixture is checked THREE separate ways, because "Swift's true quantized kernel
 vs a Python reference" bundles two very different questions that must not be conflated:
@@ -316,7 +336,42 @@ well-posed rather than flaky.
     --quant-bits 4 --quant-group-size 64 --quant-head-bits 8 --seed 1
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
     --out swift/engine/Fixtures/toy-short --batch 1 --seq 2 --gen-steps 8
+.venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
+    --out swift/engine/Fixtures/toy-fp16 --batch 2 --seq 40 --precision fp16
+.venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
+    --out swift/engine/Fixtures/toy-bf16 --batch 2 --seq 40 --precision bf16
+.venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
+    --out swift/engine/Fixtures/toy-moe-fp16 --batch 2 --seq 40 \
+    --precision fp16 --seed 15 --moe-bias
+.venv/bin/python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
+    --out swift/engine/Fixtures/toy-hybrid-fp16 --batch 2 --seq 40 --precision fp16
 ```
+
+**#266's low-precision fixtures carry no `--packed-doc-lengths`** — P6's packing gate
+reuses the file-level DTYPE band already, so a low-precision packed fixture would work,
+but none of the four adds one (the fp32 packed fixtures already cover the packing code
+paths; adding packing here would only grow CI runtime for no new coverage).
+
+**`toy-moe-fp16`'s `--seed 15 --moe-bias`** is the #266 fallback ladder in action: the
+fp16 route-margin guard (`128 * u_fp16 = 6.25e-2`) is far stricter than fp32's historical
+`1e-5`, and `toy-moe.yaml`'s near-uniform random-init router logits could not clear it at
+the DEFAULT (unbiased) ranking for any seed in `0..59`. Falling back to `--moe-bias` (the
+same asymmetric bias `toy-moe-biased` already uses) widened the achievable margins
+considerably; `--seed 15` was the first of a short sweep (`0..19`, biased) to clear the
+guard, at margin `0.371` — about 6x clear. If a future regeneration needs a new seed, the
+documented ladder is unchanged: seed search at the default ranking, then `--moe-bias` +
+seed search, then (only if both fail) `--allow-moe-load-omit`, which records
+`moe_load_omitted_reason` in `meta.json` instead of raising — `monica-parity` accepts a
+DECLARED omission as a legitimate skip, never a silent one.
+
+**A local MLX (0.32.0) buffer-protocol gap surfaced while adding `toy-bf16`:** converting
+a `bfloat16` MLX array straight to numpy via the buffer protocol fails
+(`RuntimeError: Item size 2 ... does not match ... item size 1`) for INTERMEDIATE arrays
+(hidden states, mixing matrices, per-layer state) — final logits were never affected
+(the head computes in fp32 already). The exporter's `_np_f32` helper casts to fp32 inside
+MLX before the numpy conversion, sidestepping it. This is separate from #298 (the
+buffer-CACHE-reuse corruption bug); `mx.clear_cache()`/`mx.set_cache_limit(0)` stays
+exactly as documented below and did not need to change for this.
 
 `--seed 1` is pinned for the quantized fixtures because the toy model's RANDOM-INIT
 weights produce near-uniform logits — small quantization perturbations move a

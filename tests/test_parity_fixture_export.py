@@ -33,6 +33,7 @@ mx.set_cache_limit(0)
 from safetensors.numpy import load_file            # noqa: E402
 
 from scripts.export_parity_fixture import build_fixture   # noqa: E402
+from src.conformance.tolerances import band_for           # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[1] / "swift" / "engine" / "Fixtures" / "toy"
 MOE_FIXTURE = FIXTURE.parent / "toy-moe"
@@ -142,6 +143,43 @@ def test_checked_in_tokens_are_reproducible():
     tokens = load_file(str(FIXTURE / "inputs.safetensors"))["tokens"]
     expected = np.random.default_rng(0).integers(0, 256, size=(2, 129)).astype(np.int32)
     np.testing.assert_array_equal(tokens, expected)
+
+
+FP16_FIXTURE = FIXTURE.parent / "toy-fp16"
+
+
+def test_checked_in_toy_fp16_fixture_matches_todays_backend(tmp_path):
+    """#266: the low-precision oracle rots exactly like the fp32 one does — a future
+    change to `mlx_backend.py`'s math must be caught here, not first noticed as a
+    stale-fixture failure in Swift CI. Compared at fp16's OWN band (not fp32's 1e-4/1e-5,
+    which would be meaningless here — see src/conformance/tolerances.py), matching
+    `monica-parity`'s own resolved band for this fixture.
+
+    If fp16 re-export ever proves non-deterministic in CI (see #298), the documented
+    fallback is to downgrade this to 'recorded measurements agree within 2x' rather than
+    deleting the check — T6 in tests/test_lowp_parity_band.py's docstring already
+    confirmed reproducibility on this host at the time #266 landed."""
+    assert FP16_FIXTURE.is_dir(), f"missing checked-in fixture {FP16_FIXTURE}"
+    meta_ref = load_file(str(FP16_FIXTURE / "reference.safetensors"))
+    meta_json = json.loads((FP16_FIXTURE / "meta.json").read_text())
+    assert meta_json["precision"] == "fp16"
+    rtol, atol = band_for("fp16")
+
+    build_fixture("config/toy.yaml", str(tmp_path / "toy-fp16"), batch=2, seq=40,
+                  precision="fp16")
+    fresh = load_file(str(tmp_path / "toy-fp16" / "reference.safetensors"))
+
+    assert set(fresh.keys()) == set(meta_ref.keys()), (
+        f"toy-fp16 reference.safetensors key set drifted (missing="
+        f"{sorted(set(meta_ref) - set(fresh))}, extra={sorted(set(fresh) - set(meta_ref))})")
+    for key in sorted(meta_ref.keys()):
+        assert np.allclose(fresh[key], meta_ref[key], rtol=rtol, atol=atol), (
+            f"toy-fp16 reference.safetensors[{key!r}] drifted from the checked-in "
+            f"Swift-parity oracle (max|d| = "
+            f"{np.abs(fresh[key] - meta_ref[key]).max():.3e}, band rtol={rtol} "
+            f"atol={atol}). If the backend change is intended, regenerate the fixtures "
+            "— see swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+        )
 
 
 def test_checked_in_toy_moe_fixture_load_counts_match_todays_backend(tmp_path):

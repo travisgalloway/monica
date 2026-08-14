@@ -1,0 +1,20 @@
+{
+  "config": "toy.yaml",
+  "batch": 2,
+  "seq": 40,
+  "seed": 0,
+  "precision": "fp16",
+  "vocab_size": 256,
+  "gen_steps": 16,
+  "mlx_version": "0.32.0",
+  "moe_bias": false,
+  "forward_step_max_abs_diff": 0.0009418725967407227,
+  "prefill_decode_max_abs_diff": 0.0002048015594482422,
+  "prefill_decode_max_abs_state_diff": 0.00048828125,
+  "greedy_margin_min": 6.31350040435791,
+  "mixing_layers": [
+    0,
+    1
+  ],
+  "lowp_self_mean_kl": 1.702213082485812e-09
+}
