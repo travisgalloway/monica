@@ -411,6 +411,55 @@ measurement contract:
 - **Dropped arms:** two-clock "slow-clock structural state" (conflicts with the MoE spine) and the
   diffusion path.
 
+### #230 — RLVR/GRPO verifier reward (Phase 1 shipped)
+
+Promotes the LSP/opengrep oracle from a measurement-only harness to a **verifier reward**:
+GRPO's within-group standardization (`group_advantages`) is itself the diagnostic-cleanliness
+reranker, so no new sampling/training plumbing was needed — the whole net-new surface is one
+reward function (`src/train/verifiers.py`'s `diagnostics_to_reward` + `LspVerifier`) wired into
+`scripts/rlvr.py` via `--reward lsp`.
+
+- **Reward shape.** `reward = max(base_clean − Σ severity_weight(d), diag_floor)` over the
+  oracle's findings on the FULL artifact (`prompt + completion` — a completion fragment alone
+  isn't standalone TypeScript); clean → `+1.0`, each surviving Error → `−0.30` (the density term
+  that keeps an all-clean/all-dirty group from producing zero GRPO advantage), floor for an
+  honest-but-dirty attempt `−0.5`.
+- **Two anti-Goodhart guards, both dominant over the density term.** `hacked` (any #225 M5
+  escape hatch — `@ts-ignore`/`as any`/etc. — present in the completion) and `degenerate` (empty /
+  whitespace-only / comment-only / near-empty output) each force the reward to `−1.0`,
+  strictly below `diag_floor`. Without that ordering, a many-diagnostic honest attempt could
+  score *below* a suppression hack (inverting the intended ranking) or a single 20-diagnostic
+  outlier could squash an entire group's advantages toward zero after standardization — both
+  silent training failures the floor exists to prevent. Guards are evaluated on the
+  **completion alone** (the prompt may legitimately contain `as any` or an unfinished body);
+  only the model's own text is penalized.
+- **`SUPPRESSION_RE`-vs-superset — deliberately the superset.** Like #226/#227, this arm imports
+  `src.lsp.diagnostics.find_escape_hatches` (the #225 M5 ten-hatch superset), not the narrow
+  `SUPPRESSION_RE` that stays reserved for `harness.py`'s in-loop rollback control (see that
+  module's decision-record comment). `--lsp-hatches directives` restricts to the five explicit
+  directives for an ablation that isolates the two known-noisy superset members (`empty_body`,
+  `non_null_assertion`); `--lsp-hatches none` disables the hack floor entirely (control arm only).
+- **Cost model.** #278 established a ~350ms client-side debounce floor per `didChange` on the
+  pinned `typescript-language-server` 5.3.0 that no project-size reduction removes, so
+  `oracle.wall_s ≈ K × prompts_per_step × steps × per-call latency` dominates step time at
+  scale — e.g. K=8 × 200 steps ≈ 1600 calls ≈ 9–10 minutes of pure oracle wall. `--oracle ts`
+  (not `both`) is the default for this reason; `scripts/rlvr.py` logs `oracle_wall_frac`
+  (oracle wall ÷ elapsed wall) every `--log-every` step and writes `telemetry.json` so a run's
+  real cost is measured, not assumed.
+- **No prompt-baseline subtraction.** The prompt's own diagnostics are constant across all K
+  samples of a GRPO group and cancel exactly under `group_advantages`' standardization, so
+  `LspVerifier` scores `prompt + completion` without a second oracle call to subtract a
+  per-prompt baseline — it shifts `mean_reward` in the logs but not the gradient.
+- **Scope.** This is Phase 1 only (diagnostic-cleanliness + anti-hack + anti-degenerate +
+  telemetry + the `scripts/build_rlvr_prompts.py` train/val split over the checked-in
+  `eval_sets/ts_error_injection` + `humaneval_ts` sets). Phase 2 (a reference-based over-repair
+  penalty on `clean_control` rows) is deferred to a follow-up issue — it needs a
+  `{prompt, reference, kind:"clean_control"}` data-format change the issue itself sequences
+  second. The RLVR *accept* criteria (monotone `error_avoidance_rate` gain vs. a math/random
+  control, with no hatch-rate rise) need a real GPU run under the #225 M4 null-arm control and
+  are not claimed here — this PR ships the mechanism and the telemetry that makes that run
+  measurable.
+
 ### Why SSI is secondary — the recorded assessment
 
 The LSP-in-the-loop experiment (design record + measurement in
