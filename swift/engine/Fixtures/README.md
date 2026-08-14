@@ -31,6 +31,7 @@ function and a mismatch between them is exactly the bug this harness exists to c
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
 | `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. |
 | `meta.json` | config name, B/L, seed, precision, vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, and the minimum greedy margin |
+| `train.safetensors` (#195, `toy`/`toy-hybrid`/`toy-moe` only) | `mb.{j}.inputs`/`mb.{j}.targets` int32 micro-batches, and per step `k` in `0..<train_steps`: `loss.{k}`, `grad_norm.{k}` (scalars), `grad.{k}.<param>` (the full gradient tree, pre-clip), `weights_after.{k}.<param>` (the full parameter tree, post-optimizer-update) — the K-step training-trajectory oracle `monica-train` gates against |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). `monica-parity` only reads it on failure, to report
@@ -61,6 +62,28 @@ exporter-private step loop.
 | `toy-gen/` | `config/toy.yaml`, `--vocab-size 512` | 1 × 8 | #167: exercises `monica-generate`'s real `--prompt` path (tokenizer → ids → model) end to end in CI. A `monica-tokenize`-trained tokenizer's vocab (256 base bytes + specials) cannot fit `toy.yaml`'s default 256-wide model, so this fixture widens the model instead of shrinking the tokenizer. Not in `monica-parity`'s default fixture list — it is consumed directly by `monica-generate` in the `swift-engine` CI job. |
 | `toy-moe-int8/` | `config/toy-moe.yaml`, `--quant-bits 8` | 2 × 40 | #168: int8 weight-only quantization (group 64, affine, `mx.quantize`-compatible). Exercises the MoE experts, Mamba projections, AND the tied embedding/head in one artifact. |
 | `toy-moe-int4/` | `config/toy-moe.yaml`, `--quant-bits 4 --quant-head-bits 8` | 2 × 40 | #168: int4, with the tied head kept at int8 — plain int4-on-embedding pushed this particular random-init toy model's KL past the int4 threshold (an accuracy risk the design doc flags), so `--quant-head-bits 8` is the recorded default for int4 fixtures. |
+
+### Which fixtures get a training oracle (#195)
+
+Three of the seven above additionally carry `train.safetensors` (via `--train-steps 3`):
+**`toy`** (pure Mamba/SSD backward), **`toy-hybrid`** (attention + RoPE backward), and
+**`toy-moe`** (router argsort-mask + expert backward) — one representative fixture per
+distinct backward-pass shape in the tree. The other four are excluded, each for a stated
+reason:
+
+* `toy-short` (L=2) — the conv left-pad edge case is inference/prefill-specific; there is
+  no training-side analogue.
+* `toy-moe-biased` — the route bias is an inference-side ranking input; the Loss-Free-
+  Balancing *write* path is DEFERRED (see `.claude/plans/issue-195.md`), so this fixture
+  would add no training coverage over `toy-moe`.
+* `toy-moe-int8`/`toy-moe-int4` — training a quantized checkpoint is out of scope
+  entirely: `QuantizedLinear`'s packed uint32 codes have no meaningful weight gradient.
+  The exporter refuses `--train-steps` combined with `--quant-bits`.
+
+`monica-train` carries its OWN default fixture list (`toy`, `toy-hybrid`, `toy-moe`,
+narrower than `monica-parity`'s seven) and treats a missing `train.safetensors` in a
+fixture it was asked to check as a **FAILURE, not a skip** — the same standing rule every
+other oracle file in this directory follows.
 
 ## Two tolerance regimes (#168)
 
@@ -101,15 +124,32 @@ margins, and Swift decodes through the true quantized kernel, so a margin comfor
 of the loose kernel tolerance is needed for cross-implementation greedy-id equality to stay
 well-posed rather than flaky.
 
+## A third tolerance regime: training (#195)
+
+`train.safetensors`'s four surfaces (`loss`, `grad_norm`, the full `grad.{k}.<param>`
+tree, and the full `weights_after.{k}.<param>` tree) are compared at their OWN
+`train_rtol`/`train_atol` in `meta.json` — new keys, deliberately not `rtol`/`atol` (those
+are the quantized fixtures' logit-gate keys, `2e-2`/`2e-2`, which would be far too loose
+here and would gate nothing). A training step is not a forward pass: gradients accumulate
+error through the whole backward graph, and AdamW moments compound it across steps.
+`loss` is a pure forward quantity and stays at the same tight regime the fp32 logit gate
+uses; `grad_norm`/`grad`/`weights_after` sit in a looser `2e-4`/`1e-6` band — tighter atol
+than the fp32 gate's `1e-5` (which would be *looser than the grad values themselves* on
+small toy leaves and gate nothing there), traded against a looser rtol to absorb the fp32
+summation-order difference between Python's `tree_flatten`-order reduction and Swift's
+sorted-key-order one. See `docs/design/14-inference-engine.md`'s #195 entry for the full
+rationale, including why `MLXOptimizers.clipGradNorm` is NOT used (R2: its strict `<`
+clip boundary differs from Python's unconditional `min(1.0, clip/(norm+eps))`).
+
 ## Regenerating
 
 ```bash
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
-    --out swift/engine/Fixtures/toy --batch 2 --seq 129
+    --out swift/engine/Fixtures/toy --batch 2 --seq 129 --train-steps 3
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
-    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40
+    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40 --train-steps 3
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
-    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40
+    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40 --train-steps 3
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
     --out swift/engine/Fixtures/toy-moe-biased --batch 2 --seq 40 --moe-bias
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
@@ -149,7 +189,10 @@ that is internally inconsistent can never reach disk.
 `tests/test_parity_fixture_export.py` re-exports `toy` into a tmpdir and compares it to the
 checked-in reference (logits, `greedy_ids`, AND `prefill.safetensors`'s logits/state). That
 is what stops a future change to `mlx_backend.py`'s math from silently leaving the Swift
-gate testing a stale oracle.
+gate testing a stale oracle. `tests/test_train_parity_fixture_export.py` does the same for
+`train.safetensors` (#195), re-exporting `toy` with `--train-steps 3` and comparing every
+key at the training tolerance above — the guard against `mlx_train_step.py`'s math
+silently drifting from `monica-train`'s oracle.
 
 ## `poc` is deliberately NOT checked in
 

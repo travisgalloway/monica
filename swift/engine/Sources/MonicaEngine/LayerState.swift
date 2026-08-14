@@ -19,11 +19,13 @@ public enum LayerState {
 public enum EngineError: Error, CustomStringConvertible {
     case stateMismatch(String)
     case badCheckpoint(String)
+    case unsupportedOptimizer(String)
 
     public var description: String {
         switch self {
         case .stateMismatch(let m): return "state mismatch: \(m)"
         case .badCheckpoint(let m): return "bad checkpoint: \(m)"
+        case .unsupportedOptimizer(let m): return "unsupported optimizer: \(m)"
         }
     }
 }

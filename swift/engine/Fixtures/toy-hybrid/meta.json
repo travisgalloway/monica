@@ -11,5 +11,29 @@
   "forward_step_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_diff": 9.5367431640625e-07,
   "prefill_decode_max_abs_state_diff": 5.960464477539062e-07,
-  "greedy_margin_min": 1.4541618824005127
+  "greedy_margin_min": 1.4541618824005127,
+  "train_steps": 3,
+  "train_grad_accum": 2,
+  "train_grad_clip": 1.5395530462265015,
+  "train_lrs": [
+    0.001,
+    0.0005,
+    0.0002
+  ],
+  "train_loss": [
+    5.951314926147461,
+    5.175178050994873,
+    4.860827445983887
+  ],
+  "train_grad_norm": [
+    2.9856643676757812,
+    1.5395644903182983,
+    1.2627768516540527
+  ],
+  "train_clipped_steps": [
+    0,
+    1
+  ],
+  "train_rtol": 0.0002,
+  "train_atol": 1e-06
 }

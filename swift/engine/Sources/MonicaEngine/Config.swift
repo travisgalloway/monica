@@ -70,6 +70,12 @@ public struct MambaConfig: Decodable, Sendable {
     public var dtMax: Float = 1e-1
     public var dtInitFloor: Float = 1e-4
 
+    // --- optimizer (#237, decoded so #195's train step can guard on it; TrainStep.swift
+    // only ever builds AdamW and throws on either of these asking for something else,
+    // rather than silently substituting AdamW for a poc sidecar that wanted Muon/8-bit) ---
+    public var optimizer: String = "adamw"
+    public var optimizer8bit: Bool = false
+
     enum CodingKeys: String, CodingKey {
         case dModel = "d_model"
         case nLayers = "n_layers"
@@ -93,6 +99,8 @@ public struct MambaConfig: Decodable, Sendable {
         case dtMin = "dt_min"
         case dtMax = "dt_max"
         case dtInitFloor = "dt_init_floor"
+        case optimizer
+        case optimizer8bit = "optimizer_8bit"
     }
 
     // --- derived properties: transliterated from blocks.py:163-209 ---

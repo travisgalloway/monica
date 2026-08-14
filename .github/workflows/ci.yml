@@ -388,6 +388,32 @@ jobs:
             exit 1
           fi
           "$BIN"
+      # ── #195: monica-train — the training-step + optimizer parity gate ──
+      - name: monica-train --self-test (DynamicLossScaler policy, no MLX math needed)
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-train -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-train binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          echo "MONICA_TRAIN_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" --self-test
+      - name: monica-train fixture gate (loss / grad-norm / grad-tree / post-step-weights)
+        # The tolerance-calibration round trip: this is the FIRST execution of mlx-swift's
+        # autodiff against the Swift engine (mlx-swift cannot run on the CLT-only dev
+        # host at all, see docs/design/14-inference-engine.md's #195 entry) — achieved
+        # max|d| per surface is printed even on success, so a first-run failure here is
+        # expected to be diagnosed via that output, not treated as a flake.
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN"
+      - name: monica-train --overflow-check (fp16 skip branch, end to end)
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN --overflow-check toy"
+      - name: monica-train --train (free-running, the issue's literal decreasing-loss AC)
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN --train Fixtures/toy --steps 20 --lr 1e-3"
       # ── #167: the generation CLI, self-test + tokenizer-free + native-tokenizer paths ──
       - name: monica-generate self-test (sampler semantics, no weights/MLX needed)
         working-directory: swift/engine
