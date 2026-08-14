@@ -14,18 +14,29 @@ MLX-gated, like the other ~19 mlx-only test files: runs on `full-macos`, skips e
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-pytest.importorskip("mlx.core")
+mx = pytest.importorskip("mlx.core")
+# #298: this local MLX build (0.32.0) has been observed to silently corrupt a computation
+# when many independently-constructed models allocate/free buffers of the same size class
+# within one process — exactly what `build_fixture` (re-invoked below) and the fresh
+# `MLXMambaModel` construction in the route-bias test do inside an already-populated
+# pytest process. Same mitigation as `scripts/export_parity_fixture.py` and
+# `tests/test_mlx_mixing_matrix.py`: disable the buffer-cache pool for this module.
+mx.clear_cache()
+mx.set_cache_limit(0)
 
 from safetensors.numpy import load_file            # noqa: E402
 
 from scripts.export_parity_fixture import build_fixture   # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[1] / "swift" / "engine" / "Fixtures" / "toy"
+MOE_FIXTURE = FIXTURE.parent / "toy-moe"
+MOE_BIASED_FIXTURE = FIXTURE.parent / "toy-moe-biased"
 # The same tolerance monica-parity applies, with the checked-in array as the reference
 # operand (np.allclose is asymmetric in rtol).
 RTOL, ATOL = 1e-4, 1e-5
@@ -131,3 +142,90 @@ def test_checked_in_tokens_are_reproducible():
     tokens = load_file(str(FIXTURE / "inputs.safetensors"))["tokens"]
     expected = np.random.default_rng(0).integers(0, 256, size=(2, 129)).astype(np.int32)
     np.testing.assert_array_equal(tokens, expected)
+
+
+def test_checked_in_toy_moe_fixture_load_counts_match_todays_backend(tmp_path):
+    """#265: the load-count oracle (`load.{i}`) rots exactly like the logit oracle does —
+    a future change to `_moe`'s routing math (`mlx_backend.py`) must be caught here, not
+    first noticed as a stale-fixture failure in Swift CI.
+
+    Counts are EXACT integers (`assert_array_equal`, never `allclose`/`rtol`/`atol`) —
+    the #265 rule that this port must never blur the distinction between the logit
+    oracle (a tolerance comparison) and the count oracle (an exact one)."""
+    assert MOE_FIXTURE.is_dir(), f"missing checked-in fixture {MOE_FIXTURE}"
+    meta_ref = load_file(str(MOE_FIXTURE / "reference.safetensors"))
+
+    build_fixture("config/toy-moe.yaml", str(tmp_path / "toy-moe"), batch=2, seq=40,
+                  packed_doc_lengths="Q,7,Q+3")
+    fresh = load_file(str(tmp_path / "toy-moe" / "reference.safetensors"))
+
+    # A dropped oracle key rots as quietly as a drifted one (the #264 rule this test file
+    # already applies to hidden.*/mixing.*) — so the key sets must match exactly.
+    ref_keys = set(meta_ref.keys())
+    fresh_keys = set(fresh.keys())
+    assert fresh_keys == ref_keys, (
+        f"reference.safetensors key set drifted from the checked-in toy-moe oracle "
+        f"(missing={sorted(ref_keys - fresh_keys)}, extra={sorted(fresh_keys - ref_keys)}). "
+        "If the backend change is intended, regenerate the fixture — see "
+        "swift/engine/Fixtures/README.md.")
+
+    for key in ("load.1", "load.3"):
+        np.testing.assert_array_equal(
+            fresh[key], meta_ref[key],
+            err_msg=f"reference.safetensors[{key!r}] drifted from the checked-in toy-moe "
+                    "load-count oracle. Counts are exact integers — this must be exact "
+                    "equality, never a tolerance comparison. If the backend change is "
+                    "intended, regenerate the fixture — see swift/engine/Fixtures/README.md.")
+
+    fresh_meta = json.loads((tmp_path / "toy-moe" / "meta.json").read_text())
+    assert fresh_meta.get("moe_load_layers") == [1, 3], fresh_meta.get("moe_load_layers")
+    margin = fresh_meta.get("moe_route_margin_min")
+    assert margin is not None and margin > 1e-5, (
+        f"moe_route_margin_min={margin!r} must be present and above the exact-comparison "
+        "hazard threshold (1e-5) — see export_parity_fixture.py's #265 section.")
+
+
+def test_route_bias_write_lands_in_the_logits_and_the_counts():
+    """The strongest available proof that #265's `set_moe_biases` WRITE path actually
+    lands: build a fresh model from `toy-moe`'s (unbiased) checked-in weights, push
+    `toy-moe-biased`'s own checked-in route-bias vectors into it via `set_moe_biases`, and
+    assert BOTH the forward logits and the load counts reproduce `toy-moe-biased`'s
+    checked-in oracle — not merely that the call doesn't raise. The bias is read out of
+    `toy-moe-biased`'s `weights.safetensors` rather than hard-coded, so this can never
+    drift from the fixture it is checked against."""
+    from src.model.blocks import load_config
+    from src.model.mlx_backend import MLXMambaModel
+
+    assert MOE_FIXTURE.is_dir() and MOE_BIASED_FIXTURE.is_dir()
+
+    cfg = load_config("config/toy-moe.yaml")
+    model = MLXMambaModel(cfg)
+    model.load(str(MOE_FIXTURE / "weights.safetensors"))   # toy-moe: no bias keys, unbiased
+
+    biased_weights = load_file(str(MOE_BIASED_FIXTURE / "weights.safetensors"))
+    bias_layers = sorted(
+        int(k.split(".", 1)[1]) for k in biased_weights if k.startswith("moe_route_bias."))
+    assert bias_layers == [i for i, l in enumerate(model.layers)
+                           if l.__class__.__name__ == "MoEBlock"], bias_layers
+    biases = [biased_weights[f"moe_route_bias.{i}"].tolist() for i in bias_layers]
+    model.set_moe_biases(biases)
+
+    tokens = load_file(str(MOE_FIXTURE / "inputs.safetensors"))["tokens"]
+    model.set_moe_load_counting(True)
+    model.pop_moe_load()      # drain (nothing has run yet on this fresh model — hygiene)
+    logits = np.array(model.forward(tokens), dtype=np.float32)
+    loads = model.pop_moe_load()
+    model.set_moe_load_counting(False)
+
+    biased_ref = load_file(str(MOE_BIASED_FIXTURE / "reference.safetensors"))
+    assert np.allclose(logits, biased_ref["forward_logits"], rtol=RTOL, atol=ATOL), (
+        f"forward_logits after set_moe_biases do not reproduce toy-moe-biased's checked-in "
+        f"oracle (max|d| = {np.abs(logits - biased_ref['forward_logits']).max():.3e}) — the "
+        "route-bias write path did not land.")
+
+    for layer_idx, counts in zip(bias_layers, loads):
+        np.testing.assert_array_equal(
+            np.asarray(counts, dtype=np.float32), biased_ref[f"load.{layer_idx}"],
+            err_msg=f"load counts for layer {layer_idx} after set_moe_biases do not "
+                    "reproduce toy-moe-biased's checked-in oracle exactly — the route-bias "
+                    "write path did not land in the routing decision.")

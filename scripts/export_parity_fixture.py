@@ -110,7 +110,8 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
 
     from src.eval.quantize import (
         dequantize_portable_state_dict, quant_targets, quantize_portable_state_dict)
-    from src.model.mlx_backend import AttentionBlock, MambaBlock, MLXMambaModel, MoEBlock
+    from src.model.mlx_backend import (
+        _DTYPES, _f32, _linear, AttentionBlock, MambaBlock, MLXMambaModel, MoEBlock)
     from src.serve import sampling
     from src.serve.generate import generate as py_generate
     from src.serve.sessions import SessionStore
@@ -229,7 +230,75 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
 
         save_file({"tokens": tokens}, str(out / "inputs.safetensors"))
 
+        # --- #265: MoE load counting + route-bias write-back oracle ------------------------
+        # Load counting does not depend on the balancer (`moe_balance_rate` is null in every
+        # config in the tree, #217) — `set_moe_load_counting` is an independent switch
+        # (`mlx_backend.py:992-996`), so the harness turns it on explicitly around exactly the
+        # forward pass whose logits are already pinned above. `top_k < n_experts` is required
+        # because Python counts only in the `k < E` branch (at `k == E` no mask exists and
+        # balancing is vacuous).
+        moe_blocks_list = ref_model.moe_blocks()
+        count_loads = quant_bits is None and bool(moe_blocks_list) and cfg.top_k < cfg.n_experts
+        if count_loads:
+            ref_model.set_moe_load_counting(True)
+            # Drain first: `check_forward_step_parity`/`check_prefill_decode_parity` above
+            # already ran forwards on this model and would otherwise contribute counts to
+            # the pinned pass below.
+            ref_model.pop_moe_load()
         forward_logits = np.array(ref_model.forward(tokens), dtype=np.float32)
+        moe_load_layers: list[int] = []
+        moe_loads: list[list[float]] = []
+        moe_route_margin_min = None
+        if count_loads:
+            moe_loads = ref_model.pop_moe_load()
+            ref_model.set_moe_load_counting(False)   # off before hidden_states/generation below
+            moe_load_layers = [i for i, l in enumerate(ref_model.layers) if isinstance(l, MoEBlock)]
+            expected_total = tokens.size * cfg.top_k
+            length_mismatch = len(moe_loads) != len(moe_load_layers)
+            all_zero = all(c == 0 for row in moe_loads for c in row)
+            # `zip` (not indexed) so a length mismatch can never silently truncate the check —
+            # `length_mismatch` above already refuses on that shape, independent of this loop.
+            bad_totals = [] if length_mismatch else [
+                (i, sum(row)) for i, row in zip(moe_load_layers, moe_loads)
+                if abs(sum(row) - expected_total) > 1e-6]
+            if not moe_load_layers or length_mismatch or all_zero or bad_totals:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: the load-count oracle would be a silent "
+                    f"no-op (layers={moe_load_layers}, length_mismatch={length_mismatch}, "
+                    f"all_zero={all_zero}, bad_totals={bad_totals}, "
+                    f"expected per-layer total={expected_total})")
+
+            # The exactness hazard: load.{i} is compared without tolerance, exactly like
+            # greedy_ids — and greedy_ids is only safe because the exporter records
+            # greedy_margin_min. Compute the analogue: the gap between the k-th and
+            # (k+1)-th largest SELECTION score (`logits + route_bias` when the bias is
+            # active, else `logits`) per token, per MoE layer — reconstructed from the SAME
+            # expression `_moe` ranks by, so this can never describe a different ranking
+            # than the counts above.
+            hs_for_margin = ref_model.hidden_states(tokens)   # hs_for_margin[i] is layer i's INPUT
+            cd = _DTYPES[cfg.precision]
+            margin_per_layer: dict[int, float] = {}
+            for i in moe_load_layers:
+                layer = ref_model.layers[i]
+                xn = layer.norm(hs_for_margin[i])
+                logits_i = _f32(_linear(layer.router, xn, cd))
+                sel = logits_i + layer._route_bias if layer._bias_active else logits_i
+                sorted_desc = mx.sort(sel, axis=-1)[..., ::-1]
+                margin = sorted_desc[..., cfg.top_k - 1] - sorted_desc[..., cfg.top_k]
+                margin_per_layer[i] = float(mx.min(margin).item())
+            moe_route_margin_min = min(margin_per_layer.values())
+            if moe_route_margin_min < 1e-5:
+                raise SystemExit(
+                    f"refusing to write {out_dir}: moe_route_margin_min="
+                    f"{moe_route_margin_min:.3e} is inside the exact-comparison hazard band "
+                    "(< 1e-5) — a near-tie routing rank makes load.{i} equality flaky across "
+                    f"implementations. Bump --seed and retry (per-layer minima={margin_per_layer})")
+            for i, m in margin_per_layer.items():
+                if m < 1e-3:
+                    print(f"WARNING: {out_dir} layer {i} moe_route_margin_min={m:.3e} is "
+                         "below 1e-3 — routing rank is close to a tie; watch this fixture for "
+                         "future flakes.")
+
         state = ref_model.init_state(batch)
         steps = []
         for t in range(seq):
@@ -264,6 +333,12 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                     f"refusing to write {out_dir}: mixing_matrices() returned no layers for a "
                     "config with at least one Mamba layer — the mixing-matrix oracle would be "
                     "a silent no-op")
+        # `load.{i}` (#265), keyed by ABSOLUTE layer index like `mixing.{i}` — the per-expert
+        # token counts from the pinned forward pass above. Present only when `count_loads`,
+        # so the six non-participating fixtures (no MoE layers, or quantized) keep
+        # byte-identical metadata.
+        for i, counts in zip(moe_load_layers, moe_loads):
+            ref[f"load.{i}"] = np.asarray(counts, dtype=np.float32)
         save_file(ref, str(out / "reference.safetensors"))
         if dequant_ref:
             save_file(dequant_ref, str(out / "dequant_ref.safetensors"))
@@ -435,6 +510,9 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         }
         if quant_bits is None:
             meta["mixing_layers"] = mixing_layers
+        if count_loads:
+            meta["moe_load_layers"] = moe_load_layers
+            meta["moe_route_margin_min"] = moe_route_margin_min
         if packed_meta_doc_lengths is not None:
             # Human-readable only (#68/#263) — monica-parity's P6 section reads the shapes it
             # needs (doc_lengths, chunk_size) straight out of packed.safetensors/the loaded

@@ -16,6 +16,11 @@
     0,
     2
   ],
+  "moe_load_layers": [
+    1,
+    3
+  ],
+  "moe_route_margin_min": 9.205937385559082e-05,
   "packed_doc_lengths": [
     64,
     7,

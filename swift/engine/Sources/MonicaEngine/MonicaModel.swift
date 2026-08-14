@@ -142,6 +142,43 @@ public final class MonicaModel: Module {
         layers.compactMap { $0 as? MoEBlock }
     }
 
+    // MARK: - Loss-Free-Balancing accessors (#213 / #265, `mlx_backend.py:963-1002`)
+
+    /// `set_moe_biases` (`:969-983`) — push per-layer route-bias vectors into each MoE
+    /// block, in layer order. A layer-count mismatch throws rather than `zip`-truncating:
+    /// leaving some routers on the old bias while others take the new one is a
+    /// partially-activated routing state that would be very hard to notice mid-run.
+    /// Per-vector length is checked by `MoEBlock.setRouteBias`.
+    public func setMoeBiases(_ biases: [[Float]]) throws {
+        let blocks = moeBlocks()
+        guard biases.count == blocks.count else {
+            throw EngineError.badCheckpoint(
+                "got \(biases.count) bias vectors for \(blocks.count) MoE layers")
+        }
+        for (block, vec) in zip(blocks, biases) {
+            try block.setRouteBias(vec)
+        }
+    }
+
+    /// `moe_biases` (`:985-990`) — per-MoE-layer route biases as host floats, in layer
+    /// order (an inactive block reports `[]`, `routeBias ?? []`).
+    public func moeBiases() -> [[Float]] {
+        moeBlocks().map { $0.routeBias ?? [] }
+    }
+
+    /// `set_moe_load_counting` (`:992-996`) — enable/disable per-expert load counting on
+    /// every MoE block. Off by default; the harness/training wiring turns it on explicitly.
+    public func setMoeLoadCounting(_ flag: Bool) {
+        for block in moeBlocks() { block.setLoadCounting(flag) }
+    }
+
+    /// `pop_moe_load` (`:998-1002`) — per-MoE-layer accumulated expert-load counts since
+    /// the last pop, in layer order, resetting each block's accumulator. `[]` when the
+    /// model has no MoE layers (dense/hybrid-only).
+    public func popMoeLoad() -> [[Float]] {
+        moeBlocks().map { $0.popLoad() }
+    }
+
     // MARK: - interpretability accessors (`mixing_matrices`/`verify_block`, #264/#100/#52)
 
     /// `mixing_matrices` (`mlx_backend.py:938-950`, corrected guard): each Mamba layer's
