@@ -547,6 +547,7 @@ for dir in fixtureDirs {
         // and the two SAME-PROCESS exact-tensor comparisons ((a) and (b)) are immune to
         // the cross-machine drift that broke #293's checked-in gradient oracle.
         do {
+            let priorFailCount = failures.count
             // When the caller didn't ask to keep the round-trip artifacts
             // (`--roundtrip-out`), we write to a scratch dir under the system temp
             // directory — clean it up on the way out so repeated local runs don't
@@ -618,7 +619,20 @@ for dir in fixtureDirs {
             // that just byte-copied the source file would pass (a) too. Mutates modelB
             // (the round-tripped copy from (a), otherwise unused from here on) rather
             // than the shared `model`, which the #168 quant section below still reads.
-            modelB.normF.weight = modelB.normF.weight * MLXArray(Float(2))
+            //
+            // mlx-swift caches MLXArray references via Mirror at the first items() call
+            // and never re-scans. Direct property assignment (`model.normF.weight = ...`)
+            // replaces the STORED PROPERTY reference but leaves the cache pointing at the
+            // old MLXArray — so parameters()/portableStateDict still see the old value.
+            // model.update(parameters:) calls _updateInternal on the cached arrays in
+            // place: both the stored property and the cache remain the SAME object with
+            // the new data, which is what portableStateDict observes.
+            let mutKey = "norm_f.weight"
+            let preMut = Dictionary(
+                modelB.parameters().flattened(), uniquingKeysWith: { a, _ in a })[mutKey]!
+            let mutWeight = preMut * MLXArray(Float(2))
+            MLX.eval(mutWeight)
+            modelB.update(parameters: ModuleParameters.unflattened([(mutKey, mutWeight)]))
             MLX.eval(modelB.normF.weight)
             let rtWeightsB = rtBase.appendingPathComponent("weights-mutated.safetensors")
             try Checkpoint.save(modelB, to: rtWeightsB)
@@ -685,9 +699,11 @@ for dir in fixtureDirs {
                 }
             }
 
-            print("\(name): round trip (save -> load) OK — tensors bit-identical, "
-                  + "sidecar fidelity, mutation, and route-bias checks passed"
-                  + (meta.quant_bits != nil ? " (+ quant-block re-decode)" : ""))
+            if failures.count == priorFailCount {
+                print("\(name): round trip (save -> load) OK — tensors bit-identical, "
+                      + "sidecar fidelity, mutation, and route-bias checks passed"
+                      + (meta.quant_bits != nil ? " (+ quant-block re-decode)" : ""))
+            }
         } catch {
             failures.append("\(name): round trip threw — \(error)")
         }
