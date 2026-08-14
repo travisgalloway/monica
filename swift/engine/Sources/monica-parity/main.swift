@@ -547,12 +547,22 @@ for dir in fixtureDirs {
         // and the two SAME-PROCESS exact-tensor comparisons ((a) and (b)) are immune to
         // the cross-machine drift that broke #293's checked-in gradient oracle.
         do {
+            // When the caller didn't ask to keep the round-trip artifacts
+            // (`--roundtrip-out`), we write to a scratch dir under the system temp
+            // directory — clean it up on the way out so repeated local runs don't
+            // accumulate one throwaway directory per fixture per run.
+            let isScratchDir = roundtripOut == nil
             let rtBase = (roundtripOut?.appendingPathComponent(name))
                 ?? FileManager.default.temporaryDirectory
                     .appendingPathComponent("monica-parity-roundtrip-\(UUID().uuidString)")
                     .appendingPathComponent(name)
             try FileManager.default.createDirectory(
                 at: rtBase, withIntermediateDirectories: true)
+            defer {
+                if isScratchDir {
+                    try? FileManager.default.removeItem(at: rtBase)
+                }
+            }
 
             // (a) identity round trip: save this model, reload it, compare everything.
             let rtWeightsA = rtBase.appendingPathComponent("weights.safetensors")
