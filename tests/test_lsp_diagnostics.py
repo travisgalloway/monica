@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.lsp.diagnostics import (Diagnostic, FORWARD_RESOLVABLE_CODES,
+from src.lsp.diagnostics import (Diagnostic, ESCAPE_HATCH_PATTERNS, FORWARD_RESOLVABLE_CODES,
                                   MODULE_RESOLUTION_CODES, SUPPRESSION_RE,
-                                  close_open_delimiters, drop_codes, filter_diagnostics,
+                                  close_open_delimiters, deletion_of_target, drop_codes,
+                                  filter_diagnostics, find_escape_hatches, has_escape_hatch,
                                   is_incomplete, is_source_balanced, line_col_to_offset,
-                                  offset_to_lsp_position, parse_tsc_output,
-                                  statement_boundary, strip_suggestion)
+                                  mask_strings_and_comments, offset_to_lsp_position,
+                                  parse_tsc_output, statement_boundary, strip_suggestion)
 
 
 # --------------------------------------------------------------------------- #
@@ -398,3 +399,132 @@ def test_offset_to_lsp_position_rejects_offset_past_end():
     source = "abc"
     with pytest.raises(ValueError):
         offset_to_lsp_position(source, len(source) + 1)
+
+
+# --------------------------------------------------------------------------- #
+# #225 M5 -- mask_strings_and_comments
+# --------------------------------------------------------------------------- #
+
+def test_mask_preserves_length_and_newlines():
+    source = 'const s = "a\nb";\n// comment\nconst t = 1;\n'
+    masked = mask_strings_and_comments(source)
+    assert len(masked) == len(source)
+    newline_positions = [i for i, c in enumerate(source) if c == "\n"]
+    for i in newline_positions:
+        assert masked[i] == "\n"
+
+
+def test_mask_blanks_string_content():
+    masked = mask_strings_and_comments('const s = "cast it as any";')
+    assert "as any" not in masked
+    assert masked.startswith("const s = ")
+
+
+def test_mask_blanks_line_comment_content():
+    masked = mask_strings_and_comments("// don't use as any here\nfoo();")
+    assert "as any" not in masked
+    assert "foo();" in masked
+
+
+def test_mask_blanks_block_comment_content():
+    masked = mask_strings_and_comments("/* as any */ foo();")
+    assert "as any" not in masked
+    assert "foo();" in masked
+
+
+def test_mask_leaves_template_interpolation_as_code():
+    masked = mask_strings_and_comments("const s = `hi ${1 as any}`;")
+    assert "as any" in masked
+
+
+# --------------------------------------------------------------------------- #
+# #225 M5 -- find_escape_hatches / has_escape_hatch
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("name,snippet", [
+    ("ts_ignore", "// @ts-ignore\nfoo();"),
+    ("ts_expect_error", "// @ts-expect-error\nfoo();"),
+    ("ts_nocheck", "// @ts-nocheck\nfoo();"),
+    ("as_any", "const v = u as any;"),
+    ("as_unknown_as", "const v = u as unknown as Foo;"),
+    ("non_null_assertion", "foo!.bar();"),
+    ("empty_body", "function f(): void {}"),
+    ("throw_not_implemented", 'throw new Error("not implemented");'),
+    ("declare_stub", "declare function foo(): void;"),
+])
+def test_find_escape_hatches_positive(name, snippet):
+    assert name in find_escape_hatches(snippet)
+    assert has_escape_hatch(snippet)
+
+
+def test_escape_hatch_patterns_has_the_nine_regex_hatches():
+    # Ten total per #225 M5, but deletion_of_target is structural, not a regex.
+    assert set(ESCAPE_HATCH_PATTERNS) == {
+        "ts_ignore", "ts_expect_error", "ts_nocheck", "as_any", "as_unknown_as",
+        "non_null_assertion", "empty_body", "throw_not_implemented", "declare_stub",
+    }
+
+
+def test_ts_ignore_fires_inside_block_comment():
+    # Directives are raw-matched -- this IS a positive, not a trap.
+    assert "ts_ignore" in find_escape_hatches("/* @ts-ignore in a block comment */")
+
+
+@pytest.mark.parametrize("snippet", [
+    "a !== b;",
+    "a != b;",
+    "if (!x) { foo(); }",
+])
+def test_non_null_assertion_negative_traps(snippet):
+    assert "non_null_assertion" not in find_escape_hatches(snippet)
+
+
+@pytest.mark.parametrize("snippet", [
+    'const s = "cast it as any";',
+    "// don't use as any here",
+])
+def test_as_any_negative_traps(snippet):
+    assert "as_any" not in find_escape_hatches(snippet)
+
+
+def test_declare_stub_negative_inside_string():
+    assert "declare_stub" not in find_escape_hatches(
+        'const s = "declare function foo(): void;";'
+    )
+
+
+def test_empty_body_negative_on_nonempty_body():
+    assert "empty_body" not in find_escape_hatches("function f() { return 1; }")
+
+
+def test_throw_not_implemented_negative_on_unrelated_message():
+    assert "throw_not_implemented" not in find_escape_hatches('throw new Error("boom");')
+
+
+def test_find_escape_hatches_empty_on_clean_code():
+    assert find_escape_hatches("function add(a: number, b: number): number {\n"
+                                "  return a + b;\n"
+                                "}\n") == []
+    assert not has_escape_hatch("const x = 1;\n")
+
+
+# --------------------------------------------------------------------------- #
+# #225 M5 -- deletion_of_target
+# --------------------------------------------------------------------------- #
+
+def test_deletion_of_target_flags_removed_anchor():
+    before = "function target(): void { throw new Error('x'); }\ntarget();"
+    after = "\ntarget();"
+    assert deletion_of_target(before, after, anchors=["function target"]) == ["function target"]
+
+
+def test_deletion_of_target_flags_commented_out_anchor():
+    before = "function target(): void {}\n"
+    after = "// function target(): void {}\n"
+    assert deletion_of_target(before, after, anchors=["function target"]) == ["function target"]
+
+
+def test_deletion_of_target_empty_when_anchor_survives():
+    before = "function target(): void { return; }\n"
+    after = "function target(): void { return 1; }\n"
+    assert deletion_of_target(before, after, anchors=["function target"]) == []
