@@ -346,7 +346,7 @@ public enum Bench {
         let snap = Memory.snapshot()
         let peak = snap.peakMemory > 0 ? snap.peakMemory : nil
         let active = snap.activeMemory > 0 ? snap.activeMemory : nil
-        let cache = snap.cacheMemory
+        let cache = snap.cacheMemory > 0 ? snap.cacheMemory : nil
 
         return MemoryResult(
             peakBytes: peak, activeBytes: active, cacheBytes: cache,
@@ -412,10 +412,16 @@ public enum Bench {
     // MARK: baseline comparison / regression flagging
 
     /// Compare `record` against `baselines`, matching on machine id (architecture +
-    /// hw model + device) AND mode. No match => every metric is `.skipped`, never a
-    /// green `.ok` — "a comparison that cannot observe its target must not read
-    /// healthy." tok/s-style metrics regress when `observed < baseline*(1-tolerance)`;
-    /// ms/byte-style metrics regress when `observed > baseline*(1+tolerance)`.
+    /// hw model + memory size + device) AND mode. `hwModel` alone can under-identify
+    /// hardware — Apple Silicon `hw.model` values do not encode RAM configuration, so
+    /// two machines of the same model with different memory would otherwise compare —
+    /// hence `memorySizeBytes` joins the predicate (#170 review). OS/Swift versions are
+    /// deliberately excluded: routine toolchain/OS bumps on the same CI runner or
+    /// laptop should not perpetually SKIP every comparison. No match => every metric is
+    /// `.skipped`, never a green `.ok` — "a comparison that cannot observe its target
+    /// must not read healthy." tok/s-style metrics regress when
+    /// `observed < baseline*(1-tolerance)`; ms/byte-style metrics regress when
+    /// `observed > baseline*(1+tolerance)`.
     public static func compareToBaseline(
         _ record: BenchRecord, baselines: [BenchRecord], tolerance: Double = 0.15
     ) -> [BaselineComparison] {
@@ -423,6 +429,7 @@ public enum Bench {
             $0.mode == record.mode
                 && $0.machine.architecture == record.machine.architecture
                 && $0.machine.hwModel == record.machine.hwModel
+                && $0.machine.memorySizeBytes == record.machine.memorySizeBytes
                 && $0.machine.device == record.machine.device
         }) else {
             return [BaselineComparison(

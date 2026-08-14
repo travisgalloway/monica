@@ -3,7 +3,7 @@
 `swift/engine/Benchmarks/configs/*.json` are `MambaConfig.to_dict()` exports
 (`scripts/export_bench_config.py`) that let `monica-bench` run poc-scale, random-init
 timing/memory sweeps without checking in a ~500 MB safetensors artifact. Like the Swift
-parity fixtures (`tests/test_parity_fixture_export.py`), that makes them a artifact that
+parity fixtures (`tests/test_parity_fixture_export.py`), that makes them an artifact that
 can silently drift from `config/*.yaml` — so re-derive each one into a tmpdir and assert
 it matches the checked-in file exactly.
 

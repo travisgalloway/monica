@@ -88,6 +88,15 @@ are real **developer Apple Silicon** numbers.
   context-length sweep at poc-small scale.
 
 `monica-bench --baseline Benchmarks/baselines.json [--tolerance 0.15] [--strict]` is how a future
-run flags a regression against the seeded CI-runner baseline (matching on machine id — a
-different machine, including any developer Mac, reads `SKIPPED` for that comparison, never a
-false-green `OK`, until its own baseline row is added).
+run flags a regression against a captured baseline (matching on machine id — architecture, hw
+model, memory size, and device; a different machine, including any developer Mac, reads
+`SKIPPED` for that comparison, never a false-green `OK`, until its own baseline row is added).
+
+**`Benchmarks/baselines.json`'s checked-in row is a hand-authored placeholder, not a captured
+measurement** — its `machine` fields (`hwModel: "github-actions-macos-latest"`, `cpuCores: 0`,
+`architecture: "unknown (...)"`, `memorySizeBytes: 0`) are stand-ins and will not equal what
+`monica-bench` actually records via `sysctl hw.model` / core count / `GPU.deviceInfo()` on the
+real GitHub-hosted runner. Until this row is replaced with a real `monica-bench` JSON record
+captured on that runner, every `--baseline` comparison against it reads `SKIPPED` (never a false
+`OK` — see `Bench.compareToBaseline`), so `--baseline`/`--strict` do not yet gate CI on a real
+regression threshold; they only exercise the comparison machinery end-to-end.

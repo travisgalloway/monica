@@ -322,6 +322,17 @@ struct BuiltModel {
     let quantBits: Int?
 }
 
+/// `BenchRecord.quantBits` is a single `Int?` field, but a checkpoint's quant sidecar or
+/// `Bench.quantTargets`'s filter can produce MIXED per-tensor bit-widths (e.g.
+/// `--quant-head-bits` giving the embedding a different width than the rest). Recording
+/// an arbitrary single value (`targets.values.first`, which is also dictionary-order
+/// nondeterministic) would misrepresent a mixed-bit run as uniform — so record the
+/// shared value only when every target actually agrees, `nil` otherwise (#170 review).
+func uniformQuantBits(_ targets: [String: Int]) -> Int? {
+    let distinct = Set(targets.values)
+    return distinct.count == 1 ? distinct.first : nil
+}
+
 func buildModel(_ flags: [String: String]) -> BuiltModel {
     let src: ModelSource
     switch resolveModelSourceFlag(flags) {
@@ -340,7 +351,8 @@ func buildModel(_ flags: [String: String]) -> BuiltModel {
             let (model, _) = try Checkpoint.load(weights: URL(fileURLWithPath: path))
             let spec = try? QuantSpec.load(sidecar: URL(fileURLWithPath: path + ".config.json"))
             return BuiltModel(model: model, source: src, randomInit: false,
-                              quantized: spec != nil, quantBits: spec?.targets.values.first)
+                              quantized: spec != nil,
+                              quantBits: spec.flatMap { uniformQuantBits($0.targets) })
         } catch {
             fail("failed to load weights \(path): \(error)")
         }
@@ -388,7 +400,7 @@ func buildModel(_ flags: [String: String]) -> BuiltModel {
         })
         MLX.eval(model.parameters())
         return BuiltModel(model: model, source: src, randomInit: true,
-                          quantized: true, quantBits: bits)
+                          quantized: true, quantBits: uniformQuantBits(targets))
     }
 }
 

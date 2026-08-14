@@ -166,17 +166,24 @@ def _prefill_sequential(model, mx, tokens, length: int, state):
     return length / elapsed, last, state
 
 
-def _prefill_parallel(model, mx, tokens, length: int):
-    """The one-shot `model.prefill(tokens_2d, last_only=True)` scan (#165) — the Swift
-    engine's default arm. Fresh-session-only (mirrors #165's seam contract), so this
-    takes no incoming state. A short untimed warmup on a throwaway short prefix runs
-    first, mirroring `_prefill_sequential`'s warmup discipline. Returns
-    `(tok_s, last, state)`.
-    """
+def _warmup_parallel(model, mx, tokens, length: int) -> None:
+    """Untimed warmup for `_prefill_parallel` on a throwaway short prefix, run BEFORE
+    `mx.reset_peak_memory()` so the compile/allocation it triggers is excluded from the
+    measured `peak_gb` (#170 review — see `_prefill_parallel`)."""
     tokens_2d = tokens[:length].reshape(1, -1)
     warm_len = min(4, length)
     warm_last, warm_state = model.prefill(tokens_2d[:, :warm_len], last_only=True)
     mx.eval(warm_last, warm_state)
+
+
+def _prefill_parallel(model, mx, tokens, length: int):
+    """The one-shot `model.prefill(tokens_2d, last_only=True)` scan (#165) — the Swift
+    engine's default arm. Fresh-session-only (mirrors #165's seam contract), so this
+    takes no incoming state. Callers must run `_warmup_parallel` first, before
+    `mx.reset_peak_memory()` — see that function's docstring. Returns
+    `(tok_s, last, state)`.
+    """
+    tokens_2d = tokens[:length].reshape(1, -1)
 
     t0 = time.perf_counter()
     last, state = model.prefill(tokens_2d, last_only=True)
@@ -218,6 +225,9 @@ def measure(model, mx, length: int, decode_tokens: int, *, seed: int = 0,
     for i in range(n_warm):
         last, warm_state = model.step(warm_tokens[i:i + 1], warm_state)
         mx.eval(last, warm_state)
+
+    if prefill_mode in ("parallel", "both"):
+        _warmup_parallel(model, mx, tokens, length)
 
     mx.reset_peak_memory()
     result: dict = {}
