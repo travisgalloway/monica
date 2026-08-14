@@ -190,10 +190,9 @@ def unpack_uint32_codes(packed: np.ndarray, bits: int, cols: int) -> np.ndarray:
     rows = packed.shape[0]
     per_word = 32 // bits
     mask = np.uint32(2 ** bits - 1)
-    codes = np.zeros((rows, cols), dtype=np.uint32)
-    for j in range(cols):
-        codes[:, j] = (packed[:, j // per_word] >> np.uint32(bits * (j % per_word))) & mask
-    return codes
+    shifts = (np.arange(per_word, dtype=np.uint32) * np.uint32(bits))
+    codes = (packed[:, :, None] >> shifts) & mask
+    return codes.reshape(rows, -1)[:, :cols]
 
 
 def quant_targets(
