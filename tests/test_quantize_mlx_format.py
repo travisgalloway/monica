@@ -8,6 +8,8 @@ this comparison. If it does not pass, nothing else in #168 can be trusted — se
 `.claude/plans/issue-168.md`.
 """
 
+import zlib
+
 import numpy as np
 import pytest
 
@@ -26,6 +28,15 @@ BITS = (2, 4, 8)
 GROUP_SIZES = (32, 64, 128)
 
 
+def _seed_for(bits: int, group_size: int, shape: tuple, salt: int = 0) -> int:
+    """A stable, explicit RNG seed derived from `(bits, group_size, shape)` —
+    deliberately not Python's built-in `hash()`, whose tuple-hashing algorithm is not
+    guaranteed stable across Python versions/interpreters, which would make a CI
+    failure at one Python version hard to reproduce at another."""
+    key = f"{bits}:{group_size}:{shape}:{salt}".encode()
+    return zlib.crc32(key) & 0xFFFFFFFF
+
+
 def _cases():
     for bits in BITS:
         for group_size in GROUP_SIZES:
@@ -37,7 +48,7 @@ def _cases():
 
 @pytest.mark.parametrize("bits,group_size,shape", list(_cases()))
 def test_packed_codes_and_scales_match_mx_quantize_byte_for_byte(bits, group_size, shape):
-    rng = np.random.default_rng(hash((bits, group_size, shape)) & 0xFFFFFFFF)
+    rng = np.random.default_rng(_seed_for(bits, group_size, shape))
     # A spread of magnitudes (not just unit-normal) so edge cases like a
     # larger-magnitude negative edge, and a near-constant group, both get exercised.
     w = (rng.standard_normal(shape).astype(np.float64) * rng.uniform(0.1, 50.0)).astype(np.float32)
@@ -57,7 +68,7 @@ def test_packed_codes_and_scales_match_mx_quantize_byte_for_byte(bits, group_siz
 
 @pytest.mark.parametrize("bits,group_size,shape", list(_cases()))
 def test_dequantize_matches_mx_dequantize(bits, group_size, shape):
-    rng = np.random.default_rng((hash((bits, group_size, shape)) + 1) & 0xFFFFFFFF)
+    rng = np.random.default_rng(_seed_for(bits, group_size, shape, salt=1))
     w = (rng.standard_normal(shape).astype(np.float64) * rng.uniform(0.1, 50.0)).astype(np.float32)
 
     codes, scales, biases = mlx_affine_quantize(w, bits, group_size)

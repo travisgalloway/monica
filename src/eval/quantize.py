@@ -178,10 +178,10 @@ def pack_uint32_codes(codes: np.ndarray, bits: int) -> np.ndarray:
     if cols % per_word != 0:
         raise ValueError(
             f"cols={cols} must be a multiple of 32/bits={per_word} to pack into uint32 words")
-    codes = codes.astype(np.uint32)
-    packed = np.zeros((rows, cols // per_word), dtype=np.uint32)
-    for j in range(cols):
-        packed[:, j // per_word] |= codes[:, j] << np.uint32(bits * (j % per_word))
+    n_words = cols // per_word
+    codes = codes.astype(np.uint32).reshape(rows, n_words, per_word)
+    shifts = (np.arange(per_word, dtype=np.uint32) * np.uint32(bits))
+    packed = np.bitwise_or.reduce(codes << shifts, axis=-1)
     return packed
 
 

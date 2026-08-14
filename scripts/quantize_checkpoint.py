@@ -54,7 +54,13 @@ def main() -> None:
     args = _parse_args()
 
     sd = load_weights_dict(str(args.weights))
-    config = load_config_sidecar(str(args.weights))  # None if no sidecar, or fp-only
+    config = load_config_sidecar(str(args.weights))
+    if config is None:
+        raise SystemExit(
+            f"no <weights>.config.json sidecar found next to {args.weights} — a "
+            f"quantized checkpoint without a MambaConfig sidecar cannot be "
+            f"reconstructed by the Swift/Python loaders (only the quant block would "
+            f"be written); re-run with weights that carry their config sidecar")
 
     targets = quant_targets(sd, group_size=args.group_size, bits=args.bits,
                             head_bits=args.head_bits)
