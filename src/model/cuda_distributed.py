@@ -160,7 +160,12 @@ def all_reduce_loads(loads: List[List[float]], *, group=None) -> List[List[float
         return []
     n_layers = len(loads)
     n_experts = len(loads[0]) if loads[0] else 0
-    flat = torch.tensor([v for row in loads for v in row], dtype=torch.float32)
+    # NCCL's collectives require CUDA tensors; gloo (the CPU/test backend) requires CPU
+    # ones. Build `flat` on whichever device the GROUP's actual backend needs — not just
+    # `torch.cuda.is_available()` — so this keeps working under gloo-on-a-CUDA-box (the
+    # `[GLOO-SIM]` tests) as well as a real NCCL run.
+    device = "cuda" if dist.get_backend(group) == "nccl" else "cpu"
+    flat = torch.tensor([v for row in loads for v in row], dtype=torch.float32, device=device)
     if flat.numel() and float(flat.abs().max()) >= _MAX_EXACT_FP32_SUM:
         raise ValueError(
             f"a per-expert load count already exceeds the fp32-exact-sum bound "
@@ -190,16 +195,30 @@ def make_load_reduce_fn(group=None) -> Callable[[List[List[float]]], List[List[f
 # expert-parallel, merge every rank's LOCAL expert shard into one dict (EP). Both
 # stages are collectives — EVERY rank must call this, even though only the primary
 # rank writes the result to disk (a rank-0-only call deadlocks the others).
+#
+# The merge uses `gather_object(..., group_dst=0)`, NOT `all_gather_object`: only the
+# GROUP's rank 0 needs the merged dict (the caller only ever writes it from
+# `is_primary()`, i.e. global rank 0 — which `init_device_mesh`'s row-major layout
+# always places at group-local rank 0 of its own EP subgroup). `all_gather_object`
+# would materialize every OTHER rank's expert shard on every rank too, defeating the
+# memory-savings goal of EP/FSDP and risking an OOM on non-primary ranks during
+# checkpointing. `group_dst` (not `dst`) is required here — `dst` is a GLOBAL rank and
+# would be invalid/wrong for any EP subgroup that doesn't itself contain global rank 0
+# (every EP group besides dp-index 0's).
 # --------------------------------------------------------------------------- #
 def gather_portable_state_dict(model, *, ep_process_group=None) -> dict:
     sd = model._portable_state_dict()   # DTensor entries already .full_tensor()'d inside
     if ep_process_group is not None and dist.get_world_size(ep_process_group) > 1:
-        gathered = [None] * dist.get_world_size(ep_process_group)
-        dist.all_gather_object(gathered, sd, group=ep_process_group)
-        merged: dict = {}
-        for part in gathered:
-            merged.update(part)
-        sd = merged
+        is_group_dst = dist.get_rank(ep_process_group) == 0
+        gathered = [None] * dist.get_world_size(ep_process_group) if is_group_dst else None
+        dist.gather_object(sd, gathered, group_dst=0, group=ep_process_group)
+        if is_group_dst:
+            merged: dict = {}
+            for part in gathered:
+                merged.update(part)
+            sd = merged
+        else:
+            sd = {}
     return sd
 
 

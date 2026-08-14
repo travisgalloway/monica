@@ -1442,7 +1442,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         # Expert parallel (#271): this rank's `named_parameters()` above only yields ITS
         # OWN local expert shard (see MoEBlock.__init__'s ModuleDict). Merging every
         # rank's shard into one unsharded dict is `cuda_distributed.
-        # gather_portable_state_dict`'s job (an `all_gather_object` over the EP group,
+        # gather_portable_state_dict`'s job (a `gather_object` to the EP group's rank 0,
         # called from the checkpoint-save path) — NOT this method's, so a plain
         # single-rank call here still returns exactly this rank's params, matching
         # every pre-#271 caller (sizing tests, `--init`, non-distributed saves).
