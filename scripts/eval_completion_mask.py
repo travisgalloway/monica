@@ -58,7 +58,7 @@ def main() -> None:
                          "identical 'seeds' -- pass --temperature > 0")
     if args.limit is None and len(set(seeds)) < 3:
         raise SystemExit(f"--seeds must give >= 3 distinct seeds (M2) for a real "
-                         f"(non---limit) run, got {seeds}")
+                         f"(non--limit) run, got {seeds}")
     # The #225 M1/M2 contract declares each arm's DESIGN as >= 3 seeds regardless of
     # how many this particular invocation actually runs -- a `--limit` smoke pass
     # (the plan's own example is `--seeds 0`) proves the wiring without claiming to
@@ -137,9 +137,9 @@ def main() -> None:
     service.open_project({f"rec_{i}.ts": rec["prompt"] for i, rec in enumerate(records)})
     print(f"model + oracle + mask service ready in {time.monotonic() - t_load:.1f}s")
 
-    transcript_f = open(args.transcript, "w", encoding="utf-8") if args.transcript else None
-    if transcript_f:
+    if args.transcript:
         args.transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript_f = open(args.transcript, "w", encoding="utf-8") if args.transcript else None
 
     # #226's OracleLabels exclusion (a blank reference) must apply IDENTICALLY across
     # every arm for `per_seed_compare`/`pooled_compare`'s id-order check to hold (it
@@ -155,8 +155,13 @@ def main() -> None:
 
     t_run = time.monotonic()
     for seed in seeds:
-        rng = np.random.default_rng(seed) if args.temperature > 0 else None
         for arm in arms:
+            # Re-seeded per arm (not once per `seed` and shared across arms): reusing one
+            # `rng` instance across arms would let earlier arms in the loop advance its
+            # state, so later arms silently start from a different draw sequence even
+            # though they're nominally "the same seed" -- arm ordering would then affect
+            # results and the per-seed comparison wouldn't be reproducible.
+            rng = np.random.default_rng(seed) if args.temperature > 0 else None
             scored: List[dict] = []
             for i, rec in enumerate(records):
                 if rec["id"] in unavailable_ids:
