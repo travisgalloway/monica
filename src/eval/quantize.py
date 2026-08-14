@@ -46,6 +46,14 @@ def quantize_dequantize(w: np.ndarray, bits: int, group_size: int,
     back into the model to measure the perplexity cost. Groups run along the last
     axis (`_effective_group_size`). `symmetric` centres the range on zero (no zero
     point), which is what weight-quant schemes typically use for signed weights.
+
+    NOTE (#168): this is classic min/max affine (`scale = (hi-lo)/(2**bits-1) >= 0`,
+    `bias = lo`) — a DIFFERENT variant from `mx.quantize`'s zero-preserving, edge-exact
+    affine scheme (whose scale can be NEGATIVE). It is #51's measurement contract
+    (`tests/test_quantize.py`) and stays exactly as it is; it is NOT the on-disk format
+    a Swift/mlx-swift loader can consume. That format is `mlx_affine_quantize` /
+    `mlx_affine_dequantize` below, verified byte-identical to `mx.quantize` in
+    `tests/test_quantize_mlx_format.py`.
     """
     if bits < 1 or bits > 16:
         raise ValueError(f"bits must be in [1, 16], got {bits}")
@@ -74,6 +82,221 @@ def quantize_dequantize(w: np.ndarray, bits: int, group_size: int,
         deq = q * scale + lo
 
     return deq.reshape(w64.shape).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# MLX-compatible affine (the on-disk format — #168)
+# --------------------------------------------------------------------------- #
+# `quantize_dequantize` above is a DIFFERENT affine variant from `mx.quantize`
+# (classic min/max affine: `scale = (hi-lo)/(2**bits-1)`, `bias = lo`, always
+# `scale >= 0`). It stays exactly as-is — it is #51's measurement contract, covered
+# by `tests/test_quantize.py` — but it is NOT byte-compatible with mlx-swift's
+# quantized kernels and must never be used to produce a checkpoint Swift will load.
+# The functions below are the format Swift actually consumes: verified against
+# `mx.quantize`/`mx.dequantize` 0.31.2 to <1e-5 (scale/bias) and byte-identical
+# (packed codes) across bits in {2,4,8} x group_size in {32,64,128}
+# (`tests/test_quantize_mlx_format.py`). Two load-bearing differences from the
+# classic scheme above:
+#   - the scale is ZERO-PRESERVING and EDGE-EXACT (picks the larger-magnitude
+#     group edge, then sets scale so that edge quantizes back exactly), not a
+#     plain min/max span — and the scale CAN BE NEGATIVE;
+#   - both `scale`/`bias` are always emitted (MLX's `QuantizationMode` is
+#     `.affine`/`.mxfp4`; there is no separate symmetric mode to special-case).
+def mlx_affine_quantize(
+    w: np.ndarray, bits: int, group_size: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Group-wise affine quantize `w` the way `mx.quantize` does.
+
+    `w` must be 2-D with `w.shape[-1] % group_size == 0` (MLX requires exact
+    grouping; there is no ragged-group fallback on this path — see
+    `_effective_group_size`'s docstring, which is for the OTHER scheme only).
+
+    Returns `(codes, scales, biases)`:
+      - `codes`: `uint32 (rows, cols)`, each entry in `[0, 2**bits - 1]` — the
+        UNPACKED per-element code (packing into `uint32` words is a separate step,
+        `pack_uint32_codes`, so this function stays easy to test element-by-element).
+      - `scales`, `biases`: `float32 (rows, cols // group_size)`.
+
+    Dequantize with `mlx_affine_dequantize`; `codes * scales[..., None] + biases[...,
+    None]` per group reproduces the original weight to quantization error.
+    """
+    if bits < 1 or bits > 16:
+        raise ValueError(f"bits must be in [1, 16], got {bits}")
+    w64 = np.asarray(w, dtype=np.float64)
+    if w64.ndim != 2:
+        raise ValueError(f"mlx_affine_quantize requires a 2-D array, got shape {w64.shape}")
+    rows, cols = w64.shape
+    if group_size <= 0 or cols % group_size != 0:
+        raise ValueError(
+            f"group_size={group_size} must evenly divide the last axis ({cols}); "
+            "MLX has no ragged-group fallback")
+    n_groups = cols // group_size
+    groups = w64.reshape(rows, n_groups, group_size)
+    n = float(2 ** bits - 1)
+
+    mn = groups.min(axis=2)
+    mx_ = groups.max(axis=2)
+    # Pick whichever edge has the larger magnitude — the scale is built to represent
+    # THAT edge exactly, which is what makes the format zero-preserving (a group whose
+    # true zero falls inside its range dequantizes back to exactly 0.0, not a rounded
+    # near-zero value).
+    mask = np.abs(mn) > np.abs(mx_)
+    s0 = np.maximum(mx_ - mn, 1e-7) / n
+    s0 = np.where(mask, s0, -s0)          # scale is SIGNED — do not assume scale > 0
+    edge = np.where(mask, mn, mx_)
+    q0 = np.round(edge / s0)
+    # A group whose values are all equal (`mx_ == mn` -> `edge == 0` -> `q0 == 0`)
+    # falls back to `scale = s0` (the 1e-7 floor) and `bias = 0.0`.
+    scale = np.where(q0 == 0.0, s0, edge / q0)
+    bias = np.where(q0 == 0.0, 0.0, edge)
+
+    codes = np.clip(np.round((groups - bias[..., None]) / scale[..., None]), 0.0, n)
+    codes = codes.reshape(rows, cols).astype(np.uint32)
+    return codes, scale.astype(np.float32), bias.astype(np.float32)
+
+
+def mlx_affine_dequantize(
+    codes: np.ndarray, scales: np.ndarray, biases: np.ndarray, group_size: int
+) -> np.ndarray:
+    """Invert `mlx_affine_quantize`: `codes (rows, cols)` + per-group `scales`/`biases`
+    `(rows, cols // group_size)` -> `float32 (rows, cols)`."""
+    rows, cols = codes.shape
+    n_groups = cols // group_size
+    g = codes.reshape(rows, n_groups, group_size).astype(np.float64)
+    deq = g * scales.astype(np.float64)[..., None] + biases.astype(np.float64)[..., None]
+    return deq.reshape(rows, cols).astype(np.float32)
+
+
+def pack_uint32_codes(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Pack per-element `codes` (`uint32 (rows, cols)`, each in `[0, 2**bits-1]`) into
+    `mx.quantize`'s on-disk layout: little-endian within each `uint32` word, `32 // bits`
+    codes per word, groups running along the last axis. `packed[i, j // per_word] |=
+    codes[i, j] << (bits * (j % per_word))`. Requires `cols % (32 // bits) == 0`
+    (true whenever `bits` divides 32, which every supported bit-width does)."""
+    rows, cols = codes.shape
+    per_word = 32 // bits
+    if cols % per_word != 0:
+        raise ValueError(
+            f"cols={cols} must be a multiple of 32/bits={per_word} to pack into uint32 words")
+    codes = codes.astype(np.uint32)
+    packed = np.zeros((rows, cols // per_word), dtype=np.uint32)
+    for j in range(cols):
+        packed[:, j // per_word] |= codes[:, j] << np.uint32(bits * (j % per_word))
+    return packed
+
+
+def unpack_uint32_codes(packed: np.ndarray, bits: int, cols: int) -> np.ndarray:
+    """Invert `pack_uint32_codes`: `packed (rows, cols // per_word)` -> `codes (rows, cols)`."""
+    rows = packed.shape[0]
+    per_word = 32 // bits
+    mask = np.uint32(2 ** bits - 1)
+    codes = np.zeros((rows, cols), dtype=np.uint32)
+    for j in range(cols):
+        codes[:, j] = (packed[:, j // per_word] >> np.uint32(bits * (j % per_word))) & mask
+    return codes
+
+
+def quant_targets(
+    state_dict: Dict[str, np.ndarray], group_size: int, bits: int,
+    head_bits: Optional[int] = None,
+    exclude: Tuple[str, ...] = ("dt_proj", "router"),
+) -> Dict[str, int]:
+    """Which module paths to quantize, and at what bit-width, for the MLX on-disk
+    format. Starts from `is_quantizable` (2-D float, the heavy GEMM/embedding weights)
+    and narrows it:
+
+      - drop any name containing a token in `exclude` (default `dt_proj`, `router` —
+        `dt_proj` is the load-bearing dt path, `router` decides argmax routing and is
+        tiny; both would otherwise slip through `is_quantizable`'s shape-only test);
+      - drop any tensor whose last axis is not evenly divisible by `group_size` (MLX
+        has no ragged-group fallback on this path — unlike `_effective_group_size`,
+        which is for the OTHER quant scheme and must not be reused here);
+      - `head_bits`, if given, overrides the bit-width for `embedding.weight`
+        specifically (the tied head shares that tensor — see module docstring note in
+        the plan/design doc — so this is the lever for keeping the head at a higher
+        precision than the rest of the model).
+
+    Returns `{module_path: bits}` keyed by MODULE path (e.g. `"layers.0.mamba.in_proj"`),
+    not parameter name (`"...in_proj.weight"`) — that is what the Swift
+    `MLXNN.quantize(filter:)` callback matches against.
+    """
+    out: Dict[str, int] = {}
+    for name, arr in state_dict.items():
+        arr = np.asarray(arr)
+        if not is_quantizable(name, arr):
+            continue
+        if any(tok in name for tok in exclude):
+            continue
+        cols = arr.shape[-1]
+        if group_size <= 0 or cols % group_size != 0:
+            continue
+        assert name.endswith(".weight"), (
+            f"quant_targets expects a '*.weight' parameter name, got {name!r}")
+        module_path = name[: -len(".weight")]
+        bits_for_this = (
+            head_bits if (head_bits is not None and module_path == "embedding") else bits)
+        out[module_path] = bits_for_this
+    return out
+
+
+def quantize_portable_state_dict(
+    state_dict: Dict[str, np.ndarray], targets: Dict[str, int], group_size: int,
+) -> Tuple[Dict[str, np.ndarray], dict]:
+    """Apply `mlx_affine_quantize` to each targeted module's `.weight` in `state_dict`,
+    replacing it with `{path}.weight` (packed uint32 codes), `{path}.scales`,
+    `{path}.biases`. Every other key (including non-2-D params and any `.weight` not in
+    `targets`) passes through unchanged.
+
+    Returns `(new_state_dict, quant_block)` where `quant_block` is the JSON-able dict
+    meant for the `save_weights(..., quant=quant_block)` sidecar: `{"mode": "affine",
+    "group_size": group_size, "targets": targets}`. `targets` is recorded verbatim so a
+    reader (Python or Swift) never has to re-derive which paths were quantized.
+    """
+    out: Dict[str, np.ndarray] = {}
+    for name, arr in state_dict.items():
+        arr = np.asarray(arr)
+        module_path = name[: -len(".weight")] if name.endswith(".weight") else None
+        if module_path is not None and module_path in targets:
+            bits = targets[module_path]
+            codes, scales, biases = mlx_affine_quantize(arr, bits, group_size)
+            packed = pack_uint32_codes(codes, bits)
+            out[name] = packed
+            out[f"{module_path}.scales"] = scales
+            out[f"{module_path}.biases"] = biases
+        else:
+            out[name] = arr
+    quant_block = {"mode": "affine", "group_size": group_size, "targets": dict(targets)}
+    return out, quant_block
+
+
+def dequantize_portable_state_dict(
+    state_dict: Dict[str, np.ndarray], quant_block: dict,
+) -> Dict[str, np.ndarray]:
+    """Invert `quantize_portable_state_dict`: reconstruct a plain fp32 state dict from a
+    quantized one + its `quant` sidecar block. This is the FAKE-QUANT reference path —
+    load the result into the unmodified `MLXMambaModel` (no change to `mlx_backend.py`)
+    to get a Python reference whose weights are numerically identical to what Swift's
+    true quantized GEMM operates on, isolating the comparison to
+    accumulation-order/precision inside `quantizedMM` rather than the weights
+    themselves."""
+    group_size = quant_block["group_size"]
+    targets: Dict[str, int] = quant_block["targets"]
+    out: Dict[str, np.ndarray] = {}
+    consumed = set()
+    for module_path, bits in targets.items():
+        w_key, s_key, b_key = (f"{module_path}.weight", f"{module_path}.scales",
+                               f"{module_path}.biases")
+        packed = np.asarray(state_dict[w_key])
+        scales = np.asarray(state_dict[s_key])
+        biases = np.asarray(state_dict[b_key])
+        cols = scales.shape[-1] * group_size
+        codes = unpack_uint32_codes(packed, bits, cols)
+        out[w_key] = mlx_affine_dequantize(codes, scales, biases, group_size)
+        consumed.update({w_key, s_key, b_key})
+    for name, arr in state_dict.items():
+        if name not in consumed and name not in out:
+            out[name] = arr
+    return out
 
 
 def quant_error(w: np.ndarray, w_hat: np.ndarray) -> Dict[str, float]:
