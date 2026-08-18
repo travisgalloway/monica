@@ -728,11 +728,12 @@ jobs:
           cd "$RUNNER_TEMP/train-diag-a"
           find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/train-diag-a-manifest.txt"
           cat "$RUNNER_TEMP/train-diag-a-manifest.txt"
-          # Anti-BLIND: exactly 7 files (weights/.config.json/inputs/reference/
-          # generation/prefill/train.safetensors), same shape as the poc-fixture-oracle
-          # manifest below. A short manifest must fail loud, not read as agreement.
+          # Anti-BLIND: exactly 8 files (weights/.config.json/inputs/reference/
+          # generation/prefill/train.safetensors, one more than the poc-fixture-oracle
+          # manifest below because --train-steps adds train.safetensors). A short
+          # manifest must fail loud, not read as agreement.
           N=$(wc -l < "$RUNNER_TEMP/train-diag-a-manifest.txt")
-          [ "$N" -eq 7 ] || { echo "BLIND: expected 7 fixture files, got $N"; exit 2; }
+          [ "$N" -eq 8 ] || { echo "BLIND: expected 8 fixture files, got $N"; exit 2; }
           grep -q 'train.safetensors$' "$RUNNER_TEMP/train-diag-a-manifest.txt"
       - uses: actions/upload-artifact@v4
         with:
@@ -774,7 +775,7 @@ jobs:
           cd "$RUNNER_TEMP/train-diag-b"
           find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/train-diag-b-manifest.txt"
           N=$(wc -l < "$RUNNER_TEMP/train-diag-b-manifest.txt")
-          [ "$N" -eq 7 ] || { echo "BLIND: expected 7 fixture files, got $N"; exit 2; }
+          [ "$N" -eq 8 ] || { echo "BLIND: expected 8 fixture files, got $N"; exit 2; }
       - uses: actions/download-artifact@v4
         with:
           name: train-fixture-diag-a
@@ -783,7 +784,7 @@ jobs:
         run: |
           test -s oracle/train-diag-a-manifest.txt || { echo "BLIND: diag-a manifest missing/empty"; exit 2; }
           N=$(wc -l < oracle/train-diag-a-manifest.txt)
-          [ "$N" -eq 7 ] || { echo "BLIND: short diag-a manifest ($N lines)"; exit 2; }
+          [ "$N" -eq 8 ] || { echo "BLIND: short diag-a manifest ($N lines)"; exit 2; }
           echo "--- diag-a manifest ---"; cat oracle/train-diag-a-manifest.txt
           echo "--- diag-b manifest ---"; cat "$RUNNER_TEMP/train-diag-b-manifest.txt"
           if diff oracle/train-diag-a-manifest.txt "$RUNNER_TEMP/train-diag-b-manifest.txt" > /tmp/ab.diff; then
