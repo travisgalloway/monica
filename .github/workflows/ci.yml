@@ -10,6 +10,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # #267: the poc-scale Swift parity gate (jobs 9/10 below) runs ONLY on
+  # workflow_dispatch or this weekly schedule — never on pull_request/push. Monday
+  # 09:17 UTC, an off-the-hour time to avoid the top-of-hour GitHub Actions scheduler
+  # crunch.
+  schedule:
+    - cron: "17 9 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -179,6 +185,22 @@ jobs:
       - name: Self-check
         working-directory: swift
         run: swift run monica-selfcheck
+      # ── #197: the native LSP harness's binary-free self-test (framing/demux/trie/
+      # scanner over pipe(2) — no subprocess, no node). Runs on both swift-macos and
+      # swift-linux; see the macOS-only live-server steps further down for the parts
+      # that actually need a typescript-language-server toolchain.
+      - name: MonicaLSP self-check (framing/demux/trie/scanner — no subprocess)
+        working-directory: swift
+        run: swift run monica-lsp --self-test
+      - name: Guard — swift/ (MonicaTokenizer + MonicaLSP) stays dependency-free (#167/#197)
+        # A new MonicaLSP TARGET adds no dependency edge; this is what proves it. Run here
+        # (not just once, at the bottom of swift-engine) so a regression on this specific
+        # job is caught directly rather than via a distant guard step.
+        working-directory: swift
+        run: |
+          OUT=$(swift package show-dependencies --format flatlist)
+          echo "output: '$OUT'"
+          [ -z "$OUT" ]
       - name: Train the parity corpus
         # Fixed corpus in, tokenizer.json out — compared byte-for-byte against
         # the Linux job's copy in swift-parity below. TokenizerFormat.save uses
@@ -217,6 +239,79 @@ jobs:
           name: fim-shards-macos
           path: ${{ runner.temp }}/fim-shards
           retention-days: 7
+      # ── #197: the parts of MonicaLSP that need a real typescript-language-server —
+      # macOS-only (this job has the pinned node_modules toolchain; swift-linux does not
+      # install node at all, matching how the rest of this job's fixture files are
+      # macOS-only too).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install the pinned typescript-language-server toolchain (#194's set)
+        working-directory: eval_sets/ts_error_injection
+        run: npm ci
+      - name: MonicaLSP --probe-reap — every ProcessSupervisor exit path, with the orphan check (V7)
+        # The gating check from the plan: a shell wrapper around the live-server run that
+        # asserts a child was actually observed (BLIND guard) and that nothing outlives it.
+        working-directory: swift
+        run: |
+          BEFORE=$(pgrep -f 'typescript-language-server|tsserver' | wc -l | tr -d ' ')
+          swift run monica-lsp --probe-reap | tee "$RUNNER_TEMP/probe.log"
+          grep -q '^spawned_pid=' "$RUNNER_TEMP/probe.log" || { echo "BLIND: no child was ever spawned"; exit 2; }
+          grep -q '^FAIL:' "$RUNNER_TEMP/probe.log" && { echo "probe-reap reported a FAIL line above"; exit 1; }
+          sleep 2
+          AFTER=$(pgrep -f 'typescript-language-server|tsserver' | wc -l | tr -d ' ')
+          [ "$AFTER" -le "$BEFORE" ] || { echo "ORPHAN: $BEFORE -> $AFTER"; pgrep -afl 'tsserver'; exit 1; }
+      - name: MonicaLSP --bench — Swift fast-loop latency vs the Python reference (V8)
+        working-directory: swift
+        run: |
+          swift run monica-lsp --bench --n-files 500 --iters 100 \
+            --out "$RUNNER_TEMP/swift_lsp_bench.json"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Python (stdlib-only src/lsp — no data/mlx/torch needed for this check)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Python fast-loop bench, same synthetic project shape, for comparison
+        run: |
+          python scripts/bench_ts_lsp.py --n-files 500 --warmup 10 --iters 100 \
+            --out "$RUNNER_TEMP/ts_lsp_bench.json"
+          echo "--- Swift ---"; cat "$RUNNER_TEMP/swift_lsp_bench.json"
+          echo "--- Python ---"; cat "$RUNNER_TEMP/ts_lsp_bench.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsp-bench-records
+          path: |
+            ${{ runner.temp }}/swift_lsp_bench.json
+            ${{ runner.temp }}/ts_lsp_bench.json
+          retention-days: 90
+      - name: Mask-set parity, no checked-in oracle (V5)
+        # Both sides compute the SAME fixed synthetic vocab/label/prefix cases from
+        # scratch and are compared with a byte cmp — no numeric oracle checked in (#195's
+        # lesson). The Python side is generated at run time from src/serve/constrained.py,
+        # NOT imported from monica-lsp's own logic, so this is a real cross-language check.
+        run: |
+          swift run --package-path swift monica-lsp --emit-mask-parity "$RUNNER_TEMP/swift-mask-parity.json"
+          python3 - "$RUNNER_TEMP/py-mask-parity.json" <<'PYEOF'
+          import json, sys
+          sys.path.insert(0, ".")
+          from src.serve.constrained import VocabTrie, allowed_extensions
+          VOCAB = ["x", "y", "length", "len", "toString", "to", "String", ".", " ",
+                   "toLowerCase", "toUpperCase", "foo", "fooBar", "_bar", "1", "2",
+                   "a", "ab", "abc", "!"]
+          LABELS = ["length", "toString", "toLowerCase", "toUpperCase", "x", "y", "abc"]
+          EXIT_IDS = [7, 8, 19]
+          PREFIXES = ["", "to", "len", "x", "abc", "ab", "zzz"]
+          trie = VocabTrie(VOCAB)
+          cases = [{"prefix": p, "allowed": sorted(allowed_extensions(trie, LABELS, p, exit_ids=EXIT_IDS))}
+                   for p in PREFIXES]
+          with open(sys.argv[1], "w") as f:
+              f.write(json.dumps({"cases": cases}, separators=(",", ":")) + "\n")
+          PYEOF
+          diff "$RUNNER_TEMP/swift-mask-parity.json" "$RUNNER_TEMP/py-mask-parity.json"
 
   # ── Job 6: native Swift toolchain, Linux (#246) ───────────────────────────
   # The official swift image (Ubuntu 24.04, glibc 2.39) — the same toolchain the
@@ -242,6 +337,12 @@ jobs:
       - name: Self-check
         working-directory: swift
         run: swift run monica-selfcheck
+      # #197: binary-free (no subprocess, no node) — must pass on Linux too, since
+      # MonicaLSP lives inside `swift/` and this job compiles/runs it like everything else
+      # here. The live-server steps (npm-installed toolchain) are macOS-only, in swift-macos.
+      - name: MonicaLSP self-check (framing/demux/trie/scanner — no subprocess)
+        working-directory: swift
+        run: swift run monica-lsp --self-test
       - name: Train the parity corpus
         working-directory: swift
         run: |
@@ -450,6 +551,32 @@ jobs:
             --temperature 0 --max-new-tokens 8)
           echo "$OUT"
           [ -n "$OUT" ]
+      # ── #197: end-to-end native masked decode (V9) — the one item that is CI-only on
+      # this host (mlx-swift needs Metal, which needs Xcode's compiled metallib; this job
+      # gets that via the xcodebuild step above, unlike a plain `swift build`).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install the pinned typescript-language-server toolchain (#194's set)
+        working-directory: eval_sets/ts_error_injection
+        run: npm ci
+      - name: monica-generate --lsp-mask end to end (V9)
+        run: |
+          cd swift
+          swift run monica-tokenize train --in Fixtures/parity-corpus.jsonl \
+            --out "$RUNNER_TEMP/gen-tokenizer.json" --vocab-size 512
+          cd engine
+          OUT=$("$MONICA_GENERATE_BIN" --weights Fixtures/toy-gen/weights.safetensors \
+            --tokenizer "$RUNNER_TEMP/gen-tokenizer.json" --prompt 'function foo() { return 1; }' \
+            --temperature 0 --max-new-tokens 8 --lsp-mask \
+            --lsp-eval-set-dir "$GITHUB_WORKSPACE/eval_sets/ts_error_injection")
+          echo "$OUT"
+          # A masked run that silently fell back to unconstrained (e.g. the toolchain
+          # resolving to nil and the flag being ignored) would print the SAME thing as the
+          # unmasked step above and read as a false pass — so this asserts non-empty output
+          # AND that the process didn't fail() on toolchain resolution (fail() exits 1,
+          # which the command substitution above would have already surfaced).
+          [ -n "$OUT" ]
       - name: monica-generate AC3 — prefill bench (#169, informational)
         # NOT a gate: hosted-runner timing is noisy, so no threshold assertion. It DOES
         # assert the two prefill paths' argmax id AGREES (a correctness property, not a
@@ -505,9 +632,216 @@ jobs:
             ${{ runner.temp }}/monica-bench-toy.json
             ${{ runner.temp }}/monica-bench-toy-moe-int8.json
           retention-days: 90
+      # ── #196: checkpoint I/O — the Swift WRITER round-trips into Python ──
+      # `monica-parity`'s own round-trip section (Checkpoint.swift's `save`, gated
+      # above as part of "Logit + greedy-id parity") only proves Swift can read back
+      # what Swift wrote. The issue's other acceptance direction — "a checkpoint
+      # written by Swift loads and runs in Python" — can only be proven by a Python
+      # process, hence the two steps below.
+      - name: Emit Swift-written checkpoints for the Python round-trip gate
+        # Cheap: the binary is already built and every fixture is tiny. Reruns the
+        # same binary rather than adding a second executable/target.
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-parity binary not found under .build-xcode/Build/Products" >&2
+            exit 1
+          fi
+          "$BIN" --roundtrip-out "$RUNNER_TEMP/swift-ckpt"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Python (mlx only — no data/torch needed for this check)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Swift -> Python checkpoint round trip (GATE)
+        # Closes the direction `monica-parity`'s own round trip cannot: sidecar
+        # dict equality, quant-block equality, key-set equality, and forward logits
+        # vs reference.safetensors, for every checkpoint the step above emitted. An
+        # empty --roundtrip-dir is a FAILURE in this script, not a silent pass — see
+        # scripts/check_swift_checkpoint.py's module docstring. If Python setup ever
+        # makes this job noticeably slower, the documented fallback (see that
+        # script's docstring and #196's plan) is to upload
+        # "$RUNNER_TEMP/swift-ckpt" as an artifact and run this check in a small
+        # separate `needs:`-gated macOS job instead of inline here.
+        run: |
+          python scripts/check_swift_checkpoint.py \
+            --roundtrip-dir "$RUNNER_TEMP/swift-ckpt" \
+            --fixtures swift/engine/Fixtures
       - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
         # Cheap, and it fails loudly the day someone "simplifies" the two packages into one.
         # The engine -> tokenizer edge (Package.swift) must never become tokenizer -> engine.
+        run: |
+          cd swift
+          OUT=$(swift package show-dependencies --format flatlist)
+          echo "output: '$OUT'"
+          [ -z "$OUT" ]
+
+  # ── Job 9: the poc-scale parity oracle, generation side (#267) ────────────
+  # Dispatch/schedule-only — see the `on:` block above. Generation side of the
+  # two-process #298 guard job 10 completes: #298 (MLX 0.32.0 buffer-reuse
+  # corruption) is deterministic PER PROCESS, so two independent fresh-process
+  # generations, on two separate runners, have to corrupt identically to survive
+  # the manifest `diff` in job 10. Python+MLX only — NO Swift toolchain, so this
+  # job cannot be contaminated by the thing it is generating an oracle FOR.
+  # Uploads a ~2 KB manifest, never the 571 MB fixture itself: job 10 regenerates
+  # its own copy in ~6 s, which is both cheaper than moving the bytes and
+  # strictly stronger evidence (two processes, two runners, not one process
+  # trusted twice).
+  poc-fixture-oracle:
+    name: poc parity oracle — generate (macOS, Python MLX)
+    runs-on: macos-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (mlx only — no data/torch needed to export a fixture)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Export the poc-scale fixture
+        # config/poc.yaml is fp16 by default; --precision fp32 overrides it (the harness
+        # gates fp32 — see export_parity_fixture.py's --precision help). Measured on an
+        # M1 Pro during planning: 5.77s wall, 571 MB output.
+        run: |
+          /usr/bin/time -l python scripts/export_parity_fixture.py \
+            --config config/poc.yaml --precision fp32 --batch 1 --seq 128 \
+            --out "$RUNNER_TEMP/poc-fixture"
+          du -sh "$RUNNER_TEMP/poc-fixture"
+          cat "$RUNNER_TEMP/poc-fixture/meta.json"
+      - name: Manifest (relative paths, so job 10's own copy is comparable)
+        run: |
+          cd "$RUNNER_TEMP/poc-fixture"
+          find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/poc-manifest.txt"
+          cat "$RUNNER_TEMP/poc-manifest.txt"
+          # A manifest that cannot observe its target must never read green: an empty
+          # or short manifest would `cmp` clean against another equally-empty one. Exactly
+          # 7 files: generation/inputs/meta.json/prefill/reference/weights.safetensors +
+          # weights.safetensors.config.json.
+          N=$(wc -l < "$RUNNER_TEMP/poc-manifest.txt")
+          [ "$N" -eq 7 ] || { echo "BLIND: expected 7 fixture files, got $N"; exit 2; }
+          grep -q 'weights.safetensors$' "$RUNNER_TEMP/poc-manifest.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: poc-fixture-manifest
+          path: |
+            ${{ runner.temp }}/poc-manifest.txt
+            ${{ runner.temp }}/poc-fixture/meta.json
+          retention-days: 30
+          if-no-files-found: error      # never let an empty artifact upload look like success
+
+  # ── Job 10: the poc-scale parity gate, Swift consumer side (#267) ─────────
+  # Dispatch/schedule-only. `needs: [swift-engine, poc-fixture-oracle]` — depending on
+  # swift-engine is deliberate and free: it makes this job start AFTER swift-engine has
+  # written the `swift-engine-${{ runner.os }}-…` xcodebuild cache, so this job's
+  # mlx-swift build is a warm restore + incremental build rather than a second cold
+  # 20-40 min vendored-C++ compile. It does NOT modify swift-engine itself — that job
+  # gains no `needs:`, so it can never be skip-propagated by this new dependency.
+  poc-parity:
+    name: poc parity gate (macOS, mlx-swift, dispatch/schedule only)
+    runs-on: macos-latest
+    needs: [swift-engine, poc-fixture-oracle]
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version | tee .swift-toolchain-version
+      # Same rationale as swift-engine's identical step above: mlx-swift's Metal kernels
+      # need Xcode's `metal` compiler, which plain `swift build` never invokes.
+      - name: Ensure Metal toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -downloadComponent MetalToolchain || true
+          xcodebuild -showComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: actions/cache@v4
+        with:
+          path: swift/engine/.build-xcode
+          # IDENTICAL key to swift-engine's cache, plus a restore-keys prefix: this job
+          # wants a warm restore of the cache swift-engine (an earlier job in this same
+          # run, via `needs:`) just wrote, not a fresh cold build.
+          key: swift-engine-${{ runner.os }}-${{ hashFiles('swift/engine/Package.resolved') }}-${{ hashFiles('.swift-toolchain-version') }}
+          restore-keys: |
+            swift-engine-${{ runner.os }}-
+      - name: Build (xcodebuild, so mlx-swift's Metal kernels actually get compiled)
+        working-directory: swift/engine
+        run: |
+          xcodebuild build -scheme MonicaEngine-Package -destination 'platform=macOS' \
+            -derivedDataPath .build-xcode -skipPackagePluginValidation
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (mlx only — no data/torch needed to export a fixture)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Regenerate the fixture in THIS job's own fresh process
+        # The other half of the #298 cross-process guard: a second, independent
+        # generation on a SECOND runner, in a fresh Python process that has never touched
+        # job 9's. #298's corruption is deterministic per-process, so two independent
+        # processes have to corrupt identically to fool the diff below.
+        run: |
+          python scripts/export_parity_fixture.py \
+            --config config/poc.yaml --precision fp32 --batch 1 --seq 128 \
+            --out "$RUNNER_TEMP/poc-fixture"
+          cd "$RUNNER_TEMP/poc-fixture"
+          find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/poc-manifest-local.txt"
+      - uses: actions/download-artifact@v4      # errors (fails the job) if the artifact is absent
+        with:
+          name: poc-fixture-manifest
+          path: oracle
+      - name: "#298 guard — two fresh processes on two runners must agree byte-for-byte"
+        # This MUST run, and pass, BEFORE monica-parity below ever reads poc-fixture — an
+        # oracle that disagrees with its own independent regeneration is not a valid
+        # oracle regardless of what the Swift side says about it.
+        run: |
+          test -s oracle/poc-manifest.txt || { echo "BLIND: oracle manifest missing/empty"; exit 2; }
+          N=$(wc -l < oracle/poc-manifest.txt)
+          [ "$N" -eq 7 ] || { echo "BLIND: short oracle manifest ($N lines)"; exit 2; }
+          diff oracle/poc-manifest.txt "$RUNNER_TEMP/poc-manifest-local.txt"
+          # upload-artifact's multi-path least-common-ancestor is $RUNNER_TEMP (shared by
+          # poc-manifest.txt and poc-fixture/meta.json in job 9), so the poc-fixture/
+          # subdir survives into the download — the file lands at oracle/poc-fixture/meta.json,
+          # not oracle/meta.json.
+          test -s oracle/poc-fixture/meta.json || { echo "BLIND: oracle meta.json missing/empty"; exit 2; }
+          diff <(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' oracle/poc-fixture/meta.json) \
+               <(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))' "$RUNNER_TEMP/poc-fixture/meta.json")
+      - name: Record the poc-scale tolerance headroom (informational, but printed)
+        # NOT a threshold check — src/conformance/tolerances.py's fp32 band (rtol=1e-4/
+        # atol=1e-5, reused unmodified — see #267's scope) is enforced by the exporter
+        # itself (it refuses to write a fixture that fails its own forward/step parity
+        # check) and by monica-parity's gate step below. This just makes the measured
+        # numbers a standing CI observation instead of a one-off in a plan file.
+        run: |
+          python3 -c "import json;m=json.load(open('$RUNNER_TEMP/poc-fixture/meta.json'));print('forward_step_max_abs_diff=%s greedy_margin_min=%s prefill_decode_max_abs_diff=%s' % (m['forward_step_max_abs_diff'], m['greedy_margin_min'], m['prefill_decode_max_abs_diff']))"
+      - name: Swift logit + greedy-id parity at poc scale (GATE)
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-parity -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-parity binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          "$BIN" --fixtures "$RUNNER_TEMP/poc-fixture" | tee "$RUNNER_TEMP/poc-parity.log"
+          # Exit 0 is not sufficient evidence a real comparison happened: main.swift
+          # already fails on an empty fixture set ("no fixtures to check"), but this makes
+          # the observation explicit at this call site too — a check that cannot observe
+          # its target must never read green.
+          grep -qE '^OK — all 1 fixtures pass forward \+ step parity' "$RUNNER_TEMP/poc-parity.log"
+      - name: Guard — swift/ (MonicaTokenizer) stays dependency-free (#167)
         run: |
           cd swift
           OUT=$(swift package show-dependencies --format flatlist)

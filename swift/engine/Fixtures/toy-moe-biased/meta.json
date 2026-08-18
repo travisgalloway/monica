@@ -6,10 +6,19 @@
   "precision": "fp32",
   "vocab_size": 256,
   "gen_steps": 16,
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0",
   "moe_bias": true,
   "forward_step_max_abs_diff": 2.384185791015625e-06,
   "prefill_decode_max_abs_diff": 4.76837158203125e-07,
   "prefill_decode_max_abs_state_diff": 4.76837158203125e-07,
-  "greedy_margin_min": 4.218270540237427
+  "greedy_margin_min": 4.218270540237427,
+  "mixing_layers": [
+    0,
+    2
+  ],
+  "moe_load_layers": [
+    1,
+    3
+  ],
+  "moe_route_margin_min": 0.06686663627624512
 }

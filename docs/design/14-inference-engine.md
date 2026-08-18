@@ -92,7 +92,7 @@ this section — three of the four are further along than they look.
 |---|---|---|---|
 | **Prefill via parallel scan** (#165 → Swift #169) | `prefill(token_batch, seg_ids=None, *, last_only=False) -> (logits, State)` — **genuinely new** to `ModelInterface` | The scan **already computes the carry-out state and throws it away**: `new_states` is `(B, nc+1, H, P, N)` at `src/model/mlx_backend.py:252`, and `S_enter = new_states[:, :-1]` at `:253` drops the last entry. CUDA does exactly the same. **Shipped in #165**: `parallel(..., return_state=True)` surfaces the carry-out (the CUDA fused path passes `return_final_states=True`), `forward_prefill` on each block class pairs it with the conv window and the attention KV, and `prefill` is on the seam in both backends. `seg_ids` and continuing a non-fresh session are explicit non-goals in v1 (the packing-aware scan masks the carry-out row to zeros; RoPE positions are seeded from 0). `src/serve/generate.py` now prefills the prompt in one call | `src/conformance/prefill_decode_parity.py` (shipped): prefill-then-decode logits == pure step-by-step decode, **and** the extracted `State` == the step-produced state, element-wise, fp32 ~1e-4 |
 | **Quantization** (#168 — **done**, see below) | quantized `load` — `Checkpoint.load` decodes an optional `quant` block from the `.config.json` sidecar (`mode`, `group_size`, `targets: {module_path: bits}`) and applies `MLXNN.quantize` before loading. Absence of the block = an fp checkpoint, byte-identical to before | `src/eval/quantize.py`'s `mlx_affine_quantize`/`mlx_affine_dequantize` (the ACTUAL `mx.quantize`-compatible format — see below; `quantize_dequantize` is a DIFFERENT, older variant, #51's measurement contract only) + `scripts/quantize_checkpoint.py` driver, weight-only W8/W4/W2 | `src/conformance/quant_parity.py`: top-1 agreement + KL vs the fp model, bits-dependent thresholds. The fp32 gates stay on the fp model, unchanged |
-| **Speculative decoding** (#172) | `verify_block(tokens, state) -> (logits_list, state_list)` — **already implemented, on MLX only** (`src/model/mlx_backend.py:626`). It is **not** on `ModelInterface` and CUDA has no equivalent; promoting it to the seam is the open work | Drafter + accept rule are already portable: `src/serve/spec_decode.py` (`propose:27`, a prompt-lookup drafter needing no second model; `first_mismatch:53`). Driver: `scripts/spec_decode.py`, which calls `verify_block` at `:127`. **Greedy-only by construction** — `first_mismatch` compares against the verifier's *argmax*, stated in the module docstring | output **byte-identical to greedy decode** — what `tests/test_spec_decode.py:85` already asserts on MLX — plus accept-rate and speedup reported by the bench (#170) |
+| **Speculative decoding** (#172) | `verify_block(tokens, state) -> (logits_list, state_list)` — implemented on **MLX only, both languages now** (`src/model/mlx_backend.py:897` / `swift/engine/Sources/MonicaEngine/MonicaModel.swift`'s `verifyBlock`, #264). It is **not** on `ModelInterface` and CUDA has no equivalent; promoting it to the seam is still the open work — #264 was a Swift-only port of the existing MLX-only shape, not a seam change | Drafter + accept rule are already portable: `src/serve/spec_decode.py` (`propose:27`, a prompt-lookup drafter needing no second model; `first_mismatch:53`). Driver: `scripts/spec_decode.py`, which calls `verify_block` at `:127`. **Greedy-only by construction** — `first_mismatch` compares against the verifier's *argmax*, stated in the module docstring | output **byte-identical to greedy decode** — what `tests/test_spec_decode.py:85` already asserts on MLX — plus accept-rate and speedup reported by the bench (#170). The Swift port is gated by `monica-parity` (row-0 logits vs `step_logits`, final state vs `prefill.safetensors`, an in-process rollback identity) — no new checked-in fixture |
 | **Continuous batching** (**deferred**, per #163) | `step_batch` | `step` already takes a `(B,)` token array against a `(B, …)` state (`init_state(batch_size)`, `src/model/mlx_backend.py:681`), so **uniform** batching works today. What is missing is per-sequence admission / eviction / ragged lengths layered on `SessionStore`'s LRU (`src/serve/sessions.py:65`) | batched decode == per-sequence decode for the same inputs, fp32 ~1e-4. Specify the gate now; the lever stays **deferred** until the single-stream Mac path works |
 
 **Prefill, concretely.** The carry-out is `new_states[:, -1]` — the entry `S_enter` discards —
@@ -216,21 +216,120 @@ implementation reproduces the policy; it does not re-invent it. See
 **The gate.** Loss and grad-norm versus the Python MLX train step on a fixed-seed toy batch,
 in the spirit of `src/conformance/backend_parity.py` — fp32, ~1e-4.
 
-**Checkpoint I/O (#196).** Both directions against `src/train/checkpoint.py:75` (`save_weights`):
-safetensors plus the `<path>.config.json` sidecar. Python-written checkpoints must load in Swift
-and Swift-written checkpoints must load in Python, bit-for-bit on the tensors. The **slot-a/slot-b
-resume bundle** (`CheckpointStore`, `src/train/checkpoint.py:121`) is explicitly **out of
-scope** — that is the within-backend concern the two-concern split exists to keep separate
-(optimizer state does not need to port).
+**Checkpoint I/O (#196) — shipped.** Both directions against `src/train/checkpoint.py:75`
+(`save_weights`): safetensors plus the `<path>.config.json` sidecar. Python-written checkpoints
+load in Swift and Swift-written checkpoints load in Python, bit-for-bit on the tensors.
 
-**The LSP fast loop (#197).** A native persistent `tsserver` client — the Python reference is
-`src/lsp/ts_lsp.py` plus `src/lsp/harness.py`, driven through the `LMAdapter` seam
-(`src/lsp/lm.py:29`), whose only implementation is `src/model/mlx_lm_adapter.py:73` — together
-with a per-step logit-mask hook analogous to the Python `sampler` wrapper (`src/serve/sampling.py:26`).
-That hook is what SSI's constrained decode (#226) needs. The **latency motive** comes straight
-from [12-lsp-in-the-loop.md](12-lsp-in-the-loop.md): the harness's cost is dominated by round-trips
-between the model and the language server, so a native fast loop is the lever that makes the
-experiment affordable.
+*The reader half already existed.* `Checkpoint.load`/`loadInto`
+(`swift/engine/Sources/MonicaEngine/Checkpoint.swift`) landed with #166/#168 — decode the
+sidecar, apply an optional `quant` block, pop the non-parameter `moe_route_bias.{i}` keys, and
+`update(parameters:verify: .all)`. #196's net-new work was the **writer**
+(`Checkpoint.save`/`portableStateDict`) and the Swift→Python direction of the round trip.
+
+*The writer* mirrors `_portable_state_dict` exactly: `model.parameters().flattened()` plus,
+for each `MoEBlock` whose route bias is ACTIVE, `moe_route_bias.{i}` — emitted conditionally,
+because an unconditional key would break Python's `num_parameters()` accounting
+(`tests/test_moe.py`, `tests/test_sizing_mlx.py`; the bias is training-side routing state, not
+a parameter, on either side of the seam). It rejects `bfloat16` at save time (Python's
+`safetensors.numpy` reader has no bf16 numpy dtype — better to fail at the write, not three
+files later on the read), and writes atomically (`.safetensors`-suffixed temp path,
+`replaceItemAt`/`moveItem`), mirroring `checkpoint.py`'s `_atomic_write_bytes` discipline.
+
+*The sidecar-fidelity decision.* `MambaConfig.to_dict()` on the Python side is
+`dataclasses.asdict(self)` — **every** field (Muon / `torch_compile` / `fp8_experts` /
+data-side knobs / `quant`). Swift's `MambaConfig` only *decodes* the ~22 fields the inference
+path reads. Re-encoding just that subset on save would silently reset every other field to a
+Python dataclass default on the next Python read — a quiet corruption of the cross-backend
+bridge. Instead, `MambaConfig.load(sidecar:)` decodes the file **twice**: once into
+`MambaConfig` (typed, known fields), once into a raw `[String: JSONValue]`
+(`swift/engine/Sources/MonicaEngine/Config.swift`'s minimal `Any`-Codable enum, order-sensitive
+— `Int` is tried before `Double` so `"d_model": 64` doesn't become `64.0`). `save(sidecar:)`
+writes the raw dict back, **overlaid** with the known fields' current values, so an unmodeled
+field (or `quant`) survives verbatim while a config actually mutated in Swift is still
+reflected. This is deliberately **not** byte-identical to Python's `json.dumps(cfg, indent=2)`
+(dataclass field order can't be reproduced without hardcoding it); the gate is *semantic* dict
+equality (`scripts/check_swift_checkpoint.py`), not `cmp`. A config built directly in Swift
+(no `rawSidecar`) writes only the known fields — lossy by construction, documented at the call
+site, and not a path any checkpoint destined for Python should go through.
+
+*The round-trip gate* has two halves, because a Swift binary alone cannot prove the direction
+that matters to Python. `monica-parity --roundtrip-out <dir>` (Swift side, no new checked-in
+fixture — see `swift/engine/Fixtures/README.md`) exercises, per fixture: (a) an identity round
+trip — save, reload, assert every parameter tensor is **bit-identical** (save/load is lossless
+by construction, so `rtol`/`atol` would be the wrong tool here), the sidecar round-trips to an
+equal `MambaConfig`, and forward logits still match the Python oracle; (b) a mutation round
+trip — perturb one parameter, save, reload, confirm the perturbation survived exactly, which is
+what catches a writer that degenerates into a file copy; (c) route-bias presence/absence
+matching `_portable_state_dict`'s conditional; (d) for the quantized fixtures, that the `quant`
+block re-decodes to the same `mode`/`group_size`/`targets` (the packed tensors themselves are
+already covered by (a)'s exact comparison). `scripts/check_swift_checkpoint.py` (Python side)
+then loads what that step wrote: sidecar dict equality, quant-block equality, key-set equality,
+and forward logits vs each fixture's `reference.safetensors`. It explicitly **SKIPs** — never
+silently passes — the two quantized fixtures' model-construction/forward checks, because
+`src/eval/quantize.py` is a fake-quant *measurement* spike (see "Quantization" above): the
+Python MLX backend never builds an `nn.QuantizedLinear`/`nn.QuantizedEmbedding`, so there is no
+loader reachable from a plain `MLXMambaModel` that can consume packed
+`.weight`/`.scales`/`.biases`. Sidecar/quant-block equality still gates those two fixtures; the
+packed-tensor and quant-block round trip is gated Swift-side by (a)/(d) above. An empty
+`--roundtrip-dir` is itself a FAIL in the Python script, not a pass — a checker that can't see
+its target must never read green.
+
+*Explicitly out of scope, and why.* The **slot-a/slot-b resume bundle**
+(`CheckpointStore`, `src/train/checkpoint.py:121` — step / loss-scale / RNG / optimizer state /
+dataloader position) is **not** implemented here. That's the within-backend concern the
+two-concern split exists to keep separate from portable weights (optimizer state does not need
+to port across backends), and #196 delivers exactly concern (1) of that split. Concretely: at
+the time #196 landed, #195 (the Swift train step) had not merged — `main` had no Swift
+optimizer type, no `monica-train`, and no `train.safetensors` fixture — so there was nothing
+real to serialize yet, and inventing an optimizer-state format against nonexistent types would
+have collided with #195 when it eventually lands. `Checkpoint.save` takes only a model and a
+destination URL, so a future optimizer serializer is an orthogonal file written into the same
+directory, not a refactor of this one. Swift resume (optimizer state + step) should be filed as
+its own issue once #195 lands, referencing this note.
+
+**The LSP fast loop (#197) — SHIPPED.** A native persistent `typescript-language-server` client
+plus a per-step completion-list logit-mask hook, ported from `src/lsp/ts_service.py` /
+`src/lsp/jsonrpc.py` / `src/serve/constrained.py` / `src/lsp/completion_mask.py`. The
+constrained-decode hook itself (`Generator.allowedIdsFor`) already existed from #167/#169 — #197
+built the native **producer** and wired it through `monica-generate`.
+
+*Package placement.* `MonicaLSP` is a new **target** in `swift/` (the zero-dependency
+`MonicaTokenizer` package), not a new package and not a new dependency edge —
+`swift/Package.swift` stays `dependencies: []`. It needs no MLX at all (`Process` + pipes + JSON
++ string scanning), so the framing/demux/trie/scanner majority of the code — the parts with real
+correctness risk — is built and self-checked (`swift run monica-lsp --self-test`, binary-free, no
+subprocess) on **both** `swift-macos` and `swift-linux`, with no mlx-swift build in the loop. Only
+the wiring lives in `swift/engine/`: `monica-generate` gains `--lsp-mask`/`--lsp-project`/
+`--lsp-file` flags that construct a `TsLspClient` + `CompletionMasker` and hand
+`allowedIdsFor:` to `Generator.generate` (`.product(name: "MonicaLSP", package: "swift")` — same
+path-dependency identity trap as the tokenizer edge, see #167's note two sections up). Absent the
+flags, `allowedIdsFor` stays `nil`: an exact no-op, so every existing `monica-generate`
+invocation is byte-identical in behavior to before this issue.
+
+*Why this doesn't reduce `diagnostics` latency* — and does not claim to. #278 diagnosed ~350ms of
+the measured `diagnostics` round trip as a **client-side debounce hardcoded inside
+`typescript-language-server` 5.3.0** (`cli.mjs:17868`/`:20516`), not type-checking; that debounce
+lives in the Node process on the far side of the pipe, so no Swift client can cut it. The fast
+loop instead runs on `completions` (debounce-free, 2,500+ calls/s on the Python reference,
+[12-lsp-in-the-loop.md](12-lsp-in-the-loop.md)'s #197 section has the Swift-vs-Python numbers),
+and the masker issues exactly **one completion query per identifier span, not per token** — the
+load-bearing amortization, reported as queries per 100 generated tokens in the bench output.
+
+*Reaping.* `ProcessSupervisor` (`swift/Sources/MonicaLSP/ProcessSupervisor.swift`) is the only
+type in the codebase allowed to own the child process: a scoped `withServer { }` entry point
+reaps on return/throw via `defer`, `shutdown()` is idempotent and follows the same
+terminate-then-bounded-wait-then-kill ladder as `src/lsp/ts_service.py:446`, and a process-wide
+`sig_atomic_t` + `SIGINT`/`SIGTERM`/`SIGHUP`/`atexit` backstop kills the last-spawned child even
+on a signal Swift's `defer` never runs for. `typescript-language-server` 5.3.0 also empirically
+honors the LSP `processId` parent-death watch (verified via `monica-lsp --probe-reap`'s SIGKILL
+scenario on this pin — the server exits on its own even when the parent is killed with no chance
+to run a handler), so a `SIGKILL`ed `monica-lsp` still leaves no orphan in practice.
+
+*Out of scope, filed as follow-ups rather than built here*: a Swift port of #279's raw-`tsserver`-
+protocol (`semanticDiagnosticsSync`) transport, if #279 lands and the bypass proves worth a second
+client; tree-sitter grammar masking for the fast loop (the Python extractor,
+`src/lsp/ts_boundaries.py`, is an optional `[eval]` extra with a C dependency the zero-dependency
+`swift/` package must not take).
 
 ## The native-engine investigation (B1–B4)
 
@@ -307,9 +406,32 @@ The #163 dependency order:
 2. **#166** — port the model to mlx-swift + the logit-parity harness. Everything else waits on it.
 3. **#167** (generation CLI — **done**), **#195** (train step + optimizer), **#196** (checkpoint
    I/O) — in parallel once #166 lands.
-4. **#197** (LSP harness), **#168** (quantization — **done**), **#169** (Swift prefill —
-   **done**), **#170** (Apple-Silicon benchmark harness — **done**).
+4. **#197** (LSP harness — **done**), **#168** (quantization — **done**), **#169** (Swift
+   prefill — **done**), **#170** (Apple-Silicon benchmark harness — **done**).
 5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
+6. **#267 — done: the poc-scale Swift parity gate, generate-on-runner (CI, dispatch/schedule
+   only).** #166 gated `swift-engine` against four checked-in *toy*-scale fixtures and
+   verified `config/poc.yaml` (d_model 768, 24 layers, vocab 50280) manually, once, locally.
+   #267 turns that into a standing gate without checking the 571 MB poc fixture into git:
+   two new jobs, `poc-fixture-oracle` (macOS, Python+MLX, no Swift toolchain — generates the
+   fixture, hashes it, uploads a ~2 KB sha256 manifest + `meta.json`) and `poc-parity`
+   (macOS, `needs: [swift-engine, poc-fixture-oracle]` so it restores swift-engine's warm
+   xcodebuild cache — regenerates its own independent copy, `cmp`s the two manifests, THEN
+   runs `monica-parity --fixtures` against the verified fixture). Measured on an M1 Pro
+   during planning: **5.2-5.8 s wall, ~2 GB peak RSS, 571 MB output**, and the two
+   independent generations were **bit-identical, 7/7 files** — which is what makes the
+   manifest `diff` a real guard against **#298** (MLX 0.32.0's deterministic-per-process
+   buffer-reuse corruption) rather than a coin flip: two fresh processes on two runners would
+   have to corrupt identically to pass it. Both jobs are gated
+   `if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'` (a new
+   weekly Monday `schedule:` trigger) — **never `pull_request`/`push`** — because poc adds
+   zero new *code-path* coverage over `toy` (pure Mamba, no attention/MoE/quant); what it adds
+   is *scale* coverage of the tolerance contract (R2 below), which does not change PR to PR,
+   so per-PR cost (a second macOS mlx-swift build) isn't worth paying. `swift-engine` gains
+   no `needs:` and no existing job's cache key/`if:` changed. No change to
+   `src/conformance/tolerances.py`, `scripts/export_parity_fixture.py`, or any checked-in
+   fixture. See `swift/engine/Fixtures/README.md` §poc for the operator-facing version and
+   the local reproduction command.
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
 DPO/GRPO step factories.
@@ -333,6 +455,17 @@ DPO/GRPO step factories.
   is gone. Swift porting the CUDA-specific gather dispatch remains out of scope for #166
   (Swift is inference-only and evaluates every expert the same way the MLX/dense reference
   does; gather is a training-throughput optimization with no logit effect to port).
+- **`seg_ids` packing-aware forward path — RESOLVED (#263).** The three forward-path arms
+  (`_chunk_seg_mask` -> `SelectiveSSM.chunkSegMask`, `_conv_seq_seg` -> `MambaBlock.
+  convSeqSeg`, `AttentionBlock.forward_seq`'s block-diagonal mask) are ported and gated by
+  `monica-parity`'s P6 section against a new checked-in `packed.safetensors` oracle
+  (`toy`/`toy-hybrid`/`toy-moe`; see `swift/engine/Fixtures/README.md`). Deliberately
+  scoped to inference: `forwardPrefill`/`prefill` still take no `segIds` — that is the
+  same #165 exclusion as before (a packing-aware carry-out reads as zeros; see
+  `SelectiveSSM.scan`'s `carryOutRequested` precondition), not a gap #263 left open. Also
+  out of scope: plumbing `seg_ids` through a Swift training loop, data loader, or shard
+  reader — none of that exists yet (#195/#271 territory), and this port is a
+  prerequisite of #195 rather than a dependent of it.
 - **`SessionStore`'s budget math ignores the attention KV cache.** `per_session_state_floats`
   (`src/serve/sessions.py:40`) charges every layer a conv window plus an SSM state and has **no
   attention term**. That is exact for a pure-Mamba config, but the M12 hybrid's ~12.5% attention
@@ -429,6 +562,24 @@ DPO/GRPO step factories.
   `default.metallib`), so every genuinely local-hardware Swift-engine number in
   `docs/benchmarks.md` is recorded as "not yet measured" with the exact command to fill
   it in. Python-MLX numbers (no such constraint) are measured locally where noted.
+- **R2 (#267) — the fp32 parity band is relative-dominated at poc scale, not
+  absolute-dominated like it was derived to be.** `src/conformance/tolerances.py`'s Step 2
+  designs the fp32 band (`rtol=1e-4/atol=1e-5`) to be absolute-dominated for `|logit| ~ 8`
+  ("`rtol = atol / 8` so the relative term contributes at most one `atol` at the largest
+  logit"), calibrated on the `toy*.yaml` configs only. At `config/poc.yaml` scale
+  (d_model 768, 24 layers, vocab 50280), measured `forward_step_max_abs_diff = 3.62e-05` is
+  already 3.6x `atol` on its own, and `greedy_margin_min = 23.94` — logits ~3x larger than
+  toy's — mean the check only passes because the relative term (`rtol * |logit| ~= 2.4e-3`)
+  carries it: the band has flipped to relative-dominated. Net headroom is still ~66x (vs
+  toy's ~70x), so the contract holds *today*, and #267's `poc-parity` CI job (dispatch/
+  schedule-only, above) is what keeps that a monitored fact instead of a one-off measurement
+  that silently goes stale. **If a future mlx-swift version introduces a benign op-order
+  difference, this gate could trip at poc scale while every toy fixture stays green — that
+  is a finding to triage (is the drift real, or just the relative term catching up), not a
+  number to widen.** The only sanctioned escape hatch, if one is ever needed, is a *measured*
+  poc-scale row added to `src/conformance/tolerances.py` with its derivation recorded the
+  same way the existing toy-derived bands are — never an ad-hoc `rtol`/`atol` literal in the
+  CI workflow YAML.
 
 - **#195 — the Swift MLX training step + optimizer.** `swift/engine/Sources/MonicaEngine/
   TrainStep.swift` + `LossScaler.swift` mirror `src/model/mlx_train_step.py`'s pretraining

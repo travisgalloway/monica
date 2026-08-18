@@ -6,15 +6,25 @@
   "precision": "fp32",
   "vocab_size": 256,
   "gen_steps": 16,
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_diff": 9.5367431640625e-07,
   "prefill_decode_max_abs_state_diff": 5.960464477539062e-07,
   "greedy_margin_min": 1.4541618824005127,
+  "mixing_layers": [
+    0,
+    2
+  ],
+  "packed_doc_lengths": [
+    64,
+    7,
+    67
+  ],
+  "packed_seq_len": 256,
   "train_steps": 3,
   "train_grad_accum": 2,
-  "train_grad_clip": 1.5395530462265015,
+  "train_grad_clip": 1.539553165435791,
   "train_lrs": [
     0.001,
     0.0005,
@@ -26,9 +36,9 @@
     4.860827445983887
   ],
   "train_grad_norm": [
-    2.9856643676757812,
+    2.9856646060943604,
     1.5395644903182983,
-    1.2627768516540527
+    1.2627769708633423
   ],
   "train_clipped_steps": [
     0,

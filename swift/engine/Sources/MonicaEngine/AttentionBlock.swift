@@ -4,8 +4,8 @@
 // Scores and softmax run in fp32 regardless of `cd` (qkv/o_proj GEMMs in `cd`) so forward
 // and step agree at the fp32 ~1e-4 parity tolerance.
 //
-// Not ported (out of scope for #166): the `seg_ids` block-diagonal mask.
-// `forward_prefill` landed in #169 as `forwardPrefill`.
+// The `seg_ids` block-diagonal mask landed in #263. `forward_prefill` landed in #169 as
+// `forwardPrefill` — it has no `seg_ids` counterpart, matching #165's exclusion.
 
 import Foundation
 import MLX
@@ -43,8 +43,11 @@ public final class AttentionBlock: Block {
         return (heads(parts[0]), heads(parts[1]), heads(parts[2]))
     }
 
-    /// `forward_seq` (`:516-537`), the `seg_ids == nil` arm.
-    public override func forwardSeq(_ x: MLXArray) -> MLXArray {
+    /// `forward_seq` (`:516-537`). `segIds == nil` is the original single-segment causal
+    /// mask; otherwise the mask is block-diagonal (#68/#263) — a token only attends within
+    /// its own document. Exact for ARBITRARY boundaries: unlike the SSM scan, attention
+    /// needs no chunk-alignment.
+    public override func forwardSeq(_ x: MLXArray, _ segIds: MLXArray?) -> MLXArray {
         let cd = config.cd
         let l = x.dim(1)
         let xn = norm(x)
@@ -54,8 +57,15 @@ public final class AttentionBlock: Block {
         q = applyRope(q, cosv, sinv)
         k = applyRope(k, cosv, sinv)
         var scores = matmul(q, k.transposed(0, 1, 3, 2)) / MLXArray(Float(sqrt(Double(dh))))
-        scores = which(causalMask(l), scores,
-                       MLXArray(-Float.infinity).asType(scores.dtype))
+        if let seg = segIds {
+            let same = seg.expandedDimensions(axis: 2) .== seg.expandedDimensions(axis: 1)  // (B,L,L)
+            let allow = causalMask(l) .&& same                                              // (B,L,L)
+            scores = which(allow.expandedDimensions(axis: 1), scores,
+                           MLXArray(-Float.infinity).asType(scores.dtype))
+        } else {
+            scores = which(causalMask(l), scores,
+                           MLXArray(-Float.infinity).asType(scores.dtype))
+        }
         var out = matmul(softmaxLastDim(scores), v)                     // (B,H,L,Dh)
         out = out.transposed(0, 2, 1, 3).reshaped([x.dim(0), l, h * dh])
         return x + linear(oProj, cast(out, cd), cd)

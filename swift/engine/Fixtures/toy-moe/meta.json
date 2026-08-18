@@ -6,12 +6,27 @@
   "precision": "fp32",
   "vocab_size": 256,
   "gen_steps": 16,
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_diff": 9.5367431640625e-07,
   "prefill_decode_max_abs_state_diff": 4.76837158203125e-07,
   "greedy_margin_min": 4.339304208755493,
+  "mixing_layers": [
+    0,
+    2
+  ],
+  "moe_load_layers": [
+    1,
+    3
+  ],
+  "moe_route_margin_min": 9.205937385559082e-05,
+  "packed_doc_lengths": [
+    64,
+    7,
+    67
+  ],
+  "packed_seq_len": 256,
   "train_steps": 3,
   "train_grad_accum": 2,
   "train_grad_clip": 2.504133462905884,

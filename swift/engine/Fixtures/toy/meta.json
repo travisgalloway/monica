@@ -6,12 +6,22 @@
   "precision": "fp32",
   "vocab_size": 256,
   "gen_steps": 16,
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_diff": 2.384185791015625e-07,
   "prefill_decode_max_abs_state_diff": 3.5762786865234375e-07,
   "greedy_margin_min": 6.3131983280181885,
+  "mixing_layers": [
+    0,
+    1
+  ],
+  "packed_doc_lengths": [
+    64,
+    128,
+    5
+  ],
+  "packed_seq_len": 256,
   "train_steps": 3,
   "train_grad_accum": 2,
   "train_grad_clip": 1.2266427278518677,
@@ -23,7 +33,7 @@
   "train_loss": [
     7.934021949768066,
     7.64931583404541,
-    7.459782123565674
+    7.459781646728516
   ],
   "train_grad_norm": [
     1.2668588161468506,

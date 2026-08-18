@@ -14,6 +14,17 @@ public enum LayerState {
     case attention(k: MLXArray, v: MLXArray)
     /// MoE FFN blocks are pointwise and stateless.
     case moe
+
+    /// The `MLXArray` leaves of this state case (#264, `verifyBlock`'s prerequisite): lets
+    /// a caller collect every intermediate state across a whole token batch into ONE
+    /// `MLX.eval` call without a per-case switch of its own. `.moe` carries none.
+    public var arrays: [MLXArray] {
+        switch self {
+        case .mamba(let conv, let ssm): return [conv, ssm]
+        case .attention(let k, let v): return [k, v]
+        case .moe: return []
+        }
+    }
 }
 
 public enum EngineError: Error, CustomStringConvertible {
@@ -37,9 +48,23 @@ public enum EngineError: Error, CustomStringConvertible {
 /// `Module`, and `[Block]` where `Block: Module` is exactly such an array. The Python
 /// model's `self.layers` list flattens to `layers.{i}.…` the same way.
 open class Block: Module {
-    open func forwardSeq(_ x: MLXArray) -> MLXArray {
+    /// `forward_seq` (#68/#263: the `segIds` arm packs multiple documents into one
+    /// sequence and masks recurrent state so it can't bleed across a boundary; `nil` is
+    /// the original single-segment path).
+    ///
+    /// Deliberately NOT `segIds: MLXArray? = nil` on this `open` method: Swift resolves
+    /// default argument values against the STATIC type, not the dynamic one, so a
+    /// subclass that re-declares the default would silently diverge from a caller that
+    /// holds a `Block`-typed reference — exactly the class of bug #263 exists to catch.
+    /// The explicit two-arg override plus the `final` one-arg forwarder below has no
+    /// such hole.
+    open func forwardSeq(_ x: MLXArray, _ segIds: MLXArray?) -> MLXArray {
         fatalError("Block subclasses must override forwardSeq")
     }
+
+    /// Convenience forwarder for the (still very common) single-segment call sites.
+    /// `final` — not part of the overridable seam, so it carries no divergence risk.
+    public final func forwardSeq(_ x: MLXArray) -> MLXArray { forwardSeq(x, nil) }
 
     open func step(_ x: MLXArray, _ state: LayerState) throws -> (MLXArray, LayerState) {
         fatalError("Block subclasses must override step")

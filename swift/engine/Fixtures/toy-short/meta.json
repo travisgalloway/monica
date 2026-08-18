@@ -6,10 +6,14 @@
   "precision": "fp32",
   "vocab_size": 256,
   "gen_steps": 8,
-  "mlx_version": "0.31.2",
+  "mlx_version": "0.32.0",
   "moe_bias": false,
   "forward_step_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_diff": 1.430511474609375e-06,
   "prefill_decode_max_abs_state_diff": 4.172325134277344e-07,
-  "greedy_margin_min": 4.433773040771484
+  "greedy_margin_min": 4.433773040771484,
+  "mixing_layers": [
+    0,
+    1
+  ]
 }
