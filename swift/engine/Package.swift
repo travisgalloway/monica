@@ -40,6 +40,7 @@ let package = Package(
         .executable(name: "monica-parity", targets: ["monica-parity"]),
         .executable(name: "monica-generate", targets: ["monica-generate"]),
         .executable(name: "monica-bench", targets: ["monica-bench"]),
+        .executable(name: "monica-train", targets: ["monica-train"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
@@ -51,6 +52,10 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                // #195: AdamW for the Swift train step. `LossScaler.swift` deliberately
+                // does NOT need this — it is pure-Swift policy, importable and testable
+                // even where mlx-swift cannot execute.
+                .product(name: "MLXOptimizers", package: "mlx-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
@@ -93,6 +98,18 @@ let package = Package(
             dependencies: [
                 "MonicaEngine",
                 .product(name: "MLX", package: "mlx-swift"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The training-step + optimizer parity runner (#195). Same dependency-free-runner
+        // style as monica-parity/monica-bench: no tokenizer edge (it trains on the
+        // fixtures' own token batches, never text), but does need MLXOptimizers for AdamW.
+        .executableTarget(
+            name: "monica-train",
+            dependencies: [
+                "MonicaEngine",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXOptimizers", package: "mlx-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

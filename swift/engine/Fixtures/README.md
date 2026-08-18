@@ -43,14 +43,19 @@ Swift **writer** produces a checkpoint Swift can read back byte-for-byte, and
 a new checked-in tensor. Every comparison is computed **in-process** from the fixture already
 loaded above: save the already-loaded model, reload it, and diff against the SAME model
 object's own tensors/config/logits, all in the same run. This is deliberate, not an oversight:
-#195 (the Swift train step) shipped a checked-in **gradient** oracle that turned out to
+#195 (the Swift train step) shipped a checked-in **gradient** oracle that appeared to
 diverge across macOS machines (`grad.0.layers.0.conv.weight` by `max|d|=1.226e-02` on the
-hosted CI runner vs. locally) — forward/step *logit* and *weight* fixtures have never shown
-that failure mode, but the safest fix is to not add another checked-in tensor of any kind. The
-round trip's two EXACT (no-tolerance) comparisons — save→load tensor bit-identity, and the
-mutation round trip's exact-preservation check — are therefore same-process, same-machine
-comparisons by construction, which makes them immune to the cross-machine drift that broke
-#195's fixture regardless of what hardware CI runs on next.
+hosted CI runner vs. locally) — investigated further and RESOLVED (see "train.safetensors
+is host-portable" below): a column-major-vs-row-major export bug
+(`np.array()` not canonicalizing a transposed-view gradient array), fixed with
+`mx.contiguous()`, not an actual cross-machine numeric difference. Regardless, the design
+choice here still holds on its own merits: forward/step *logit* and *weight* fixtures have
+never shown any export-layout failure mode, but avoiding a new checked-in gradient tensor
+sidesteps the whole class of "did the export canonicalize correctly on this host" question
+rather than depending on it. The round trip's two EXACT (no-tolerance) comparisons —
+save→load tensor bit-identity, and the mutation round trip's exact-preservation check — are
+same-process, same-machine comparisons by construction, immune to that class of bug
+regardless of what hardware CI runs on next.
 
 ## Files in a fixture
 
@@ -63,7 +68,8 @@ comparisons by construction, which makes them immune to the cross-machine drift 
 | `generation.safetensors` | `prompt_ids` `int32 (P,)`, `greedy_ids` `int32 (S,)`, `margins` `fp32 (S,)` — #167's greedy-decode oracle |
 | `prefill.safetensors` | `prefill_logits` `fp32 (B, L, V)`, `prefill_last_logits` `fp32 (B, V)`, plus `state.{i}.conv`/`state.{i}.ssm` (Mamba layers) or `state.{i}.k`/`state.{i}.v` (attention layers) — #169's state-handoff oracle. MoE layers are stateless and emit no keys. Also #264's `verifyBlock` oracle — see below; it adds no new tensor. |
 | `packed.safetensors` (OPTIONAL) | `packed_tokens`/`packed_seg_ids` `int32 (1, Lp)`, `doc_lengths` `int32 (D,)` (real, pre-pad token count per doc), `packed_logits` `fp32 (1, Lp, V)` — #68/#263's packing-aware `seg_ids` oracle. Present only for `toy`/`toy-hybrid`/`toy-moe`; see "The packed (`seg_ids`) oracle" below. |
-| `meta.json` | config name, B/L, seed, precision (#266: REQUIRED — `monica-parity`'s band lookup key, missing/unrecognised is a hard failure), vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264), (when the fixture has unquantized MoE layers with `top_k < n_experts`) `moe_load_layers` — the ABSOLUTE layer indices `load.{i}` was exported for — and `moe_route_margin_min` — the exactness-hazard guard for `load.{i}`'s exact comparison (#265), (low-precision fixtures only) `lowp_self_mean_kl` — a MEASUREMENT, never a threshold (`monica-parity` reads thresholds only from its own table), and (only if the #266 `--allow-moe-load-omit` fallback fired) `moe_load_omitted_reason` — a DECLARED skip of the load-count oracle, never a silent one |
+| `train.safetensors` (#195, `toy`/`toy-hybrid`/`toy-moe` only) | `mb.{j}.inputs`/`mb.{j}.targets` int32 micro-batches, and per step `k` in `0..<train_steps`: `loss.{k}`, `grad_norm.{k}` (scalars), `grad.{k}.<param>` (the full gradient tree, pre-clip), `weights_after.{k}.<param>` (the full parameter tree, post-optimizer-update) — the K-step training-trajectory oracle `monica-train` gates against |
+| `meta.json` | config name, B/L, seed, precision (#266: REQUIRED — `monica-parity`'s band lookup key, missing/unrecognised is a hard failure), vocab_size, gen_steps, mlx version, Python's own forward-vs-step max-abs-diff, the prefill/decode max-abs-diff and max-abs-state-diff, the minimum greedy margin, (when `packed.safetensors` was written) `packed_doc_lengths`/`packed_seq_len`, (non-quantized fixtures only) `mixing_layers` — the ABSOLUTE layer indices `mixing.{i}` was exported for (#264), (when the fixture has unquantized MoE layers with `top_k < n_experts`) `moe_load_layers` — the ABSOLUTE layer indices `load.{i}` was exported for — and `moe_route_margin_min` — the exactness-hazard guard for `load.{i}`'s exact comparison (#265), (low-precision fixtures only) `lowp_self_mean_kl` — a MEASUREMENT, never a threshold (`monica-parity` reads thresholds only from its own table), (only if the #266 `--allow-moe-load-omit` fallback fired) `moe_load_omitted_reason` — a DECLARED skip of the load-count oracle, never a silent one, and (when `train.safetensors` was written) `train_steps`/`train_grad_accum`/`train_grad_clip`/`train_lrs`/`train_loss`/`train_grad_norm`/`train_clipped_steps`/`train_rtol`/`train_atol` — see "A third tolerance regime: training (#195)" below |
 
 `hidden.{i}` is the per-layer output (`hidden.0` is the embedding, `hidden.{i+1}` is layer
 `i`'s output — the HF convention). As of #264 `monica-parity` checks it UNCONDITIONALLY on
@@ -215,6 +221,28 @@ exporter-private step loop.
 | `toy-moe-fp16/` | `config/toy-moe.yaml`, `--precision fp16 --seed 15 --moe-bias` | 2 × 40 | #266: fp16 + MoE routing. `--seed 15 --moe-bias` — no seed in `0..59` at the DEFAULT (unbiased) ranking cleared the fp16 route-margin guard (`128 * u_fp16 = 6.25e-2`; the toy model's near-uniform random-init router logits produce margins an order of magnitude too small), so this fixture uses the same `--moe-bias` fallback `toy-moe-biased` already established, then a short seed sweep among biased seeds (margin 0.371 at `--seed 15`, ~6x clear of the guard). |
 | `toy-hybrid-fp16/` | `config/toy-hybrid.yaml`, `--precision fp16` | 2 × 40 | #266: fp16 + RoPE/attention — a distinct numeric path from plain Mamba (attention softmax and the KV cache round differently at low precision) worth its own fixture. |
 
+### Which fixtures get a training oracle (#195)
+
+Three of the seven above additionally carry `train.safetensors` (via `--train-steps 3`):
+**`toy`** (pure Mamba/SSD backward), **`toy-hybrid`** (attention + RoPE backward), and
+**`toy-moe`** (router argsort-mask + expert backward) — one representative fixture per
+distinct backward-pass shape in the tree. The other four are excluded, each for a stated
+reason:
+
+* `toy-short` (L=2) — the conv left-pad edge case is inference/prefill-specific; there is
+  no training-side analogue.
+* `toy-moe-biased` — the route bias is an inference-side ranking input; the Loss-Free-
+  Balancing *write* path is DEFERRED (see `.claude/plans/issue-195.md`), so this fixture
+  would add no training coverage over `toy-moe`.
+* `toy-moe-int8`/`toy-moe-int4` — training a quantized checkpoint is out of scope
+  entirely: `QuantizedLinear`'s packed uint32 codes have no meaningful weight gradient.
+  The exporter refuses `--train-steps` combined with `--quant-bits`.
+
+`monica-train` carries its OWN default fixture list (`toy`, `toy-hybrid`, `toy-moe`,
+narrower than `monica-parity`'s seven) and treats a missing `train.safetensors` in a
+fixture it was asked to check as a **FAILURE, not a skip** — the same standing rule every
+other oracle file in this directory follows.
+
 ## The packed (`seg_ids`) oracle (#68/#263)
 
 `monica-parity`'s P6 section gates the three packing-aware forward-path arms (`chunkSegMask`
@@ -234,9 +262,11 @@ place:
    per-fixture override, unlike the #168 quantized fixtures).
 2. **Self-consistency**, the real correctness claim: each document's logit slice from the
    packed-aware forward vs that SAME document's standalone Swift forward, computed
-   in-process. This needs no checked-in numbers, so it is immune to the cross-machine
-   drift that blocked #195/PR #293's checked-in gradient oracle (`grad.0.layers.0.
-   conv.weight` diverging `max|d|=1.226e-02` between the hosted CI runner and a local Mac).
+   in-process. This needs no checked-in numbers, so it is immune to the whole class of
+   export-layout bug that initially blocked #195/PR #293's checked-in gradient oracle
+   (`grad.0.layers.0.conv.weight` appearing to diverge `max|d|=1.226e-02` between the
+   hosted CI runner and a local Mac — RESOLVED as a column-major export bug, not a real
+   cross-machine numeric difference; see "train.safetensors is host-portable" above).
 3. **Anti-no-op.** The packing-BLIND forward (`model.forward(packedTokens)`, no `segIds`)
    vs each document's standalone forward (doc 0 excluded — it never leaks a PRIOR
    document's state, so it proves nothing about packing-awareness). This must exceed
@@ -312,17 +342,34 @@ margins, and Swift decodes through the true quantized kernel, so a margin comfor
 of the loose kernel tolerance is needed for cross-implementation greedy-id equality to stay
 well-posed rather than flaky.
 
+## A third tolerance regime: training (#195)
+
+`train.safetensors`'s four surfaces (`loss`, `grad_norm`, the full `grad.{k}.<param>`
+tree, and the full `weights_after.{k}.<param>` tree) are compared at their OWN
+`train_rtol`/`train_atol` in `meta.json` — new keys, deliberately not `rtol`/`atol` (those
+are the quantized fixtures' logit-gate keys, `2e-2`/`2e-2`, which would be far too loose
+here and would gate nothing). A training step is not a forward pass: gradients accumulate
+error through the whole backward graph, and AdamW moments compound it across steps.
+`loss` is a pure forward quantity and stays at the same tight regime the fp32 logit gate
+uses; `grad_norm`/`grad`/`weights_after` sit in a looser `2e-4`/`1e-6` band — tighter atol
+than the fp32 gate's `1e-5` (which would be *looser than the grad values themselves* on
+small toy leaves and gate nothing there), traded against a looser rtol to absorb the fp32
+summation-order difference between Python's `tree_flatten`-order reduction and Swift's
+sorted-key-order one. See `docs/design/14-inference-engine.md`'s #195 entry for the full
+rationale, including why `MLXOptimizers.clipGradNorm` is NOT used (R2: its strict `<`
+clip boundary differs from Python's unconditional `min(1.0, clip/(norm+eps))`).
+
 ## Regenerating
 
 ```bash
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
-    --out swift/engine/Fixtures/toy --batch 2 --seq 129 \
+    --out swift/engine/Fixtures/toy --batch 2 --seq 129 --train-steps 3 \
     --packed-doc-lengths "Q,2*Q,5"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
-    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40 \
+    --out swift/engine/Fixtures/toy-hybrid --batch 2 --seq 40 --train-steps 3 \
     --packed-doc-lengths "Q,7,Q+3"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
-    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40 \
+    --out swift/engine/Fixtures/toy-moe --batch 2 --seq 40 --train-steps 3 \
     --packed-doc-lengths "Q,7,Q+3"
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
     --out swift/engine/Fixtures/toy-moe-biased --batch 2 --seq 40 --moe-bias
@@ -346,6 +393,44 @@ well-posed rather than flaky.
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
     --out swift/engine/Fixtures/toy-hybrid-fp16 --batch 2 --seq 40 --precision fp16
 ```
+
+**`toy`/`toy-hybrid`/`toy-moe`'s `train.safetensors` is host-portable — RESOLVED (#195/PR
+#293).** Running the commands above regenerates it fine, on any Mac, including a local
+one; there is no CI-only requirement.
+
+The investigation's real finding (full write-up in `docs/design/14-inference-engine.md`'s
+#195 entry): `tests/test_train_parity_fixture_export.py` passed on every local Mac but
+failed reproducibly on the hosted `full-macos` CI runner, printing
+`grad.0.layers.0.conv.weight max|d| = 1.226e-02`. This was FIRST (incorrectly) diagnosed
+as a host-family numeric difference in MLX's conv1d weight-gradient reduction — two
+independent CI-runner generations agreeing with each other but not with a locally-built
+oracle looked exactly like that. It wasn't. Reinterpreting each diverging tensor's raw
+buffer as column-major instead of row-major (`old.flatten(order="F")` vs
+`new.flatten(order="C")`) collapsed EVERY one of 18 mismatched `grad.*` keys (every
+`conv.weight`/`in_proj.weight`/`out_proj.weight` across all 3 steps) down to `~1e-9`
+(fp32 noise) — the two hosts computed the SAME gradient values; only the memory layout
+of the exported array differed. `weights_after.*` (real `model.parameters()` arrays,
+never a transpose-producing autodiff view) needed no reinterpretation and matched
+directly — the clean control group proving this was never about the numbers.
+
+**Root cause:** `mx.grad`/`value_and_grad` can hand back a column-major (transposed-view)
+array rather than the row-major layout `model.parameters()` always returns, and the
+exporter's plain `np.array(val, dtype=np.float32)` did not canonicalize this — apparently
+handled correctly by the MLX build on some hosts and not others. **Fix:**
+`scripts/export_parity_fixture.py`'s `_export_train_oracle` now calls
+`mx.contiguous(val)` (MLX's own API — "Force an array to be row contiguous. Copy if
+necessary") before converting every `grad.*`/`weights_after.*` leaf to numpy. This is a
+no-op wherever the array was already row-major (verified: 0.0 diff on a machine that
+never showed the bug) and a real fix wherever it wasn't.
+
+The CI job pair `train-fixture-oracle` (generate) + `train-fixture-oracle-verify` (a
+numeric-tolerance cross-check at the SAME `train_rtol=2e-4`/`train_atol=1e-6` the
+production staleness guard uses) still exists in `.github/workflows/ci.yml`, dispatch/
+schedule-gated, but it is **not load-bearing for correctness** — it is a regression check
+that lets this exporter's output be verified on the specific host family where the
+column-major bug manifested, for this change and any future one. It would NOT have
+caught the original bug on its own (both independent CI-runner generations were
+column-major, so they agreed with each other).
 
 **#266's low-precision fixtures carry no `--packed-doc-lengths`** — P6's packing gate
 reuses the file-level DTYPE band already, so a low-precision packed fixture would work,
@@ -399,7 +484,13 @@ that is internally inconsistent can never reach disk.
 checked-in reference (logits, `greedy_ids`, `prefill.safetensors`'s logits/state, AND
 `packed.safetensors`'s tokens/seg_ids/doc_lengths (exact) and `packed_logits` (tolerance)).
 That is what stops a future change to `mlx_backend.py`'s math from silently leaving the
-Swift gate testing a stale oracle.
+Swift gate testing a stale oracle. `tests/test_train_parity_fixture_export.py` does the same
+for `train.safetensors` (#195), re-exporting `toy` with `--train-steps 3` and comparing every
+key at the training tolerance above — the guard against `mlx_train_step.py`'s math silently
+drifting from `monica-train`'s oracle. **This guard's `grad.*.conv.weight` comparison once
+appeared to have a cross-machine caveat, RESOLVED as an export-layout bug** — see
+"train.safetensors is host-portable" above and `docs/design/14-inference-engine.md`'s
+#195 entry for the measured numbers and the fix applied.
 
 ## `poc` is deliberately NOT checked in
 

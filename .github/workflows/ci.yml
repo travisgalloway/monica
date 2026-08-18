@@ -489,6 +489,32 @@ jobs:
             exit 1
           fi
           "$BIN"
+      # ── #195: monica-train — the training-step + optimizer parity gate ──
+      - name: monica-train --self-test (DynamicLossScaler policy, no MLX math needed)
+        working-directory: swift/engine
+        run: |
+          BIN=$(find .build-xcode/Build/Products -type f -name monica-train -perm -u+x -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "monica-train binary not found under .build-xcode/Build/Products" >&2
+            find .build-xcode/Build/Products -maxdepth 3 >&2 || true
+            exit 1
+          fi
+          echo "MONICA_TRAIN_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" --self-test
+      - name: monica-train fixture gate (loss / grad-norm / grad-tree / post-step-weights)
+        # The tolerance-calibration round trip: this is the FIRST execution of mlx-swift's
+        # autodiff against the Swift engine (mlx-swift cannot run on the CLT-only dev
+        # host at all, see docs/design/14-inference-engine.md's #195 entry) — achieved
+        # max|d| per surface is printed even on success, so a first-run failure here is
+        # expected to be diagnosed via that output, not treated as a flake.
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN"
+      - name: monica-train --overflow-check (fp16 skip branch, end to end)
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN --overflow-check toy"
+      - name: monica-train --train (free-running, the issue's literal decreasing-loss AC)
+        working-directory: swift/engine
+        run: "$MONICA_TRAIN_BIN --train Fixtures/toy --steps 20 --lr 1e-3"
       # ── #167: the generation CLI, self-test + tokenizer-free + native-tokenizer paths ──
       - name: monica-generate self-test (sampler semantics, no weights/MLX needed)
         working-directory: swift/engine
@@ -654,6 +680,223 @@ jobs:
           OUT=$(swift package show-dependencies --format flatlist)
           echo "output: '$OUT'"
           [ -z "$OUT" ]
+
+  # ── Job 9a: the training-fixture oracle, generation side (#195) ────────────
+  # Dispatch/schedule-only, same rationale and pattern as poc-fixture-oracle/
+  # poc-parity below (#267) — this regenerates train.safetensors/meta.json for the
+  # three training fixtures (toy/toy-hybrid/toy-moe) ON DEMAND; it is not part of
+  # every-PR CI. NOT load-bearing for correctness: train.safetensors is
+  # host-portable (regenerating locally works fine, same as every other fixture).
+  # This exists as a REGRESSION CHECK — the #195/PR #293 investigation found the
+  # ORIGINAL staleness-guard failure was a column-major-vs-row-major export bug in
+  # `_export_train_oracle` (`np.array()` not canonicalizing a transposed-view MLX
+  # gradient array; fixed with `mx.contiguous()`), which manifested on this
+  # macos-latest runner family and not on the exec agent's local Mac. This job
+  # pair verifies the exporter's output on the SPECIFIC host family where that bug
+  # showed up, for this fix and any future exporter change — it would NOT have
+  # caught the original bug on its own (two independent CI-runner generations
+  # were equally column-major and agreed with each other; see
+  # train-fixture-oracle-verify's GATE step comment for how that was later
+  # distinguished from a real numeric difference). See
+  # docs/design/14-inference-engine.md's #195 entry for the full record and the
+  # regeneration command in swift/engine/Fixtures/README.md.
+  train-fixture-oracle:
+    name: train fixture oracle — generate (macOS, Python MLX)
+    runs-on: macos-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (mlx only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Host facts
+        run: |
+          python -c "import mlx.core as mx; print('mlx', mx.__version__)"
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+      - name: Export all three training fixtures (fresh process, this runner)
+        # Exact flags from swift/engine/Fixtures/README.md's "Regenerating" command.
+        run: |
+          python scripts/export_parity_fixture.py --config config/toy.yaml \
+            --out "$RUNNER_TEMP/oracle/toy" --batch 2 --seq 129 --train-steps 3 \
+            --packed-doc-lengths "Q,2*Q,5"
+          python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
+            --out "$RUNNER_TEMP/oracle/toy-hybrid" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+          python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
+            --out "$RUNNER_TEMP/oracle/toy-moe" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+      - name: "Manifest (meta.json + train.safetensors only, the only host-sensitive files)"
+        run: |
+          cd "$RUNNER_TEMP/oracle"
+          find . \( -name meta.json -o -name train.safetensors \) | sort \
+            | xargs shasum -a 256 > "$RUNNER_TEMP/oracle-manifest.txt"
+          cat "$RUNNER_TEMP/oracle-manifest.txt"
+          # Anti-BLIND: exactly 6 files (3 fixtures x {meta.json, train.safetensors}).
+          N=$(wc -l < "$RUNNER_TEMP/oracle-manifest.txt")
+          [ "$N" -eq 6 ] || { echo "BLIND: expected 6 files, got $N"; exit 2; }
+      - name: "Print the uploaded tree (observed, not guessed: see PR #301, #167)"
+        run: find "$RUNNER_TEMP/oracle-manifest.txt" "$RUNNER_TEMP/oracle" -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: train-fixture-oracle
+          path: |
+            ${{ runner.temp }}/oracle-manifest.txt
+            ${{ runner.temp }}/oracle/toy/meta.json
+            ${{ runner.temp }}/oracle/toy/train.safetensors
+            ${{ runner.temp }}/oracle/toy-hybrid/meta.json
+            ${{ runner.temp }}/oracle/toy-hybrid/train.safetensors
+            ${{ runner.temp }}/oracle/toy-moe/meta.json
+            ${{ runner.temp }}/oracle/toy-moe/train.safetensors
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Job 9b: the training-fixture oracle, cross-process verification (#195) ──
+  # The #298 two-process guard, reused exactly (not reinvented): a SECOND
+  # independent generation, in a fresh process on a second runner, must agree
+  # byte-for-byte with job 9a's upload before either is trusted as an oracle —
+  # this GATES (unlike the Phase-0 diagnostic's report-only comparison), because
+  # a mismatch here would mean the "generate on CI" fix itself rests on an
+  # unstable quantity.
+  train-fixture-oracle-verify:
+    name: train fixture oracle — verify (macOS, Python MLX)
+    runs-on: macos-latest
+    needs: [train-fixture-oracle]
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (mlx only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Export all three training fixtures (fresh process, a SECOND independent runner)
+        run: |
+          python scripts/export_parity_fixture.py --config config/toy.yaml \
+            --out "$RUNNER_TEMP/oracle2/toy" --batch 2 --seq 129 --train-steps 3 \
+            --packed-doc-lengths "Q,2*Q,5"
+          python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
+            --out "$RUNNER_TEMP/oracle2/toy-hybrid" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+          python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
+            --out "$RUNNER_TEMP/oracle2/toy-moe" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+      - name: Manifest
+        run: |
+          cd "$RUNNER_TEMP/oracle2"
+          find . \( -name meta.json -o -name train.safetensors \) | sort \
+            | xargs shasum -a 256 > "$RUNNER_TEMP/oracle2-manifest.txt"
+          N=$(wc -l < "$RUNNER_TEMP/oracle2-manifest.txt")
+          [ "$N" -eq 6 ] || { echo "BLIND: expected 6 files, got $N"; exit 2; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: train-fixture-oracle
+          path: downloaded
+      - name: Print the downloaded tree (observed, not guessed)
+        run: find downloaded -type f | sort
+      - name: "Manifest diff (informational — see the GATE step below for why this isn't the gate)"
+        # Manifests hash relative "./fixture/file" paths (both sides ran `find .` from
+        # their own oracle root), so they are directly comparable despite the
+        # upload/download directory nesting being different from the local one. NOT
+        # asserted on: unlike poc's pure-forward logits (bit-reproducible across
+        # processes), the gradient reduction this oracle carries has measured ~1e-8
+        # jitter between separate runner INSTANCES of the same host family (see the
+        # GATE step) — byte-exact would be a false-negative gate here.
+        run: |
+          test -s downloaded/oracle-manifest.txt || { echo "BLIND: uploaded manifest missing/empty"; exit 2; }
+          N=$(wc -l < downloaded/oracle-manifest.txt)
+          [ "$N" -eq 6 ] || { echo "BLIND: short uploaded manifest ($N lines)"; exit 2; }
+          echo "--- runner 1 (uploaded) manifest ---"; cat downloaded/oracle-manifest.txt
+          echo "--- runner 2 (this job) manifest ---"; cat "$RUNNER_TEMP/oracle2-manifest.txt"
+          if diff downloaded/oracle-manifest.txt "$RUNNER_TEMP/oracle2-manifest.txt" > /tmp/mf.diff; then
+            echo "RESULT: byte-exact match"
+          else
+            echo "RESULT: NOT byte-exact (expected — see GATE step for the numeric check)"
+            cat /tmp/mf.diff
+          fi
+      - name: "GATE — two independent CI-runner generations must agree within the staleness-guard tolerance"
+        # DELIBERATELY not byte-exact, unlike poc-fixture-oracle/poc-parity above — poc's
+        # oracle is pure-forward LOGITS (bit-reproducible across processes); this oracle
+        # is a GRADIENT reduction, which carries inherent sub-ULP jitter even between two
+        # independent processes of the SAME host family. Do not "fix" this back to a
+        # byte-exact `diff` for consistency with poc — that made the gate permanently
+        # flaky (a real early failure, not hypothetical: see run 32086817464's
+        # toy/train.safetensors mismatch, fixed by PR #293/commit 49462be).
+        #
+        # IMPORTANT — what this gate does and does NOT prove: two SAME-host-family
+        # generations agreeing here does not by itself mean the exported gradient is
+        # CORRECT — the #195/PR #293 investigation's biggest misstep was treating exactly
+        # that agreement as proof of a real cross-host numeric difference against a
+        # locally-generated oracle, when the actual defect was a column-major-vs-row-major
+        # export bug (`np.array()` not canonicalizing a transposed-view MLX gradient
+        # array — both independent CI-runner generations were equally affected, so this
+        # gate could not and did not catch it; see docs/design/14-inference-engine.md's
+        # #195 entry). Since the `mx.contiguous()` fix landed, this gate's real job is
+        # narrower: catch #298-class silent per-process export corruption and confirm the
+        # exporter's sub-ULP run-to-run jitter stays inside the production tolerance —
+        # not a substitute for `swift model parity`/`test_train_parity_fixture_export.py`
+        # actually agreeing with the checked-in oracle. Measured magnitudes this threshold
+        # sits between:
+        #   sub-ULP jitter, two CI processes, MUST NOT fail  ~1.5e-8   (correctly tolerated)
+        #   #298-class silent export corruption, MUST fail    2.694e-5 (~27x inside the band)
+        # train_rtol=2e-4/train_atol=1e-6 — the SAME constants
+        # tests/test_train_parity_fixture_export.py uses in production — sits cleanly
+        # above the jitter and below the corruption case, so this gate asks "would this
+        # pair pass the actual staleness gate", not "are they identical". Do not loosen
+        # these constants without re-deriving against this table.
+        run: |
+          for f in toy toy-hybrid toy-moe; do
+            test -s "downloaded/oracle/$f/train.safetensors" || { echo "BLIND: downloaded $f/train.safetensors missing/empty"; exit 2; }
+            test -s "$RUNNER_TEMP/oracle2/$f/train.safetensors" || { echo "BLIND: this-job $f/train.safetensors missing/empty"; exit 2; }
+          done
+          python3 - "$RUNNER_TEMP/oracle2" <<'PYEOF'
+          import sys
+          import numpy as np
+          from safetensors.numpy import load_file
+
+          oracle2_dir = sys.argv[1]
+          RTOL, ATOL = 2e-4, 1e-6   # tests/test_train_parity_fixture_export.py's own band
+          bad = []
+          for f in ("toy", "toy-hybrid", "toy-moe"):
+              a = load_file(f"downloaded/oracle/{f}/train.safetensors")
+              b = load_file(f"{oracle2_dir}/{f}/train.safetensors")
+              if set(a) != set(b):
+                  print(f"BLIND: {f} key sets differ between the two runners")
+                  sys.exit(2)
+              worst = None
+              for k in a:
+                  d = np.abs(a[k].astype(np.float64) - b[k].astype(np.float64))
+                  ok = np.allclose(a[k], b[k], rtol=RTOL, atol=ATOL)
+                  maxd = float(d.max())
+                  if not ok:
+                      bad.append((f, k, maxd))
+                  if worst is None or maxd > worst[1]:
+                      worst = (k, maxd)
+              print(f"{f}: {len(a)} keys, worst max|d|={worst[1]:.3e} at {worst[0]!r}")
+          if bad:
+              print("GATE FAILED — outside train_rtol/train_atol:")
+              for f, k, maxd in bad:
+                  print(f"  {f}[{k!r}] max|d|={maxd:.3e}")
+              sys.exit(1)
+          print(f"GATE PASSED — both runners agree within train_rtol={RTOL}/train_atol={ATOL}")
+          PYEOF
+      - name: Per-fixture meta.json (for the record)
+        run: |
+          for f in toy toy-hybrid toy-moe; do
+            echo "--- $f ---"; cat "downloaded/oracle/$f/meta.json"
+          done
 
   # ── Job 9: the poc-scale parity oracle, generation side (#267) ────────────
   # Dispatch/schedule-only — see the `on:` block above. Generation side of the

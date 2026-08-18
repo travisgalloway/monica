@@ -581,6 +581,142 @@ DPO/GRPO step factories.
   same way the existing toy-derived bands are — never an ad-hoc `rtol`/`atol` literal in the
   CI workflow YAML.
 
+- **#195 — the Swift MLX training step + optimizer.** `swift/engine/Sources/MonicaEngine/
+  TrainStep.swift` + `LossScaler.swift` mirror `src/model/mlx_train_step.py`'s pretraining
+  `make_train_step`/`_accumulate_and_step` via mlx-swift's own autodiff
+  (`MLXNN.valueAndGrad(model:_:)` differentiating `trainableParameters()`, exactly
+  matching Python's `nn.value_and_grad`) — NOT a hand-rolled backward pass. `TrainStep.
+  accumulateAndStep` is factored as the SAME shared accumulate -> (unscale) -> clip ->
+  optimizer-step tail Python's `_accumulate_and_step` is, specifically so a future SFT
+  masked-CE step is a small delta (a different `lossAndGrad`, reusing this function
+  unchanged) rather than a rewrite. `makePretrainLossAndGrad` is exposed publicly (not
+  inlined into `makeTrainStep`) so `monica-train`'s fixture gate can drive the exact
+  production gradient-producing closure through a `captureGrads` hook, rather than
+  duplicating it a second time.
+
+  **Scope — REPRODUCE vs DEFER** (full table in `.claude/plans/issue-195.md`): grad
+  accumulation/averaging, hand-rolled grad clipping, the dynamic fp16 loss-scale policy +
+  skip control flow (numerics-independent; the general fp16/bf16 *numeric* parity band is
+  #266's, not this issue's), and `AdamW` (mlx-swift's defaults — betas (0.9, 0.999), eps
+  1e-8, weightDecay 0.01, biasCorrection false — verified identical to Python MLX's) are
+  all REPRODUCE. `grad_checkpoint`, SFT masked-CE, DPO/GRPO, MoE Loss-Free-Balancing (load
+  counting + the `setRouteBias` write path — `MoEBlock.swift` already records these as not
+  ported in #166), and optimizer-state save/load (owned by #196, which only ever *reads*
+  here) are all DEFERRED — the first three to a proposed follow-up issue, the last to #196.
+
+  **Two risks worth recording explicitly** (both in the plan as R2/R3): (1)
+  `MLXOptimizers.clipGradNorm` is NOT Python's clip — it uses a strict `totalNorm .<
+  maxNorm` branch (`Optimizers.swift:895-905`), whereas Python applies
+  `min(1.0, grad_clip/(norm+1e-6))` unconditionally; `accumulateAndStep` hand-rolls the
+  Python form rather than calling the library helper. (2) `globalGradNorm` sums grad
+  leaves in SORTED-KEY order for run-to-run determinism, but this does not reproduce
+  Python's `tree_flatten`-order summation exactly — fp32 non-associativity puts a floor of
+  ~1e-7 relative on `grad_norm`, which is why it (and the full gradient tree, and
+  post-step weights) sit in a looser **`2e-4`/`1e-6`** band, not the fp32 forward/step
+  gate's `1e-4`/`1e-5`. `loss` (a pure forward quantity) stays at the tight band. These
+  live as NEW `meta.json` keys — `train_rtol`/`train_atol` — deliberately not `rtol`/
+  `atol`, so they can never collide with the two quantized fixtures' own looser logit
+  band.
+
+  **The oracle.** `scripts/export_parity_fixture.py --train-steps K` (K=3) adds
+  `train.safetensors` to `toy`/`toy-hybrid`/`toy-moe` only (of the seven checked-in
+  fixtures) — see `swift/engine/Fixtures/README.md` for why the other four carry no
+  training coverage. Built from a **pristine reload** of the just-written weights, so the
+  inference oracles stay computed on untrained weights; per-step LRs are non-constant
+  (`[1e-3, 5e-4, 2e-4]`) so a Swift port that set `learningRate` once at construction
+  would fail the gate; `grad_clip` is chosen as the median of a clip-disabled dry run's
+  per-step norms, and the exporter refuses to write unless at least one of the K steps
+  clips and at least one does not. The per-parameter gradient tree is captured by
+  duplicating only the "objective-specific piece" (`loss_fn` + `nn.value_and_grad`) on the
+  Python side and recomputing it on the same pristine model state immediately before each
+  *production* `train_step` call — MLX being deterministic given identical inputs and no
+  randomness in this graph, this reproduces the pre-clip gradients `_accumulate_and_step`
+  computes internally but never returns, without touching `mlx_train_step.py` itself.
+
+  **The gate.** `monica-train` (same dependency-free-runner style as `monica-parity`/
+  `monica-bench`: hand-rolled args, a `failures` array, `exit(1)` on any failure, achieved
+  numbers always printed) has four modes: `--self-test` (the `DynamicLossScaler` policy —
+  pure Swift, no MLX import, so it runs even where mlx-swift cannot execute on this
+  Command-Line-Tools-only development host); the fixture gate (its OWN default list —
+  `toy`/`toy-hybrid`/`toy-moe`, narrower than `monica-parity`'s seven — treating a missing
+  `train.safetensors` in a checked fixture as a FAILURE, not a skip); `--overflow-check`
+  (`initScale: 1e40` forces `loss*scale -> inf` in fp32, asserting the step is skipped, the
+  scale halves, and every weight is bit-identical to before — the skip branch gated end to
+  end with no fp16 fixture and no new tolerance); and `--train <fixture> --steps N`
+  (free-running, the issue's literal decreasing-loss acceptance criterion). CI
+  (`swift-engine`) runs all four after the existing `monica-parity` step. Tolerance
+  calibration is CI-only: mlx-swift cannot execute on this development host at all — not
+  just its Metal GPU path (`MONICA_ENGINE_CPU=1` still fails, "Failed to load the default
+  metallib", because the checkout's Command Line Tools have no `metal` compiler) — so the
+  first CI run is where the achieved max|d| numbers this design doc's tolerance table
+  assumes get calibrated.
+
+  **The checked-in gradient oracle export had a column-major layout bug — RESOLVED
+  (#195/PR #293).** `tests/test_train_parity_fixture_export.py` (a Python-only staleness
+  guard: re-export `toy`, diff against the checked-in `train.safetensors` at
+  `train_rtol=2e-4`/`train_atol=1e-6`) passed on every local Mac but failed reproducibly on
+  the hosted `full-macos` CI runner, printing
+  `grad.0.layers.0.conv.weight   max|d| = 1.226e-02`. This was investigated through THREE
+  wrong hypotheses before the real one, each ruled out by direct measurement:
+
+  1. **Not a corrupted export.** Regenerating locally, with and without #264's
+     `mx.set_cache_limit(0)` mitigation, reproduced the checked-in oracle to `9.313e-10`
+     both ways.
+  2. **Not an MLX-version mismatch.** Both the checked-in oracle and CI's hosted runner
+     reported `mlx_version: 0.32.0` in `meta.json` — same version, still ~1.2–1.8e-2 apart.
+  3. **Not within-host nondeterminism, and (WRONGLY, at first) concluded to be a real
+     cross-host numeric difference.** A dedicated CI diagnostic
+     (`.claude/plans/issue-195-unblock.md`'s Phase 0) ran the exporter twice, in two fresh
+     processes on two independent `macos-latest` runners: the two agreed to **~1.5e-8**
+     (fp32 noise floor) on every key, but both disagreed with a locally-generated (M1 Pro)
+     oracle by the SAME ~1.2–1.8e-2 amounts. This looked exactly like a deterministic,
+     host-family-dependent difference in MLX's Metal conv1d weight-gradient reduction —
+     and was reported and documented as such — but it was a misdiagnosis: the CI diagnostic
+     only ever compared CI generations against EACH OTHER and against the (also
+     column-major-affected, see below) local oracle; it never tested whether the
+     *underlying values*, not just the exported bytes, actually agreed.
+
+  4. **The actual root cause: a column-major export bug, not a numeric difference.**
+     Reinterpreting each of the 18 mismatched `grad.*` keys' raw buffer as column-major
+     instead of row-major — `old.flatten(order="F")` vs `new.flatten(order="C")` — collapsed
+     EVERY one down to `~1e-9` (fp32 noise). Every `conv.weight`/`in_proj.weight`/
+     `out_proj.weight` across all 3 training steps, no exceptions. `weights_after.*` (real
+     `model.parameters()` arrays, never a transpose-producing autodiff view) needed no
+     reinterpretation and matched directly in plain row-major order — the clean control
+     group proving the underlying training math was never in question. `mx.grad`/
+     `value_and_grad` can hand back a column-major (transposed-view) array rather than the
+     row-major layout `model.parameters()` always returns, and the exporter's plain
+     `np.array(val, dtype=np.float32)` did not canonicalize this — apparently handled
+     differently by MLX across host builds (a genuine MLX/export-boundary defect, not a
+     computation difference: `swift model parity`'s `monica-train` step, running mlx-swift's
+     own autodiff on the SAME CI runner family, matched the OLD (buggy-on-CI,
+     coincidentally-correct-when-read-as-column-major-on-a-local-Mac) oracle almost exactly
+     — `grad max|d|=8.941e-08` — which is what first exposed the bug: swapping to a
+     freshly CI-generated oracle broke `swift model parity` at the SAME `1.226e-02`
+     magnitude, the wrong direction for a "CI is canonical" fix to move.
+
+  **The fix.** `scripts/export_parity_fixture.py`'s `_export_train_oracle` now calls
+  `mx.contiguous(val)` (MLX's own API — "Force an array to be row contiguous. Copy if
+  necessary", default `allow_col_major=False`) before converting every `grad.*`/
+  `weights_after.*` leaf to numpy. Verified a no-op wherever the array was already
+  row-major (0.0 diff, measured on a machine that never showed the bug) and load-bearing
+  wherever it wasn't. **`train.safetensors` is host-portable again** — regenerating
+  locally works exactly as it did for every other fixture; there was never a genuine
+  cross-machine numeric difference to work around. Both `train_rtol`/`train_atol`
+  (`2e-4`/`1e-6`) and the fp32 logit gate (`PARITY_TOLERANCES["fp32"] == (1e-4, 1e-5)`) are
+  UNCHANGED — the guard was correctly detecting a real defect throughout; it just wasn't
+  the defect either the first CI diagnostic or its own follow-up initially concluded. The
+  `train-fixture-oracle`/`train-fixture-oracle-verify` CI job pair (dispatch/schedule-only,
+  mirrors `poc-fixture-oracle`/`poc-parity`, #267) still exists but is **not load-bearing
+  for correctness** — it is a regression check that verifies this exporter's output on the
+  specific host family where the column-major bug manifested, for this change and any
+  future one; it would NOT have caught the original bug on its own, since both independent
+  CI-runner generations were equally column-major and agreed with each other. This is a
+  **different phenomenon from #298** (deterministic-per-process export corruption): #298's
+  worst observed drift (`mixing.N`) was 2.7x its own tolerance; this one exceeded the
+  tensor's own absmax entirely, and reinterpreting axis order (not tolerance) resolved it.
+  Not folded into #298, and #298 is not folded into this.
+
 ## See also
 
 - [01-architecture-seam.md](01-architecture-seam.md) — the seam whose Python implementation is the

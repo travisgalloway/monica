@@ -10,7 +10,12 @@ decode against, exactly.
 
     python scripts/export_parity_fixture.py --config config/toy.yaml \\
         --out swift/engine/Fixtures/toy --batch 2 --seq 129 \\
-        [--precision fp32] [--vocab-size N] [--gen-steps 16] [--moe-bias]
+        [--precision fp32] [--vocab-size N] [--gen-steps 16] [--moe-bias] [--train-steps K]
+
+`--train-steps K` (#195) additionally writes `train.safetensors`: a K-step Swift/MLX
+`train_step` trajectory oracle (per-step loss, grad-norm, the full gradient tree, and
+post-step weights) that `monica-train` gates against. Only `toy`/`toy-hybrid`/`toy-moe`
+carry one — see `swift/engine/Fixtures/README.md`'s "Which fixtures get a train oracle".
 
 The checked-in fixtures under `swift/engine/Fixtures/` ARE the Swift contract, so this
 script is also the regeneration command recorded there — and
@@ -37,6 +42,199 @@ from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.conformance.quant_parity import check_quant_parity
 from src.conformance.tolerances import LOWP_MEAN_KL_MAX, band_for, route_margin_min
 from src.model.blocks import load_config
+
+
+def _tree_add(a, b):
+    from mlx.utils import tree_map
+    return tree_map(lambda x, y: x + y, a, b)
+
+
+def _tree_scale(a, factor):
+    from mlx.utils import tree_map
+    return tree_map(lambda x: x * factor, a)
+
+
+def _export_train_oracle(cfg, weights_path: str, tokens, *, out: "Path",
+                         train_steps: int, seed: int) -> dict:
+    """#195: write `train.safetensors` — a K-step trajectory oracle for `monica-train`.
+
+    Reuses the REAL production `make_train_step` (`src/model/mlx_train_step.py`) for the
+    loss/grad_norm/skipped/weight-update trajectory a Swift port must reproduce. The only
+    piece duplicated here is `loss_fn` + `nn.value_and_grad` — the "only objective-specific
+    piece" per `_accumulate_and_step`'s own docstring — recomputed on the SAME pristine
+    model state immediately before each production step call, so it reproduces (bit-for-
+    bit, MLX being deterministic given identical inputs and no dropout/randomness in this
+    graph) the pre-clip gradient tree `_accumulate_and_step` computes internally but never
+    returns. This is what makes the per-parameter `grad.{k}.<param>` surface possible
+    without modifying `mlx_train_step.py` itself.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+    from mlx.utils import tree_flatten
+
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.mlx_train_step import make_train_step
+    from src.train.loss_scale import scaler_for_precision
+
+    grad_accum = 2
+    b = tokens.shape[0]
+    if b < grad_accum or b % grad_accum != 0:
+        raise SystemExit(
+            f"--train-steps needs batch ({b}) divisible by grad_accum={grad_accum}")
+    groups = np.array_split(tokens, grad_accum, axis=0)
+    micro_batches = [(g[:, :-1], g[:, 1:]) for g in groups]
+
+    lr_ladder = [1e-3, 5e-4, 2e-4]
+    if train_steps > len(lr_ladder):
+        raise SystemExit(
+            f"--train-steps {train_steps} > {len(lr_ladder)} hard-coded LRs; extend the ladder")
+    lrs = lr_ladder[:train_steps]
+
+    def fresh_model() -> "MLXMambaModel":
+        m = MLXMambaModel(cfg)
+        m.load(weights_path)
+        return m
+
+    def run(grad_clip: float, want_grads: bool):
+        # Reseed before every call (not just once at the top of `main`, #293 review): the
+        # graph has no randomness today, but `run()` is invoked multiple times per export
+        # (natural-norm dry run, real run, determinism re-run) and if a future objective
+        # variant introduces one (e.g. dropout), the seed argument must actually govern
+        # each of those calls rather than silently drifting with ambient RNG state — the
+        # determinism check at step 3 below would then have a real seed to reproduce.
+        mx.random.seed(seed)
+        model = fresh_model()
+        opt = optim.AdamW(learning_rate=lrs[0])
+        scaler = scaler_for_precision(cfg.precision)
+        step_fn = make_train_step(model, opt, grad_clip=grad_clip, scaler=scaler)
+
+        def loss_fn(m, inputs, targets):
+            logits = m.forward(inputs)
+            v = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce = nn.losses.cross_entropy(
+                logits.reshape(-1, v).astype(mx.float32), t, reduction="mean")
+            return ce * scaler.scale if scaler else ce
+
+        value_and_grad = nn.value_and_grad(model, loss_fn)
+
+        def recompute_avg_grads():
+            n = len(micro_batches)
+            acc_grads = None
+            acc_loss = mx.zeros(())
+            for inp, tgt in micro_batches:
+                loss, grads = value_and_grad(model, inp, tgt)
+                acc_grads = grads if acc_grads is None else _tree_add(acc_grads, grads)
+                acc_loss = acc_loss + loss
+                mx.eval(acc_grads, acc_loss)
+            grads = _tree_scale(acc_grads, 1.0 / n)
+            loss = acc_loss / n
+            if scaler:
+                inv = 1.0 / scaler.scale
+                grads = _tree_scale(grads, inv)
+                loss = loss * inv
+            return loss, grads
+
+        losses, norms, grads_by_step, weights_by_step = [], [], [], []
+        for k in range(train_steps):
+            pre_grads = None
+            if want_grads:
+                _, pre_grads = recompute_avg_grads()
+                mx.eval(pre_grads)
+            step_out = step_fn(model, micro_batches, lrs[k])
+            if step_out.get("skipped"):
+                raise SystemExit(
+                    f"refusing to write {out}: training oracle step {k} was skipped "
+                    "(fp16 overflow) — pick a different --seed")
+            losses.append(float(step_out["loss"]))
+            norms.append(float(step_out["grad_norm"]))
+            if want_grads:
+                grads_by_step.append(dict(tree_flatten(pre_grads)))
+                weights_by_step.append(dict(tree_flatten(model.parameters())))
+        return losses, norms, grads_by_step, weights_by_step
+
+    # 1. dry run with clipping effectively off -> the "natural" per-step norm trajectory.
+    natural_losses, natural_norms, _, _ = run(grad_clip=1e9, want_grads=False)
+    grad_clip = float(np.median(natural_norms))
+    if not (grad_clip > 0 and np.isfinite(grad_clip)):
+        raise SystemExit(
+            f"refusing to write {out}: bad grad_clip candidate {grad_clip} "
+            f"from natural norms {natural_norms}")
+
+    # 2. the real run, from a pristine reload, with grad_clip=median(natural norms).
+    losses, norms, grads_by_step, weights_by_step = run(grad_clip=grad_clip, want_grads=True)
+    clipped_steps = [i for i, n in enumerate(norms) if n > grad_clip]
+    unclipped_steps = [i for i, n in enumerate(norms) if n <= grad_clip]
+    if not clipped_steps or not unclipped_steps:
+        raise SystemExit(
+            f"refusing to write {out}: grad_clip={grad_clip} exercises no clip branch "
+            f"(norms={norms}) — clipped={clipped_steps} unclipped={unclipped_steps}")
+
+    # 3. determinism: re-running from the same seed must reproduce the same trajectory.
+    losses2, norms2, _, _ = run(grad_clip=grad_clip, want_grads=False)
+    if losses2 != losses or norms2 != norms:
+        raise SystemExit(
+            f"refusing to write {out}: training oracle is not deterministic across re-runs "
+            f"(losses {losses} vs {losses2}, norms {norms} vs {norms2})")
+
+    # 4. every step's grads must be finite and non-zero — a fixture must gate something.
+    for k, gk in enumerate(grads_by_step):
+        flat = list(gk.values())
+        if not all(bool(mx.all(mx.isfinite(g)).item()) for g in flat):
+            raise SystemExit(f"refusing to write {out}: step {k} grads contain non-finite values")
+        if all(bool(mx.all(g == 0).item()) for g in flat):
+            raise SystemExit(f"refusing to write {out}: step {k} grads are all-zero")
+
+    train_out = {}
+    for j, (inp, tgt) in enumerate(micro_batches):
+        train_out[f"mb.{j}.inputs"] = np.asarray(inp, dtype=np.int32)
+        train_out[f"mb.{j}.targets"] = np.asarray(tgt, dtype=np.int32)
+    for k in range(train_steps):
+        train_out[f"loss.{k}"] = np.array(losses[k], dtype=np.float32)
+        train_out[f"grad_norm.{k}"] = np.array(norms[k], dtype=np.float32)
+        for name, val in grads_by_step[k].items():
+            # #195 (PR #293 follow-up): `mx.grad`/`value_and_grad` can hand back a
+            # COLUMN-major array (a transpose-producing backward op's lazy view, never
+            # materialized) rather than the row-major layout `model.parameters()` always
+            # returns. `np.array(val, ...)` does not reliably canonicalize this — on one
+            # macOS host family it silently reads the raw column-major buffer as if it
+            # were row-major, producing a numpy array whose VALUES are a full row/column
+            # transpose of the true gradient at every shape (e.g. every `conv.weight`,
+            # `in_proj.weight`, `out_proj.weight` in a 3-step toy trajectory) while the
+            # SET of values (sorted) is untouched and `weights_after` — real, always
+            # row-major, parameter arrays — is unaffected. `mx.contiguous(val)` (default
+            # `allow_col_major=False`) forces a genuine row-major copy before the numpy
+            # conversion, fixing this at the source rather than relying on `np.array`'s
+            # buffer-protocol handling. See docs/design/14-inference-engine.md's #195
+            # entry for the full measurement (this was originally, and incorrectly,
+            # diagnosed as a host-family NUMERIC difference in the gradient itself).
+            train_out[f"grad.{k}.{name}"] = np.array(mx.contiguous(val), dtype=np.float32)
+        for name, val in weights_by_step[k].items():
+            # Same defensive canonicalization as grads above — `model.parameters()`
+            # arrays have never been observed non-row-major, but the fix is free.
+            train_out[f"weights_after.{k}.{name}"] = np.array(mx.contiguous(val), dtype=np.float32)
+    from safetensors.numpy import save_file
+    save_file(train_out, str(out / "train.safetensors"))
+
+    return {
+        "train_steps": train_steps,
+        "train_grad_accum": grad_accum,
+        "train_grad_clip": grad_clip,
+        "train_lrs": lrs,
+        "train_loss": losses,
+        "train_grad_norm": norms,
+        "train_clipped_steps": clipped_steps,
+        # New keys, deliberately NOT `rtol`/`atol` — those are the fp32 LOGIT gate's keys
+        # (and, for the two quantized fixtures, their own looser 2e-2/2e-2). A training
+        # step is not a forward pass: gradients accumulate error through the whole
+        # backward graph and AdamW moments compound it across steps, so it gets its own
+        # band (see `.claude/plans/issue-195.md`'s tolerance table). `1e-5` atol would be
+        # LOOSER than the grad values themselves on small toy leaves and gate nothing
+        # there — hence the tighter atol traded against a modestly looser rtol.
+        "train_rtol": 2e-4,
+        "train_atol": 1e-6,
+    }
 
 
 _ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div)
@@ -127,6 +325,7 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                   seed: int = 0, vocab_size: int | None = None,
                   gen_steps: int = 16, quant_bits: int | None = None,
                   quant_group_size: int = 64, quant_head_bits: int | None = None,
+                  train_steps: int = 0,
                   packed_doc_lengths: str | None = None,
                   allow_moe_load_omit: bool = False) -> dict:
     """Build and write one fixture directory. Returns the `meta.json` contents.
@@ -656,6 +855,18 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                     f"refusing to write {out_dir}: quantized-vs-fp quality gate failed "
                     f"(top1={q['top1_agreement']:.4f} kl={q['mean_kl']:.4f}) — try "
                     "--quant-head-bits 8, a larger --quant-group-size, or a different seed")
+        if train_steps > 0:
+            if quant_bits is not None:
+                raise SystemExit(
+                    "--train-steps and --quant-bits are mutually exclusive: training a "
+                    "quantized checkpoint is out of scope (packed uint32 codes have no "
+                    "meaningful weight gradient) — see the plan's fixture-selection table")
+            # #195: the K-step training trajectory oracle. Built from a PRISTINE RELOAD of
+            # the weights just written above — critical ordering, so the inference oracles
+            # above are computed on untrained weights (the exporter must never train the
+            # model the logit fixtures were exported from).
+            meta.update(_export_train_oracle(cfg, weights_path, tokens, out=out,
+                                             train_steps=train_steps, seed=seed))
         (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
         return meta
     finally:
@@ -690,6 +901,10 @@ def main() -> None:
     p.add_argument("--quant-head-bits", type=int, default=None,
                    help="override bits for the tied embedding/head; defaults to 8 "
                         "automatically when --quant-bits 4 (see quant_targets)")
+    p.add_argument("--train-steps", type=int, default=0,
+                   help="#195: write train.safetensors, a K-step Swift/MLX train_step "
+                        "trajectory oracle (loss/grad_norm/grad-tree/post-step-weights). "
+                        "0 (default) writes no training oracle, unchanged from before #195")
     p.add_argument("--packed-doc-lengths", default=None,
                    help="#68/#263: write packed.safetensors (the Swift monica-parity P6 "
                         "packing-aware seg_ids oracle) with these comma-separated, "
@@ -711,7 +926,7 @@ def main() -> None:
                          precision=args.precision, moe_bias=args.moe_bias, seed=args.seed,
                          vocab_size=args.vocab_size, gen_steps=args.gen_steps,
                          quant_bits=args.quant_bits, quant_group_size=args.quant_group_size,
-                         quant_head_bits=quant_head_bits,
+                         quant_head_bits=quant_head_bits, train_steps=args.train_steps,
                          packed_doc_lengths=args.packed_doc_lengths,
                          allow_moe_load_omit=args.allow_moe_load_omit)
     print(f"wrote {args.out}: {json.dumps(meta)}")

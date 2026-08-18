@@ -26,5 +26,29 @@
     7,
     67
   ],
-  "packed_seq_len": 256
+  "packed_seq_len": 256,
+  "train_steps": 3,
+  "train_grad_accum": 2,
+  "train_grad_clip": 2.504133462905884,
+  "train_lrs": [
+    0.001,
+    0.0005,
+    0.0002
+  ],
+  "train_loss": [
+    6.606293678283691,
+    4.051090717315674,
+    2.8796939849853516
+  ],
+  "train_grad_norm": [
+    3.140575408935547,
+    2.5041470527648926,
+    2.020289897918701
+  ],
+  "train_clipped_steps": [
+    0,
+    1
+  ],
+  "train_rtol": 0.0002,
+  "train_atol": 1e-06
 }
