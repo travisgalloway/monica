@@ -681,27 +681,29 @@ jobs:
           echo "output: '$OUT'"
           [ -z "$OUT" ]
 
-  # ── TEMPORARY DIAGNOSTIC (#195) ────────────────────────────────────────────
-  # Phase 0 of `.claude/plans/issue-195-unblock.md`: nobody has ever observed
-  # what CI's hosted macOS runner actually computes for the toy `train.safetensors`
-  # gradient oracle — `tests/test_train_parity_fixture_export.py` only reports a
-  # single-number `max|d|` on failure, never the full per-key table, and no one
-  # has diffed two independent CI-runner generations against EACH OTHER (as
-  # opposed to against the checked-in, locally-generated oracle). This pair of
-  # jobs gets that evidence with one push, modelled directly on the
-  # poc-fixture-oracle/poc-parity two-process pattern below (#267), scoped to the
-  # toy train oracle instead of poc-scale logits, and NEVER asserting on the
-  # measured drift — only reporting it. Deliberately runs on `pull_request`/`push`
-  # (not gated to workflow_dispatch, unlike jobs 9/10 below) because the decision
-  # rule in the plan needs this evidence before any permanent fix can be chosen.
-  # REMOVE both jobs once the decision-rule fix (T4) lands and this evidence is
-  # recorded in docs/design/14-inference-engine.md's #195 entry — see the plan's
-  # "Step 4 — record and push" (unless decision branch (a) promotes Job A to a
-  # permanent `train-fixture-oracle` job, in which case only Job B goes away).
-  train-fixture-diag-a:
-    name: "[TEMP #195] toy train oracle diag — generate A (macOS, Python MLX)"
+  # ── Job 9a: the training-fixture oracle, generation side (#195) ────────────
+  # Dispatch/schedule-only, same rationale and pattern as poc-fixture-oracle/
+  # poc-parity below (#267) — this regenerates train.safetensors/meta.json for the
+  # three training fixtures (toy/toy-hybrid/toy-moe) ON DEMAND; it is not part of
+  # every-PR CI. Landed after the #195/PR #293 Phase-0 diagnostic
+  # (`.claude/plans/issue-195-unblock.md`) established that MLX's Metal conv1d
+  # weight-gradient reduction is HOST-FAMILY dependent — not within-host
+  # nondeterministic, and not an MLX-version artifact (both sides measured
+  # mlx 0.32.0): two independent generations on two separate macos-latest runners
+  # agreed to ~1.5e-8 (fp32 noise floor) while BOTH differed from a
+  # locally-generated (non-CI-hardware) oracle by up to 1.83e-2 on
+  # grad.*.conv.weight — exceeding the tensor's own absmax, i.e. not accumulated
+  # rounding. `tests/test_train_parity_fixture_export.py` and
+  # `swift model parity (macOS, mlx-swift)`'s `monica-train` step both run on this
+  # SAME macos-latest runner family, so the checked-in oracle must be GENERATED on
+  # that family too. See docs/design/14-inference-engine.md's #195 entry for the
+  # full record and the regeneration command in
+  # swift/engine/Fixtures/README.md.
+  train-fixture-oracle:
+    name: train fixture oracle — generate (macOS, Python MLX)
     runs-on: macos-latest
-    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -718,48 +720,56 @@ jobs:
           python -c "import mlx.core as mx; print('mlx', mx.__version__)"
           sysctl -n machdep.cpu.brand_string
           sw_vers
-      - name: Export the toy train fixture (fresh process, this runner)
+      - name: Export all three training fixtures (fresh process, this runner)
+        # Exact flags from swift/engine/Fixtures/README.md's "Regenerating" command.
         run: |
           python scripts/export_parity_fixture.py --config config/toy.yaml \
-            --out "$RUNNER_TEMP/train-diag-a" --batch 2 --seq 129 --train-steps 3
-          cat "$RUNNER_TEMP/train-diag-a/meta.json"
-      - name: Manifest
+            --out "$RUNNER_TEMP/oracle/toy" --batch 2 --seq 129 --train-steps 3 \
+            --packed-doc-lengths "Q,2*Q,5"
+          python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
+            --out "$RUNNER_TEMP/oracle/toy-hybrid" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+          python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
+            --out "$RUNNER_TEMP/oracle/toy-moe" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+      - name: "Manifest (meta.json + train.safetensors only, the only host-sensitive files)"
         run: |
-          cd "$RUNNER_TEMP/train-diag-a"
-          find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/train-diag-a-manifest.txt"
-          cat "$RUNNER_TEMP/train-diag-a-manifest.txt"
-          # Anti-BLIND: exactly 8 files (weights/.config.json/inputs/reference/
-          # generation/prefill/train.safetensors, one more than the poc-fixture-oracle
-          # manifest below because --train-steps adds train.safetensors). A short
-          # manifest must fail loud, not read as agreement.
-          N=$(wc -l < "$RUNNER_TEMP/train-diag-a-manifest.txt")
-          [ "$N" -eq 8 ] || { echo "BLIND: expected 8 fixture files, got $N"; exit 2; }
-          grep -q 'train.safetensors$' "$RUNNER_TEMP/train-diag-a-manifest.txt"
-      - name: Print the uploaded tree (so the download layout is observed, not guessed)
-        # actions/upload-artifact preserves the LEAST-COMMON-ANCESTOR of the given paths,
-        # not a flattened bag of files — #267/PR #301 and #167 both hit a stale assumption
-        # about this. One path here (train-diag-a-manifest.txt) is a bare file directly
-        # under $RUNNER_TEMP; the other two live under $RUNNER_TEMP/train-diag-a/. Their
-        # LCA is $RUNNER_TEMP itself, so the artifact download preserves the
-        # train-diag-a/ subdirectory for meta.json/train.safetensors but NOT for the
-        # manifest. Printed here so the next reader sees the real layout in the log
-        # instead of re-deriving it.
-        run: find "$RUNNER_TEMP/train-diag-a-manifest.txt" "$RUNNER_TEMP/train-diag-a" -type f | sort
+          cd "$RUNNER_TEMP/oracle"
+          find . \( -name meta.json -o -name train.safetensors \) | sort \
+            | xargs shasum -a 256 > "$RUNNER_TEMP/oracle-manifest.txt"
+          cat "$RUNNER_TEMP/oracle-manifest.txt"
+          # Anti-BLIND: exactly 6 files (3 fixtures x {meta.json, train.safetensors}).
+          N=$(wc -l < "$RUNNER_TEMP/oracle-manifest.txt")
+          [ "$N" -eq 6 ] || { echo "BLIND: expected 6 files, got $N"; exit 2; }
+      - name: "Print the uploaded tree (observed, not guessed: see PR #301, #167)"
+        run: find "$RUNNER_TEMP/oracle-manifest.txt" "$RUNNER_TEMP/oracle" -type f | sort
       - uses: actions/upload-artifact@v4
         with:
-          name: train-fixture-diag-a
+          name: train-fixture-oracle
           path: |
-            ${{ runner.temp }}/train-diag-a-manifest.txt
-            ${{ runner.temp }}/train-diag-a/meta.json
-            ${{ runner.temp }}/train-diag-a/train.safetensors
-          retention-days: 14
+            ${{ runner.temp }}/oracle-manifest.txt
+            ${{ runner.temp }}/oracle/toy/meta.json
+            ${{ runner.temp }}/oracle/toy/train.safetensors
+            ${{ runner.temp }}/oracle/toy-hybrid/meta.json
+            ${{ runner.temp }}/oracle/toy-hybrid/train.safetensors
+            ${{ runner.temp }}/oracle/toy-moe/meta.json
+            ${{ runner.temp }}/oracle/toy-moe/train.safetensors
+          retention-days: 30
           if-no-files-found: error
 
-  train-fixture-diag-b:
-    name: "[TEMP #195] toy train oracle diag — regenerate B + report (macOS, Python MLX)"
+  # ── Job 9b: the training-fixture oracle, cross-process verification (#195) ──
+  # The #298 two-process guard, reused exactly (not reinvented): a SECOND
+  # independent generation, in a fresh process on a second runner, must agree
+  # byte-for-byte with job 9a's upload before either is trusted as an oracle —
+  # this GATES (unlike the Phase-0 diagnostic's report-only comparison), because
+  # a mismatch here would mean the "generate on CI" fix itself rests on an
+  # unstable quantity.
+  train-fixture-oracle-verify:
+    name: train fixture oracle — verify (macOS, Python MLX)
     runs-on: macos-latest
-    needs: [train-fixture-diag-a]
-    timeout-minutes: 20
+    needs: [train-fixture-oracle]
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -771,84 +781,46 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,mlx]"
-      - name: Host facts
-        run: |
-          python -c "import mlx.core as mx; print('mlx', mx.__version__)"
-          sysctl -n machdep.cpu.brand_string
-          sw_vers
-      - name: Export the toy train fixture (fresh process, a SECOND independent runner)
+      - name: Export all three training fixtures (fresh process, a SECOND independent runner)
         run: |
           python scripts/export_parity_fixture.py --config config/toy.yaml \
-            --out "$RUNNER_TEMP/train-diag-b" --batch 2 --seq 129 --train-steps 3
+            --out "$RUNNER_TEMP/oracle2/toy" --batch 2 --seq 129 --train-steps 3 \
+            --packed-doc-lengths "Q,2*Q,5"
+          python scripts/export_parity_fixture.py --config config/toy-hybrid.yaml \
+            --out "$RUNNER_TEMP/oracle2/toy-hybrid" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
+          python scripts/export_parity_fixture.py --config config/toy-moe.yaml \
+            --out "$RUNNER_TEMP/oracle2/toy-moe" --batch 2 --seq 40 --train-steps 3 \
+            --packed-doc-lengths "Q,7,Q+3"
       - name: Manifest
         run: |
-          cd "$RUNNER_TEMP/train-diag-b"
-          find . -type f | sort | xargs shasum -a 256 > "$RUNNER_TEMP/train-diag-b-manifest.txt"
-          N=$(wc -l < "$RUNNER_TEMP/train-diag-b-manifest.txt")
-          [ "$N" -eq 8 ] || { echo "BLIND: expected 8 fixture files, got $N"; exit 2; }
+          cd "$RUNNER_TEMP/oracle2"
+          find . \( -name meta.json -o -name train.safetensors \) | sort \
+            | xargs shasum -a 256 > "$RUNNER_TEMP/oracle2-manifest.txt"
+          N=$(wc -l < "$RUNNER_TEMP/oracle2-manifest.txt")
+          [ "$N" -eq 6 ] || { echo "BLIND: expected 6 files, got $N"; exit 2; }
       - uses: actions/download-artifact@v4
         with:
-          name: train-fixture-diag-a
-          path: oracle
-      - name: Print the downloaded tree (the observed layout, not the assumed one)
-        run: find oracle -type f | sort
-      - name: "(a) vs (b): do two independent CI-runner generations agree byte-for-byte?"
-        # Layout note (see job A's "Print the uploaded tree" step): the manifest lands at
-        # oracle/train-diag-a-manifest.txt (bare file, matched the upload path's own
-        # basename) but meta.json/train.safetensors land under oracle/train-diag-a/ —
-        # upload-artifact's least-common-ancestor rule, not a flat bag of files.
+          name: train-fixture-oracle
+          path: downloaded
+      - name: Print the downloaded tree (observed, not guessed)
+        run: find downloaded -type f | sort
+      - name: "GATE — two independent CI-runner generations must agree byte-for-byte"
+        # Manifests hash relative "./fixture/file" paths (both sides ran `find .` from
+        # their own oracle root), so they are directly comparable despite the
+        # upload/download directory nesting being different from the local one.
         run: |
-          test -s oracle/train-diag-a-manifest.txt || { echo "BLIND: diag-a manifest missing/empty"; exit 2; }
-          N=$(wc -l < oracle/train-diag-a-manifest.txt)
-          [ "$N" -eq 8 ] || { echo "BLIND: short diag-a manifest ($N lines)"; exit 2; }
-          echo "--- diag-a manifest ---"; cat oracle/train-diag-a-manifest.txt
-          echo "--- diag-b manifest ---"; cat "$RUNNER_TEMP/train-diag-b-manifest.txt"
-          if diff oracle/train-diag-a-manifest.txt "$RUNNER_TEMP/train-diag-b-manifest.txt" > /tmp/ab.diff; then
-            echo "RESULT: diag-a and diag-b AGREE byte-for-byte (two independent CI runners, same generator)"
-          else
-            echo "RESULT: diag-a and diag-b DISAGREE (nondeterministic within the CI host family)"
-            cat /tmp/ab.diff
-          fi
-      - name: Per-key max|d| — diag-a vs checked-in, diag-b vs checked-in (report only, never asserts)
+          test -s downloaded/oracle-manifest.txt || { echo "BLIND: uploaded manifest missing/empty"; exit 2; }
+          N=$(wc -l < downloaded/oracle-manifest.txt)
+          [ "$N" -eq 6 ] || { echo "BLIND: short uploaded manifest ($N lines)"; exit 2; }
+          echo "--- runner 1 (uploaded) manifest ---"; cat downloaded/oracle-manifest.txt
+          echo "--- runner 2 (this job) manifest ---"; cat "$RUNNER_TEMP/oracle2-manifest.txt"
+          diff downloaded/oracle-manifest.txt "$RUNNER_TEMP/oracle2-manifest.txt"
+      - name: Per-fixture meta.json (for the record)
         run: |
-          test -s oracle/train-diag-a/train.safetensors || { echo "BLIND: diag-a train.safetensors missing/empty"; exit 2; }
-          test -s "$RUNNER_TEMP/train-diag-b/train.safetensors" || { echo "BLIND: diag-b train.safetensors missing/empty"; exit 2; }
-          test -s swift/engine/Fixtures/toy/train.safetensors || { echo "BLIND: checked-in oracle missing"; exit 2; }
-          python3 - "oracle/train-diag-a/train.safetensors" "$RUNNER_TEMP/train-diag-b/train.safetensors" \
-            "swift/engine/Fixtures/toy/train.safetensors" <<'PYEOF'
-          import sys
-          import numpy as np
-          from safetensors.numpy import load_file
-
-          a_path, b_path, ref_path = sys.argv[1], sys.argv[2], sys.argv[3]
-          a, b, ref = load_file(a_path), load_file(b_path), load_file(ref_path)
-
-          def report(name, x, y):
-              common = sorted(set(x) & set(y))
-              if not common:
-                  print(f"BLIND: no common keys between {name} — cannot observe target")
-                  sys.exit(2)
-              rows = []
-              for k in common:
-                  xv, yv = x[k], y[k]
-                  if xv.shape != yv.shape:
-                      rows.append((k, float("inf"), float("nan"), float("inf")))
-                      continue
-                  d = np.abs(xv.astype(np.float64) - yv.astype(np.float64))
-                  maxd = float(d.max())
-                  absmax = float(np.abs(xv.astype(np.float64)).max())
-                  ratio = maxd / absmax if absmax > 0 else (0.0 if maxd == 0 else float("inf"))
-                  rows.append((k, maxd, absmax, ratio))
-              rows.sort(key=lambda r: -r[1])
-              print(f"\n=== {name}: {len(rows)} common keys, worst 15 by max|d| ===")
-              print(f"{'key':38s} {'max|d|':>14s} {'absmax(x)':>14s} {'max|d|/absmax':>16s}")
-              for k, maxd, absmax, ratio in rows[:15]:
-                  print(f"{k:38s} {maxd:14.6e} {absmax:14.6e} {ratio:16.6e}")
-
-          report("diag-a (CI runner 1) vs checked-in oracle", a, ref)
-          report("diag-b (CI runner 2) vs checked-in oracle", b, ref)
-          report("diag-a vs diag-b (two independent CI runners)", a, b)
-          PYEOF
+          for f in toy toy-hybrid toy-moe; do
+            echo "--- $f ---"; cat "downloaded/oracle/$f/meta.json"
+          done
 
   # ── Job 9: the poc-scale parity oracle, generation side (#267) ────────────
   # Dispatch/schedule-only — see the `on:` block above. Generation side of the
