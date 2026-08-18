@@ -194,9 +194,26 @@ def _export_train_oracle(cfg, weights_path: str, tokens, *, out: "Path",
         train_out[f"loss.{k}"] = np.array(losses[k], dtype=np.float32)
         train_out[f"grad_norm.{k}"] = np.array(norms[k], dtype=np.float32)
         for name, val in grads_by_step[k].items():
-            train_out[f"grad.{k}.{name}"] = np.array(val, dtype=np.float32)
+            # #195 (PR #293 follow-up): `mx.grad`/`value_and_grad` can hand back a
+            # COLUMN-major array (a transpose-producing backward op's lazy view, never
+            # materialized) rather than the row-major layout `model.parameters()` always
+            # returns. `np.array(val, ...)` does not reliably canonicalize this — on one
+            # macOS host family it silently reads the raw column-major buffer as if it
+            # were row-major, producing a numpy array whose VALUES are a full row/column
+            # transpose of the true gradient at every shape (e.g. every `conv.weight`,
+            # `in_proj.weight`, `out_proj.weight` in a 3-step toy trajectory) while the
+            # SET of values (sorted) is untouched and `weights_after` — real, always
+            # row-major, parameter arrays — is unaffected. `mx.contiguous(val)` (default
+            # `allow_col_major=False`) forces a genuine row-major copy before the numpy
+            # conversion, fixing this at the source rather than relying on `np.array`'s
+            # buffer-protocol handling. See docs/design/14-inference-engine.md's #195
+            # entry for the full measurement (this was originally, and incorrectly,
+            # diagnosed as a host-family NUMERIC difference in the gradient itself).
+            train_out[f"grad.{k}.{name}"] = np.array(mx.contiguous(val), dtype=np.float32)
         for name, val in weights_by_step[k].items():
-            train_out[f"weights_after.{k}.{name}"] = np.array(val, dtype=np.float32)
+            # Same defensive canonicalization as grads above — `model.parameters()`
+            # arrays have never been observed non-row-major, but the fix is free.
+            train_out[f"weights_after.{k}.{name}"] = np.array(mx.contiguous(val), dtype=np.float32)
     from safetensors.numpy import save_file
     save_file(train_out, str(out / "train.safetensors"))
 

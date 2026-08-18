@@ -43,14 +43,19 @@ Swift **writer** produces a checkpoint Swift can read back byte-for-byte, and
 a new checked-in tensor. Every comparison is computed **in-process** from the fixture already
 loaded above: save the already-loaded model, reload it, and diff against the SAME model
 object's own tensors/config/logits, all in the same run. This is deliberate, not an oversight:
-#195 (the Swift train step) shipped a checked-in **gradient** oracle that turned out to
+#195 (the Swift train step) shipped a checked-in **gradient** oracle that appeared to
 diverge across macOS machines (`grad.0.layers.0.conv.weight` by `max|d|=1.226e-02` on the
-hosted CI runner vs. locally) — forward/step *logit* and *weight* fixtures have never shown
-that failure mode, but the safest fix is to not add another checked-in tensor of any kind. The
-round trip's two EXACT (no-tolerance) comparisons — save→load tensor bit-identity, and the
-mutation round trip's exact-preservation check — are therefore same-process, same-machine
-comparisons by construction, which makes them immune to the cross-machine drift that broke
-#195's fixture regardless of what hardware CI runs on next.
+hosted CI runner vs. locally) — investigated further and RESOLVED (see "train.safetensors
+is host-portable" below): a column-major-vs-row-major export bug
+(`np.array()` not canonicalizing a transposed-view gradient array), fixed with
+`mx.contiguous()`, not an actual cross-machine numeric difference. Regardless, the design
+choice here still holds on its own merits: forward/step *logit* and *weight* fixtures have
+never shown any export-layout failure mode, but avoiding a new checked-in gradient tensor
+sidesteps the whole class of "did the export canonicalize correctly on this host" question
+rather than depending on it. The round trip's two EXACT (no-tolerance) comparisons —
+save→load tensor bit-identity, and the mutation round trip's exact-preservation check — are
+same-process, same-machine comparisons by construction, immune to that class of bug
+regardless of what hardware CI runs on next.
 
 ## Files in a fixture
 
@@ -257,9 +262,11 @@ place:
    per-fixture override, unlike the #168 quantized fixtures).
 2. **Self-consistency**, the real correctness claim: each document's logit slice from the
    packed-aware forward vs that SAME document's standalone Swift forward, computed
-   in-process. This needs no checked-in numbers, so it is immune to the cross-machine
-   drift that blocked #195/PR #293's checked-in gradient oracle (`grad.0.layers.0.
-   conv.weight` diverging `max|d|=1.226e-02` between the hosted CI runner and a local Mac).
+   in-process. This needs no checked-in numbers, so it is immune to the whole class of
+   export-layout bug that initially blocked #195/PR #293's checked-in gradient oracle
+   (`grad.0.layers.0.conv.weight` appearing to diverge `max|d|=1.226e-02` between the
+   hosted CI runner and a local Mac — RESOLVED as a column-major export bug, not a real
+   cross-machine numeric difference; see "train.safetensors is host-portable" above).
 3. **Anti-no-op.** The packing-BLIND forward (`model.forward(packedTokens)`, no `segIds`)
    vs each document's standalone forward (doc 0 excluded — it never leaks a PRIOR
    document's state, so it proves nothing about packing-awareness). This must exceed
@@ -387,41 +394,43 @@ clip boundary differs from Python's unconditional `min(1.0, clip/(norm+eps))`).
     --out swift/engine/Fixtures/toy-hybrid-fp16 --batch 2 --seq 40 --precision fp16
 ```
 
-**`toy`/`toy-hybrid`/`toy-moe`'s `train.safetensors` + its `meta.json` `train_*` keys are
-CI-generated, not locally-generated (#195/PR #293).** Running the commands above will
-regenerate the base 6-7 files fine, but the `--train-steps 3` addition will NOT reproduce
-the checked-in `train.safetensors` on a local Mac.
+**`toy`/`toy-hybrid`/`toy-moe`'s `train.safetensors` is host-portable — RESOLVED (#195/PR
+#293).** Running the commands above regenerates it fine, on any Mac, including a local
+one; there is no CI-only requirement.
 
-Measured evidence (the #195/PR #293 investigation; full write-up in
-`docs/design/14-inference-engine.md`'s #195 entry): `tests/
-test_train_parity_fixture_export.py` passed on every local Mac but failed reproducibly on
-the hosted `full-macos` CI runner. A dedicated CI diagnostic
-(`.claude/plans/issue-195-unblock.md` Phase 0) established the split precisely:
+The investigation's real finding (full write-up in `docs/design/14-inference-engine.md`'s
+#195 entry): `tests/test_train_parity_fixture_export.py` passed on every local Mac but
+failed reproducibly on the hosted `full-macos` CI runner, printing
+`grad.0.layers.0.conv.weight max|d| = 1.226e-02`. This was FIRST (incorrectly) diagnosed
+as a host-family numeric difference in MLX's conv1d weight-gradient reduction — two
+independent CI-runner generations agreeing with each other but not with a locally-built
+oracle looked exactly like that. It wasn't. Reinterpreting each diverging tensor's raw
+buffer as column-major instead of row-major (`old.flatten(order="F")` vs
+`new.flatten(order="C")`) collapsed EVERY one of 18 mismatched `grad.*` keys (every
+`conv.weight`/`in_proj.weight`/`out_proj.weight` across all 3 steps) down to `~1e-9`
+(fp32 noise) — the two hosts computed the SAME gradient values; only the memory layout
+of the exported array differed. `weights_after.*` (real `model.parameters()` arrays,
+never a transpose-producing autodiff view) needed no reinterpretation and matched
+directly — the clean control group proving this was never about the numbers.
 
-- **Same MLX version, both sides** — `meta.json`'s `mlx_version` read `0.32.0` on both the
-  locally-generated checked-in oracle and the CI runner. Not a stale-version artifact.
-- **CI is internally stable.** Two independent generations, in two fresh processes on two
-  separate `macos-latest` runners, agreed to **~1.5e-08** (fp32 noise floor) on every key.
-  Not within-host nondeterminism.
-- **A real, deterministic, host-family difference.** Both CI runners disagreed with the
-  local (physical M1 Pro) checked-in oracle by the SAME amounts — up to
-  `max|d| = 1.83e-02` on `grad.*.conv.weight`, EXCEEDING that tensor's own `absmax`
-  (`1.20e-02`) — not accumulated rounding. Confined to gradients that reduce over a
-  shifted/padded input window (`conv.weight` dominant, `{in,out}_proj.weight` a smaller
-  echo); `conv.bias` (a plain sum) and every non-gradient key passed at the strict band.
-  MLX's Metal conv1d weight-gradient reduction order is host-family-dependent — CI's
-  "Apple M1 (Virtual)" runner vs a physical M1 Pro.
+**Root cause:** `mx.grad`/`value_and_grad` can hand back a column-major (transposed-view)
+array rather than the row-major layout `model.parameters()` always returns, and the
+exporter's plain `np.array(val, dtype=np.float32)` did not canonicalize this — apparently
+handled correctly by the MLX build on some hosts and not others. **Fix:**
+`scripts/export_parity_fixture.py`'s `_export_train_oracle` now calls
+`mx.contiguous(val)` (MLX's own API — "Force an array to be row contiguous. Copy if
+necessary") before converting every `grad.*`/`weights_after.*` leaf to numpy. This is a
+no-op wherever the array was already row-major (verified: 0.0 diff on a machine that
+never showed the bug) and a real fix wherever it wasn't.
 
-The canonical regeneration path is the CI job pair `train-fixture-oracle` (generate) +
-`train-fixture-oracle-verify` (a numeric-tolerance cross-check, at the SAME
-`train_rtol=2e-4`/`train_atol=1e-6` the production staleness guard uses — see the
-comment on the GATE step in `.github/workflows/ci.yml` for why this is tolerance-based
-rather than poc's byte-exact check) before the output is trusted:
-`gh workflow run ci.yml --ref <branch>`, then download the `train-fixture-oracle`
-artifact and copy `train.safetensors`/`meta.json` for the three fixtures into their
-directories here. The other 6-7 files per fixture (forward-only — weights/logits/state,
-never a gradient) are unaffected by this and can still be regenerated locally with the
-plain commands above.
+The CI job pair `train-fixture-oracle` (generate) + `train-fixture-oracle-verify` (a
+numeric-tolerance cross-check at the SAME `train_rtol=2e-4`/`train_atol=1e-6` the
+production staleness guard uses) still exists in `.github/workflows/ci.yml`, dispatch/
+schedule-gated, but it is **not load-bearing for correctness** — it is a regression check
+that lets this exporter's output be verified on the specific host family where the
+column-major bug manifested, for this change and any future one. It would NOT have
+caught the original bug on its own (both independent CI-runner generations were
+column-major, so they agreed with each other).
 
 **#266's low-precision fixtures carry no `--packed-doc-lengths`** — P6's packing gate
 reuses the file-level DTYPE band already, so a low-precision packed fixture would work,
@@ -478,10 +487,10 @@ That is what stops a future change to `mlx_backend.py`'s math from silently leav
 Swift gate testing a stale oracle. `tests/test_train_parity_fixture_export.py` does the same
 for `train.safetensors` (#195), re-exporting `toy` with `--train-steps 3` and comparing every
 key at the training tolerance above — the guard against `mlx_train_step.py`'s math silently
-drifting from `monica-train`'s oracle. **This guard's `grad.*.conv.weight` comparison has a
-known cross-machine-drift caveat** — see the checkpoint round-trip note above and
-`docs/design/14-inference-engine.md`'s #195 entry for the measured numbers and the fix
-applied.
+drifting from `monica-train`'s oracle. **This guard's `grad.*.conv.weight` comparison once
+appeared to have a cross-machine caveat, RESOLVED as an export-layout bug** — see
+"train.safetensors is host-portable" above and `docs/design/14-inference-engine.md`'s
+#195 entry for the measured numbers and the fix applied.
 
 ## `poc` is deliberately NOT checked in
 

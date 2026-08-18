@@ -685,20 +685,21 @@ jobs:
   # Dispatch/schedule-only, same rationale and pattern as poc-fixture-oracle/
   # poc-parity below (#267) — this regenerates train.safetensors/meta.json for the
   # three training fixtures (toy/toy-hybrid/toy-moe) ON DEMAND; it is not part of
-  # every-PR CI. Landed after the #195/PR #293 Phase-0 diagnostic
-  # (`.claude/plans/issue-195-unblock.md`) established that MLX's Metal conv1d
-  # weight-gradient reduction is HOST-FAMILY dependent — not within-host
-  # nondeterministic, and not an MLX-version artifact (both sides measured
-  # mlx 0.32.0): two independent generations on two separate macos-latest runners
-  # agreed to ~1.5e-8 (fp32 noise floor) while BOTH differed from a
-  # locally-generated (non-CI-hardware) oracle by up to 1.83e-2 on
-  # grad.*.conv.weight — exceeding the tensor's own absmax, i.e. not accumulated
-  # rounding. `tests/test_train_parity_fixture_export.py` and
-  # `swift model parity (macOS, mlx-swift)`'s `monica-train` step both run on this
-  # SAME macos-latest runner family, so the checked-in oracle must be GENERATED on
-  # that family too. See docs/design/14-inference-engine.md's #195 entry for the
-  # full record and the regeneration command in
-  # swift/engine/Fixtures/README.md.
+  # every-PR CI. NOT load-bearing for correctness: train.safetensors is
+  # host-portable (regenerating locally works fine, same as every other fixture).
+  # This exists as a REGRESSION CHECK — the #195/PR #293 investigation found the
+  # ORIGINAL staleness-guard failure was a column-major-vs-row-major export bug in
+  # `_export_train_oracle` (`np.array()` not canonicalizing a transposed-view MLX
+  # gradient array; fixed with `mx.contiguous()`), which manifested on this
+  # macos-latest runner family and not on the exec agent's local Mac. This job
+  # pair verifies the exporter's output on the SPECIFIC host family where that bug
+  # showed up, for this fix and any future exporter change — it would NOT have
+  # caught the original bug on its own (two independent CI-runner generations
+  # were equally column-major and agreed with each other; see
+  # train-fixture-oracle-verify's GATE step comment for how that was later
+  # distinguished from a real numeric difference). See
+  # docs/design/14-inference-engine.md's #195 entry for the full record and the
+  # regeneration command in swift/engine/Fixtures/README.md.
   train-fixture-oracle:
     name: train fixture oracle — generate (macOS, Python MLX)
     runs-on: macos-latest
@@ -829,21 +830,32 @@ jobs:
         # DELIBERATELY not byte-exact, unlike poc-fixture-oracle/poc-parity above — poc's
         # oracle is pure-forward LOGITS (bit-reproducible across processes); this oracle
         # is a GRADIENT reduction, which carries inherent sub-ULP jitter even between two
-        # independent processes of the same host family. Do not "fix" this back to a
+        # independent processes of the SAME host family. Do not "fix" this back to a
         # byte-exact `diff` for consistency with poc — that made the gate permanently
         # flaky (a real early failure, not hypothetical: see run 32086817464's
-        # toy/train.safetensors mismatch, fixed by PR #293/commit 49462be). The three
-        # measured magnitudes this threshold has to sit between, all from the #195/PR #293
-        # investigation (`.claude/plans/issue-195-unblock.md` Phase 0 +
-        # docs/design/14-inference-engine.md's #195 entry):
+        # toy/train.safetensors mismatch, fixed by PR #293/commit 49462be).
+        #
+        # IMPORTANT — what this gate does and does NOT prove: two SAME-host-family
+        # generations agreeing here does not by itself mean the exported gradient is
+        # CORRECT — the #195/PR #293 investigation's biggest misstep was treating exactly
+        # that agreement as proof of a real cross-host numeric difference against a
+        # locally-generated oracle, when the actual defect was a column-major-vs-row-major
+        # export bug (`np.array()` not canonicalizing a transposed-view MLX gradient
+        # array — both independent CI-runner generations were equally affected, so this
+        # gate could not and did not catch it; see docs/design/14-inference-engine.md's
+        # #195 entry). Since the `mx.contiguous()` fix landed, this gate's real job is
+        # narrower: catch #298-class silent per-process export corruption and confirm the
+        # exporter's sub-ULP run-to-run jitter stays inside the production tolerance —
+        # not a substitute for `swift model parity`/`test_train_parity_fixture_export.py`
+        # actually agreeing with the checked-in oracle. Measured magnitudes this threshold
+        # sits between:
         #   sub-ULP jitter, two CI processes, MUST NOT fail  ~1.5e-8   (correctly tolerated)
         #   #298-class silent export corruption, MUST fail    2.694e-5 (~27x inside the band)
-        #   the actual cross-host bug, MUST fail               1.2-1.8e-2 (~4 orders inside)
         # train_rtol=2e-4/train_atol=1e-6 — the SAME constants
         # tests/test_train_parity_fixture_export.py uses in production — sits cleanly
-        # above the jitter and far below both failure modes, so this gate asks the right
-        # question: "would this pair pass the actual staleness gate", not "are they
-        # identical". Do not loosen these constants without re-deriving against this table.
+        # above the jitter and below the corruption case, so this gate asks "would this
+        # pair pass the actual staleness gate", not "are they identical". Do not loosen
+        # these constants without re-deriving against this table.
         run: |
           for f in toy toy-hybrid toy-moe; do
             test -s "downloaded/oracle/$f/train.safetensors" || { echo "BLIND: downloaded $f/train.safetensors missing/empty"; exit 2; }
