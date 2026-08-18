@@ -81,8 +81,18 @@ public func globalGradNorm(_ grads: ModuleParameters) -> MLXArray {
 /// built-in two-tree zip, so this goes through `flattened()`/`unflattened(_:)` (the same
 /// round-trip `Checkpoint.loadInto` already uses for a single tree).
 func addTrees(_ a: ModuleParameters, _ b: ModuleParameters) -> ModuleParameters {
+    let aFlat = a.flattened()
     let bFlat = Dictionary(uniqueKeysWithValues: b.flattened())
-    let summed: [(String, MLXArray)] = a.flattened().map { key, value in
+    // Python's `tree_map`-based `_add` requires the two trees to match structurally, so
+    // mirror that here: a `b` with extra keys beyond `a` must fail loudly rather than
+    // silently drop those leaves from the sum (the missing-key case below already fails
+    // loudly the other direction).
+    guard bFlat.count == aFlat.count else {
+        fatalError(
+            "accumulateAndStep: gradient tree mismatch — a has \(aFlat.count) keys, "
+            + "b has \(bFlat.count)")
+    }
+    let summed: [(String, MLXArray)] = aFlat.map { key, value in
         guard let bValue = bFlat[key] else {
             fatalError("accumulateAndStep: gradient tree mismatch — missing key '\(key)'")
         }

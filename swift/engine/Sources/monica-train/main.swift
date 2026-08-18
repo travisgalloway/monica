@@ -21,7 +21,6 @@
 import Foundation
 import MLX
 import MLXNN
-import MLXOptimizers
 import MonicaEngine
 
 func fail(_ msg: String) -> Never {
@@ -368,6 +367,14 @@ func runOverflowCheck(_ dir: URL) {
         }
         let after = model.parameters().flattened().sorted { $0.0 < $1.0 }
             .map { ($0.0, flatArray($0.1)) }
+        // `zip` silently truncates to the shorter sequence, so a parameter-tree shape
+        // drift between the two snapshots (unexpected here — same model instance, one
+        // step — but cheap to guard) would otherwise under-check and report a false OK.
+        guard before.map(\.0) == after.map(\.0) else {
+            failures.append("\(name): --overflow-check parameter name list changed across "
+                            + "the step (\(before.count) before, \(after.count) after)")
+            return
+        }
         var worst = 0.0
         for (b, a) in zip(before, after) {
             for (bv, av) in zip(b.1, a.1) {
