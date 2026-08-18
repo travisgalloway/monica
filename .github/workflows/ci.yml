@@ -826,14 +826,24 @@ jobs:
             cat /tmp/mf.diff
           fi
       - name: "GATE — two independent CI-runner generations must agree within the staleness-guard tolerance"
-        # The Phase-0 diagnostic (.claude/plans/issue-195-unblock.md) measured ~1.5e-8
-        # max|d| between two independent same-host-family generations — real but far
-        # inside train_rtol=2e-4/train_atol=1e-6 (tests/test_train_parity_fixture_export.py),
-        # the SAME band the checked-in oracle will be compared against in production. So
-        # the correct guard here is "would this pair pass the actual staleness gate",
-        # not exact-byte equality — the latter is what poc-parity uses because pure
-        # forward-pass logits ARE bit-reproducible across processes; this oracle's
-        # gradient reduction is not, even within one host family.
+        # DELIBERATELY not byte-exact, unlike poc-fixture-oracle/poc-parity above — poc's
+        # oracle is pure-forward LOGITS (bit-reproducible across processes); this oracle
+        # is a GRADIENT reduction, which carries inherent sub-ULP jitter even between two
+        # independent processes of the same host family. Do not "fix" this back to a
+        # byte-exact `diff` for consistency with poc — that made the gate permanently
+        # flaky (a real early failure, not hypothetical: see run 32086817464's
+        # toy/train.safetensors mismatch, fixed by PR #293/commit 49462be). The three
+        # measured magnitudes this threshold has to sit between, all from the #195/PR #293
+        # investigation (`.claude/plans/issue-195-unblock.md` Phase 0 +
+        # docs/design/14-inference-engine.md's #195 entry):
+        #   sub-ULP jitter, two CI processes, MUST NOT fail  ~1.5e-8   (correctly tolerated)
+        #   #298-class silent export corruption, MUST fail    2.694e-5 (~27x inside the band)
+        #   the actual cross-host bug, MUST fail               1.2-1.8e-2 (~4 orders inside)
+        # train_rtol=2e-4/train_atol=1e-6 — the SAME constants
+        # tests/test_train_parity_fixture_export.py uses in production — sits cleanly
+        # above the jitter and far below both failure modes, so this gate asks the right
+        # question: "would this pair pass the actual staleness gate", not "are they
+        # identical". Do not loosen these constants without re-deriving against this table.
         run: |
           for f in toy toy-hybrid toy-moe; do
             test -s "downloaded/oracle/$f/train.safetensors" || { echo "BLIND: downloaded $f/train.safetensors missing/empty"; exit 2; }

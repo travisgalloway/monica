@@ -651,6 +651,59 @@ DPO/GRPO step factories.
   first CI run is where the achieved max|d| numbers this design doc's tolerance table
   assumes get calibrated.
 
+  **The checked-in gradient oracle is host-family-dependent — RESOLVED (#195/PR #293).**
+  `tests/test_train_parity_fixture_export.py` (a Python-only staleness guard: re-export
+  `toy`, diff against the checked-in `train.safetensors` at `train_rtol=2e-4`/
+  `train_atol=1e-6`) passed on every local Mac but failed reproducibly on the hosted
+  `full-macos` CI runner, printing `grad.0.layers.0.conv.weight   max|d| = 1.226e-02`. Four
+  measured facts, in the order they rule out the wrong explanations:
+
+  1. **Not a corrupted export.** Regenerating locally, with and without #264's
+     `mx.set_cache_limit(0)` mitigation, reproduced the checked-in oracle to `9.313e-10`
+     both ways — the mitigation is a no-op for this failure, and the oracle was not
+     corrupted at export time.
+  2. **Not an MLX-version mismatch.** Both the checked-in oracle (regenerated locally
+     during the #195/PR #293 merge) and CI's hosted runner report `mlx_version: 0.32.0` in
+     `meta.json` — same version, still ~1.2–1.8e-2 apart.
+  3. **Not within-host nondeterminism.** A dedicated CI diagnostic
+     (`.claude/plans/issue-195-unblock.md`'s Phase 0; the `train-fixture-oracle`/
+     `train-fixture-oracle-verify` jobs below are its promoted, permanent form) ran the
+     exporter twice, in two fresh processes on two independent `macos-latest` runners: the
+     two agreed to **~1.5e-8** (fp32 noise floor) on every key, including every
+     `grad.*.conv.weight`. Two independent CI-runner generations do not disagree with each
+     other.
+  4. **A real, deterministic, host-family difference.** Both CI runners disagreed with the
+     locally-generated (M1 Pro) checked-in oracle by the SAME amounts — up to
+     `max|d| = 1.829e-02` on `grad.2.layers.1.conv.weight`, whose own `absmax` is
+     `1.202e-02` (`max|d|` EXCEEDS the tensor's own maximum — not accumulated rounding,
+     which could never do that). Confined to gradients that reduce over a
+     shifted/padded input window: `grad.*.conv.weight` dominates (~1.2e-2 to 1.8e-2),
+     `grad.*.{in,out}_proj.weight` show a smaller but present echo (~1.0e-3 to 2.5e-3);
+     `grad.*.conv.bias` (a plain sum, no windowed reduction) and every non-gradient key
+     (`loss.*`, `weights_after.*` before any update lands) passed at the strict band.
+     MLX's Metal conv1d weight-gradient reduction order is host-family-dependent — CI's
+     "Apple M1 (Virtual)" runner vs a physical M1 Pro — not a bug in `mlx_train_step.py`,
+     `mlx_backend.py`, or the Swift port: `swift model parity (macOS, mlx-swift)`'s
+     `monica-train` step runs mlx-swift's OWN autodiff gradients against the SAME
+     checked-in oracle, on the SAME `macos-latest` runner family, and has passed
+     throughout.
+
+  **The fix.** `train.safetensors`/`meta.json` for `toy`/`toy-hybrid`/`toy-moe` are now
+  generated ON the `macos-latest` CI runner family (the `train-fixture-oracle` job below),
+  not on a local Mac — the same runner family `test_train_parity_fixture_export.py` and
+  `monica-train` both run on, so the staleness guard compares like against like. Both
+  `train_rtol`/`train_atol` (`2e-4`/`1e-6`) and the fp32 logit gate
+  (`PARITY_TOLERANCES["fp32"] == (1e-4, 1e-5)`) are UNCHANGED — the guard was correctly
+  detecting a real difference, and widening either would make it vacuous rather than fix
+  the actual defect (a provenance mismatch, not a tolerance one). `train-fixture-oracle`
+  is dispatch/schedule-only (mirrors `poc-fixture-oracle`/`poc-parity`, #267) and gated by
+  its OWN two-independent-process byte-exact check (`train-fixture-oracle-verify`) before
+  its output is trusted — regenerating locally will (by design) no longer reproduce the
+  checked-in fixture; see `swift/engine/Fixtures/README.md`'s regeneration note. This is a
+  **different phenomenon from #298** (deterministic-per-process export corruption): #298's
+  worst observed drift (`mixing.N`) was 2.7x its own tolerance; this one exceeded the
+  tensor's own absmax entirely. Not folded into #298, and #298 is not folded into this.
+
 ## See also
 
 - [01-architecture-seam.md](01-architecture-seam.md) — the seam whose Python implementation is the

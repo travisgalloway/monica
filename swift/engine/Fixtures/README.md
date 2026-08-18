@@ -387,6 +387,42 @@ clip boundary differs from Python's unconditional `min(1.0, clip/(norm+eps))`).
     --out swift/engine/Fixtures/toy-hybrid-fp16 --batch 2 --seq 40 --precision fp16
 ```
 
+**`toy`/`toy-hybrid`/`toy-moe`'s `train.safetensors` + its `meta.json` `train_*` keys are
+CI-generated, not locally-generated (#195/PR #293).** Running the commands above will
+regenerate the base 6-7 files fine, but the `--train-steps 3` addition will NOT reproduce
+the checked-in `train.safetensors` on a local Mac.
+
+Measured evidence (the #195/PR #293 investigation; full write-up in
+`docs/design/14-inference-engine.md`'s #195 entry): `tests/
+test_train_parity_fixture_export.py` passed on every local Mac but failed reproducibly on
+the hosted `full-macos` CI runner. A dedicated CI diagnostic
+(`.claude/plans/issue-195-unblock.md` Phase 0) established the split precisely:
+
+- **Same MLX version, both sides** — `meta.json`'s `mlx_version` read `0.32.0` on both the
+  locally-generated checked-in oracle and the CI runner. Not a stale-version artifact.
+- **CI is internally stable.** Two independent generations, in two fresh processes on two
+  separate `macos-latest` runners, agreed to **~1.5e-08** (fp32 noise floor) on every key.
+  Not within-host nondeterminism.
+- **A real, deterministic, host-family difference.** Both CI runners disagreed with the
+  local (physical M1 Pro) checked-in oracle by the SAME amounts — up to
+  `max|d| = 1.83e-02` on `grad.*.conv.weight`, EXCEEDING that tensor's own `absmax`
+  (`1.20e-02`) — not accumulated rounding. Confined to gradients that reduce over a
+  shifted/padded input window (`conv.weight` dominant, `{in,out}_proj.weight` a smaller
+  echo); `conv.bias` (a plain sum) and every non-gradient key passed at the strict band.
+  MLX's Metal conv1d weight-gradient reduction order is host-family-dependent — CI's
+  "Apple M1 (Virtual)" runner vs a physical M1 Pro.
+
+The canonical regeneration path is the CI job pair `train-fixture-oracle` (generate) +
+`train-fixture-oracle-verify` (a numeric-tolerance cross-check, at the SAME
+`train_rtol=2e-4`/`train_atol=1e-6` the production staleness guard uses — see the
+comment on the GATE step in `.github/workflows/ci.yml` for why this is tolerance-based
+rather than poc's byte-exact check) before the output is trusted:
+`gh workflow run ci.yml --ref <branch>`, then download the `train-fixture-oracle`
+artifact and copy `train.safetensors`/`meta.json` for the three fixtures into their
+directories here. The other 6-7 files per fixture (forward-only — weights/logits/state,
+never a gradient) are unaffected by this and can still be regenerated locally with the
+plain commands above.
+
 **#266's low-precision fixtures carry no `--packed-doc-lengths`** — P6's packing gate
 reuses the file-level DTYPE band already, so a low-precision packed fixture would work,
 but none of the four adds one (the fp32 packed fixtures already cover the packing code
