@@ -735,6 +735,16 @@ jobs:
           N=$(wc -l < "$RUNNER_TEMP/train-diag-a-manifest.txt")
           [ "$N" -eq 8 ] || { echo "BLIND: expected 8 fixture files, got $N"; exit 2; }
           grep -q 'train.safetensors$' "$RUNNER_TEMP/train-diag-a-manifest.txt"
+      - name: Print the uploaded tree (so the download layout is observed, not guessed)
+        # actions/upload-artifact preserves the LEAST-COMMON-ANCESTOR of the given paths,
+        # not a flattened bag of files — #267/PR #301 and #167 both hit a stale assumption
+        # about this. One path here (train-diag-a-manifest.txt) is a bare file directly
+        # under $RUNNER_TEMP; the other two live under $RUNNER_TEMP/train-diag-a/. Their
+        # LCA is $RUNNER_TEMP itself, so the artifact download preserves the
+        # train-diag-a/ subdirectory for meta.json/train.safetensors but NOT for the
+        # manifest. Printed here so the next reader sees the real layout in the log
+        # instead of re-deriving it.
+        run: find "$RUNNER_TEMP/train-diag-a-manifest.txt" "$RUNNER_TEMP/train-diag-a" -type f | sort
       - uses: actions/upload-artifact@v4
         with:
           name: train-fixture-diag-a
@@ -780,7 +790,13 @@ jobs:
         with:
           name: train-fixture-diag-a
           path: oracle
+      - name: Print the downloaded tree (the observed layout, not the assumed one)
+        run: find oracle -type f | sort
       - name: "(a) vs (b): do two independent CI-runner generations agree byte-for-byte?"
+        # Layout note (see job A's "Print the uploaded tree" step): the manifest lands at
+        # oracle/train-diag-a-manifest.txt (bare file, matched the upload path's own
+        # basename) but meta.json/train.safetensors land under oracle/train-diag-a/ —
+        # upload-artifact's least-common-ancestor rule, not a flat bag of files.
         run: |
           test -s oracle/train-diag-a-manifest.txt || { echo "BLIND: diag-a manifest missing/empty"; exit 2; }
           N=$(wc -l < oracle/train-diag-a-manifest.txt)
@@ -795,10 +811,10 @@ jobs:
           fi
       - name: Per-key max|d| — diag-a vs checked-in, diag-b vs checked-in (report only, never asserts)
         run: |
-          test -s oracle/train.safetensors || { echo "BLIND: diag-a train.safetensors missing/empty"; exit 2; }
+          test -s oracle/train-diag-a/train.safetensors || { echo "BLIND: diag-a train.safetensors missing/empty"; exit 2; }
           test -s "$RUNNER_TEMP/train-diag-b/train.safetensors" || { echo "BLIND: diag-b train.safetensors missing/empty"; exit 2; }
           test -s swift/engine/Fixtures/toy/train.safetensors || { echo "BLIND: checked-in oracle missing"; exit 2; }
-          python3 - "oracle/train.safetensors" "$RUNNER_TEMP/train-diag-b/train.safetensors" \
+          python3 - "oracle/train-diag-a/train.safetensors" "$RUNNER_TEMP/train-diag-b/train.safetensors" \
             "swift/engine/Fixtures/toy/train.safetensors" <<'PYEOF'
           import sys
           import numpy as np
