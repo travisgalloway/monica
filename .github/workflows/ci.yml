@@ -805,17 +805,71 @@ jobs:
           path: downloaded
       - name: Print the downloaded tree (observed, not guessed)
         run: find downloaded -type f | sort
-      - name: "GATE — two independent CI-runner generations must agree byte-for-byte"
+      - name: "Manifest diff (informational — see the GATE step below for why this isn't the gate)"
         # Manifests hash relative "./fixture/file" paths (both sides ran `find .` from
         # their own oracle root), so they are directly comparable despite the
-        # upload/download directory nesting being different from the local one.
+        # upload/download directory nesting being different from the local one. NOT
+        # asserted on: unlike poc's pure-forward logits (bit-reproducible across
+        # processes), the gradient reduction this oracle carries has measured ~1e-8
+        # jitter between separate runner INSTANCES of the same host family (see the
+        # GATE step) — byte-exact would be a false-negative gate here.
         run: |
           test -s downloaded/oracle-manifest.txt || { echo "BLIND: uploaded manifest missing/empty"; exit 2; }
           N=$(wc -l < downloaded/oracle-manifest.txt)
           [ "$N" -eq 6 ] || { echo "BLIND: short uploaded manifest ($N lines)"; exit 2; }
           echo "--- runner 1 (uploaded) manifest ---"; cat downloaded/oracle-manifest.txt
           echo "--- runner 2 (this job) manifest ---"; cat "$RUNNER_TEMP/oracle2-manifest.txt"
-          diff downloaded/oracle-manifest.txt "$RUNNER_TEMP/oracle2-manifest.txt"
+          if diff downloaded/oracle-manifest.txt "$RUNNER_TEMP/oracle2-manifest.txt" > /tmp/mf.diff; then
+            echo "RESULT: byte-exact match"
+          else
+            echo "RESULT: NOT byte-exact (expected — see GATE step for the numeric check)"
+            cat /tmp/mf.diff
+          fi
+      - name: "GATE — two independent CI-runner generations must agree within the staleness-guard tolerance"
+        # The Phase-0 diagnostic (.claude/plans/issue-195-unblock.md) measured ~1.5e-8
+        # max|d| between two independent same-host-family generations — real but far
+        # inside train_rtol=2e-4/train_atol=1e-6 (tests/test_train_parity_fixture_export.py),
+        # the SAME band the checked-in oracle will be compared against in production. So
+        # the correct guard here is "would this pair pass the actual staleness gate",
+        # not exact-byte equality — the latter is what poc-parity uses because pure
+        # forward-pass logits ARE bit-reproducible across processes; this oracle's
+        # gradient reduction is not, even within one host family.
+        run: |
+          for f in toy toy-hybrid toy-moe; do
+            test -s "downloaded/oracle/$f/train.safetensors" || { echo "BLIND: downloaded $f/train.safetensors missing/empty"; exit 2; }
+            test -s "$RUNNER_TEMP/oracle2/$f/train.safetensors" || { echo "BLIND: this-job $f/train.safetensors missing/empty"; exit 2; }
+          done
+          python3 - "$RUNNER_TEMP/oracle2" <<'PYEOF'
+          import sys
+          import numpy as np
+          from safetensors.numpy import load_file
+
+          oracle2_dir = sys.argv[1]
+          RTOL, ATOL = 2e-4, 1e-6   # tests/test_train_parity_fixture_export.py's own band
+          bad = []
+          for f in ("toy", "toy-hybrid", "toy-moe"):
+              a = load_file(f"downloaded/oracle/{f}/train.safetensors")
+              b = load_file(f"{oracle2_dir}/{f}/train.safetensors")
+              if set(a) != set(b):
+                  print(f"BLIND: {f} key sets differ between the two runners")
+                  sys.exit(2)
+              worst = None
+              for k in a:
+                  d = np.abs(a[k].astype(np.float64) - b[k].astype(np.float64))
+                  ok = np.allclose(a[k], b[k], rtol=RTOL, atol=ATOL)
+                  maxd = float(d.max())
+                  if not ok:
+                      bad.append((f, k, maxd))
+                  if worst is None or maxd > worst[1]:
+                      worst = (k, maxd)
+              print(f"{f}: {len(a)} keys, worst max|d|={worst[1]:.3e} at {worst[0]!r}")
+          if bad:
+              print("GATE FAILED — outside train_rtol/train_atol:")
+              for f, k, maxd in bad:
+                  print(f"  {f}[{k!r}] max|d|={maxd:.3e}")
+              sys.exit(1)
+          print(f"GATE PASSED — both runners agree within train_rtol={RTOL}/train_atol={ATOL}")
+          PYEOF
       - name: Per-fixture meta.json (for the record)
         run: |
           for f in toy toy-hybrid toy-moe; do
