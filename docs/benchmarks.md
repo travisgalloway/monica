@@ -69,8 +69,8 @@ are real **developer Apple Silicon** numbers.
 | `config/poc-small.yaml` | ~97M | prefill speedup | 39.81x | **developer Apple Silicon** (M1 Pro), same run |
 | `config/poc-small.yaml` | ~97M | decode (batch-1 `model.step` loop, length 512) | 134.5 tok/s | **developer Apple Silicon** (M1 Pro), same run |
 | `config/poc-small.yaml` | ~97M | peak memory (prefill+decode, length 512) | 0.812 GB | **developer Apple Silicon** (M1 Pro), same run |
-| `config/poc-small.yaml` | ~97M | decode, exact M7 protocol (32 warmup, 256 measured, batch 1) | 127.5 tok/s | **developer Apple Silicon** (M1 Pro), `scripts/bench_train_step.py --mode decode` — directly comparable to the cited 94.7 tok/s poc-scale (`config/poc.yaml`, ~180M) M7 record; poc-small is ~97M, smaller, hence faster |
-| `config/poc.yaml` | ~127M–180M | decode, exact M7 protocol | 94.7 tok/s | **developer Apple Silicon** (M1 Pro) — the pre-#170 M7 record cited in `docs/design/14-inference-engine.md`; not re-measured in this run |
+| `config/poc-small.yaml` | ~97M | decode, exact M7 protocol (32 warmup, 256 measured, batch 1) | 127.5 tok/s | **developer Apple Silicon** (M1 Pro), `scripts/bench_train_step.py --mode decode` — directly comparable to the cited 94.7 tok/s poc-scale (`config/poc.yaml`, ~127M today, possibly ~205M as measured — see next row) M7 record; poc-small is ~97M, smaller, hence faster |
+| `config/poc.yaml` | ~127M | decode, exact M7 protocol | 94.7 tok/s | **developer Apple Silicon** (M1 Pro) — the pre-#170 M7 record cited in `docs/design/14-inference-engine.md`; not re-measured in this run, and predates the poc/poc-qwen split, so the measured config may have carried the larger Qwen vocab (~205M) |
 | `config/poc-small.yaml` | ~97M | context-length sweep, `attn` arm / crossover point | — | **not yet measured** — command: `.venv/bin/python scripts/bench_context.py --config config/poc-small.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 64 --json out.json` |
 
 ## Which numbers came from where — summary

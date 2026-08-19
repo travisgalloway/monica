@@ -142,7 +142,7 @@ dt_init_floor: 0.0001
 
 ## The decisions, distilled
 
-### Sizing: ~100M params, ~3B tokens
+### Sizing: ~127M params, ~3B tokens
 
 `d_model 768 × 24 layers` measures **126.7M** parameters (`scripts/model_size.py`), not the
 ~100M the config name suggests — the 38M tied embedding is the difference; the target ~3B tokens is
