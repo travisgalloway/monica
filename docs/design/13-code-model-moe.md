@@ -125,7 +125,7 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 - **MHM-P1 — Corpus** (#193): general multilingual Essential-Web + Stack-v2 mixture, repo-context
   packing, decontamination blocklist. (Rescopes the earlier FineWeb-Edu + Stack-v1 corpus.)
 - **MHM-P1b — Tokenizer** (#191, **done** — PR #245): own byte-level BPE, shipped as a **native
-  Swift package** (`swift/MonicaTokenizer` + the `monica-tokenize` CLI) rather than a Python build.
+  Swift package** (`swift/Sources/MonicaTokenizer` + the `monica-tokenize` CLI) rather than a Python build.
   Its own **tiktoken-style JSON format**, **raw-byte** BPE (no GPT-2 `bytes_to_unicode` remap), and
   an **o200k-style pretokenizer** (digit runs split ≤3; whitespace/indentation runs grouped so BPE
   learns indentation merges). It **builds and runs on macOS *and* Linux/CUDA with bit-identical

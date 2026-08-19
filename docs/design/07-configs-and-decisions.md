@@ -5,8 +5,11 @@
 `config/*.yaml` is the single source of truth for model dimensions and run parameters,
 loaded into [`MambaConfig`](../../src/model/blocks.py). **The comments in these files
 *are* the decision record.** Two of them carry the load-bearing decisions and are
-reproduced verbatim below — `toy.yaml` (correctness / smoke) and `poc.yaml` (the ~100M
-scale run) — but they are no longer the whole surface.
+reproduced below — `toy.yaml` (correctness / smoke) and `poc.yaml` (the ~127M scale run) —
+but they are no longer the whole surface. `toy.yaml` is byte-identical to the real file;
+`poc.yaml`'s **model-config block** is reproduced verbatim, while its ~21-line "Recommended
+scale run" runbook appendix is deliberately not duplicated here — read it in
+[`config/poc.yaml`](../../config/poc.yaml), which is the single source of truth for it.
 
 ### The full config surface
 
@@ -99,9 +102,11 @@ gives 8 heads — enough timescale spread for the dt-init recall test.
 ## `config/poc.yaml`
 
 ```yaml
-# ~100M POC config. Target ~3B tokens (~Chinchilla for 100M), seq length 1024.
+# ~127M POC config. Target ~3B tokens (~Chinchilla for this size class), seq length 1024.
 # The tied embedding (vocab x d_model ~= 50280*768 ~= 38M) is a large share of the
-# budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers lands near 100M.
+# budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers measures 126.7M
+# (`scripts/model_size.py --config config/poc.yaml`) — the embedding is why this is not
+# the clean ~100M the name suggests.
 d_model: 768           # d_inner = expand*d_model = 1536
 n_layers: 24
 d_state: 16            # SSM state width N (per head, shared B/C group)
@@ -114,13 +119,14 @@ vocab_size: 50280      # CONFIRMED: allenai/OLMo-7B-hf, vocab 50280 < 65536 (uin
 seq_len: 1024
 tie_embeddings: true
 
-# CONFIRMED ON MLX (M1 micro-benchmark): fp16 ~3.96 TFLOP/s vs bf16 ~3.36 and
-# fp32 ~3.40 on this Metal GPU -> fp16 is ~18% faster; bf16 gives no speedup.
-# Use fp16 + loss scaling for the scale run (toy/smoke stay fp32 for exact resume).
+# CONFIRMED ON MLX (issue #3, reproduce: `python scripts/bench_precision.py`):
+# fp16 ~4.37 TFLOP/s vs bf16 ~3.78 vs fp32 ~3.33 on this Metal GPU -> fp16 is ~16%
+# faster than bf16 (and ~31% over fp32). Do NOT assume bf16. Use fp16 + loss scaling
+# for the scale run (toy/smoke stay fp32 for exact resume).
 precision: fp16
 chunk_size: null       # SSD chunk length Q (null -> backend default 64)
-grad_checkpoint: true  # REQUIRED at depth: recompute layers in backward so the
-                       # 24-layer fp16 backward fits in unified memory (else it swaps)
+grad_checkpoint: true  # REQUIRED at this depth: recompute layers in backward so the
+                       # 24-layer fp16 backward fits in unified memory (else it swaps).
 
 # dt-projection bias init (load-bearing)
 dt_min: 0.001
@@ -138,7 +144,8 @@ dt_init_floor: 0.0001
 
 ### Sizing: ~100M params, ~3B tokens
 
-`d_model 768 × 24 layers` lands near 100M parameters; the target ~3B tokens is
+`d_model 768 × 24 layers` measures **126.7M** parameters (`scripts/model_size.py`), not the
+~100M the config name suggests — the 38M tied embedding is the difference; the target ~3B tokens is
 roughly Chinchilla-optimal for that size. `seq_len 1024` runs the [SSD
 scan](02-model-ssm.md#the-ssd-chunked-matmul-scan) with the default chunk length
 `Q = 64`; an explicit `chunk_size` is only needed to tune that. `head_dim 64` splits

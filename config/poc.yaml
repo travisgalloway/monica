@@ -1,6 +1,8 @@
-# ~100M POC config. Target ~3B tokens (~Chinchilla for 100M), seq length 1024.
+# ~127M POC config. Target ~3B tokens (~Chinchilla for this size class), seq length 1024.
 # The tied embedding (vocab x d_model ~= 50280*768 ~= 38M) is a large share of the
-# budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers lands near 100M.
+# budget -> tie_embeddings MUST stay true. d_model 768 x 24 layers measures 126.7M
+# (`scripts/model_size.py --config config/poc.yaml`) — the embedding is why this is not
+# the clean ~100M the name suggests.
 d_model: 768           # d_inner = expand*d_model = 1536
 n_layers: 24
 d_state: 16            # SSM state width N (per head, shared B/C group)
