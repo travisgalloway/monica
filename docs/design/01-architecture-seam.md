@@ -7,7 +7,7 @@
 All hardware-specific code lives behind **one abstraction**,
 [`ModelInterface`](../../src/model/interface.py). Everything above the seam —
 `data/`, `train/`, `serve/`, `eval/`, `conformance/`, `lsp/` — is portable Python that
-**never imports MLX or CUDA**. Exactly six modules touch a hardware library:
+**never imports MLX or CUDA**. Exactly seven modules touch a hardware library:
 
 | Module | Role |
 |---|---|
@@ -16,6 +16,7 @@ All hardware-specific code lives behind **one abstraction**,
 | `src/model/cuda_backend.py` | CUDA/PyTorch model |
 | `src/model/cuda_train_step.py` | CUDA backprop/optimizer primitive |
 | `src/model/cuda_muon.py` | Muon + AdamW hybrid optimizer (#237) |
+| `src/model/cuda_distributed.py` | FSDP2 + expert-parallel process groups/mesh/collectives (#271) |
 | `src/model/mlx_lm_adapter.py` | the LSP harness's `LMAdapter` (see [12-lsp-in-the-loop.md](12-lsp-in-the-loop.md)) |
 
 `src/model/backend.py` is deliberately **not** on that list: it is the portable

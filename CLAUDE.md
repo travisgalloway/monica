@@ -54,7 +54,8 @@ python -m src.data.split --packed data/packed.bin --out data/split --val-tokens 
 There is no separate lint/format/build step — pytest is the gate, and it now runs in CI
 (`.github/workflows/ci.yml`, #249): a Linux `portable` job (`pytest -q -rs`, no mlx/torch —
 where `test_import_guard.py` is unambiguous), a Linux `smoke-linux` job (CPU-torch,
-`scripts/smoke_test.py --backend cuda`), and a macOS `full-macos` job (mlx installed,
+`scripts/smoke_test.py --backend cuda`), a Linux `cuda-cpu` job (CPU-torch, the CUDA test
+suite), and a macOS `full-macos` job (mlx installed,
 `pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not installable on Linux;
 on a non-Mac host the MLX backend simply won't import (by design), and only the portable
 tests run. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
@@ -100,7 +101,7 @@ is a recent example: numpy-only, no backend import, lives above the seam in
 below-seam backends produce.
 
 **A third category — the `swift/` native toolchain (the repo's first Swift package).** The
-code tokenizer (#191, PR #245) is a native, cross-platform Swift package (`swift/MonicaTokenizer`
+code tokenizer (#191, PR #245) is a native, cross-platform Swift package (`swift/Sources/MonicaTokenizer`
 + the `monica-tokenize` CLI) that trains/encodes/packs entirely outside the Python seam — it is
 neither above-seam Python nor a hardware backend behind `ModelInterface`, and the import guard
 does not cover it. It builds and runs on macOS **and** Linux/CUDA with bit-identical output (Swift
@@ -222,9 +223,11 @@ The smoke gate stresses exactly this round-trip.
   (structural-signal integration) as a secondary
   measurement/training-signal axis (completion-list logit masking #226, diagnostic supervision
   #227, RLVR/opengrep verifier reward #230, under the #225 measurement contract + escape-hatch
-  gate). The MoE build (#213/#214) is done on both backends; remaining net-new work ahead of
-  the #222/#223 runs is FSDP/ZeRO-2 + expert parallel and resolving #223's `d_model`
-  conflict with #200 (see `docs/design/13-code-model-moe.md`'s "Open (#223)" note).
+  gate). The MoE build (#213/#214) is done on both backends, and so are FSDP/ZeRO-2 +
+  expert parallel (#271) and #223's `d_model` conflict (#272, resolved to `d_model 768` for
+  both rungs). The remaining net-new work ahead of
+  the #222/#223 runs is the **corpus (#252)**, plus **#288** — `grad_checkpoint` does not compose
+  with FSDP2, which blocks #223 but not #222 (see `docs/design/13-code-model-moe.md`).
 - **Reserve/history — M10 distillation (#65) was dropped 2026-07-19; its code was removed from the
   tree (#189).** The teacher/student/distill modules, `scripts/distill.py`/`sweep.py`/
   `precompute_teacher.py`, `distill_manifest`, and the corpus tooling are gone (recoverable via git

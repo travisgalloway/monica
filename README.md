@@ -151,9 +151,10 @@ the corpus build itself is #252, the current blocker) → aux-loss-free MoE rout
 → CUDA MoE backend (#214 — **done**) → FIM / length curriculum / evals (#215/#216/#221 — **done**)
 → ablation sweep (#219) → small full run (#222) → sparse-upcycled large run (#223). **MoE now runs
 on both backends**: MLX keeps the dense-evaluation reference, and CUDA adds grouped-gather dispatch,
-a shared expert and a sparse-upcycle init path. The net-new work remaining ahead of the runs is the
-corpus (#252), multi-GPU sharding (#271, which blocks #223 but not #222), and resolving #200's
-`d_model` conflict with Large A (#272). A **secondary axis (SSI)** studies language-server / static-analysis signal:
+a shared expert and a sparse-upcycle init path. Multi-GPU sharding (#271) and the `d_model`
+conflict between #200 and Large A (#272) are both **resolved**; the net-new work remaining ahead
+of the runs is the corpus (#252), plus #288 (grad_checkpoint does not compose with FSDP2, which
+blocks #223). A **secondary axis (SSI)** studies language-server / static-analysis signal:
 a validated clean-rate tool with a found functional ceiling (#225/#226/#227/#230).
 
 **Reserve — M10 distillation (dropped 2026-07-19; code removed #189).** The frozen-teacher

@@ -6,7 +6,10 @@
 # 2048 x 28 -> ~1.03B params (verify: `python scripts/model_size.py --config config/student-1b.yaml`).
 # Depth 28 is a sweep seed (the size ladder is an open question, #65): the teacher is 36 layers, so
 # the Mamba-in-the-Llama layer-to-layer init (#99) maps endpoint-to-endpoint via the adaptive
-# `_teacher_layer_for` bridge (it does NOT require 1:1 depth). 1B is the single target model;
+# `_teacher_layer_for` bridge (it did NOT require 1:1 depth). 1B is the single target model;
+# RESERVE: M10 was dropped 2026-07-19 and `_teacher_layer_for` was removed from the tree with
+# the rest of the distillation machinery (#189) — this paragraph records the decision, not the
+# current code. See docs/reserve/10-distillation.md.
 # the from-scratch config/1b.yaml is the same ~1B size class.
 #
 # NOTE: vocab_size 151669 (Qwen3) exceeds the uint16 ceiling; it packs as uint32 and
