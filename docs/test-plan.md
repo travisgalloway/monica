@@ -1,0 +1,154 @@
+# Test plan
+
+Mirrors `docs/feature-matrix.md` row for row, keyed by the same IDs, tracking coverage by test
+type so gaps are **visible rather than assumed**.
+
+Columns match what this repository actually runs:
+
+- **Unit** — a `tests/test_*.py`, or a case in the Swift `monica-selfcheck` / `monica-lsp
+  --self-test` runners (`swift/` deliberately has no `.testTarget`; `swift test` is a no-op).
+- **Integration** — a test wiring two or more subsystems, or a `src/conformance/` check.
+- **E2E** — `scripts/smoke_test.py`, a job in `.github/workflows/ci.yml`, or `monica-parity` /
+  `monica-bench`.
+
+`n/a` means the tier cannot exist for that capability; `none` means it could and does not. The
+two are never interchangeable. An empty Gaps cell is a claim, so it is only written when true.
+
+Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 test surfaces —
+128 `tests/test_*.py` + `conftest.py` + 2 Swift native runners).
+
+## Data pipeline
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| DATA-1 | `test_download_sources.py`, `test_filters.py`, `test_dedup.py`, `test_cleaned_jsonl.py` | `test_data_pipeline.py` | CI `smoke-linux`/`full-macos` `--dummy` step | offline byte-fallback | live HF download path has no CI coverage (by design, `--dummy` only) |
+| DATA-2 | none | `test_data_pipeline.py` | CI `--byte-fallback` tokenize step | byte fallback, dtype selection | no unit test isolating `src/data/tokenize.py` from the pipeline |
+| DATA-3 | `test_shard.py`, `test_packing_dtype.py` | `test_data_pipeline.py` | CI pack step | uint16/uint32 boundary at vocab 65536 | none |
+| DATA-4 | `test_split_shards.py` | `test_data_pipeline.py` | CI split step feeding `smoke_test.py` | shard-boundary split, val-token count | none |
+| DATA-5 | `test_r2_sync.py`, `test_storage.py` | none | none | mocked/hermetic paths only | real-network R2 round-trip never exercised in CI (credentials-gated) |
+| DATA-6 | `test_datatrove_pipeline.py` | none | none | offline-asset skip | scale pipeline runs in `.venv-dt`, outside CI entirely |
+| DATA-7 | `test_stack_v2.py`, `test_ts_clean.py` | `test_build_ts_clean_corpus.py` | none | `resolve_tsc()`-gated real-tsc path | full 2–3B corpus build never run (#252) |
+| DATA-8 | `test_sft_data.py`, `test_sft_loader.py`, `test_sft_sources.py`, `test_instruct_sft.py`, `test_reasoning_sft.py`, `test_reasoning_traces.py`, `test_tool_sft.py`, `test_chat_template.py`, `test_qwen_chat_template.py` | `test_sft_loader.py` | none | response masking, chat-template EOS | `scripts/sft.py` has no test; tool/reasoning builders have no driver at all |
+| DATA-9 | `test_dpo_data.py`, `test_dpo_loader.py`, `test_dpo_sources.py` | `test_dpo_loader.py` | none | licence/source tagging | `scripts/dpo.py` untested end to end |
+| DATA-10 | `test_build_decontam_blocklist.py` | none | none | n-gram hashing | no integration test wiring the blocklist into a corpus build |
+| DATA-11 | `test_vocab_sample.py` | none | none | fetch/filter/tagging, hermetic | `scripts/vocab_sweep.py` (the driver) has zero test references |
+| DATA-12 | `test_curriculum.py`, `test_swift_fim.py` | CI FIM-pack steps (`swift-macos`/`swift-linux`) | CI `swift-parity` FIM-shard byte-diff | length-curriculum stage boundaries | none |
+
+## Native tokenizer
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| TOK-1 | `monica-selfcheck` | n/a (zero-dependency package by design) | CI `swift-macos`/`swift-linux` train-the-parity-corpus step | merge-order determinism | none |
+| TOK-2 | `monica-selfcheck` | `test_swift_fim.py` (build-gated) | CI FIM-pack steps | shard layout vs `src/data/shard.py` | none |
+| TOK-3 | n/a (cross-platform property) | n/a | CI `swift-parity` (`cmp` of `tokenizer.json` + FIM shards) | byte-identity Mac vs Linux | none — the strongest-gated capability in the repo |
+| TOK-4 | `test_swift_parquet.py` | n/a | CI `full-macos` (only job with both pyarrow and a Swift toolchain) | skips when `monica-tokenize` unbuilt | Linux CI never builds Swift, so Parquet parity is macOS-only |
+| TOK-5 | `test_swift_fim.py` | CI FIM-pack | CI `swift-parity` diff | FIM span selection | none |
+
+## Model and the seam
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| MODEL-1 | none dedicated | `load_config()` in `test_mlx_parity.py`, `test_cuda_parity.py`, `test_bench_config_export.py` | `scripts/smoke_test.py` | valid configs only | no test asserts `MambaConfig.validate()` **raises** on an invalid config (e.g. `head_dim ∤ d_inner`) |
+| MODEL-2 | `test_mlx_parity.py` | `test_mlx_parity.py` | `smoke_test.py --backend mlx` (CI `full-macos`) | chunk-boundary, seg_ids packing | none |
+| MODEL-3 | `test_mlx_parity.py` (`forward_step_parity`) | same | same smoke gate | stacked-step vs forward | none |
+| MODEL-4 | `test_cuda_parity.py`, `test_cuda_train_step.py`, `test_cuda_compile.py` | `test_backend_parity.py` (torch self-check half only) | `smoke_test.py --backend cuda` (CI `smoke-linux`, CPU torch) | CPU-torch path | real-GPU path (fused mamba-ssm kernel, MPS) skip-gated in CI — no GPU on hosted runners |
+| MODEL-5 | `test_moe.py`, `test_moe_routing.py`, `test_moe_balance.py`, `test_moe_balance_mlx.py`, `test_cuda_moe.py`, `test_cuda_moe_balance.py`, `test_cuda_moe_gather.py` | `test_cuda_moe_fixture_parity.py`, `test_backend_parity.py` | CI `smoke-linux` MoE-config smoke step | dropless grouped-gather, shared expert, route-bias | none |
+| MODEL-6 | `test_upcycle.py` (mlx-gated) | none | none | `_MUST_MATCH` 15-field guard | `scripts/upcycle.py` untested end to end |
+| MODEL-7 | `test_sizing.py`, `test_sizing_mlx.py`, `test_train_time.py` | `test_bench_config_export.py`, `test_bench_context.py` | none (informational) | tied-embedding accounting | none |
+| MODEL-8 | `test_quantize.py`, `test_quantize_mlx_format.py` | `test_quant_checkpoint.py`, `test_quant_parity.py` | CI `swift-engine` int8 `monica-bench` step | int8 group size, scale/zero-point | none |
+
+## Training
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| TRAIN-1 | `test_train_loop.py` | `test_train_loop.py` | `scripts/smoke_test.py` (CI `smoke-linux`/`full-macos`) | grad accum, grad checkpointing | none |
+| TRAIN-2 | `test_train_loop.py` resume tests | `test_checkpoint.py` | `scripts/smoke_test.py` (resume exactness is its headline check) | bit-exact fp32 resume at toy scale | `scripts/train.py`'s **stream-resume** path (data position rebuilt from seed+step) is a separate code path the smoke gate does not cover |
+| TRAIN-3 | `test_loss_scale.py`, `test_lowp_parity_band.py` | `test_mlx_train_step.py`, `test_cuda_train_step.py` | `scripts/smoke_test.py` | overflow skip, scale halving | smoke gate runs `toy.yaml` (fp32), so the overflow/skip path never executes end to end |
+| TRAIN-4 | `test_stream.py` | none | none | shard rotation | real R2 streaming untested in CI (credentials-gated) |
+| TRAIN-5 | `test_schedule.py` | `test_train_loop.py` | `scripts/smoke_test.py` | warmup/stable/decay boundaries | none |
+| TRAIN-6 | `test_cuda_muon.py`, `test_muon_taxonomy.py` | `test_cuda_train_step.py` | none | param taxonomy (Muon vs AdamW split) | none beyond CPU-torch gating |
+| TRAIN-7 | `test_parallel.py` (portable sizing/partition math) | `test_cuda_distributed.py` | none | single-process mocks, expert-partition policy | real multi-GPU/multi-node FSDP2 has no CI path — structurally unverifiable on a single hosted runner |
+| TRAIN-8 | `test_cuda_8bit_optimizer.py`, `test_cuda_fp8.py` | none | none | dependency-absent path | hardware-unverified: no Hopper+ GPU, no `transformer_engine`/`bitsandbytes` in CI |
+| TRAIN-9 | none | `test_train_loop.py` (`log_every` wiring only) | `scripts/smoke_test.py` (runs, output not asserted) | none | `src/train/logging.py` has no direct unit test; its output format is never asserted on |
+
+## Post-training
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| POST-1 | `test_sft_train_step.py` | `test_sft_train_step.py` | none | response masking in the loss | `scripts/sft.py` untested end to end |
+| POST-2 | `test_dpo_math.py` | `test_dpo_train_step.py` | none | reference-model logratio, beta | `scripts/dpo.py` untested end to end |
+| POST-3 | `test_grpo.py` | `test_grpo_train_step.py`, `test_verifiers.py` | none | group advantage, KL penalty | `test_verifiers.py:39` gates real code execution behind `RUN_CODE_VERIFIER`, which **no CI job sets** — the execution path never runs in the standard matrix |
+| POST-4 | none | `test_dpo_sources.py` (source label only, never invokes generation) | none | none | `scripts/gen_onpolicy_prefs.py` has zero test references anywhere |
+
+## Serving
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| SERVE-1 | `test_generate.py` | `test_generate.py` | `scripts/smoke_test.py`, CI `swift-engine` `monica-generate` steps | EOS handling, max tokens | none |
+| SERVE-2 | `test_repetition_penalty.py`, `test_generate.py`, `test_constrained_sampling.py` | same | `scripts/smoke_test.py` | temp 0, top-p renormalization, all-non-finite fallback | none |
+| SERVE-3 | `test_serve.py` | `test_serve.py` | none | snapshot/restore of the recurrent state | no CLI or serving entry point reaches `RewindTree` — unit-tested only |
+| SERVE-4 | `test_constrained_sampling.py`, `test_masked_decode.py`, `test_completion_mask.py` | CI `swift-macos` mask-set parity (Python vs Swift `VocabTrie`) | CI `swift-engine` `monica-generate --lsp-mask` | empty/all-out-of-range `allowed_ids` | none |
+| SERVE-5 | `test_spec_decode.py` (mlx-gated) | none | none | greedy-equivalence assertion | Swift side has only the `verifyBlock` prerequisite; full spec decode not built (#172) |
+
+## Evaluation
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| EVAL-1 | `test_val_loss.py`, `test_domain_bpb.py` | `test_train_loop.py` | `scripts/smoke_test.py` | per-domain split, BPB vs ppl | none |
+| EVAL-2 | `test_olmes_adapter.py`, `test_olmes_generate.py` | none | none | `lm_eval`-gated skip | full benchmark run has no CI coverage |
+| EVAL-3 | `test_long_context.py` (mlx-gated) | none | none | extension beyond trained length | never runs in CI |
+| EVAL-4 | `test_code_suite.py`, `test_build_humaneval_ts_set.py` | `test_eval_code_suite.py` | none | synthetic fixtures only | live pulls **raise** (`external_sets.py:227`) — no revision is pinned, so no real suite can be run |
+| EVAL-5 | `test_fim_eval.py` | none | none | prefix/suffix/middle split | no CI job runs FIM eval |
+| EVAL-6 | `test_code_recall.py`, `test_code_needle.py` | none | none | distractor sampling | no CI job runs these |
+| EVAL-7 | `test_retrieval_probe.py` (mlx-gated), `test_probes.py` | none | none | key/value distinctness | no CI job runs these |
+| EVAL-8 | `test_moe_routing.py` | `test_backend_parity.py` routing-stats section | Swift `monica-parity` `mixing_matrix` | routing entropy | none |
+| EVAL-9 | `test_bfcl_adapter.py` | none | none | call-shape normalization | `scripts/eval_bfcl.py` untested end to end |
+| EVAL-10 | `test_quant_parity.py` | `test_quant_parity.py` | CI `swift-engine` quantized bench (informational) | int8 tolerance band | none |
+| EVAL-11 | `test_ssi_contract.py` | `test_ssi_contract.py` | none | escape-hatch gate | no CI job runs the SSI contract end to end |
+| EVAL-12 | `test_ts_error_eval.py` (node/tsc-gated) | none | none | 96-item injection set | `scripts/validate_ts_error_set.py` untested; needs `npm install` no Python CI job performs |
+
+## LSP / structural-signal integration
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| LSP-1 | `test_opengrep_oracle.py`, `test_eval_code_suite.py` | `test_ts_lsp.py`, `test_lsp_harness.py` | CI `swift-macos` live-tsserver steps | multi-push diagnostics ordering (#211) | none |
+| LSP-2 | `test_lsp_diagnostics.py` | `test_lsp_harness.py` | none | debounce, reap | none |
+| LSP-3 | see SERVE-4 | see SERVE-4 | see SERVE-4 | trie prefix masking | none |
+| LSP-4 | `test_opengrep.py` (binary-gated), `test_opengrep_oracle.py` | none | none | rule-match scoring | `scripts/opengrep_soak.py` untested end to end |
+| LSP-5 | `test_lsp_tsc.py` (tsc-gated) | none | none | pinned tsconfig | none beyond toolchain gating |
+| LSP-6 | `test_prettier.py` (PATH-gated) | none | none | idempotent format | none |
+| LSP-7 | `test_lsp_chat.py`, `test_lsp_lm.py`, `test_mlx_lm_adapter.py` | none | none | model-availability gating | none |
+| LSP-8 | `test_lsp_execute.py` (tsc-gated) | none | none | timeout, non-zero exit | none beyond toolchain gating |
+| LSP-9 | `monica-lsp --self-test` | `monica-lsp --probe-reap` (CI `swift-macos`) | `monica-lsp --bench` vs `scripts/bench_ts_lsp.py` | framing/demux/trie/scanner | `swift-linux` runs only `--self-test` (no node toolchain) — live-server path is macOS-only, by design |
+
+## Swift engine
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| ENGINE-1 | n/a | n/a | CI `swift-engine` `monica-parity` forward + stacked-step | fp32 `rtol=1e-4/atol=1e-5` | none |
+| ENGINE-2 | `monica-bench --self-test` | n/a | CI `swift-engine` `--mode all` (informational) | argmax agreement gated | timing regressions are informational only, never threshold-gated |
+| ENGINE-3 | n/a | n/a | `monica-parity` MoE sections | load counting, route-bias write-back | none |
+| ENGINE-4 | n/a | n/a | `monica-parity` | fp16/bf16 tolerance band | none |
+| ENGINE-5 | n/a | n/a | `monica-parity` extras | `mixing_matrix`, `hidden_states`, `verify_block` | none |
+| ENGINE-6 | n/a | n/a | CI `poc-fixture-oracle` + `poc-parity` | 571 MB poc-scale fixture, cross-process corruption guard (#298) | **dispatch/schedule-only** — never on `pull_request`/`push`, so a green PR never implies poc-scale parity |
+| ENGINE-7 | n/a | `scripts/check_swift_checkpoint.py` | CI `swift-engine` Swift→Python round-trip (GATE) | the direction `monica-parity` alone cannot prove | none |
+| ENGINE-8 | n/a | n/a | n/a | n/a | n/a — not built (#171) |
+| ENGINE-9 | n/a | n/a | n/a | n/a | n/a — only the `verifyBlock` prerequisite exists (#172) |
+
+## Conformance
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| CONF-1 | `test_mlx_parity.py`, `test_cuda_parity.py` | `src/conformance/forward_step_parity.py` | `scripts/smoke_test.py` | fp32 ~1e-4 rel | none |
+| CONF-2 | `test_backend_parity.py` | `test_backend_parity.py` | none | torch self-check only | **5 of 6 tests (`:48,76,103,137,168`) skip in every CI job** — no job installs mlx and torch together, so real MLX-vs-CUDA parity has never been checked by automation |
+| CONF-3 | `test_doc_boundary_parity.py`, `test_cuda_doc_boundary_parity.py` | `src/conformance/doc_boundary_parity.py` | none | seg_ids block-diagonal masking | none |
+| CONF-4 | `test_mlx_parity.py`, `test_cuda_parity.py` | `src/conformance/prefill_decode_parity.py` | `monica-parity` | prefill vs stacked step | none |
+| CONF-5 | `test_quant_parity.py` | `src/conformance/quant_parity.py` | CI `swift-engine` | int8 tolerance | none |
+
+## Operations
+
+| ID | Unit | Integration | E2E | Edge cases covered | Gaps |
+|----|------|-------------|-----|--------------------|------|
+| OPS-1 | n/a | n/a | `scripts/smoke_test.py`, CI `smoke-linux` + `full-macos` | resume exactness + eval | does not cover `train.py`'s stream-resume (see TRAIN-2) |
+| OPS-2 | n/a | n/a | `.github/workflows/ci.yml`, 10 jobs | portable/seam guard, both backends, Swift parity | 2 of 10 jobs never run on PR/push (see ENGINE-6) |
+| OPS-3 | `test_bench_config_export.py`, `test_bench_context.py` | none | `monica-bench` CI steps (informational) | provenance tagging | nothing checks `docs/benchmarks.md` stays in sync with CI bench output |
