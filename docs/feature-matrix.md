@@ -135,6 +135,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | ENGINE-7 | A person can round-trip a checkpoint Swift to Python | done | done | n/a | done | Shipped | #196 | design/14 |
 | ENGINE-8 | A person gets a fused Metal SSD-scan/conv kernel | n/a | n/a | n/a | none | Planned | #171 | design/14 |
 | ENGINE-9 | A person can decode speculatively in the Swift engine | n/a | n/a | n/a | none | Planned | #172 | design/14 |
+| ENGINE-10 | A person can trust a checked-in parity oracle was not silently corrupted | done | done | n/a | n/a | Shipped | #298 | design/14 |
 
 ## Conformance
 

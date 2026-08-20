@@ -722,6 +722,177 @@ DPO/GRPO step factories.
   tensor's own absmax entirely, and reinterpreting axis order (not tolerance) resolved it.
   Not folded into #298, and #298 is not folded into this.
 
+## MLX 0.32.0 buffer reuse (#298)
+
+**Status: OPEN upstream, GUARDED here.** This section is the written half of #298. Nothing below
+claims the defect is fixed — it is an MLX bug this repository cannot fix. What #298 shipped is
+(a) a guard that makes a corrupted oracle impossible to check in unnoticed and (b) these measured
+answers. #298 stays open as an upstream-tracking item.
+
+**The defect.** Calling `MLXMambaModel.mixing_matrices` (or any accessor that forks a lazy `h`
+into two independent consumers) on a freshly-constructed model silently corrupts a *later,
+unrelated* computation on that same model — `prefill(..., last_only=True)` in the observed case.
+Correct shapes, no exception, no log, and the corruption is catastrophic rather than marginal:
+`max|d|` on fp32 logits is **6-9**, not `1e-5`. It is deterministic within a process but varies
+between processes, so a rerun "fixes" it and it reads as a flake.
+
+All numbers below are from `scripts/probe_mlx_buffer_reuse.py` on this host (M1 Pro, macOS,
+Python 3.14.6), 2026-08-19. The probe compares every trial to an **accessor-free reference**
+(`prefill` on a fresh model with no interpretability call), *not* to trial 0 — with the accessor in
+the loop roughly half of the trials including trial 0 are corrupt, so a trial-0 reference reports
+the clean trials as the failures and undercounts by ~2x. The reference is recomputed at the end of
+every run and a run whose reference moved is reported `BLIND`, never clean.
+
+### D1 — Is it version-specific? Is there an upstream fix?
+
+**No, and none found.** `pyproject.toml` pins only `mlx>=0.18`; three released versions were built
+into throwaway venvs and run through the identical probe (`--pattern mixing --trials 40 --seq 129`,
+barrier removed, buffer cache on):
+
+| mlx | toy.yaml | toy-hybrid.yaml | toy-moe.yaml |
+|-----|----------|-----------------|--------------|
+| 0.31.2 (2026-04-22) | 35/40 | 16/40 | 14/40 |
+| 0.32.0 (2026-07-07, the installed build) | 30/40 | 18/40 | 11/40 |
+| 0.32.1 (2026-08-18, latest) | 27/40 | 24/40 | 16/40 |
+
+The rates are the same order across all three, so **downgrading to 0.31.2 is not a remedy and
+upgrading to 0.32.1 is not either.** Reproduce with:
+
+```bash
+python -m venv .venv-mlx031 && .venv-mlx031/bin/pip install "mlx==0.31.2" numpy safetensors pyyaml
+PYTHONPATH=. .venv-mlx031/bin/python scripts/probe_mlx_buffer_reuse.py \
+    --pattern mixing --trials 40 --seq 129 --config config/toy.yaml
+```
+
+**Upstream search (2026-08-19), what was searched and what was found.** `ml-explore/mlx` issues
+and PRs via `gh api search/issues` for *buffer cache corruption*, *set_cache_limit*, *allocator
+reuse wrong results*, *silent wrong results*, *hazard tracking*, *untracked hazard*, *lazy graph
+fork wrong results*, *nondeterministic results same input*; plus the release notes for v0.32.0 and
+v0.32.1. **Result: no upstream issue matching this defect.** The near neighbours are all different
+bugs — #3866 (int32 corruption under `async_eval` + in-place slice updates, closed), #3461/#3462
+(buffer destroyed mid-flight under *untracked hazard mode with custom kernels*, closed), #3912 /
+#4253 / #4261 (quantized-matmul and `gather_mm` wrong results), #3350 (the cache pool retaining
+unusable buffers — a memory-growth bug, not a correctness one). This is a **documented negative**:
+no upstream fix exists to wait for, and no upstream issue has been filed by this project either.
+
+### D2 — Does the barrier belong on the training/inference path? **No.**
+
+**Decision: the `mx.eval(h)` barrier and `mx.set_cache_limit(0)` both stay OFF the
+training/inference path.** Two independent reasons, one structural and one measured.
+
+*Structural.* `mixing_matrices` is the only place in the backend that forks a **lazy** `h` into two
+independent consumers — `layer.mixing_matrix(h)` and `layer_fn(h)` — without materialising it
+first. No training or inference path does that: `forward`/`forward_seq`, `prefill` and `step` each
+consume `h` linearly, one consumer per value. The interpretability accessors (`mixing_matrices`,
+`hidden_states`) are the exception, and they are not on any hot path.
+
+*Measured.* `--pattern hotpath --trials 30` — `forward`, `prefill`, three stacked `step`s, and a
+real `make_train_step` over 30 freshly-constructed models, buffer cache **on**:
+
+| config | failures |
+|--------|----------|
+| toy.yaml | 0/30 |
+| toy-hybrid.yaml | 0/30 |
+| toy-moe.yaml | 0/30 |
+
+That clean result is evidence **because the same instrument, on the same host, in the same
+session, does see the defect** at 11-30/40 in the `mixing` pattern. A clean run from an instrument
+that had never demonstrated detection would be BLIND, and the probe exits non-zero rather than
+report it.
+
+*Cost, so the decision is grounded rather than asserted.* `--pattern throughput --trials 30`
+(forward + `make_train_step`, timed with the cache on and then at limit 0, toy scale):
+
+| config | cache on | limit 0 | slowdown |
+|--------|----------|---------|----------|
+| toy.yaml | 0.317 s | 0.358 s | **+13.0%** |
+| toy-moe.yaml | 0.477 s | 0.623 s | **+30.5%** |
+
+Toy scale overstates the penalty for a real run (allocator cost is largest where allocation
+dominates compute) but the sign and order are clear, and at ~99 s/step for the poc protocol a
+double-digit percentage is not a cost to take on speculatively. If a future reader wants to widen
+the scope, the cost is on record either way.
+
+### D3 — The guard, and what it does and does not claim
+
+`scripts/export_parity_fixture.py` now exports **twice, in two fresh processes**, and compares the
+trees byte-for-byte (`src/conformance/fixture_digest.py`, portable) before leaving anything at
+`--out`. On agreement `--out` is kept; on disagreement **nothing** is left at `--out`, both trees
+are preserved as `--out.mismatch-1`/`-2`, the per-file verdicts print, and the process exits 2.
+`--no-double-export` opts out (and is set automatically on the child, bounding the recursion).
+
+The defect is deterministic *per process*, so two independent interpreters would have to corrupt
+identically to agree — that is the whole content of the guard, and it is why the second export
+lives in `main()` rather than inside `build_fixture` (an in-process repeat would prove nothing).
+
+**Scope: intra-machine only.** Two processes on ONE host. Cross-machine byte identity is *not*
+claimed and is known to be false — CI's `train-fixture-oracle`/`-verify` pair measures ~1e-8 drift
+in `train.safetensors` between runner instances.
+
+**Confinement, now checkable in one command.** One helper, `disable_buffer_cache()` /
+`disable_buffer_cache_for_process()`, in `scripts/export_parity_fixture.py`, with **five** call
+sites: `build_fixture`, `tests/test_mlx_mixing_matrix.py`, `tests/test_parity_fixture_export.py`,
+`tests/test_train_parity_fixture_export.py`, `tests/test_lowp_parity_band.py`. The issue text says
+two and the plan said three; both undercounted — #264's mitigation had already been copy-pasted
+into two more test modules. `git grep -n set_cache_limit -- src scripts tests` now names
+`export_parity_fixture.py` and nothing else, which is what makes the confinement an observation
+rather than an assumption. The helper **raises** (naming `mx.__version__`) if the limit does not
+take effect, so an MLX API change fails loudly instead of silently no-op'ing; MLX 0.32.0 exposes no
+`get_cache_limit`, so it confirms via a second `set_cache_limit(0)` plus `get_cache_memory()`.
+
+**Determinism of the export graph, i.e. why byte-for-byte is the right predicate.** The export has
+no dropout and no sampling: `generation.safetensors` is a **greedy** decode, `mx.random.seed(seed)`
+is re-applied at the top of each `run()`, and `_export_train_oracle` already re-runs its trajectory
+and refuses a non-reproducing one. Measured: 20/20 in-process `build_fixture("config/toy.yaml")`
+runs reproduce the checked-in oracle exactly (D4), and the double-export agrees on all 8 files.
+
+### D4 — The `mixing.N` near-zero flake (the escalation comment)
+
+CI run 31806256071 failed `test_checked_in_toy_fixture_matches_todays_backend` once with
+`mixing.1 max|d| = 2.694e-05` against `rtol=1e-4/atol=1e-5`, then passed on rerun. `--pattern
+export --trials 20` regenerates `toy` twenty times and diffs every `mixing.{i}` key plus
+`forward_logits` as a control, against the checked-in oracle:
+
+| key | max\|d\| over 20 | nonzero trials |
+|-----|------------------|----------------|
+| `mixing.0` | 0.0 | 0/20 |
+| `mixing.1` | 0.0 | 0/20 |
+| `forward_logits` | 0.0 | 0/20 |
+
+**Branch fired: no drift reproduces, so nothing is loosened.** No tolerance changed — not for
+`mixing.*`, and certainly not for `forward_logits`/`step_logits`/`greedy_ids`.
+`src/conformance/tolerances.py` is untouched by #298. The near-zero concern is real in principle
+(the causal mixing matrix's strict upper triangle is *exactly* zero, so at `|b| ~ 0` the
+`np.allclose` band collapses to `atol=1e-5` with no `rtol` headroom, and the observed 2.694e-05 is
+~2.7x over) — but widening a band to absorb an unreproduced failure would be picking a number to
+make a run green, which is the one thing the tolerance contract forbids.
+
+What that leaves open, stated plainly: the CI failure was **not** reproduced here, so its cause is
+undetermined. The two live hypotheses are a #298 sighting on the CI runner (in which case the
+right response is the guard, not a tolerance) and fp32 accumulation-order nondeterminism specific
+to that runner's hardware. Given the drift magnitudes measured above — #298 corrupts by **6-9**,
+not by 2.7e-05 — the second is the more likely of the two, and neither is closed. If it recurs,
+re-run `--pattern export --trials 20` on the runner that saw it before touching any band.
+
+### D5 — What stays open
+
+- The upstream MLX defect itself. Unfixed in 0.31.2, 0.32.0 and 0.32.1; no upstream issue found;
+  none filed from here. **#298 remains open as an upstream-tracking item.**
+- **#264's `mx.eval(h)` barrier is not sufficient on its own.** With the barrier in place and the
+  buffer cache on, the probe still measures 18/40 (toy.yaml) and 20/40 (toy-moe.yaml) corrupt
+  trials; only 0/40 for toy-hybrid.yaml. The mitigation that actually holds on this host is
+  `set_cache_limit(0)`: barrier **plus** limit 0 gives **0/40 on all three configs**, on 0.32.0 and
+  on 0.31.2. Every path that writes a checked-in oracle already runs under that combination, so the
+  fixtures are covered — but a caller invoking `mixing_matrices` outside the exporter and the four
+  test modules is **not** protected by the barrier alone. Parked in `docs/parked-findings.md`;
+  changing it is a behaviour decision beyond #298's contract.
+- Pinning `mlx==` in `pyproject.toml`. Out of scope for #298 (a repo-wide dependency decision) and
+  pointless as a remedy anyway, since all three tested versions are affected.
+- A PR-time CI job for the double-export. The guard is in the CLI the regeneration command already
+  invokes, and the dispatch-only `poc-fixture-oracle`/`poc-parity` and `train-fixture-oracle`/
+  `-verify` pairs already do the cross-runner form; an always-on macOS job is a runtime-cost
+  decision for the user.
+
 ## See also
 
 - [01-architecture-seam.md](01-architecture-seam.md) — the seam whose Python implementation is the

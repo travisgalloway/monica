@@ -361,6 +361,28 @@ clip boundary differs from Python's unconditional `min(1.0, clip/(norm+eps))`).
 
 ## Regenerating
 
+**The exporter double-exports by default (#298).** Every command below runs `build_fixture`
+twice — the second time in a **fresh subprocess** — and compares the two trees byte-for-byte
+before leaving anything at `--out`. On agreement you get `double-export: N files identical`
+and `--out` is kept. On disagreement **nothing is left at `--out`**: both trees are preserved
+as `--out.mismatch-1` and `--out.mismatch-2`, the per-file verdicts print, and the command
+exits 2. That is deliberate — a mismatch means one of the two exports is silently corrupt and
+there is no way to tell which, so neither may be committed. Treat it as a #298 sighting, not a
+flake to rerun past.
+
+**Scope: intra-machine determinism, not cross-machine.** The check is two processes on ONE
+host, which is exactly what #298's per-process corruption requires to be caught. It does *not*
+claim a fixture regenerates byte-identically on a different machine, and that is known to be
+false: CI's `train-fixture-oracle`/`train-fixture-verify` pair measures ~1e-8 drift in
+`train.safetensors` between runner instances. The cross-runner form of this check is the
+`poc-fixture-oracle`/`poc-parity` manifest `diff` (see §poc below), which compares sha256
+manifests across two runners rather than raw bytes.
+
+`--no-double-export` opts out. Use it for the **poc** fixture, where that CI pair already
+performs the cross-runner check and a local repeat would double a ~571 MB, multi-minute
+export. (It is also set automatically on the child process, which is what bounds the
+recursion to exactly one extra export.)
+
 ```bash
 .venv/bin/python scripts/export_parity_fixture.py --config config/toy.yaml \
     --out swift/engine/Fixtures/toy --batch 2 --seq 129 --train-steps 3 \

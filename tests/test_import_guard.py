@@ -116,6 +116,7 @@ PORTABLE_MODULES = [
     "src.conformance.prefill_decode_parity",
     "src.conformance.quant_parity",
     "src.conformance.tolerances",
+    "src.conformance.fixture_digest",
     "src.serve.sessions",
     "src.serve.rewind",
     "src.serve.sampling",

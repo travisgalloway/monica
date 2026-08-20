@@ -44,9 +44,12 @@ def _build_model_and_tokens(config_name: str, precision: str, seed: int = 0):
     import mlx.core as mx
 
     # #298 mitigation (buffer-cache reuse corrupting an unrelated later computation) —
-    # same as scripts/export_parity_fixture.py and tests/test_parity_fixture_export.py.
-    mx.clear_cache()
-    mx.set_cache_limit(0)
+    # the one shared helper, imported LOCALLY so this module still imports with no MLX at
+    # all (T5 runs on the portable Linux job). Unscoped on purpose: the models this helper
+    # returns are used by the caller long after it returns.
+    from scripts.export_parity_fixture import disable_buffer_cache_for_process
+
+    disable_buffer_cache_for_process()
 
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
