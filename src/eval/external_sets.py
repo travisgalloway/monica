@@ -205,13 +205,19 @@ def normalize_safim(row: dict) -> dict:
 def normalize_real_fim(row: dict) -> dict:
     """Real-FIM-Eval (`add`): `{repo, ref, path, prompt, suffix, canonical_solution, lang,
     timestamp}` — real commit-derived insertions. There is no `id` column, so one is built
-    from `repo@ref:path`."""
-    _require(row, "real-fim-eval", "repo", "path", "prompt", "suffix", "canonical_solution")
+    from `repo@ref:path`.
+
+    `ref` is `_require`d rather than defaulted to `""`: it is the only thing separating two
+    insertions at the same path in the same repo across commits, so quietly substituting an
+    empty string for a missing one would hide schema drift behind an ambiguous id. A live pull
+    carries it on all 17879 rows (all ids distinct), which is what makes requiring it safe."""
+    _require(row, "real-fim-eval", "repo", "ref", "path", "prompt", "suffix",
+             "canonical_solution")
     ts = row.get("timestamp")
-    return _norm("real-fim-eval", id=f"{row['repo']}@{row.get('ref') or ''}:{row['path']}",
+    return _norm("real-fim-eval", id=f"{row['repo']}@{row['ref']}:{row['path']}",
                  kind="infill", prompt=row["prompt"], suffix=row["suffix"],
                  answer=row["canonical_solution"],
-                 meta={"lang": row.get("lang"), "repo": row["repo"], "ref": row.get("ref"),
+                 meta={"lang": row.get("lang"), "repo": row["repo"], "ref": row["ref"],
                        "path": row["path"],
                        "timestamp": None if ts is None else str(ts)})
 
@@ -228,7 +234,19 @@ def normalize_crosscodeeval(row: dict) -> dict:
     md = row["metadata"]
     if not isinstance(md, dict):
         raise ValueError(f"crosscodeeval: metadata must be a mapping, got {type(md).__name__}")
-    task_id = md.get("task_id") or f"{md.get('repository')}::{md.get('file')}"
+    # `task_id` is the upstream instance key; `repository::file` is only a fallback for its
+    # absence. Build that fallback solely when both halves are actually there — the old
+    # unconditional f-string interpolated missing keys as the literal "None::None", which is
+    # a colliding id that would sail past every check downstream instead of failing here.
+    task_id = md.get("task_id")
+    if not task_id:
+        repository, file = md.get("repository"), md.get("file")
+        if not (repository and file):
+            raise ValueError(
+                f"crosscodeeval: row has no task_id and cannot fall back to "
+                f"repository::file (repository={repository!r}, file={file!r}); the upstream "
+                "schema has changed, or the wrong config/split was loaded")
+        task_id = f"{repository}::{file}"
     ctx = row["crossfile_context"]
     ctx_text = ctx.get("text") if isinstance(ctx, dict) else ctx
     ctx_list = ctx.get("list") if isinstance(ctx, dict) else None

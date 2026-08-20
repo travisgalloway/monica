@@ -258,6 +258,33 @@ def test_real_fim_allows_a_top_of_file_insertion_with_an_empty_prefix():
                             "suffix": "", "canonical_solution": "x"})
 
 
+def test_real_fim_requires_ref_rather_than_defaulting_it_into_an_ambiguous_id():
+    """`ref` is the only thing separating two insertions at the same path in the same repo
+    across commits. Defaulting a missing one to `""` would bury schema drift in an ambiguous
+    id, so its absence has to fail like any other missing column."""
+    with pytest.raises(ValueError, match="missing"):
+        normalize_real_fim({"repo": "org/repo", "path": "src/a.ts", "prompt": "const a = ",
+                            "suffix": ";\n", "canonical_solution": "1"})
+
+
+def test_crosscodeeval_refuses_to_build_a_none_none_id_from_an_empty_fallback():
+    """`repository::file` is only a fallback for a missing `task_id`. Interpolating absent
+    keys used to yield the literal `"None::None"` — a colliding id that reads as valid
+    everywhere downstream — so an unusable fallback must raise instead."""
+    with pytest.raises(ValueError, match="cannot fall back"):
+        normalize_crosscodeeval({
+            "prompt": "p", "groundtruth": "g", "metadata": {},
+            "crossfile_context": {"text": "ctx"},
+        })
+    # ...but a genuine fallback (no task_id, both halves present) still works.
+    row = normalize_crosscodeeval({
+        "prompt": "p", "groundtruth": "g",
+        "metadata": {"repository": "org/repo", "file": "src/a.ts"},
+        "crossfile_context": {"text": "ctx"},
+    })
+    assert row["id"] == "org/repo::src/a.ts"
+
+
 def test_crossfile_context_rides_in_meta_not_the_prompt():
     """How cross-file context is laid into the window is the caller's experimental choice,
     so the adapter must not silently concatenate it."""
