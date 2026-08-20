@@ -87,7 +87,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | SERVE-1 | `test_generate.py` | `test_generate.py` | `scripts/smoke_test.py`, CI `swift-engine` `monica-generate` steps | EOS handling, max tokens | none |
 | SERVE-2 | `test_repetition_penalty.py`, `test_generate.py`, `test_constrained_sampling.py` | same | `scripts/smoke_test.py` | temp 0, top-p renormalization, all-non-finite fallback | none |
 | SERVE-3 | `test_serve.py` | `test_serve.py` | none | snapshot/restore of the recurrent state | no CLI or serving entry point reaches `RewindTree` — unit-tested only |
-| SERVE-4 | `test_constrained_sampling.py`, `test_masked_decode.py`, `test_completion_mask.py` | CI `swift-macos` mask-set parity (Python vs Swift `VocabTrie`) | CI `swift-engine` `monica-generate --lsp-mask` | empty/all-out-of-range `allowed_ids` | none |
+| SERVE-4 | `test_constrained_sampling.py`, `test_masked_decode.py`, `test_completion_mask.py` | CI `swift-macos` mask-set parity (Python vs Swift `VocabTrie`) | CI `swift-engine` `monica-generate --lsp-mask` | empty/all-out-of-range/duplicate-bearing `allowed_ids` | none |
 | SERVE-5 | `test_spec_decode.py` (mlx-gated) | none | none | greedy-equivalence assertion | Swift side has only the `verifyBlock` prerequisite; full spec decode not built (#172) |
 
 ## Evaluation

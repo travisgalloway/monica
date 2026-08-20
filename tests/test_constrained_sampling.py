@@ -65,6 +65,42 @@ def test_all_finite_fallback_stays_within_allowed_ids_when_repetition_bans_the_r
     assert seen <= {0, 1}
 
 
+def test_duplicate_allowed_ids_do_not_bias_the_fallback_draw():
+    # #285: the fallback draws uniformly over the DISTINCT allowed ids. Listing 7
+    # three times must not make it 3x as likely as 9. Same fallback recipe as the
+    # test above: no_repeat_ngram_size=1 with previous_tokens covering the whole
+    # allowed set bans every remaining logit, so the all-non-finite fallback fires.
+    logits = np.zeros(12, dtype=np.float32)
+    rng = np.random.default_rng(11)
+    draws = [sample(logits, temperature=1.0, rng=rng, allowed_ids=[7, 7, 7, 9],
+                    previous_tokens=[7, 9], no_repeat_ngram_size=1)
+             for _ in range(2000)]
+    assert set(draws) == {7, 9}
+    for tok in (7, 9):
+        share = draws.count(tok) / len(draws)
+        # Pre-fix 7 takes ~75%; post-fix ~50%. At n=2000, p=0.5 this band is ~4.5 sigma.
+        assert 0.4 <= share <= 0.6, f"id {tok} drawn {share:.3f} of the time"
+
+
+def test_all_duplicates_allowed_ids_draws_the_single_candidate():
+    # Every entry is the same id -> exactly one candidate after the dedupe, so the
+    # fallback returns it deterministically.
+    logits = np.zeros(8, dtype=np.float32)
+    rng = np.random.default_rng(5)
+    for _ in range(50):
+        tok = sample(logits, temperature=1.0, rng=rng, allowed_ids=[5, 5, 5],
+                     previous_tokens=[5], no_repeat_ngram_size=1)
+        assert tok == 5
+
+
+def test_duplicate_out_of_range_allowed_ids_still_raise():
+    # Dedupe must not weaken the all-out-of-range guard: {99, -1} is still empty
+    # after the range filter, so this raises rather than narrowing silently.
+    logits = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="no ids within"):
+        sample(logits, temperature=0.0, allowed_ids=[99, 99, -1])
+
+
 # --------------------------------------------------------------------------- #
 # ordering: mask first, then repetition penalty, then temperature/top-k/top-p
 # --------------------------------------------------------------------------- #

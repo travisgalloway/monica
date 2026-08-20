@@ -99,3 +99,9 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   ~70 s of which is the LSP client's own #278 debounce paid 192 times. There is no `slow`/`live`
   pytest marker in this repo to gate it behind. Found while adding the gate. Severity: test
   runtime, non-blocking.
+
+- [2026-08-19] `swift/engine/Sources/MonicaEngine/Sampler.swift:146-148`, the Swift port's
+  all-non-finite fallback carries the same duplicate bias #285 fixed on the Python side, and
+  rebuilds the in-range `ids` array a second time rather than reusing the one built for the mask.
+  Found while fixing #285. Severity: cosmetic, non-blocking (sampled draws are not a
+  cross-language parity contract; only greedy is).
