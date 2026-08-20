@@ -176,8 +176,10 @@ jobs:
         run: pytest -q -rs tests/test_backend_parity.py
       - name: pytest
         # No MONICA_REQUIRE_BOTH_BACKENDS here on purpose: the rest of the suite keeps
-        # its normal skip semantics.
-        run: pytest -q -rs
+        # its normal skip semantics. tests/test_backend_parity.py is ignored here: it
+        # already ran (and gated) in the dedicated step above, and this job installs
+        # both backends, so an un-ignored run here would just duplicate it.
+        run: pytest -q -rs --ignore=tests/test_backend_parity.py
       - name: Build a fresh toy split
         run: |
           python -m src.data.download --dummy --out "$RUNNER_TEMP/toy/raw" --max-docs 2000

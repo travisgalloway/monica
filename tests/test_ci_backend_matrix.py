@@ -152,13 +152,30 @@ def test_designated_job_runs_on_macos() -> None:
 
 
 def test_the_parity_step_targets_the_parity_test_file() -> None:
-    """The step carrying the flag must actually run the file it unlocks. A flag set on a
-    step that runs something else is a gate pointed at nothing."""
+    """The flag must actually unlock a step that runs the file it protects. A flag set on
+    (or over) a step that runs something else is a gate pointed at nothing.
+
+    ``_declaring_jobs``/``test_exactly_one_job_declares_the_both_backends_flag`` both
+    accept the flag at job level OR step level, so this test must accept both shapes too:
+    job-level only requires *some* step in the job to run the parity file; step-level
+    requires *every* flagged step to run it.
+    """
     job = _ci_jobs()[DESIGNATED_JOB]
-    flagged = [step for step in job.get("steps") or [] if FLAG in (step.get("env") or {})]
-    assert flagged, f"{CI}: no step of {DESIGNATED_JOB} carries {FLAG}"
-    for step in flagged:
-        assert "tests/test_backend_parity.py" in str(step.get("run", "")), (
-            f"{CI}: the step carrying {FLAG} does not run tests/test_backend_parity.py; "
-            f"the flag would be set for a command it does not affect"
+    steps = job.get("steps") or []
+    job_level = FLAG in (job.get("env") or {})
+    flagged = [step for step in steps if FLAG in (step.get("env") or {})]
+    assert job_level or flagged, f"{CI}: no step of {DESIGNATED_JOB} carries {FLAG}"
+
+    if job_level:
+        ran = any("tests/test_backend_parity.py" in str(step.get("run", "")) for step in steps)
+        assert ran, (
+            f"{CI}: {FLAG} is declared at job level on {DESIGNATED_JOB} but no step runs "
+            f"tests/test_backend_parity.py; the flag would be set for a job that never "
+            f"runs the file it unlocks"
         )
+    else:
+        for step in flagged:
+            assert "tests/test_backend_parity.py" in str(step.get("run", "")), (
+                f"{CI}: the step carrying {FLAG} does not run tests/test_backend_parity.py; "
+                f"the flag would be set for a command it does not affect"
+            )
