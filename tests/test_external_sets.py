@@ -287,8 +287,21 @@ def test_repobench_takes_its_prompt_from_cropped_code_not_the_context_structs():
     })
     assert row["prompt"] == "import { h } from './h';\n\nfunction f() {\n"
     assert isinstance(row["prompt"], str)
+    assert row["id"] == "org/repo::src/a.ts::12::0"
     assert row["meta"]["crossfile_snippets"] == context
     assert row["answer"] == "  return h;"
+
+
+def test_repobench_id_disambiguates_multiple_completion_points_per_file():
+    """`repo_name::file_path` alone is not unique — RepoBench v1.1 has several completion
+    points per file (a live `cross_file_first` pull yields 8033 rows but only 4588 distinct
+    `repo_name::file_path` pairs). `token_num`/`gold_snippet_index` must make the id unique
+    across rows that otherwise share a repo and file."""
+    base = {"repo_name": "org/repo", "file_path": "src/a.ts", "context": [],
+            "cropped_code": "a", "next_line": "b"}
+    row_a = normalize_repobench({**base, "token_num": 12, "gold_snippet_index": 0})
+    row_b = normalize_repobench({**base, "token_num": 45, "gold_snippet_index": 1})
+    assert row_a["id"] != row_b["id"]
 
 
 def test_a_struct_valued_prompt_is_rejected_rather_than_passed_through():
@@ -299,7 +312,7 @@ def test_a_struct_valued_prompt_is_rejected_rather_than_passed_through():
         normalize_repobench({
             "repo_name": "org/repo", "file_path": "src/a.ts", "context": context,
             "cropped_code": context,          # the old bug's shape, made explicit
-            "next_line": "  return h;",
+            "next_line": "  return h;", "token_num": 12, "gold_snippet_index": 0,
         })
     with pytest.raises(ValueError, match="prompt must be a str"):
         normalize_multipl_e({"name": "n", "prompt": ["not", "a", "string"]})

@@ -245,15 +245,25 @@ def normalize_repobench(row: dict) -> dict:
 
     **`context` is a list of `{identifier, path, snippet}` structs, not a string** — the
     prompt is `cropped_code`; the retrieved snippets belong in `meta`.
+
+    **`repo_name::file_path` alone is not an instance id** — RepoBench v1.1 has multiple
+    completion points per file, so a live `cross_file_first` pull yields 8033 rows carrying
+    only 4588 distinct pairs and anything keyed by `id` silently collapses them. `token_num`
+    and `gold_snippet_index` (stable per-row disambiguators, present on every upstream row,
+    hence `_require`d) are folded in, taking that to 8020 distinct ids. The remaining 13
+    collisions are **duplicate rows upstream** — byte-identical `prompt` *and* `answer` — so
+    the id is a faithful instance key even though it is not literally unique per row.
     """
-    _require(row, "repobench", "repo_name", "file_path", "cropped_code", "next_line")
-    return _norm("repobench", id=f"{row['repo_name']}::{row['file_path']}", kind="cross_file",
+    _require(row, "repobench", "repo_name", "file_path", "cropped_code", "next_line",
+             "token_num", "gold_snippet_index")
+    id_ = f"{row['repo_name']}::{row['file_path']}::{row['token_num']}::{row['gold_snippet_index']}"
+    return _norm("repobench", id=id_, kind="cross_file",
                  prompt=row["cropped_code"], suffix=None, answer=row["next_line"],
                  meta={"repo_name": row["repo_name"], "file_path": row["file_path"],
                        "import_statement": row.get("import_statement"),
                        "crossfile_snippets": row.get("context"),
-                       "gold_snippet_index": row.get("gold_snippet_index"),
-                       "token_num": row.get("token_num"), "level": row.get("level")})
+                       "gold_snippet_index": row["gold_snippet_index"],
+                       "token_num": row["token_num"], "level": row.get("level")})
 
 
 def normalize_mceval(row: dict) -> dict:

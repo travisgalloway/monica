@@ -158,11 +158,18 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   `ci.yml` for #302 (a move of 383 lines of YAML with no local schema gate). Severity: CI
   tooling, non-blocking.
 
-- [2026-08-20] `src/eval/external_sets.py:238` (`normalize_repobench`), the row `id` is
+- [2026-08-20] ~~`src/eval/external_sets.py:238` (`normalize_repobench`), the row `id` is
   `f"{repo_name}::{file_path}"`, which is not unique: a live `cross_file_first` pull yields 8033
   rows carrying only 4588 distinct ids, because RepoBench v1.1 has several completion points per
   file. Anything that keys results by `id` would silently collapse them. Found while pinning the
-  external suites for #304. Severity: correctness risk in downstream scoring, non-blocking here.
+  external suites for #304. Severity: correctness risk in downstream scoring, non-blocking here.~~
+  **RESOLVED by #304** (2026-08-20): the id now folds in `token_num` and `gold_snippet_index` —
+  both stable per-row disambiguators present on every upstream row — and both are required by
+  `_require(...)` so schema drift on either field is caught rather than silently degrading back
+  to a colliding id. Confirmed against a live pull: 8033 rows now carry 8020 distinct ids (was
+  4588). The 13 residual collisions are duplicate rows *upstream* — byte-identical `prompt` and
+  `answer` — so no distinct instance is collapsed; the id is a faithful instance key, not a
+  literally-unique row key.
 
 - [2026-08-20] `scripts/build_decontam_blocklist.py:138`, the `--min-words` filter (default 13)
   drops every text from `external:safim`, `external:repobench` and `external:real-fim-eval` in
