@@ -58,7 +58,32 @@ SFT is the main event.**
 the Mixture-of-Thoughts / `load_topup` sources). It writes **two** forms: `reasoning.jsonl`
 (response-masked records for `SFTLoader`) and `reasoning-packed/` — the long 8K packing where each
 trace is one chunk-aligned document, so **no trace spans a sequence boundary** and `.bounds` marks
-each start for the SSM reset (#68); over-length traces are dropped, never split. GSM8K + MATH and code-with-executable-tests supply the GRPO rewards and
+each start for the SSM reset (#68); over-length traces are dropped, never split.
+
+**The two forms take two different drivers (#306), and that is not an accident.**
+
+```bash
+# build once
+python -m src.data.reasoning_sft --sources mot --tokenizer qwen3 --out-root data/shared
+
+# (a) reasoning.jsonl -> the SFT driver (masked CE on the assistant span)
+.venv/bin/python scripts/sft.py --config config/poc.yaml \
+    --data data/shared/sft/tokenized/qwen3-8k --corpus-form reasoning \
+    --init runs/poc/weights.safetensors --out runs/sft-reasoning
+
+# (b) reasoning-packed/ -> the PRETRAINING driver (unmasked next-token CE)
+python -m src.data.split --shards data/shared/sft/tokenized/qwen3-8k/reasoning-packed \
+    --out data/reasoning-split --val-tokens 100000
+.venv/bin/python scripts/train.py --config config/poc.yaml --data data/reasoning-split
+```
+
+`reasoning-packed/` is `shard.pack_atomic` output: a flat token stream whose `.bounds` marks
+document *starts* only, with every document padded to `chunk_align` and every sequence tail padded
+with `pad_id`. Nothing in it separates a document's real last token from its alignment padding, so
+**a response mask cannot be reconstructed from it** — an "SFT over packed" mode would have to
+invent one, and an invented mask is a silently wrong training signal. `scripts/sft.py
+--corpus-form reasoning-packed` therefore fails by name and prints recipe (b) rather than
+guessing. GSM8K + MATH and code-with-executable-tests supply the GRPO rewards and
 evaluation; the [open-r1](https://github.com/huggingface/open-r1) harness provides GRPO with
 code-execution rewards and 1.5B configs that adapt directly. References: Chain-of-Thought,
 DeepSeek-R1.
@@ -84,6 +109,43 @@ examples** (learn when *not* to call), validating every call against the schema 
 Sources: Glaive function-calling-v2, xLAM, ToolACE, plus When2Call for restraint; BFCL for eval.
 References: ReAct, Toolformer, TinyAgent.
 
+`src/data/tool_sft.py` builds the corpus (`tool.jsonl` + `tool-manifest.json` under
+`shared/sft/tokenized/<tok>-<k>/`); the call is ordinary assistant content, so it trains through
+the same SFT driver as the other masked forms (#306):
+
+```bash
+python -m src.data.tool_sft --sources xlam toolace when2call --tokenizer qwen3 --out-root data/shared
+.venv/bin/python scripts/sft.py --config config/poc.yaml \
+    --data data/shared/sft/tokenized/qwen3-8k --corpus-form tool \
+    --init runs/poc/weights.safetensors --out runs/sft-tool
+```
+
+## Running an SFT pass over the shared corpora (#306)
+
+`scripts/sft.py` is the **single** SFT driver for every masked form — instruct (#95), reasoning
+(#96) and tool (#102). There is no per-form trainer, and adding one would be a regression against
+the injected-`train_step` design (`docs/design/01-architecture-seam.md`).
+
+`--data` accepts either layout:
+
+| `--data` | `--corpus-form` | What happens |
+|---|---|---|
+| a dir with `train.jsonl` + `val.jsonl` (`src.data.sft_data`) | `auto` / `generic` | passed straight through, unchanged |
+| a `shared/sft/tokenized/<tok>-<k>/` dir | `auto` | every masked form present is mixed |
+| the same | `instruct` / `reasoning` / `tool` (one or several) | those forms, mixed |
+| the same | `reasoning-packed` | **rejected by name**, with recipe (b) above |
+
+The builders write one file per form and no held-out set, so the driver makes the split itself:
+one seeded permutation over the concatenated records, `--val-frac` (default 0.05, min one record)
+to the tail, and `train=/val=` printed so a run is reproducible from its log. Records longer than
+`--max-len` (default: the config's `seq_len`) are **dropped and counted, never truncated** —
+truncating clips the answer span off the end of the mask, which teaches the model to stop
+mid-answer.
+
+Mixing several forms in one run is supported **only** when their manifests agree on `chat_eos`,
+`template`, `tokenizer`, `model_id` and `seq_len`; a disagreement is refused by name, because
+concatenating two corpora built on different tokenizers trains one of them on the other's ids.
+
 ## The detail that bites: chat-template consistency
 
 The Qwen base defines **`<|im_end|>`** as the chat EOS. Keep it **identical across SFT, RL, and
@@ -92,6 +154,12 @@ all three layers and the GRPO pass. `src/data/chat_template.py` is the single so
 the ChatML render + assistant-span masking (the assistant turn is trained up to and including its
 trailing `<|im_end|>`, so the model learns to stop on it); the shared instruct corpus under
 `shared/sft/` is produced by `src/data/instruct_sft.py` (#95).
+
+Since #306 this is **verified at load, not merely recorded**. Every builder writes `chat_eos` and
+`template` into its manifest, and `src/data/sft_corpus.resolve_sft_corpus` refuses a corpus whose
+`chat_eos` differs from `chat_template.CHAT_EOS`, whose `template` is not `qwen-chatml`, or which
+**lacks** the `chat_eos` key at all — an older manifest is unknown provenance, not a pass. Before
+that check existed, a corpus built under a different template would have trained silently.
 
 ## Shared with production
 

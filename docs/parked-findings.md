@@ -184,3 +184,30 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   works but duplicates bookkeeping the tree already has and would silently drift if anything ever
   committed to the tree without going through `SessionHistory`. Found while wiring the rewind
   entry point for #305. Severity: minor API gap, non-blocking.
+
+- [2026-08-20] `src/data/tool_sft.py:96-115` (`_iter_calls`), a `<tool_call>` block whose payload is
+  syntactically malformed JSON is silently *skipped* rather than counted: the row then declares zero
+  calls, passes `_row_schema_valid` vacuously, and is written to `tool.jsonl` with the broken text
+  trained verbatim. `n_schema_invalid` counts only well-formed-JSON calls that violate the declared
+  schema. Pinned by `tests/test_sft_corpus.py::test_syntactically_malformed_payload_is_a_named_outcome`.
+  Found while wiring the SFT training driver for #306 (changing builder output was out of scope).
+  Severity: training-signal quality, non-blocking.
+
+- [2026-08-20] `src/data/loader.py:36-38`, `PackedLoader`'s `seq_len + 1` stride re-straddles the
+  atomic documents `shard.pack_atomic` was careful to chunk-align — a `reasoning-packed/` corpus
+  packed so that no trace spans a sequence boundary loses that property as soon as the loader cuts
+  it into `seq_len+1` windows, and `.bounds` is dropped by `split_shards` anyway. Found while
+  proving the packed form trains via the pretraining driver for #306. Severity: correctness of the
+  #68 boundary-reset claim on this path, non-blocking.
+
+- [2026-08-20] `src/data/instruct_sft.py:157`, the instruct builder writes its manifest as
+  `manifest.json` while `reasoning_sft.py` and `tool_sft.py` write `<kind>-manifest.json`. The
+  resolver carries a per-form name table because of it (`src/data/sft_corpus.py:FORMS`), and the
+  bare name is one `pack_atomic` output away from a collision if a future form ever writes shards
+  into the same directory. Found while writing the #306 resolver. Severity: naming inconsistency,
+  non-blocking.
+
+- [2026-08-20] `scripts/dpo.py` / `scripts/rlvr.py` consume neither the `shared/sft/` layout nor
+  `src/data/sft_corpus.py` — #306 gave the masked SFT forms a driver, but DPO and GRPO over the same
+  corpora still have no path. Found while closing #306 (explicitly out of its scope). Severity:
+  missing consumer, non-blocking.

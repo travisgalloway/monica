@@ -227,21 +227,26 @@ benchmark scores (see Step 6). Then compare the two layouts and keep the winning
 On the Qwen ChatML SFT corpus from Step 2, applied to the winning student's `weights.safetensors`.
 
 ```bash
-# instruct-SFT (sft.py supports --backend cuda; expects a dir with train.jsonl/val.jsonl):
+# instruct-SFT (sft.py supports --backend cuda; --data is the tokenized DIR, --corpus-form
+# picks the file inside it — the builder writes instruct.jsonl, not an `instruct/` directory):
 python scripts/sft.py --backend cuda --config <winner config> \
     --init /vol/runs/<winner>/logit-distill/weights.safetensors \
-    --data /vol/shared/sft/tokenized/qwen3-8k/instruct --out /vol/runs/sft-instruct \
+    --data /vol/shared/sft/tokenized/qwen3-8k --corpus-form instruct \
+    --out /vol/runs/sft-instruct \
     --epochs 2 --batch-size 8 --grad-accum 16 --base-lr 2e-5 --ckpt-every 100
 ```
 
 **Open items to resolve before running the rest of Step 5** (these are why #101/#102/#103 are still
 open — flag, don't improvise):
 
-- **reasoning-SFT** — `src/data/reasoning_sft.py` builds the data, but there is **no dedicated
-  reasoning-SFT training driver** in `scripts/`. It reuses the masked-CE SFT machinery; confirm how
-  `sft.py` consumes the reasoning records (jsonl vs the `reasoning-packed/` form) before running, or
-  track #101.
-- **tool-SFT** — optional, code not built (#102). Skip for the first winner.
+- **reasoning-SFT** — resolved by #306. `scripts/sft.py --corpus-form reasoning` trains
+  `reasoning.jsonl` directly (same masked-CE machinery, same `--backend cuda`). The
+  `reasoning-packed/` form is **not** an SFT input — it carries no loss mask, so it takes the
+  pretraining driver (`python -m src.data.split --shards <packed> --out <split> --val-tokens N`,
+  then `scripts/train.py --data <split>`); `--corpus-form reasoning-packed` fails by name with
+  that recipe. See `docs/design/11-post-training.md` (Thinking).
+- **tool-SFT** — built (#102) and trainable: `scripts/sft.py --corpus-form tool` over the same
+  `--data` directory. Still optional for the first winner.
 - **GRPO** — `scripts/rlvr.py` (`--init <sft weights> --problems <jsonl {prompt,answer}> --reward
   math`) is documented **MLX-only** (it uses the serving recurrence) and does **not** take a
   `--backend` flag. A ~1B GRPO run on Mac/MLX is slow; the GRPO *step factory* has CUDA parity
