@@ -28,7 +28,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | DATA-5 | A person can sync a corpus to and from R2/S3 | done | n/a | n/a | n/a | Shipped | — | infrastructure |
 | DATA-6 | A person can build a scale corpus with datatrove | done | n/a | n/a | n/a | Shipped | #193 | design/08 |
 | DATA-7 | A person can build the TS LSP-clean Stack-v2 corpus | done | n/a | n/a | n/a | In progress | #252 | design/08 |
-| DATA-8 | A person can build an SFT corpus (instruct/reasoning/tool) | done | n/a | n/a | n/a | In progress | #306 | design/11 |
+| DATA-8 | A person can build an SFT corpus (instruct/reasoning/tool) and train on it | done | n/a | n/a | n/a | Shipped | #306 | design/11 |
 | DATA-9 | A person can build a DPO preference set | done | n/a | n/a | n/a | Shipped | — | design/11 |
 | DATA-10 | A person can build a decontamination blocklist | done | n/a | n/a | n/a | Shipped | — | design/08 |
 | DATA-11 | A person can sweep vocab size against a sample | done | n/a | n/a | n/a | Shipped | #251 | design/08 |
