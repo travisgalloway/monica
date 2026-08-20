@@ -18,7 +18,14 @@ Usage::
     store.create("s1")
     logits = store.prefill("s1", prompt_ids)   # whole prompt in ONE parallel scan
     logits = store.step("s1", next_id)         # then one token at a time
-    snapshot = store.get_state("s1")     # hand to serve.rewind.RewindTree.commit(...)
+
+    history = SessionHistory(store, "s1")      # composes the store with serve.rewind
+    history.commit_turn()                      # snapshot this turn boundary into the tree
+    history.rewind_turns(1)                    # ... and restore it later, in place
+
+`SessionHistory` (below) is the composition point between this module and
+`serve.rewind.RewindTree`; `scripts/generate.py --interactive` is the entry point that
+drives it (#305).
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import numpy as np
 
 from ..model.blocks import MambaConfig
 from ..model.interface import Array, ModelInterface, State
+from .rewind import RewindTree
 
 # Bytes per state element by declared precision. Note the conservative default below:
 # the MLX backend keeps the SSM state in fp32 even when precision is fp16, so a naive
@@ -153,7 +161,11 @@ class SessionStore:
 
     # --- snapshot / restore (the bridge to serve.rewind) ---
     def get_state(self, session_id: str) -> State:
-        """An independent snapshot of a session's state, safe to retain (cloned)."""
+        """An independent snapshot of a session's state, safe to retain (cloned).
+
+        `SessionHistory.commit_turn` (below) is the caller: it hands the clone straight to
+        `RewindTree.commit`, which retains it as a turn-boundary node.
+        """
         return self.model.clone_state(self._states[session_id])
 
     def set_state(self, session_id: str, state: State) -> None:
@@ -163,6 +175,9 @@ class SessionStore:
         independent copy. Without this, installing a `RewindTree.rewind(...)` result
         (which aliases the tree node) lets a subsequent in-place `step` mutation on a
         numpy/CUDA state silently corrupt the retained snapshot.
+
+        `SessionHistory.rewind_to` (below) is the caller: it pairs `RewindTree.rewind`
+        with this method, which is the whole of the rewind operation.
         """
         self._states[session_id] = self.model.clone_state(state)
         self._states.move_to_end(session_id)
@@ -191,3 +206,127 @@ class SessionStore:
             self._positions.pop(sid, None)
             evicted.append(sid)
         return evicted
+
+
+class SessionHistory:
+    """Turn-boundary history for ONE session: the composition of `SessionStore` and
+    `serve.rewind.RewindTree`.
+
+    `SessionStore` owns the live state and `RewindTree` owns the retained snapshots;
+    neither knows about the other. This class is the join: `commit_turn` snapshots the
+    live session (`store.get_state`, which clones at the seam) into the tree, and
+    `rewind_to` pulls a snapshot back out (`tree.rewind`) and reinstalls it
+    (`store.set_state`). It never touches the model and never inspects a `State` — above
+    the seam `State` is opaque, so the blob is only ever passed through.
+
+    **Rewinds count RETAINED boundaries, not wall-clock turns.** The tree is LRU-capped at
+    `max_depth`, and `RewindTree._detach` reparents an evicted node's children onto its
+    grandparent so deeper branches outlive the cap. One "parent hop" therefore skips any
+    turn that has already been evicted. `rewind_turns(n)` walks `n` retained parents; if
+    the run is long enough for eviction, that is not the same as "n turns ago", and the
+    caller is told the retained depth when it asks for more than exists.
+
+    Guards **reject**; none clamps and none silently no-ops. Asking to rewind further than
+    the retained history raises rather than landing on the root, because a rewind that
+    quietly lands somewhere else is indistinguishable from one that worked.
+    """
+
+    def __init__(self, store: SessionStore, session_id: str, max_depth: int = 32) -> None:
+        if session_id not in store:
+            raise KeyError(
+                f"session {session_id!r} does not exist in the store; create it before "
+                "attaching a SessionHistory")
+        self.store = store
+        self.session_id = session_id
+        self.tree = RewindTree(max_depth=max_depth)   # raises if max_depth < 1
+        # Ids in commit order. The tree evicts, so this is a superset of what is retained;
+        # `retained_ids` filters it through the tree's own membership test rather than
+        # reaching into `RewindTree._nodes`.
+        self._committed: list[int] = []
+
+    # --- the composition ---
+    def commit_turn(self) -> int:
+        """Snapshot the live session as a turn boundary. Returns the new node id."""
+        node_id = self.tree.commit(self.store.get_state(self.session_id))
+        self._committed.append(node_id)
+        return node_id
+
+    def rewind_turns(self, n: int) -> int:
+        """Walk `n` retained parents from the current node and restore that snapshot.
+
+        Returns the node id landed on. Raises `ValueError` — without touching the session
+        — if `n < 1`, if nothing has been committed, or if fewer than `n` retained
+        ancestors exist (the message names both `n` and the available depth).
+        """
+        if n < 1:
+            raise ValueError(f"n must be >= 1 (got {n})")
+        current = self.tree.current()
+        if current is None:
+            raise ValueError(
+                f"session {self.session_id!r} has no committed turn boundaries; "
+                "call commit_turn() before rewinding")
+        target = current
+        for _ in range(n):
+            parent = self.tree.parent(target)
+            if parent is None:
+                available = self.depth() - 1
+                raise ValueError(
+                    f"cannot rewind {n} turn(s): session {self.session_id!r} retains "
+                    f"{self.depth()} boundary/boundaries including the current one, so at "
+                    f"most {available} rewind hop(s) are possible "
+                    f"(retained ids: {self.retained_ids()})")
+            target = parent
+        return self.rewind_to(target)
+
+    def rewind_to(self, node_id: int) -> int:
+        """Restore an absolute node id. Raises `LookupError` if it is unknown or evicted."""
+        try:
+            state = self.tree.rewind(node_id)
+        except KeyError:
+            raise LookupError(
+                f"node {node_id} is not retained by session {self.session_id!r}'s rewind "
+                f"tree (retained ids: {self.retained_ids()})") from None
+        self.store.set_state(self.session_id, state)
+        return node_id
+
+    # --- introspection ---
+    def current(self) -> Optional[int]:
+        return self.tree.current()
+
+    def __len__(self) -> int:
+        """Retained nodes, as the tree itself counts them (the LRU cap's own view)."""
+        return len(self.tree)
+
+    def retained_ids(self) -> list[int]:
+        """Committed ids that survived eviction, in commit order."""
+        return [i for i in self._committed if i in self.tree]
+
+    def depth(self) -> int:
+        """Retained ancestors of the current node, inclusive. 0 if nothing is committed."""
+        node = self.tree.current()
+        n = 0
+        while node is not None:
+            n += 1
+            node = self.tree.parent(node)
+        return n
+
+    def nodes(self) -> list[tuple[int, Optional[int], list[int]]]:
+        """`(id, parent_id, children)` for every retained node, in commit order."""
+        return [(i, self.tree.parent(i), self.tree.children(i)) for i in self.retained_ids()]
+
+    @property
+    def max_depth(self) -> int:
+        return self.tree.max_depth
+
+    def per_node_bytes(self) -> int:
+        """Conservative bytes for ONE retained snapshot — pure config arithmetic."""
+        return per_session_state_bytes(self.store.model.config)
+
+    def budget_bytes(self) -> int:
+        """Ceiling on what the retained tree can cost: `max_depth x per_node_bytes()`.
+
+        Conservative (fp32-charged) and exact in shape: snapshots are uniform because the
+        recurrent state is fixed-size, which is what makes a flat node count the right
+        budget in the first place.
+        """
+        return self.max_depth * self.per_node_bytes()

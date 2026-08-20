@@ -5,7 +5,9 @@ decoded tokens to a user, and the lm-eval adapter (`src/eval/olmes_adapter.py`)
 collects them for generative tasks. It drives the model through two `SessionStore`
 primitives only — `prefill(session_id, prompt_ids)` for the prompt (#165) and
 `step(session_id, token)` for each decoded token — so it adds no state handling of its
-own.
+own. `prefill=False` routes the prompt through `step` instead, which is how the stateful
+REPL (`scripts/generate.py --interactive`, #305) extends a live or rewound session that
+`SessionStore.prefill` refuses.
 
 Above the seam: only numpy + the `SessionStore` API. Backend logits are converted to
 numpy via the injected `to_numpy` (as in `src/eval/val_loss.py`); the `sampler`
@@ -32,6 +34,7 @@ def generate(
     stop_fn: Optional[Callable[[List[int]], bool]] = None,
     on_token: Optional[Callable[[int], None]] = None,
     pass_context: bool = False,
+    prefill: bool = True,
 ) -> List[int]:
     """Generate up to `max_new_tokens` continuation ids for `session_id`.
 
@@ -45,6 +48,17 @@ def generate(
     `stop_fn(generated)` is True. `prompt_ids` must be non-empty (the recurrence needs a
     token to advance on). Returns only the generated ids (not the prompt).
 
+    `prefill=False` seeds the loop by `step`-ing each prompt id instead. The two paths are
+    equivalent by construction — same state, same final logits, gated by
+    `src/conformance/prefill_decode_parity.py` — so the default is byte-identical to the
+    single-scan path and no existing caller changes behavior. The option exists because a
+    **live** session cannot be prefilled: `SessionStore.prefill` is fresh-session-only
+    (`src/serve/sessions.py:111`), and a session restored from a rewind snapshot has an
+    unknowable token position above the seam (`set_state` marks it `None`), so prefill
+    refuses it rather than mis-seeding attention RoPE from position 0. The stateful
+    continuation REPL (`scripts/generate.py --interactive`) uses `prefill=False` for every
+    turn after the first and after every rewind.
+
     `pass_context=True` calls `sampler(logits, previous_tokens=prompt + generated)` so a
     repetition-aware sampler can penalize already-emitted tokens; the default keeps the
     bare `sampler(logits)` contract the lm-eval adapter relies on.
@@ -53,7 +67,11 @@ def generate(
         raise ValueError("prompt_ids must be non-empty")
 
     prompt = [int(t) for t in prompt_ids]
-    logits = store.prefill(session_id, prompt)
+    if prefill:
+        logits = store.prefill(session_id, prompt)
+    else:
+        for tok_id in prompt:
+            logits = store.step(session_id, tok_id)
 
     generated: List[int] = []
     for _ in range(max_new_tokens):

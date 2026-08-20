@@ -18,6 +18,7 @@ import pytest
 from src.model.blocks import MambaConfig
 from src.serve.rewind import RewindTree
 from src.serve.sessions import (
+    SessionHistory,
     SessionStore,
     per_session_state_bytes,
     per_session_state_floats,
@@ -295,3 +296,175 @@ def test_eviction_reparents_children_onto_grandparent():
     assert tree.parent(n2) == n0      # n2 reparented onto the grandparent
     assert n2 in tree.children(n0)
     assert tree.parent(n3) == n2 and tree.current() == n3
+
+
+# --- SessionHistory: the SessionStore x RewindTree composition (#305) ----------------
+
+def _history(max_depth: int = 32, vocab_size: int = 8):
+    store = SessionStore(FakeModel(vocab_size=vocab_size), max_concurrent=1)
+    store.create("s1")
+    return store, SessionHistory(store, "s1", max_depth=max_depth)
+
+
+def test_session_history_requires_an_existing_session():
+    store = SessionStore(FakeModel())
+    with pytest.raises(KeyError, match="does not exist"):
+        SessionHistory(store, "nope")
+
+
+def test_session_history_rejects_a_zero_max_depth():
+    store = SessionStore(FakeModel())
+    store.create("s1")
+    with pytest.raises(ValueError, match="max_depth must be >= 1"):
+        SessionHistory(store, "s1", max_depth=0)
+
+
+def test_commit_turn_snapshots_the_live_state_and_depth_tracks_it():
+    store, history = _history()
+    assert history.depth() == 0 and history.current() is None
+    root = history.commit_turn()
+    store.step("s1", 5)
+    second = history.commit_turn()
+    assert history.depth() == 2
+    assert history.retained_ids() == [root, second]
+    assert history.nodes() == [(root, None, [second]), (second, root, [])]
+
+
+def test_rewind_turns_restores_the_earlier_snapshot():
+    store, history = _history()
+    store.step("s1", 4)
+    boundary = history.commit_turn()          # state = 4
+    store.step("s1", 7)
+    history.commit_turn()                     # state = 11
+    assert int(store.get_state("s1")[0]) == 11
+    assert history.rewind_turns(1) == boundary
+    assert int(store.get_state("s1")[0]) == 4
+
+
+def test_commit_after_rewind_forks_history():
+    store, history = _history()
+    store.step("s1", 4)
+    boundary = history.commit_turn()
+    store.step("s1", 7)
+    first_branch = history.commit_turn()
+    history.rewind_turns(1)
+    store.step("s1", 2)
+    second_branch = history.commit_turn()
+    children = dict((nid, kids) for nid, _, kids in history.nodes())
+    assert sorted(children[boundary]) == sorted([first_branch, second_branch])
+
+
+def test_rewind_turns_rejects_non_positive_n():
+    _, history = _history()
+    history.commit_turn()
+    with pytest.raises(ValueError, match="n must be >= 1"):
+        history.rewind_turns(0)
+
+
+def test_rewind_turns_rejects_an_uncommitted_session():
+    _, history = _history()
+    with pytest.raises(ValueError, match="no committed turn boundaries"):
+        history.rewind_turns(1)
+
+
+def test_rewind_turns_rejects_going_deeper_than_the_retained_history():
+    store, history = _history()
+    history.commit_turn()
+    store.step("s1", 3)
+    history.commit_turn()
+    before = int(store.get_state("s1")[0])
+    with pytest.raises(ValueError, match=r"cannot rewind 4 turn\(s\).*at most 1 rewind"):
+        history.rewind_turns(4)
+    assert int(store.get_state("s1")[0]) == before   # a rejected rewind changes nothing
+
+
+def test_rewind_to_unknown_node_raises_lookup_error_naming_the_retained_ids():
+    _, history = _history()
+    history.commit_turn()
+    with pytest.raises(LookupError, match=r"node 42 is not retained.*retained ids: \[0\]"):
+        history.rewind_to(42)
+
+
+def test_retained_ids_and_depth_follow_eviction():
+    store, history = _history(max_depth=3)
+    for token in range(5):
+        store.step("s1", token + 1)
+        history.commit_turn()
+    assert len(history) == 3 == len(history.tree)
+    assert len(history.retained_ids()) == 3
+    # Eviction reparents onto the grandparent, so the retained chain is 3 deep and
+    # `rewind_turns` counts RETAINED boundaries, not the five turns actually taken.
+    assert history.depth() == 3
+    with pytest.raises(ValueError, match="at most 2 rewind"):
+        history.rewind_turns(3)
+
+
+def test_budget_bytes_is_max_depth_times_the_per_session_state():
+    store, history = _history(max_depth=6)
+    assert history.per_node_bytes() == per_session_state_bytes(store.model.config)
+    assert history.budget_bytes() == 6 * history.per_node_bytes()
+    assert history.max_depth == 6
+
+
+def test_rewound_snapshot_is_independent_of_later_steps():
+    """`get_state`/`set_state` both clone, so a retained node cannot be aliased."""
+    store, history = _history()
+    store.step("s1", 9)
+    boundary = history.commit_turn()
+    store.step("s1", 1)
+    history.commit_turn()
+    history.rewind_to(boundary)
+    store.step("s1", 100)                     # mutate the live session hard
+    history.rewind_to(boundary)               # the retained node must be untouched
+    assert int(store.get_state("s1")[0]) == 9
+
+
+# --- the real opaque state, on the real backend (mlx-gated, toy scale) ---------------
+
+def test_mlx_rewind_restores_the_opaque_state_and_the_continuation():
+    """Toy-scale MLX check that rewind restores the *actual* opaque `State`.
+
+    Everything above is numpy arithmetic through a FakeModel; this is the one place the
+    real per-layer `(conv_state, ssm_state)` tuples and the real `clone_state` semantics
+    are exercised. Greedy (`temperature=0`) so the continuation identity needs no RNG
+    bookkeeping.
+    """
+    mx = pytest.importorskip("mlx.core")
+    from functools import partial
+
+    from src.model.blocks import load_config
+    from src.model.mlx_backend import MLXMambaModel
+    from src.serve import sampling
+    from src.serve.generate import generate
+
+    cfg = load_config("config/toy.yaml")
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    store = SessionStore(model, max_concurrent=1)
+    store.create("s")
+    history = SessionHistory(store, "s", max_depth=8)
+
+    greedy = partial(sampling.sample, temperature=0.0)
+    decode = dict(sampler=greedy, to_numpy=lambda a: np.array(a), max_new_tokens=6)
+
+    generate(store, "s", [3, 14, 15, 92], **decode)          # turn A (fresh -> prefill)
+    boundary = history.commit_turn()
+    snapshot = store.get_state("s")
+
+    out_b = generate(store, "s", [65, 35, 89], prefill=False, **decode)
+    history.commit_turn()
+
+    history.rewind_to(boundary)
+    restored = store.get_state("s")
+    assert len(restored) == cfg.n_layers
+    for layer, ((snap_a, snap_b), (rest_a, rest_b)) in enumerate(zip(snapshot, restored)):
+        assert np.array_equal(np.array(snap_a), np.array(rest_a)), f"layer {layer} conv"
+        assert np.array_equal(np.array(snap_b), np.array(rest_b)), f"layer {layer} ssm"
+
+    out_x = generate(store, "s", [7, 7, 7], prefill=False, **decode)   # discarded branch
+    history.commit_turn()
+    history.rewind_to(boundary)
+    out_b_again = generate(store, "s", [65, 35, 89], prefill=False, **decode)
+
+    assert out_b_again == out_b        # state restored -> byte-identical continuation
+    assert out_b_again != out_x        # ... and a real branch, not a replay

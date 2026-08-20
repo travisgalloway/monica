@@ -188,3 +188,48 @@ def test_default_uses_bare_sampler_contract():
 
     out = generate(store, "s", [0], sampler=bare_sampler, max_new_tokens=2)
     assert out == [1, 2]
+
+
+# --- prefill=False: the live/rewound-session path (#305) -----------------------------
+
+def _greedy(logits):
+    return int(np.argmax(logits))
+
+
+def test_prefill_false_matches_prefill_true_on_a_fresh_session():
+    """The two prompt paths are equivalent by construction; assert it on both ids and state.
+
+    `prefill=True` runs the whole prompt through one parallel scan, `prefill=False` steps
+    it token by token. `src/conformance/prefill_decode_parity.py` gates that equivalence on
+    the real backends; here it is checked through `generate` itself, which is what lets the
+    stateful REPL extend a session `SessionStore.prefill` refuses.
+    """
+    prompt = [2, 5, 9]
+    scanned = _store()
+    stepped = SessionStore(CounterModel())
+    stepped.create("s")
+
+    out_scan = generate(scanned, "s", prompt, sampler=_greedy, max_new_tokens=5)
+    out_step = generate(stepped, "s", prompt, sampler=_greedy, max_new_tokens=5,
+                        prefill=False)
+
+    assert out_step == out_scan
+    assert np.array_equal(np.asarray(scanned.get_state("s")),
+                          np.asarray(stepped.get_state("s")))
+
+
+def test_prefill_false_extends_a_live_session_that_prefill_would_refuse():
+    """After one generation the session is at a non-zero position: prefill must refuse it
+    and `prefill=False` must continue it (the second-turn case in the REPL)."""
+    store = _store()
+    generate(store, "s", [1, 2], sampler=_greedy, max_new_tokens=3)
+    with pytest.raises(ValueError, match="fresh-session"):
+        generate(store, "s", [4], sampler=_greedy, max_new_tokens=3)
+    assert generate(store, "s", [4], sampler=_greedy, max_new_tokens=3,
+                    prefill=False) == [5, 6, 7]
+
+
+def test_prefill_false_still_rejects_an_empty_prompt():
+    store = _store()
+    with pytest.raises(ValueError, match="prompt_ids must be non-empty"):
+        generate(store, "s", [], sampler=_greedy, prefill=False)

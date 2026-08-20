@@ -86,7 +86,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 |----|------|-------------|-----|--------------------|------|
 | SERVE-1 | `test_generate.py` | `test_generate.py` | `scripts/smoke_test.py`, CI `swift-engine` `monica-generate` steps | EOS handling, max tokens | none |
 | SERVE-2 | `test_repetition_penalty.py`, `test_generate.py`, `test_constrained_sampling.py` | same | `scripts/smoke_test.py` | temp 0, top-p renormalization, all-non-finite fallback | none |
-| SERVE-3 | `test_serve.py` | `test_serve.py` | none | snapshot/restore of the recurrent state | no CLI or serving entry point reaches `RewindTree` — unit-tested only |
+| SERVE-3 | `test_serve.py` (`RewindTree` + `SessionHistory`) | `test_rewind_entry_point.py` (whole REPL, portable), `test_serve.py` `test_mlx_rewind_restores_the_opaque_state_and_the_continuation` (mlx-gated, toy scale) | none | over-deep rewind, uncommitted session, root rewind, `/rewind 0/-1/abc/#unknown`, unknown command, double branch + rewind across the branch point, LRU eviction, `--rewind-depth 0`, negative `--rewind-depth` | no CI job drives the CLI REPL itself — the mlx-gated integration test is the closest surface; CUDA and Swift are uncovered (the path is backend-agnostic but exercised on neither) |
 | SERVE-4 | `test_constrained_sampling.py`, `test_masked_decode.py`, `test_completion_mask.py` | CI `swift-macos` mask-set parity (Python vs Swift `VocabTrie`) | CI `swift-engine` `monica-generate --lsp-mask` | empty/all-out-of-range/duplicate-bearing `allowed_ids` | none |
 | SERVE-5 | `test_spec_decode.py` (mlx-gated) | none | none | greedy-equivalence assertion | Swift side has only the `verifyBlock` prerequisite; full spec decode not built (#172) |
 
