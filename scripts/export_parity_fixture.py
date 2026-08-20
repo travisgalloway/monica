@@ -64,9 +64,10 @@ from src.model.blocks import load_config
 #
 # It lives here, as one symbol, because #298's own definition of done requires the
 # mitigation's confinement to be *checkable* rather than assumed: `git grep set_cache_limit
-# -- src scripts tests` must name this file and nothing else, and in particular nothing on
-# the training/inference path. Callers: `build_fixture` below, plus the four MLX test
-# modules that construct models in a loop.
+# -- src scripts tests` must show no CALL site outside this file (prose mentions like this
+# comment block, and the fail-loud test's monkeypatch stubs, are expected hits and are not
+# calls) — and in particular nothing on the training/inference path. Callers: `build_fixture`
+# below, plus the four MLX test modules that construct models in a loop.
 
 
 def _apply_cache_disable() -> int:
