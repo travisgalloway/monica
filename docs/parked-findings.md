@@ -105,3 +105,45 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   rebuilds the in-range `ids` array a second time rather than reusing the one built for the mask.
   Found while fixing #285. Severity: cosmetic, non-blocking (sampled draws are not a
   cross-language parity contract; only greedy is).
+
+- [2026-08-19] `src/model/mlx_backend.py:948`, #264's `mx.eval(h)` barrier in
+  `mixing_matrices` reduces but does not eliminate the #298 corruption: measured 18/40 (toy.yaml)
+  and 20/40 (toy-moe.yaml) corrupt trials with the barrier in place and the MLX buffer cache on
+  (`scripts/probe_mlx_buffer_reuse.py --pattern mixing --barrier --trials 40`). Only barrier +
+  `set_cache_limit(0)` gives 0/40. Every path that writes a checked-in oracle already runs under
+  both, so the fixtures are covered — an arbitrary caller of `mixing_matrices`/`hidden_states` is
+  not. Found while closing #298. Severity: correctness, non-blocking (deciding what a bare caller
+  should get is a behaviour change beyond #298's contract).
+
+- [2026-08-19] `src/model/mlx_backend.py:938` `hidden_states` forks a lazy `h` the same way
+  `mixing_matrices` does (`layer_fn(h)` advancing while the previous `h` is retained in `hs`) and
+  carries no barrier at all. Unmeasured — the #298 probe only exercises `mixing_matrices`. Found
+  while closing #298. Severity: correctness, unquantified.
+
+- [2026-08-19] `pyproject.toml:30` pins only `mlx>=0.18` while the repo's numerical contracts
+  (fp32 `1e-4/1e-5`, the #266 low-precision bands, every checked-in oracle) are all calibrated on
+  one build. #298 measured three releases behaving differently under the same probe. Whether to
+  pin a floor/ceiling is a repo-wide dependency decision. Found while closing #298. Severity:
+  reproducibility, non-blocking.
+
+- [2026-08-19] No PR-time CI job runs `export_parity_fixture.py --double-export`; the guard only
+  fires when a human regenerates a fixture. The cross-runner equivalents
+  (`poc-fixture-oracle`/`poc-parity`, `train-fixture-oracle`/`-verify`,
+  `.github/workflows/ci.yml`) are dispatch/schedule-only. Adding an always-on macOS job is a
+  runtime-cost decision. Found while closing #298. Severity: coverage, non-blocking.
+
+- [2026-08-19] `CLAUDE.md` and `.claude/plans/issue-298.md`'s V8 both give the Swift gate as
+  `cd swift/engine && swift run monica-parity`, which cannot work: mlx-swift's `default.metallib`
+  is an Xcode-only build product, so `swift run` builds fine and then dies with "Failed to load
+  the default metallib". `.github/workflows/ci.yml:446-487` documents this and uses `xcodebuild`
+  + the product binary instead. On a host with only Command Line Tools installed the gate is not
+  runnable at all. Found while closing #298. Severity: docs/tooling, non-blocking (CI runs the
+  real form).
+
+- [2026-08-19] `tests/test_parity_fixture_export.py:90`, the macOS suite is flaky at ~1-in-4 when
+  `tests/test_mlx_mixing_matrix.py` runs before it in the same process (3/12 measured on `main`,
+  0/12 for the export module alone). The failure is `greedy_ids` as EXACT ints — 16/16 wrong, by
+  222 — i.e. #298 corruption, not a tolerance. Both modules already apply `set_cache_limit(0)`, so
+  the mitigation does not compose across pytest modules. Fixing it means process isolation for the
+  MLX fixture modules (pytest-forked, or a separate CI job), which is test-infrastructure work.
+  Found while verifying #298. Severity: CI reliability, non-blocking but recurring.

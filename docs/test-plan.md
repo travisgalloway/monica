@@ -135,6 +135,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ENGINE-7 | n/a | `scripts/check_swift_checkpoint.py` | CI `swift-engine` Swift→Python round-trip (GATE) | the direction `monica-parity` alone cannot prove | none |
 | ENGINE-8 | n/a | n/a | n/a | n/a | n/a — not built (#171) |
 | ENGINE-9 | n/a | n/a | n/a | n/a | n/a — only the `verifyBlock` prerequisite exists (#172) |
+| ENGINE-10 | `test_fixture_digest.py` (portable), `test_mlx_mixing_matrix.py`'s `disable_buffer_cache` cases | `test_parity_fixture_export.py`, `test_train_parity_fixture_export.py` | `export_parity_fixture.py --double-export` (default on); CI `poc-fixture-oracle` + `poc-parity`, `train-fixture-oracle` + `-verify` | flipped byte, dropped file, size mismatch, nested file, **empty tree is BLIND not clean**, MLX API change fails loudly, near-zero `mixing.*` entries | **intra-machine only** — two processes on ONE host; cross-machine determinism is not claimed and `train.safetensors` is known to drift ~1e-8 across runner instances. No PR-time CI job runs the double-export; the underlying MLX defect is unfixed upstream (design/14 §#298) |
 
 ## Conformance
 

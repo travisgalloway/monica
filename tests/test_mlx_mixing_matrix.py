@@ -19,14 +19,16 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
-# See scripts/export_parity_fixture.py's matching comment: this local MLX build (0.32.0)
-# has been observed to silently corrupt results when many independently-constructed
-# models allocate/free buffers of the same size class within one process — exactly what
-# this file's three tests do. Disabling the buffer-cache pool (proven in isolation to
-# take the observed failure rate to 0/10) trades allocator throughput, irrelevant here,
-# for correctness.
-mx.clear_cache()
-mx.set_cache_limit(0)
+# #264/#298: this local MLX build (0.32.0) has been observed to silently corrupt results
+# when many independently-constructed models allocate/free buffers of the same size class
+# within one process — exactly what this file's tests do. One shared mitigation, whose
+# rationale and loud-failure contract live on the helper (see
+# `scripts/export_parity_fixture.py`); the confinement is checkable with
+# `git grep set_cache_limit -- src scripts tests`, which must show no CALL site outside
+# that file (the remaining hits here are prose and the fail-loud test's monkeypatch stubs).
+from scripts.export_parity_fixture import disable_buffer_cache_for_process  # noqa: E402
+
+disable_buffer_cache_for_process()
 
 from src.model.blocks import MambaConfig
 from src.model.mlx_backend import MLXMambaModel, MambaBlock, _linear, _DTYPES
@@ -131,3 +133,58 @@ def test_mixing_matrices_skips_attention_and_moe_layers():
         arr = np.array(m)
         assert np.isfinite(arr).all()
         assert arr.shape == (2, 16, 16)
+
+
+def test_disable_buffer_cache_fails_loudly_if_the_limit_does_not_take(monkeypatch):
+    """#298 edge case 1: an MLX version bump that changes `set_cache_limit`'s semantics
+    must make the mitigation RAISE, never degrade to a silent no-op.
+
+    A mitigation that has quietly stopped applying is indistinguishable from a working one
+    right up until it bakes a corrupted oracle into the Swift gate — which is the exact
+    failure #298's guard exists to prevent, so the check has to be on the fail-loud side.
+    MLX 0.32.0 has no `get_cache_limit`, so the helper confirms via a second
+    `set_cache_limit(0)` (which returns the limit then in force) plus `get_cache_memory()`;
+    both observations are falsified here.
+    """
+    from scripts.export_parity_fixture import disable_buffer_cache
+
+    # (a) the limit never takes: every set_cache_limit reports a non-zero prior limit.
+    monkeypatch.setattr(mx, "set_cache_limit", lambda n: 1 << 20)
+    with pytest.raises(RuntimeError, match="did not take effect"):
+        with disable_buffer_cache():
+            raise AssertionError("the context body must never be reached")
+
+    # ...and the message names the MLX version, so a report says WHICH build changed.
+    monkeypatch.setattr(mx, "__version__", "9.9.9-probe")
+    with pytest.raises(RuntimeError, match="9.9.9-probe"):
+        disable_buffer_cache_for_process()
+
+    # (b) the limit reads back as 0 but the pool is still populated — the subtler
+    # regression, where the setter is honoured for reporting but stops freeing.
+    monkeypatch.setattr(mx, "set_cache_limit", lambda n: 0)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 4096)
+    with pytest.raises(RuntimeError, match="still holds"):
+        disable_buffer_cache_for_process()
+
+
+def test_disable_buffer_cache_restores_the_previous_limit(monkeypatch):
+    """The scoped form is scoped: `build_fixture` must not leave the process-wide limit
+    changed for whatever runs next in the same interpreter (a pytest session runs ~19 other
+    MLX modules after this one). Checked against a recording stub rather than the live
+    allocator, because this module disables the cache process-wide at import."""
+    from scripts.export_parity_fixture import disable_buffer_cache
+
+    calls = []
+    state = {"limit": 1 << 24}
+
+    def fake_set(n):
+        calls.append(n)
+        prev, state["limit"] = state["limit"], n
+        return prev
+
+    monkeypatch.setattr(mx, "set_cache_limit", fake_set)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    with disable_buffer_cache():
+        assert state["limit"] == 0
+    assert state["limit"] == 1 << 24
+    assert calls == [0, 0, 1 << 24]

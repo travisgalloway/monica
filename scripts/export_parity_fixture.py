@@ -32,16 +32,100 @@ import argparse
 import ast
 import json
 import os
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 
+from src.conformance.fixture_digest import compare_trees
 from src.conformance.forward_step_parity import check_forward_step_parity
 from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.conformance.quant_parity import check_quant_parity
 from src.conformance.tolerances import LOWP_MEAN_KL_MAX, band_for, route_margin_min
 from src.model.blocks import load_config
+
+
+# --- #264/#298: the MLX buffer-cache mitigation, in ONE place -------------------------
+#
+# This local MLX build (0.32.0) has been observed to silently corrupt a computation
+# (deterministic-per-process, exact-shape results, no exception, no log) when many
+# independently-constructed `MLXMambaModel`s allocate/free/reuse buffers of the same size
+# class within one process. `mx.set_cache_limit(0)` — proven in isolation to take the
+# observed failure rate from ~50-100% down to 0/10 trials — disables MLX's buffer-cache
+# pool, trading allocator throughput (irrelevant for a one-shot export or a test module)
+# for correctness.
+#
+# The defect is UPSTREAM and is not fixed here; see `docs/design/14-inference-engine.md`
+# §"MLX 0.32.0 buffer reuse (#298)" for the measurements and what stays open.
+#
+# It lives here, as one symbol, because #298's own definition of done requires the
+# mitigation's confinement to be *checkable* rather than assumed: `git grep set_cache_limit
+# -- src scripts tests` must show no CALL site outside this file (prose mentions like this
+# comment block, and the fail-loud test's monkeypatch stubs, are expected hits and are not
+# calls) — and in particular nothing on the training/inference path. Callers: `build_fixture`
+# below, plus the four MLX test modules that construct models in a loop.
+
+
+def _apply_cache_disable() -> int:
+    """Drop MLX's buffer cache and pin its limit to 0; return the previous limit.
+
+    Raises rather than degrading to a silent no-op if the limit did not take effect —
+    an MLX version bump that changes `set_cache_limit`'s semantics must fail LOUDLY,
+    because a mitigation that has quietly stopped applying is indistinguishable from one
+    that is working right up until it bakes a corrupted oracle into the Swift gate.
+    """
+    import mlx.core as mx
+
+    # MLX 0.32.0 exposes no `get_cache_limit`, so the confirmation is built from what IS
+    # observable: `set_cache_limit` returns the limit that was in force before the call,
+    # therefore a second `set_cache_limit(0)` returning anything but 0 means the first one
+    # did not stick. `get_cache_memory()` then confirms the pool is actually empty.
+    prev = mx.set_cache_limit(0)
+    confirm = mx.set_cache_limit(0)
+    mx.clear_cache()
+    held = mx.get_cache_memory()
+    if confirm != 0 or held != 0:
+        # Restore before raising: a half-applied mitigation must not also leave the
+        # process's allocator settings changed behind it.
+        mx.set_cache_limit(prev)
+        raise RuntimeError(
+            f"mx.set_cache_limit(0) did not take effect on mlx {mx.__version__}: a second "
+            f"set_cache_limit(0) reported a prior limit of {confirm!r} and the buffer pool "
+            f"still holds {held!r} bytes. The #298 buffer-reuse mitigation is NOT active, "
+            "so any fixture written now may be silently corrupted. Refusing to continue — "
+            "see docs/design/14-inference-engine.md §'MLX 0.32.0 buffer reuse (#298)'.")
+    return prev
+
+
+@contextmanager
+def disable_buffer_cache():
+    """Scoped form: disable MLX's buffer cache, restoring the previous limit on exit.
+
+    Used by `build_fixture`, so the disable covers the entire export (including every
+    early `raise SystemExit` refusal path) without leaving the process-wide limit changed
+    for whatever runs next in the same interpreter.
+    """
+    prev = _apply_cache_disable()
+    try:
+        yield
+    finally:
+        import mlx.core as mx
+        mx.set_cache_limit(prev)
+
+
+def disable_buffer_cache_for_process() -> None:
+    """Unscoped form: disable MLX's buffer cache for the rest of this interpreter.
+
+    Deliberately never restored. This is the module-prologue form the MLX test modules
+    need: their models are constructed at various points across many tests, so the
+    mitigation has to outlive any single `with` block. Only ever called from test modules
+    and this script — never from the training/inference path.
+    """
+    _apply_cache_disable()
 
 
 def _tree_add(a, b):
@@ -353,25 +437,16 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
     from src.serve.sessions import SessionStore
     from src.train.checkpoint import save_weights
 
-    # #264: disable MLX's buffer-cache pool for the duration of this export. Diagnosed
-    # while adding the mixing-matrix oracle — this local MLX build (0.32.0) has been
-    # observed to silently corrupt a computation (deterministic-per-process, exact-shape
-    # results, no exceptions) when many independently-constructed `MLXMambaModel`s
-    # allocate/free/reuse buffers of the same size class in one process, which this
-    # exporter does far more of than any other caller (repeated regeneration, the #166
-    # staleness test re-invoking `build_fixture` inside an already-populated pytest
-    # process). `mx.set_cache_limit(0)` (proven in isolation to take the observed failure
-    # rate from ~50-100% down to 0/10 trials) trades allocator throughput — irrelevant for
-    # a one-shot fixture export — for correctness; it must not be ported into a hot
-    # training/inference path.
-    mx.clear_cache()
-    # #264 (review follow-up): capture the prior limit and restore it in `finally`
-    # below so the disable is scoped to this export, not process-global — while still
-    # covering the ENTIRE rest of the function (including every early `raise SystemExit`
-    # refusal path), so the cache stays off for the full duration the mitigation above
-    # depends on.
-    _prev_cache_limit = mx.set_cache_limit(0)
-    try:
+    # #264/#298: disable MLX's buffer-cache pool for the duration of this export — this
+    # exporter constructs far more independent `MLXMambaModel`s per process than any other
+    # caller (repeated regeneration, the #166 staleness test re-invoking `build_fixture`
+    # inside an already-populated pytest process), which is the shape that triggers the
+    # silent corruption. The rationale, the measurement and the loud-failure contract all
+    # live on `disable_buffer_cache` above; this is one of its four call sites.
+    #
+    # The scope covers the ENTIRE rest of the function, including every early
+    # `raise SystemExit` refusal path, and restores the previous limit on exit.
+    with disable_buffer_cache():
         mx.random.seed(seed)
         cfg = load_config(config_path)
         if precision is not None:
@@ -869,8 +944,150 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
                                              train_steps=train_steps, seed=seed))
         (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
         return meta
+
+
+# --- #298: the double-export guard ----------------------------------------------------
+
+_CHILD_SUFFIX = ".double-export-check"
+
+
+def _child_argv(args, out: str) -> list:
+    """Rebuild this invocation's argv for the second, fresh-process export.
+
+    Built from the parsed namespace rather than sliced out of `sys.argv`, so a flag spelled
+    `--seq=129` or defaulted is reproduced identically either way. `--no-double-export`
+    bounds the recursion to exactly one extra process — an explicit flag, not an env var,
+    so the mechanism is visible in the command the fixture README records.
+    """
+    argv = [sys.executable, str(Path(__file__).resolve()),
+            "--config", args.config, "--out", out,
+            "--batch", str(args.batch), "--seq", str(args.seq),
+            "--gen-steps", str(args.gen_steps), "--seed", str(args.seed),
+            "--quant-group-size", str(args.quant_group_size),
+            "--train-steps", str(args.train_steps),
+            "--no-double-export"]
+    if args.precision is not None:
+        argv += ["--precision", args.precision]
+    if args.vocab_size is not None:
+        argv += ["--vocab-size", str(args.vocab_size)]
+    if args.quant_bits is not None:
+        argv += ["--quant-bits", str(args.quant_bits)]
+    if args.quant_head_bits is not None:
+        argv += ["--quant-head-bits", str(args.quant_head_bits)]
+    if args.packed_doc_lengths is not None:
+        argv += ["--packed-doc-lengths", args.packed_doc_lengths]
+    if args.moe_bias:
+        argv.append("--moe-bias")
+    if args.allow_moe_load_omit:
+        argv.append("--allow-moe-load-omit")
+    return argv
+
+
+def _double_export(args) -> None:
+    """Re-export into a fresh process and refuse to leave `--out` in place unless the two
+    trees are byte-for-byte identical.
+
+    #298 is silent, deterministic-PER-PROCESS corruption: an export that hits it writes a
+    plausible fixture with no error. A second interpreter would have to corrupt identically
+    to agree, so a match is real evidence — while a mismatch means one of the two trees is
+    wrong and there is no way to tell which, so NEITHER may be kept at `--out`.
+
+    On disagreement both trees are preserved (`--out.mismatch-1`, `--out.mismatch-2`) for
+    diagnosis, the per-file verdicts are printed, and the process exits 2. Nothing is left
+    at `--out`, so a corrupted oracle cannot be checked in unnoticed. The same holds if the
+    second export's subprocess itself fails (MLX import error, OOM, non-zero exit, ...): the
+    guard never got to compare, so the first export is unverified and is likewise moved out
+    of `--out` rather than left in place.
+
+    Scope: intra-machine determinism — two processes on ONE host. Cross-machine byte
+    identity is not claimed (see `src/conformance/fixture_digest.py`).
+    """
+    first = Path(args.out)
+    second = Path(str(first) + _CHILD_SUFFIX)
+    if second.exists():
+        shutil.rmtree(second)
+    try:
+        argv = _child_argv(args, str(second))
+        print(f"double-export: re-exporting in a fresh process -> {second}")
+        try:
+            subprocess.run(argv, check=True)
+        except subprocess.CalledProcessError as exc:
+            one = Path(str(first) + ".mismatch-1")
+            if one.exists():
+                shutil.rmtree(one)
+            first.rename(one)
+            partial_note = ""
+            if second.exists():
+                two = Path(str(first) + ".mismatch-2")
+                if two.exists():
+                    shutil.rmtree(two)
+                second.rename(two)
+                partial_note = f" (partial child output kept at {two})"
+            print(f"double-export: the second export subprocess failed ({exc}).\n"
+                  f"  The guard never got to compare, so the first export is unverified — "
+                  f"nothing is left at {first}; it is kept for diagnosis at {one}"
+                  f"{partial_note}.")
+            raise SystemExit(2)
+
+        if args._corrupt_after_first:
+            # Hidden negative control (#298 verification V4): flip one byte in the first
+            # tree so a guard that cannot fail is proven to fail. Never used by the
+            # regeneration commands; argparse.SUPPRESS keeps it out of --help.
+            target = first / args._corrupt_after_first
+            blob = bytearray(target.read_bytes())
+            blob[len(blob) // 2] ^= 0x01
+            target.write_bytes(bytes(blob))
+            print(f"double-export: DEBUG corrupted {target} (negative control)")
+
+        try:
+            verdicts = compare_trees(first, second)
+        except (FileNotFoundError, ValueError) as exc:
+            # compare_trees (via digest_tree) raises rather than returning [] when a tree
+            # is missing/empty (the anti-blind rule) — that is not an "identical" verdict
+            # and not a "mismatch" verdict either, but it is still a case where neither
+            # export is verified, so it gets the same quarantine as a mismatch: nothing
+            # stays at `--out`.
+            one = Path(str(first) + ".mismatch-1")
+            two = Path(str(first) + ".mismatch-2")
+            for stale in (one, two):
+                if stale.exists():
+                    shutil.rmtree(stale)
+            first.rename(one)
+            partial_note = ""
+            if second.exists():
+                second.rename(two)
+                partial_note = f" (second export kept at {two})"
+            print(f"double-export: comparison failed ({exc}).\n"
+                  f"  The guard could not verify agreement, so neither export is "
+                  f"trustworthy — nothing was left at {first}; the first export is kept "
+                  f"for diagnosis at {one}{partial_note}.")
+            raise SystemExit(2)
+        if not verdicts:
+            # compare_trees() already digested (fully hashed) both trees above; count
+            # files via a plain directory walk instead of re-hashing them a second time.
+            n = sum(1 for p in first.rglob("*") if p.is_file())
+            print(f"double-export: {n} files identical across two fresh processes")
+            shutil.rmtree(second)
+            return
+
+        one, two = Path(str(first) + ".mismatch-1"), Path(str(first) + ".mismatch-2")
+        for stale in (one, two):
+            if stale.exists():
+                shutil.rmtree(stale)
+        first.rename(one)
+        second.rename(two)
+        print(f"double-export: MISMATCH — two fresh exports of {first} disagree.\n"
+              f"  This is a #298 sighting (silent MLX 0.32.0 buffer-reuse corruption), "
+              f"not a flake to rerun past.\n"
+              f"  Neither tree is trustworthy, so nothing was left at {first}; both are "
+              f"kept for diagnosis:\n"
+              f"    {one}\n    {two}")
+        for v in verdicts:
+            print(f"  - {v}")
+        raise SystemExit(2)
     finally:
-        mx.set_cache_limit(_prev_cache_limit)
+        if second.exists():
+            shutil.rmtree(second)
 
 
 def main() -> None:
@@ -916,6 +1133,22 @@ def main() -> None:
                         "omit load.{i}/moe_load_layers instead of raising, and record why "
                         "in meta.json's moe_load_omitted_reason — only use after a --seed "
                         "search and --moe-bias have both failed to clear the margin guard")
+    p.add_argument("--double-export", dest="double_export", action="store_true",
+                   default=True,
+                   help="#298 (DEFAULT ON): after writing --out, export a second time in a "
+                        "FRESH process and compare the two trees byte-for-byte. On "
+                        "agreement --out is kept; on disagreement nothing is left at --out "
+                        "and the two trees are preserved as --out.mismatch-1/-2 (exit 2). "
+                        "Guards against MLX 0.32.0's silent, deterministic-per-process "
+                        "buffer-reuse corruption baking a wrong oracle into the Swift gate")
+    p.add_argument("--no-double-export", dest="double_export", action="store_false",
+                   help="skip the #298 second export. Set automatically on the child "
+                        "process; use it by hand for the poc fixture, where CI's "
+                        "poc-fixture-oracle/poc-parity pair already performs the same check "
+                        "across two runners and a local repeat would double a ~571 MB, "
+                        "multi-minute export")
+    p.add_argument("--_corrupt-after-first", dest="_corrupt_after_first", default=None,
+                   help=argparse.SUPPRESS)
     args = p.parse_args()
 
     quant_head_bits = args.quant_head_bits
@@ -929,7 +1162,9 @@ def main() -> None:
                          quant_head_bits=quant_head_bits, train_steps=args.train_steps,
                          packed_doc_lengths=args.packed_doc_lengths,
                          allow_moe_load_omit=args.allow_moe_load_omit)
-    print(f"wrote {args.out}: {json.dumps(meta)}")
+    print(f"wrote {args.out}: {json.dumps(meta)}", flush=True)
+    if args.double_export:
+        _double_export(args)
 
 
 if __name__ == "__main__":

@@ -947,12 +947,22 @@ class MLXMambaModel(ModelInterface, nn.Module):
         for i, (layer, layer_fn) in enumerate(zip(self.layers, self._layer_fns)):
             # Materialize `h` before forking it into two independent consumers
             # (`layer.mixing_matrix(h)` below and `layer_fn(h)`'s own advance). Without
-            # this barrier, this MLX build (0.32.0) has been observed to silently corrupt
-            # a LATER, unrelated call — `prefill(..., last_only=True)` on this same model
-            # two-process-later — even though every value read back from THIS function
-            # is itself correct. Reproduced in isolation and confirmed to disappear with
-            # this barrier; not a tolerance issue, so it is fixed here rather than
-            # loosened at any gate.
+            # this barrier, MLX has been observed to silently corrupt a LATER, unrelated
+            # call — `prefill(..., last_only=True)` on this same model — even though every
+            # value read back from THIS function is itself correct. Not a tolerance issue,
+            # so it is mitigated here rather than loosened at any gate.
+            #
+            # #298 CORRECTION: this barrier REDUCES but does NOT eliminate the corruption.
+            # Measured 2026-08-19 by `scripts/probe_mlx_buffer_reuse.py --pattern mixing
+            # --barrier --trials 40`: still 18/40 corrupt trials on toy.yaml and 20/40 on
+            # toy-moe.yaml (0/40 on toy-hybrid.yaml). The mitigation that actually holds is
+            # `set_cache_limit(0)` ON TOP of this barrier — 0/40 on all three configs, and
+            # on mlx 0.31.2/0.32.0/0.32.1 alike. Every path that writes a checked-in oracle
+            # runs under both (see `scripts/export_parity_fixture.py`'s
+            # `disable_buffer_cache`), but a caller invoking `mixing_matrices` outside the
+            # exporter and its four test modules is NOT protected by this barrier alone.
+            # The defect is upstream and unfixed; see
+            # `docs/design/14-inference-engine.md` §"MLX 0.32.0 buffer reuse (#298)".
             mx.eval(h)
             if not self.config.is_attention_layer(i) and not self.config.is_moe_layer(i):
                 m = layer.mixing_matrix(h).mean(axis=1)    # head-average -> (B,L,L)

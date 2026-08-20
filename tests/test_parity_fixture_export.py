@@ -25,10 +25,10 @@ mx = pytest.importorskip("mlx.core")
 # when many independently-constructed models allocate/free buffers of the same size class
 # within one process — exactly what `build_fixture` (re-invoked below) and the fresh
 # `MLXMambaModel` construction in the route-bias test do inside an already-populated
-# pytest process. Same mitigation as `scripts/export_parity_fixture.py` and
-# `tests/test_mlx_mixing_matrix.py`: disable the buffer-cache pool for this module.
-mx.clear_cache()
-mx.set_cache_limit(0)
+# pytest process. One shared mitigation, defined in `scripts/export_parity_fixture.py`.
+from scripts.export_parity_fixture import disable_buffer_cache_for_process  # noqa: E402
+
+disable_buffer_cache_for_process()
 
 from safetensors.numpy import load_file            # noqa: E402
 
