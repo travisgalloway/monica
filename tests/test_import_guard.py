@@ -59,6 +59,7 @@ PORTABLE_MODULES = [
     "src.data.tool_sft",
     "src.data.sft_data",
     "src.data.sft_loader",
+    "src.data.sft_corpus",
     "src.data.sft_sources",
     "src.data.dpo_data",
     "src.data.dpo_loader",

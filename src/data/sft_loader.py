@@ -22,10 +22,52 @@ from typing import Iterator, List, Optional
 import numpy as np
 
 
+_REQUIRED_KEYS = ("input_ids", "target_ids", "loss_mask")
+
+
+def load_sft_records(jsonl_path: Path) -> List[dict]:
+    """Read one JSONL record file, failing with the path and line number rather than a bare
+    `json.JSONDecodeError` (#306).
+
+    Also rejects a structurally invalid record — a missing key, or three lists whose lengths
+    disagree. A length-mismatched record does not crash: `_collate` right-pads each field
+    independently, so a short `loss_mask` silently shifts the mask off its tokens and the run
+    trains on the prompt. That is exactly the silent-wrong-mask failure the #306 masking criterion
+    exists to prevent, so it is caught at load.
+    """
+    path = Path(jsonl_path)
+    records: List[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno}: malformed SFT record: {exc}") from exc
+            if not isinstance(rec, dict) or any(k not in rec for k in _REQUIRED_KEYS):
+                missing = [k for k in _REQUIRED_KEYS
+                           if not isinstance(rec, dict) or k not in rec]
+                raise ValueError(f"{path}:{lineno}: SFT record is missing {missing} "
+                                 f"(expected {list(_REQUIRED_KEYS)})")
+            lengths = {k: len(rec[k]) for k in _REQUIRED_KEYS}
+            if len(set(lengths.values())) != 1:
+                raise ValueError(f"{path}:{lineno}: SFT record field lengths disagree "
+                                 f"({lengths}) — the loss mask would not line up with its tokens.")
+            records.append(rec)
+    if not records:
+        raise ValueError(f"no SFT records in {path}")
+    return records
+
+
 class SFTLoader:
     def __init__(self, jsonl_path: Path, seq_len: int, batch_size: int, *,
                  pad_id: int = 0, shuffle: bool = True, seed: int = 0,
-                 drop_last: bool = True, vocab_size: Optional[int] = None):
+                 drop_last: bool = True, vocab_size: Optional[int] = None,
+                 records: Optional[List[dict]] = None):
+        """`records` (#306) supplies an already-loaded, already-validated record list — the
+        `src.data.sft_corpus` resolver hands over its train/val split in memory instead of
+        writing temp files. `jsonl_path` is then only a label for error messages."""
         self.path = Path(jsonl_path)
         self.seq_len = seq_len           # loop.train reads this for tokens/step
         self.batch_size = batch_size
@@ -34,10 +76,12 @@ class SFTLoader:
         self.drop_last = drop_last
         self.vocab_size = vocab_size
         self.rng = np.random.default_rng(seed)
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.records = [json.loads(line) for line in f if line.strip()]
-        if not self.records:
-            raise ValueError(f"no SFT records in {self.path}")
+        if records is not None:
+            self.records = list(records)
+            if not self.records:
+                raise ValueError(f"no SFT records supplied for {self.path}")
+        else:
+            self.records = load_sft_records(self.path)
 
     def __len__(self) -> int:
         n = len(self.records)
