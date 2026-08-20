@@ -66,10 +66,14 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   runners. Legitimate hardware gating, recorded so the coverage claim is not mistaken for
   automation. Found during `/closure-audit` pass C. Severity: structural, non-blocking.
 
-- [2026-08-18] `src/eval/external_sets.py`, only the MultiPL-E entries carry `repo_verified=True`;
+- [2026-08-18] ~~`src/eval/external_sets.py`, only the MultiPL-E entries carry `repo_verified=True`;
   the SAFIM / CrossCodeEval / RepoBench / MCEval `hf_repo`/`config` identifiers are best-known
   guesses that must be confirmed at pin time. Distinct from the missing revision pins themselves,
-  which are ticketed. Found during `/closure-audit` pass B. Severity: correctness risk, deferred.
+  which are ticketed. Found during `/closure-audit` pass B. Severity: correctness risk, deferred.~~
+  **RESOLVED by #304** (2026-08-20): the guesses were wrong — two `hf_repo` ids returned 401, one
+  was an unloadable script dataset, and two `config=None` values were invalid. All seven
+  identifiers are now confirmed against the live hub, `repo_verified=True` everywhere, with the
+  method and date in each entry's `note`.
 
 - [2026-08-18] `/closure-audit` pass A left two sub-checks **UNAUDITED** rather than reporting a
   false clean: per-field consumer verification of `MambaConfig`'s ~25 fields in
@@ -153,3 +157,23 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   syntax/expression errors are only caught by GitHub at dispatch time. Found while splitting
   `ci.yml` for #302 (a move of 383 lines of YAML with no local schema gate). Severity: CI
   tooling, non-blocking.
+
+- [2026-08-20] ~~`src/eval/external_sets.py:238` (`normalize_repobench`), the row `id` is
+  `f"{repo_name}::{file_path}"`, which is not unique: a live `cross_file_first` pull yields 8033
+  rows carrying only 4588 distinct ids, because RepoBench v1.1 has several completion points per
+  file. Anything that keys results by `id` would silently collapse them. Found while pinning the
+  external suites for #304. Severity: correctness risk in downstream scoring, non-blocking here.~~
+  **RESOLVED by #304** (2026-08-20): the id now folds in `token_num` and `gold_snippet_index` —
+  both stable per-row disambiguators present on every upstream row — and both are required by
+  `_require(...)` so schema drift on either field is caught rather than silently degrading back
+  to a colliding id. Confirmed against a live pull: 8033 rows now carry 8020 distinct ids (was
+  4588). The 13 residual collisions are duplicate rows *upstream* — byte-identical `prompt` and
+  `answer` — so no distinct instance is collapsed; the id is a faithful instance key, not a
+  literally-unique row key.
+
+- [2026-08-20] `scripts/build_decontam_blocklist.py:138`, the `--min-words` filter (default 13)
+  drops every text from `external:safim`, `external:repobench` and `external:real-fim-eval` in
+  fixture mode — three of the seven external sources contribute 0 lines to the blocklist. Verified
+  identical on `main`, so it predates #304, but it means those suites are not actually
+  decontaminated against. Found while checking the #304 fixture rewrite lost no texts. Severity:
+  contamination risk, non-blocking.

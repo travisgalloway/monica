@@ -233,15 +233,27 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
 > Type-aware completion (`tsc`) was **not** rebuilt — `TscRunner`/`CompositeOracle` already
 > implement it, and `--suites tsc` only surfaces their verdicts in the shared schema.
 >
-> **Two gaps stated rather than papered over.**
+> **One gap stated rather than papered over, and one closed (#304).**
 >
-> 1. **The seven external revisions are unpinned.** An HF commit SHA cannot be resolved without
->    network access, and inventing one is worse than not having one — a wrong pin silently loads a
->    different revision or errors far from its cause. So the table ships `revision=None` with a
->    `# TODO(pin):` per entry, a live pull **raises** while unpinned, and every `None` is echoed
->    into the driver's results JSON. Only the MultiPL-E repo identifiers were confirmable offline
->    (`repo_verified`); the rest must be checked at pin time. Fixtures are synthetic,
->    schema-shaped rows — **no third-party benchmark data is checked in**.
+> 1. **The seven external suites are pinned and all seven load (#304).** Every entry carries a real
+>    40-hex HF commit SHA, resolved against the live hub on 2026-08-20 unauthenticated; none of the
+>    seven is gated, so no credential is needed and none is committed. All seven were **pulled
+>    live** and normalized end-to-end (row counts and SHAs in `eval_sets/external/README.md`).
+>    Filling the pins was the smaller half of the job: **five of the seven adapters were wrong the
+>    first time they met real data** — SAFIM has no `suffix` column (the hole is `{{completion}}`
+>    inside `eval_prompt`), McEval has no `language` column, RepoBench v1.1's `context` is a *list
+>    of structs* rather than a string, and two `hf_repo` ids were 401s. `_norm` now type-checks the
+>    normalized row, which is what stops a struct-valued column passing a presence-only check and
+>    emitting a non-string prompt. Fixtures were re-authored to the real schemas and stay synthetic
+>    — **no third-party benchmark data is checked in**. Four identifiers changed and each records
+>    why; two measurement caveats are recorded rather than smoothed over: **CrossCodeEval has no
+>    official HF dataset**, so a third-party mirror is pinned (verified by file-tree match against
+>    the official release layout and by row count, 3356 = the published TypeScript instance count),
+>    and **RepoBench v1.1 is Python/Java only**, so that row measures cross-file recall in Python,
+>    not in M12's target language. The unpinned-pull guard stays and is proven against a synthetic
+>    unpinned entry; a *stale* pin now fails by name rather than as an opaque `datasets` traceback.
+>    Live pulls are covered by an **opt-in** test (`MONICA_EXTERNAL_LIVE=1`), deliberately not
+>    wired into any CI job — CI's contract is the offline fixture path.
 > 2. **Packed shards carry no domain/language field**, so per-domain BPB comes from purpose-built
 >    per-domain val sets (`scripts/build_domain_val_sets.py`, reading the cleaned Parquet where
 >    `source`/`lang`/`meta` still exist) rather than from the training corpus. That is a different

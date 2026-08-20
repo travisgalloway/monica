@@ -97,7 +97,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | EVAL-1 | A person can measure val loss and BPB, overall and per domain | done | done | done | n/a | Shipped | — | design/06 |
 | EVAL-2 | A person can run the OLMES benchmark suite | done | done | n/a | n/a | Shipped | — | design/06 |
 | EVAL-3 | A person can probe long-context behaviour | done | done | n/a | n/a | Shipped | — | design/06 |
-| EVAL-4 | A person can evaluate against the real external code suites | done | n/a | n/a | n/a | In progress | #304 | design/13 |
+| EVAL-4 | A person can evaluate against the real external code suites | done | n/a | n/a | n/a | Shipped | #304 | design/13 |
 | EVAL-5 | A person can evaluate FIM infilling | done | done | n/a | n/a | Shipped | — | design/13 |
 | EVAL-6 | A person can measure code recall and cross-file needle retrieval | done | done | n/a | n/a | Shipped | #217 | design/13 |
 | EVAL-7 | A person can run synthetic retrieval probes | done | done | n/a | n/a | Shipped | — | design/06 |
