@@ -15,6 +15,7 @@ network are involved.
 import argparse
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -138,10 +139,13 @@ def test_the_config_echo_records_the_run_identity(offline_run):
     assert cfg["seed"] == 0 and cfg["temperature"] == 0.0
     assert cfg["tokenizer"]["kind"] == "byte"
     assert cfg["model"]["kind"] == "stub" and "NOT quality numbers" in cfg["model"]["warning"]
-    # The external manifest (including every null revision) rides in the results, so an
-    # unpinned run is visible in its own output.
-    revisions = results["sources"]["external"]["sets"]
-    assert set(revisions) and all(v["revision"] is None for v in revisions.values())
+    # The external manifest rides in the results, so the exact pin a run measured against is
+    # visible in its own output rather than only in src/eval/external_sets.py. #304 filled
+    # every revision; an entry that ever loses its pin shows up here as a null.
+    sets = results["sources"]["external"]["sets"]
+    assert set(sets)
+    assert all(re.fullmatch(r"[0-9a-f]{40}", v["revision"] or "") for v in sets.values())
+    assert all(v["pinned"] is True for v in sets.values())
 
 
 def test_fim_reports_both_keyings_from_one_run(offline_run):

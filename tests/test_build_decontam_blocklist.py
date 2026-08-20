@@ -8,6 +8,7 @@ file actually written.
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -78,10 +79,11 @@ def test_manifest_sha256_matches_the_file_it_describes(tmp_path):
     assert manifest["sha256"] == sha256_file(out)
     assert manifest["n_lines"] == len(out.read_text().splitlines())
     assert manifest["allow_network"] is False
-    # Each external source records its pin status, so an unpinned build is visible in the
-    # artifact itself rather than only in the source table.
+    # Each external source records its pin status, so the exact revision a build drew on —
+    # or the fact that it used the offline fixture instead — is visible in the artifact
+    # itself rather than only in the source table (#304 filled every pin).
     assert manifest["sources"]["external:safim"]["fixture_only"] is True
-    assert manifest["sources"]["external:safim"]["revision"] is None
+    assert re.fullmatch(r"[0-9a-f]{40}", manifest["sources"]["external:safim"]["revision"])
 
 
 def test_min_words_drops_texts_too_short_to_ever_match(tmp_path):
