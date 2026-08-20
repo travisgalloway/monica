@@ -399,6 +399,25 @@ def test_retained_ids_and_depth_follow_eviction():
         history.rewind_turns(3)
 
 
+def test_committed_bookkeeping_does_not_outgrow_the_evicted_tree():
+    """`_committed` must stay pruned to what the tree retains, not just filtered on read.
+
+    The tree is LRU-capped at `max_depth`, so a long-lived session commits far more turns
+    than it retains. `retained_ids()` has always filtered `_committed` through tree
+    membership, which makes the *symptom* invisible — but `_committed` itself grew by one
+    entry per commit forever unless it is pruned on write, too.
+    """
+    store, history = _history(max_depth=3)
+    for token in range(50):
+        store.step("s1", token + 1)
+        history.commit_turn()
+    assert len(history) == 3
+    # The private list backing retained_ids() must itself be bounded, not just its filtered
+    # view — otherwise 50 commits leaves 50 stale ids sitting in memory forever.
+    assert len(history._committed) == 3
+    assert history._committed == history.retained_ids()
+
+
 def test_budget_bytes_is_max_depth_times_the_per_session_state():
     store, history = _history(max_depth=6)
     assert history.per_node_bytes() == per_session_state_bytes(store.model.config)

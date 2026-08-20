@@ -186,6 +186,23 @@ def test_rewind_with_nothing_committed_restores_the_root_and_says_so():
                           np.asarray(repl.model.init_state(1)))
 
 
+def test_rewind_multiple_at_root_reports_over_deep_not_empty():
+    """`/rewind 2` at the root asks for a specific hop count that doesn't exist.
+
+    It must get the precise "cannot rewind 2 turn(s) ... at most 0 rewind hop(s)" error
+    (matching `test_over_deep_rewind_errors_and_leaves_the_session_untouched`'s pattern), not
+    be collapsed into the generic "session is empty" message that only the bare `/rewind`
+    (count 1) default gets.
+    """
+    repl = ScriptedRepl(["/rewind 2"]).run()
+    assert "session is empty" not in repl.chrome
+    assert "cannot rewind 2 turn(s)" in repl.chrome
+    assert "at most 0 rewind hop(s) are possible" in repl.chrome
+    # A rejected rewind must leave the session untouched, same as any other over-deep rewind.
+    assert np.array_equal(np.asarray(repl.store.get_state(repl.sid)),
+                          np.asarray(repl.model.init_state(1)))
+
+
 @pytest.mark.parametrize("argument", ["0", "-1"])
 def test_rewind_non_positive_count_is_rejected(argument):
     repl = ScriptedRepl([LINE_A, LINE_X, f"/rewind {argument}"]).run()

@@ -256,12 +256,12 @@ $ printf 'the cat\n/tree\nsat down\n/rewind 1\nran away\n/tree\n/rewind 99\n/fro
         --interactive --temperature 0 --max-new-tokens 20 --rewind-depth 8
 
 rewind: up to 8 retained turn boundaries, at most 155648 bytes (8 x 19456 B/snapshot).
->>> the cat        -> tttttttttttttttttttt      [committed #1; depth 2, 2 retained]
+>>> the cat        -> tttttttttttttttttttt      [committed #1; depth 2, 2/8 retained]
 >>> /tree            #0 parent=None children=[1]   '(start)'
                    * #1 parent=0    children=[]    'the cattttttttttttttttttttt'
->>> sat down       -> nnnnnnnnnnnnnnnnnnnn      [committed #2; depth 3, 3 retained]
+>>> sat down       -> nnnnnnnnnnnnnnnnnnnn      [committed #2; depth 3, 3/8 retained]
 >>> /rewind 1      rewound to #1 (depth 2)      <- back to the boundary after "the cat"
->>> ran away       -> yyyyyyyyyyyyyyyyyyyy      [committed #3]  <- a DIFFERENT continuation
+>>> ran away       -> yyyyyyyyyyyyyyyyyyyy      [committed #3; depth 3, 4/8 retained]  <- a DIFFERENT continuation
 >>> /tree            #1 parent=0 children=[2, 3]   <- the branch point now has two children
 >>> /rewind 99     error: cannot rewind 99 turn(s): session 'repl' retains 3 boundary/
                    boundaries including the current one, so at most 2 rewind hop(s) are
@@ -279,8 +279,11 @@ arithmetic: `--rewind-depth x per_session_state_bytes(config)`, printed at start
 scale that is `8 x 19456 B = 152 KiB`; at `config/poc.yaml` one snapshot is
 `n_layers x ((d_conv-1) x d_inner + n_heads x head_dim x d_state) x 4 B`
 (fp32-charged, the conservative direction), and the default depth 32 caps the tree at 32 of
-them. Nothing grows with conversation length — that is the whole point of an SSM state, and why
-`RewindTree` needs no paged-attention or radix-cache machinery.
+them. The retained **state snapshots** are flat in conversation length — that is the whole point
+of an SSM state, and why `RewindTree` needs no paged-attention or radix-cache machinery. The REPL
+also keeps a small amount of its own bookkeeping alongside the state (transcript text for `/tree`,
+committed-id order) — LRU-pruned to the same retained set on every commit, so it stays bounded by
+`--rewind-depth` too, but it is not literally nothing.
 
 **Rewinds count *retained* boundaries, not wall-clock turns.** When the LRU cap evicts a node,
 its children are reparented onto its grandparent so deeper branches survive, which means one

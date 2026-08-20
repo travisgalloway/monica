@@ -115,9 +115,18 @@ def interactive_repl(
     cases fall back to `prefill=False` — `SessionStore.prefill` refuses them by design.
 
     The displayed transcript (`node id -> text`) lives here, not in `SessionHistory`: the
-    tree holds opaque `State` blobs and text is a presentation concern.
+    tree holds opaque `State` blobs and text is a presentation concern. It is pruned to the
+    tree's own retained ids on every commit so it stays bounded by `--rewind-depth` too —
+    `RewindTree` evicts nodes but never tells this dict, so without pruning `transcript` would
+    grow without bound over a long-lived session even though the state it describes does not.
     """
     transcript: dict[int, str] = {}
+
+    def _prune_transcript() -> None:
+        retained = set(history.retained_ids())
+        for stale in [node_id for node_id in transcript if node_id not in retained]:
+            del transcript[stale]
+
     if rewind_enabled:
         if history is None:
             raise ValueError("rewind_enabled=True requires a SessionHistory")
@@ -145,6 +154,7 @@ def interactive_repl(
             if rewind_enabled:
                 node_id = history.commit_turn()
                 transcript[node_id] = text + out
+                _prune_transcript()
                 emit(f"[committed #{node_id}; depth {history.depth()}, "
                      f"{len(history)}/{history.max_depth} retained]")
             continue
@@ -185,9 +195,15 @@ def interactive_repl(
                     command_args[0] if command_args else "1")
                 if absolute:
                     target = history.rewind_to(count)
-                elif count >= 1 and history.depth() <= 1:
-                    # DoD 6b: nothing committed beyond the root. Restore the root (a real
-                    # set_state, not a no-op) and say why there is nothing to rewind past.
+                elif count == 1 and history.depth() <= 1:
+                    # DoD 6b: nothing committed beyond the root, and the default `/rewind`
+                    # (count 1) asked for exactly the one hop that doesn't exist. Restore the
+                    # root (a real set_state, not a no-op) and say why there is nothing to
+                    # rewind past. A larger count (e.g. `/rewind 2` at the root) falls through
+                    # to `rewind_turns` below instead, so it gets the precise "cannot rewind N
+                    # turn(s) ... at most 0 rewind hop(s) are possible" error rather than being
+                    # collapsed into this same message regardless of how far past the root it
+                    # asked to go.
                     target = history.rewind_to(history.current())
                     emit("session is empty — you are at the root (turn 0); there is no "
                          "earlier boundary to rewind past. Restored the root state.")

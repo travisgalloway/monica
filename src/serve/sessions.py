@@ -248,6 +248,12 @@ class SessionHistory:
     def commit_turn(self) -> int:
         """Snapshot the live session as a turn boundary. Returns the new node id."""
         node_id = self.tree.commit(self.store.get_state(self.session_id))
+        # Drop ids the tree has already evicted before appending the new one, so `_committed`
+        # stays bounded by `max_depth` too. The tree is LRU-capped; without this the id list
+        # would grow without bound over a long-lived session even though the tree itself
+        # never does — `retained_ids()` masked the leak by filtering on every read, but never
+        # freed the stale entries themselves.
+        self._committed = self.retained_ids()
         self._committed.append(node_id)
         return node_id
 
