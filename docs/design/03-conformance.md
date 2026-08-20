@@ -46,7 +46,8 @@ backend. From
 It loads identical [portable weights](05-training.md) into each backend (the seam's
 `save`/`load`), then compares. Because the CUDA backend is **pure PyTorch and runs on
 CPU**, this is runnable entirely on a Mac (mlx + torch-CPU both present) — no GPU
-required. `tests/test_backend_parity.py` exercises it on the toy config, and also tests
+required, which is why CI can gate it (see [Status](#status)).
+`tests/test_backend_parity.py` exercises it on the toy config, and also tests
 the **portable-weights round-trip in both directions** (MLX → safetensors → torch →
 safetensors → MLX, logits unchanged), which is what lets a CUDA-trained model come back
 to the Mac. The only layout subtlety is the depthwise-conv weight: the portable format
@@ -133,10 +134,29 @@ portable, no MLX, runs on the Linux CI job.
 
 `forward_step_parity` is active and passing on both backends (MLX, and the pure-PyTorch
 CUDA backend on torch-CPU). `backend_parity` is implemented and exercised by
-`tests/test_backend_parity.py`; the cross-backend cases need both backends present, so
-they **skip cleanly** on a single-backend host (e.g. a Linux/CUDA box without mlx, or a
-Mac without torch) and run in full on a Mac with torch-CPU installed.
-`doc_boundary_parity` is implemented and has its own dedicated tests.
+`tests/test_backend_parity.py`. `doc_boundary_parity` is implemented and has its own
+dedicated tests.
+
+**Cross-backend parity is automated (#303).** The `full-macos` job in
+`.github/workflows/ci.yml` installs `.[dev,data,mlx,cuda]` — on macOS arm64 the PyPI
+`torch` wheel is CPU-only, which is precisely the surface above — and runs a dedicated
+step with `MONICA_REQUIRE_BOTH_BACKENDS=1`. Under that flag the five cross-backend tests
+carry **no skip marker**, so a missing backend raises ImportError and the step goes red;
+`test_designated_job_has_both_backends` says the same thing up front with a message
+naming the cause, and pytest's exit code 5 catches the file disappearing. Nothing outside
+that job can police the flag, so `tests/test_ci_backend_matrix.py` parses `ci.yml` and
+asserts exactly one job declares it, that it is `full-macos` on a `macos-*` runner
+installing both extras — portable, so it runs on the Linux `portable` job.
+
+Skipping remains the behaviour everywhere else, and that is correct: a Linux/CUDA box has
+no mlx wheel, a Mac without torch has no second backend. In particular the Linux
+`cuda-cpu` job runs `tests/test_backend_parity.py` and still skips 5 of its 6 tests —
+only the torch-against-itself harness self-check executes there, so **`cuda-cpu` green is
+not evidence of cross-backend parity**.
+
+What the gate does *not* cover: it compares at **toy scale in fp32** (`config/toy.yaml`
+and friends, `B=2, L=24`) against **torch on CPU**. Real-GPU CUDA kernels and poc-scale
+shapes are compared by no job.
 
 ## Related
 
