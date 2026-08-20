@@ -111,7 +111,13 @@ RoPE'd K/V produced by the sequence forward; MoE layers contribute the stateless
 > **The constant-size state is what makes all four levers cheap.** No paged attention, no radix
 > cache, and turn-boundary snapshot/undo rides the same opaque blob — `RewindTree`
 > (`src/serve/rewind.py:42`) snapshots a **fixed-size** `State`, not a cache that grows with the
-> conversation.
+> conversation. **Composition point and entry point (#305):** `SessionHistory`
+> (`src/serve/sessions.py`) joins `SessionStore` to `RewindTree` — `commit_turn` is
+> `tree.commit(store.get_state(...))`, `rewind_to` is `store.set_state(..., tree.rewind(...))` —
+> and `scripts/generate.py --interactive` is the stateful continuation REPL a person types
+> (`/rewind`, `/tree`, `/help`, sized by `--rewind-depth`). Turns after the first, and every turn
+> after a rewind, call `serve.generate.generate(..., prefill=False)`, because `SessionStore.prefill`
+> is fresh-session-only and a restored snapshot's position is unknowable above the seam.
 
 ## Quantization (#168)
 

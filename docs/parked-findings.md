@@ -177,3 +177,10 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   identical on `main`, so it predates #304, but it means those suites are not actually
   decontaminated against. Found while checking the #304 fixture rewrite lost no texts. Severity:
   contamination risk, non-blocking.
+
+- [2026-08-20] `src/serve/rewind.py:49`, `RewindTree` exposes `__contains__`/`__len__` but no
+  public way to enumerate its retained node ids — `_nodes` is the only source. `SessionHistory`
+  (#305) therefore keeps its own commit-order list and filters it through `__contains__`, which
+  works but duplicates bookkeeping the tree already has and would silently drift if anything ever
+  committed to the tree without going through `SessionHistory`. Found while wiring the rewind
+  entry point for #305. Severity: minor API gap, non-blocking.

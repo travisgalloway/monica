@@ -199,8 +199,9 @@ by our own model) can be produced with
 
 ## 4. Serve & chat
 
-[`scripts/generate.py`](../scripts/generate.py) is the CLI front-end (completion + interactive
-chat). It needs trained `--weights`; without them it random-inits and emits gibberish.
+[`scripts/generate.py`](../scripts/generate.py) is the CLI front-end: completion, an
+instruction-template chat REPL, and a **stateful, rewindable** continuation REPL. It needs
+trained `--weights`; without them it random-inits and emits gibberish.
 
 **Completion** — continue a prompt (streams token-by-token):
 
@@ -222,11 +223,79 @@ Each chat line is wrapped in the **same instruction template the model was train
 ([`src/data/instruct_format.py`](../src/data/instruct_format.py)), and generation stops at the
 next `### Instruction:` marker or end-of-text.
 
+`--chat` is **stateless by construction** — a fresh session per turn, whole transcript
+re-rendered — so it has no rewind. For that, use `--interactive` below.
+
+**Interactive** — one stateful session for the whole run, with rewind and branching (#305):
+
+```bash
+.venv/bin/python scripts/generate.py \
+    --config config/poc.yaml --weights runs/poc/weights.safetensors \
+    --interactive --temperature 0 --rewind-depth 8
+```
+
+Each line you type **extends the live session** (no re-prefill of the transcript — the prompt
+goes through `step`, because `SessionStore.prefill` is fresh-session-only), and every completed
+exchange is committed to a
+[`RewindTree`](../src/serve/rewind.py) as a turn boundary. In-REPL commands:
+
+| Command | Effect |
+|---|---|
+| `<text>` | Continue the session; the turn is committed as a rewind boundary |
+| `/rewind [n]` | Rewind `n` retained boundaries (default 1) and branch there |
+| `/rewind #<id>` | Rewind to an absolute node id, as printed by `/tree` |
+| `/tree` | Retained boundaries: id, parent, children, `*` marks the current node |
+| `/help`, `/quit` | Command list; leave (Ctrl-D works too) |
+
+An annotated transcript — commit, branch, rewind, and a *different* continuation from the same
+prefix (toy scale, greedy, no weights, so the text itself is gibberish):
+
+```
+$ printf 'the cat\n/tree\nsat down\n/rewind 1\nran away\n/tree\n/rewind 99\n/frobnicate\n/quit\n' \
+    | .venv/bin/python scripts/generate.py --config config/toy.yaml --byte-fallback \
+        --interactive --temperature 0 --max-new-tokens 20 --rewind-depth 8
+
+rewind: up to 8 retained turn boundaries, at most 155648 bytes (8 x 19456 B/snapshot).
+>>> the cat        -> tttttttttttttttttttt      [committed #1; depth 2, 2/8 retained]
+>>> /tree            #0 parent=None children=[1]   '(start)'
+                   * #1 parent=0    children=[]    'the cattttttttttttttttttttt'
+>>> sat down       -> nnnnnnnnnnnnnnnnnnnn      [committed #2; depth 3, 3/8 retained]
+>>> /rewind 1      rewound to #1 (depth 2)      <- back to the boundary after "the cat"
+>>> ran away       -> yyyyyyyyyyyyyyyyyyyy      [committed #3; depth 3, 4/8 retained]  <- a DIFFERENT continuation
+>>> /tree            #1 parent=0 children=[2, 3]   <- the branch point now has two children
+>>> /rewind 99     error: cannot rewind 99 turn(s): session 'repl' retains 3 boundary/
+                   boundaries including the current one, so at most 2 rewind hop(s) are
+                   possible (retained ids: [0, 1, 2, 3])
+>>> /frobnicate    error: unknown command '/frobnicate' — /help lists the commands. It was
+                   NOT sent to the model.
+```
+
+Rewinding to the same boundary and re-typing the *same* line reproduces that continuation
+byte-for-byte under `--temperature 0`; that identity is what
+`tests/test_rewind_entry_point.py::test_rewound_branch_matches_direct_generation` asserts.
+
+**Memory.** Snapshots are the fixed-size recurrent state, so the tree's ceiling is flat
+arithmetic: `--rewind-depth x per_session_state_bytes(config)`, printed at startup. At toy
+scale that is `8 x 19456 B = 152 KiB`; at `config/poc.yaml` one snapshot is
+`n_layers x ((d_conv-1) x d_inner + n_heads x head_dim x d_state) x 4 B`
+(fp32-charged, the conservative direction), and the default depth 32 caps the tree at 32 of
+them. The retained **state snapshots** are flat in conversation length — that is the whole point
+of an SSM state, and why `RewindTree` needs no paged-attention or radix-cache machinery. The REPL
+also keeps a small amount of its own bookkeeping alongside the state (transcript text for `/tree`,
+committed-id order) — LRU-pruned to the same retained set on every commit, so it stays bounded by
+`--rewind-depth` too, but it is not literally nothing.
+
+**Rewinds count *retained* boundaries, not wall-clock turns.** When the LRU cap evicts a node,
+its children are reparented onto its grandparent so deeper branches survive, which means one
+"parent hop" can skip a turn that no longer exists. Asking for more hops than exist is an error
+naming the available depth — it never clamps to the root.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config` | `config/poc.yaml` | Model config (must match the weights) |
 | `--weights` | — (random init) | Path to a `.safetensors` checkpoint |
-| `--prompt "…"` / `--chat` | — | Completion prompt **or** chat REPL (one required) |
+| `--prompt "…"` / `--chat` / `--interactive` | — | Completion prompt, chat REPL, **or** stateful rewindable REPL (exactly one required) |
+| `--rewind-depth` | 32 | `--interactive` only: retained turn boundaries (LRU-capped); `0` disables rewind, negative is an error |
 | `--max-new-tokens` | 100 | Max tokens to generate |
 | `--temperature` | 0.8 | 0 = greedy/deterministic; higher = more random |
 | `--top-k` / `--top-p` | none | Top-k / nucleus filtering (e.g. `--top-p 0.9`) |
@@ -270,10 +339,26 @@ out = generate(store, "user1", ids,
 print(tok.decode(out))
 ```
 
-`SessionStore` holds each conversation's recurrent state with bounded memory; `RewindTree`
-([`src/serve/rewind.py`](../src/serve/rewind.py)) snapshots/undoes turns and branches history —
-the "experimental snapshotting" the SSM's small fixed-size state makes cheap. Both are portable,
-so the same code runs unchanged on the CUDA backend.
+`SessionStore` holds each conversation's recurrent state with bounded memory;
+`SessionHistory` ([`src/serve/sessions.py`](../src/serve/sessions.py)) composes it with
+`RewindTree` ([`src/serve/rewind.py`](../src/serve/rewind.py)) to snapshot/undo turns and branch
+history — the "experimental snapshotting" the SSM's small fixed-size state makes cheap. That
+composition is exactly what `--interactive` drives:
+
+```python
+from src.serve.sessions import SessionHistory
+
+history = SessionHistory(store, "user1", max_depth=32)
+history.commit_turn()                  # snapshot this turn boundary (get_state -> tree)
+out = generate(store, "user1", ids, ..., prefill=False)   # extend the LIVE session
+history.commit_turn()
+history.rewind_turns(1)                # tree -> set_state: back to the previous boundary
+```
+
+`prefill=False` is required for turns after the first and after every rewind: `store.prefill`
+seeds attention RoPE from position 0 and refuses a session that has consumed tokens or been
+restored from a snapshot. All three modules are portable, so the same code runs unchanged on the
+CUDA backend.
 
 ---
 

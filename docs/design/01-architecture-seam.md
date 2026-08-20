@@ -67,7 +67,11 @@ From `src/model/interface.py`:
 (`serve/sessions`, `serve/rewind`) holds many states at once and snapshots them at turn
 boundaries. On an immutable-array backend (MLX) a structural copy suffices; a backend whose
 `step` mutates buffers in place **must** deep-copy here, or a retained snapshot silently
-aliases a later step.
+aliases a later step. The two modules are joined by `SessionHistory`
+(`src/serve/sessions.py`, #305) — the composition point where a turn boundary is snapshotted
+into `RewindTree` and restored back through `SessionStore.set_state` — and driven from
+`scripts/generate.py --interactive`, the rewindable continuation REPL. Both stay above the seam:
+they pass the opaque `State` through and never inspect it.
 
 The two compute paths (`forward` and `step`) are separate implementations that must
 produce identical logits — enforced by [conformance](03-conformance.md).
