@@ -22,6 +22,11 @@ module per arm:
   with a fake `os.pipe()` transport (no subprocess) since the demux is the hard part.
 - `ts_lsp.py` — a persistent `typescript-language-server` oracle (incremental,
   open-document checking, replacing per-call batch `tsc` compiles).
+- `ts_server_direct.py` — a SECOND transport to the same pinned TypeScript (#279),
+  speaking **tsserver's own protocol** (`semanticDiagnosticsSync`) instead of LSP, so
+  the ~350ms client-side debounce inside `typescript-language-server` 5.3.0 (#278) is
+  not on the path: 19.7ms median vs 377ms, bit-identical diagnostics over the whole
+  #194 set. Diagnostics only; `ts_service.py` stays the LSP-conformant client.
 - `opengrep.py` — a persistent `opengrep lsp` oracle carrying a custom, frozen
   correctness ruleset (`eval_sets/opengrep_rules/`) targeting syntactic bug idioms a
   type checker can't see; experimental (see its module docstring's residual-risk

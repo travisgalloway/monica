@@ -22,8 +22,18 @@ never answer -- and reports `nonempty_rate: 0.0` for a reason that has
 nothing to do with correctness (exactly what #277's run did). `--edit-file-lines`
 pads the edited document to N lines before each edit -- the only input to the
 5.3.0 debounce clamp (`cli.mjs:17868`); see `scripts/probe_ts_lsp_debounce.py`
-and #279 for the debounce itself, which this bench does not attempt to work
-around.
+for the debounce itself.
+
+**Third column: `diagnostics_direct` (#279).** The same edit -> re-check cycle,
+on the same generated project and the same introduce/revert target rotation,
+driven through `src/lsp/ts_server_direct.py`'s `TsServerDirect` -- which speaks
+tsserver's own protocol and asks `semanticDiagnosticsSync` synchronously, so
+neither client-side timer exists on its path. Reported alongside, never
+instead of, the LSP column: `verdict` keeps its meaning (the LSP-conformant
+client, the #277/#278 record), and `verdict_direct` is the counterfactual the
+same `_verdict` function computes from the direct median. Skipped with a
+printed reason -- never a zero -- when no local `typescript` install is
+resolvable.
 
     # Fast smoke first, to shake out protocol shape before the 5k run:
     .venv/bin/python scripts/bench_ts_lsp.py --n-files 50 --warmup 3 --iters 20
@@ -75,6 +85,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.lsp.tsc import SET_DIR  # noqa: E402
 from src.lsp.ts_lsp import resolve_ts_lsp  # noqa: E402
+from src.lsp.ts_server_direct import TsServerDirect, resolve_tsserver  # noqa: E402
 from src.lsp.ts_service import TsLspService  # noqa: E402
 
 _HUB_PATH = "src/hub.ts"
@@ -243,6 +254,26 @@ def _sanity_probe(service: TsLspService, files: Dict[str, str]) -> dict:
     return {"ok": not failed, "checks": checks, "failed": failed}
 
 
+def _sanity_probe_direct(direct: TsServerDirect, files: Dict[str, str]) -> dict:
+    """The same BLIND guard for the #279 column. A direct client wired to a
+    project it cannot actually type-check would answer `[]` in ~2ms on every
+    iteration and read as a spectacular win -- the exact failure shape this
+    whole file exists to refuse. `diagnostics` is the only op this transport
+    implements, so the probe is the introduce/revert pair and nothing else."""
+    target = _mod_path(1)
+    mod_text = files[target]
+    checks: Dict[str, bool] = {}
+
+    direct.update(target, _broken_variant(mod_text, 0))
+    checks["diagnostics_detects_break"] = any(
+        d.code == "TS2339" for d in direct.diagnostics(target))
+    direct.update(target, mod_text)   # revert
+    checks["diagnostics_clean_after_revert"] = direct.diagnostics(target) == []
+
+    failed = sorted(k for k, v in checks.items() if not v)
+    return {"ok": not failed, "checks": checks, "failed": failed}
+
+
 # --------------------------------------------------------------------------- #
 # Measurement
 # --------------------------------------------------------------------------- #
@@ -310,7 +341,8 @@ def _measure_op(op_name: str, fn: Callable, targets: List[Tuple], *,
     return summary
 
 
-def _run_measurements(service: TsLspService, files: Dict[str, str], args) -> Dict[str, dict]:
+def _run_measurements(service: TsLspService, files: Dict[str, str], args,
+                      direct: Optional[TsServerDirect] = None) -> Dict[str, dict]:
     mod_paths = [_mod_path(i) for i in range(1, args.n_files)]
     hub_text = files[_HUB_PATH]
 
@@ -369,6 +401,27 @@ def _run_measurements(service: TsLspService, files: Dict[str, str], args) -> Dic
         "diagnostics_cached", lambda path: service.diagnostics(path),
         [(p,) for p in mod_paths], warmup=args.warmup, iters=args.iters)
 
+    # diagnostics_direct (#279): the SAME edit -> re-check cycle through the
+    # direct-tsserver transport. Same `files`, same target rotation, same
+    # introduce/revert split, same iteration count -- anything else makes the
+    # two columns incomparable, which is the only way this measurement can
+    # mislead. There is no `diagnostics_direct_cached` counterpart: that
+    # transport has no cache, every call is a real recheck.
+    if direct is not None:
+        direct_counter = [0]
+
+        def _edit_and_check_direct(path, introduce):
+            direct_counter[0] += 1
+            clean = _pad_to_lines(files[path], args.edit_file_lines)
+            text = (_broken_variant(clean, direct_counter[0]) if introduce else clean)
+            direct.update(path, text)
+            return direct.diagnostics(path)
+
+        ops["diagnostics_direct"] = _measure_op(
+            "diagnostics_direct", _edit_and_check_direct, _diagnostics_targets(mod_paths),
+            warmup=args.warmup, iters=args.iters,
+            label_of=lambda path, introduce: "introduce" if introduce else "revert")
+
     return ops
 
 
@@ -405,13 +458,23 @@ def _print_report(summary: dict, ops: Dict[str, dict]) -> None:
     print("-" * 72)
     print(f"n_restarts={summary['n_restarts']}  n_timeouts={summary['n_timeouts']}  "
           f"n_no_publish={summary['n_no_publish']}")
-    print(f"VERDICT: {summary['verdict']}")
+    if summary.get("direct_skipped_reason"):
+        print(f"diagnostics_direct: SKIPPED -- {summary['direct_skipped_reason']}")
+    else:
+        print(f"direct: cold_load_s={summary['direct_cold_load_s']:.3f}  "
+              f"n_restarts={summary['direct_n_restarts']}  "
+              f"n_timeouts={summary['direct_n_timeouts']}  "
+              f"n_command_errors={summary['direct_n_command_errors']}")
+    print(f"VERDICT: {summary['verdict']}  (LSP-conformant client -- the SLA of record)")
+    print(f"VERDICT_DIRECT: {summary['verdict_direct']}  "
+          "(#279 counterfactual: the same bars against the direct-tsserver transport)")
     if summary["verdict"] in ("WARN", "KILL"):
         print("  -> #226 decode-time completion-list masking rescopes to OFFLINE "
               "if this holds (throughput gate: completions >= 200 calls/s).")
         print("  -> most of `diagnostics`'s latency is a client-side debounce, "
-              "not type-checking (#278/scripts/probe_ts_lsp_debounce.py); a "
-              "direct-tsserver bypass (#279) is the addressable follow-up.")
+              "not type-checking (#278/scripts/probe_ts_lsp_debounce.py); "
+              "`diagnostics_direct` (#279, src/lsp/ts_server_direct.py) is that "
+              "same cycle with the debounce gone -- compare the two rows above.")
     print("=" * 72)
 
 
@@ -472,6 +535,15 @@ def main() -> int:
     if args.max_server_memory is not None:
         init_options["maxTsServerMemory"] = args.max_server_memory
 
+    # The #279 third column is optional: a host with typescript-language-server
+    # but no local `typescript` install still measures the LSP columns, and says
+    # so rather than reporting a zero.
+    direct: Optional[TsServerDirect] = None
+    direct_skipped_reason: Optional[str] = None
+    if resolve_tsserver() is None:
+        direct_skipped_reason = ("no local `typescript` install resolvable "
+                                 f"(need `npm install` in {SET_DIR})")
+
     service = TsLspService(timeout_s=args.timeout_s, initialization_options=init_options)
     try:
         service.open_project(files)
@@ -488,10 +560,43 @@ def main() -> int:
                                       "ops": {}})
             raise SystemExit(2)
 
-        ops = _run_measurements(service, files, args)
+        direct_probe: Optional[dict] = None
+        if direct_skipped_reason is None:
+            direct = TsServerDirect(timeout_s=args.timeout_s)
+            direct.open_project(files)
+            print(f"[bench_ts_lsp] direct cold load: {direct.cold_load_s:.3f}s")
+            direct_probe = _sanity_probe_direct(direct, files)
+            if not direct_probe["ok"]:
+                # BLIND applies to the third column too -- an unchecked fast
+                # zero is worse than no column at all.
+                print("BLIND: direct-tsserver sanity probe failed -- nothing was measured.")
+                for name, ok in direct_probe["checks"].items():
+                    print(f"  {name}: {'OK' if ok else 'FAILED'}")
+                _write_results(out_path, {"summary": {"verdict": "BLIND",
+                                                      "sanity_probe": probe,
+                                                      "direct_sanity_probe": direct_probe},
+                                          "ops": {}})
+                raise SystemExit(2)
+
+        ops = _run_measurements(service, files, args, direct=direct)
         verdict = _verdict(ops["diagnostics"]["median_ms"], ops["completions"]["calls_per_s"])
+        # `verdict` keeps its meaning -- the LSP-conformant client, the #277/#278
+        # record. `verdict_direct` is a SEPARATE counterfactual through the same
+        # function; redefining `verdict` in place would rewrite that record
+        # rather than extend it.
+        verdict_direct = (
+            _verdict(ops["diagnostics_direct"]["median_ms"], ops["completions"]["calls_per_s"])
+            if "diagnostics_direct" in ops else "SKIPPED")
         summary = {
             "verdict": verdict,
+            "verdict_direct": verdict_direct,
+            "direct_skipped_reason": direct_skipped_reason,
+            "direct_sanity_probe": direct_probe,
+            "direct_cold_load_s": direct.cold_load_s if direct is not None else None,
+            "direct_n_restarts": direct.n_restarts if direct is not None else None,
+            "direct_n_timeouts": direct.n_timeouts if direct is not None else None,
+            "direct_n_command_errors": (direct.n_command_errors
+                                        if direct is not None else None),
             "n_files": args.n_files, "seed": args.seed,
             "warmup": args.warmup, "iters": args.iters,
             "edit_file_lines": args.edit_file_lines,
@@ -510,8 +615,14 @@ def main() -> int:
             service._tmpdir_obj._finalizer.detach()
             service._teardown_process()
             print(f"[bench_ts_lsp] scratch dir kept at {service.scratch_dir}")
+            if direct is not None:
+                direct._tmpdir_obj._finalizer.detach()
+                direct._teardown_process()
+                print(f"[bench_ts_lsp] direct scratch dir kept at {direct.scratch_dir}")
         else:
             service.close()
+            if direct is not None:
+                direct.close()
 
     return 0
 

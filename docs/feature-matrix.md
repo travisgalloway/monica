@@ -120,6 +120,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | LSP-7 | A person can drive the harness with a chat/LM adapter | done | done | n/a | n/a | Shipped | — | design/12 |
 | LSP-8 | A person can execute generated code and capture the result | done | n/a | n/a | n/a | Shipped | — | design/12 |
 | LSP-9 | A person can run the LSP harness natively, no Python runtime | n/a | n/a | n/a | done | Shipped | #197 | design/13 |
+| LSP-10 | A person can get TS diagnostics without the LSP client debounce | done | n/a | n/a | none | Shipped | #279 | design/12 |
 
 ## Swift engine (`swift/engine/`)
 

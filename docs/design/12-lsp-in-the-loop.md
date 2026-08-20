@@ -790,8 +790,12 @@ but still fast enough to show it is a race, not real work — and it costs real 
 is correct and necessary — it closes the *observable*, indefinitely-recurring case — but a
 version-less server cannot fully close the in-flight case without an extra request/response barrier
 per edit, which is deliberately not implemented here (see the risk noted in `update()`'s comment);
-#279's direct-`tsserver` bypass sidesteps this whole notification-race class rather than patching
-around it further.
+#279's direct-`tsserver` transport (`src/lsp/ts_server_direct.py`, landed — see "The direct-`tsserver`
+transport (#279)" below) sidesteps this whole notification-race class rather than patching around it
+further: it asks for diagnostics synchronously and gets an answer in the response, so there is no
+push to race. The bench bears that out — on the same 5000-file project and the same
+introduce/revert cycle, the direct column observes **100%** of introductions against the LSP
+client's 64%.
 
 ### What the 378 ms actually is (#278)
 
@@ -851,10 +855,9 @@ distribution across a 5000-file project; a `setTimeout` does.
 **Consequence:** the genuine recheck cost, once the ~350 ms debounce floor is subtracted out, is
 **~11–33 ms** — *inside* the 50 ms bar. The type-aware eval arm is not structurally blocked by
 tsserver doing real work; it is blocked by a client-side timer, which is a different and addressable
-problem. See #279 (a direct-`tsserver` `semanticDiagnosticsSync` bypass, filed and blocked on this
-issue's confirmation) — patching the vendored `cli.mjs` itself is off-limits under the #246
-bit-identity pin discipline, so #279's own JSON-RPC channel to `tsserver` is the addressable path,
-not a patch to this server.
+problem. #279 built that bypass and **measured 19.7 ms** on the same project (below) — patching the
+vendored `cli.mjs` itself is off-limits under the #246 bit-identity pin discipline, so a second
+channel straight to `tsserver` was the addressable path, not a patch to this server.
 
 **The `n_no_publish` ambiguity.** `cli.mjs:20524` means an already-clean document that receives a
 benign edit may legitimately never get a `publishDiagnostics` push — indistinguishable, on this pin,
@@ -890,13 +893,83 @@ issue does not touch that conclusion.
 **What changes materially for the type-aware eval arm:** it is **not** structurally blocked by
 tsserver doing real whole-program work at this project size — it is blocked by a client-side timer
 (above), a different and addressable problem. A consumer needing sub-50ms diagnostics against a
-5000-file warm program on *this* server pin should still budget for ~376ms per check today, but the
-follow-up that would close that gap is filed and scoped: **#279**, a direct-`tsserver`
-`semanticDiagnosticsSync` bypass that skips `typescript-language-server`'s notification layer (and
-its debounce) entirely, now unblocked by this issue's confirmation.
+5000-file warm program **through `TsLspService`** should still budget for ~376ms per check, but
+**#279 has since closed that gap on a second transport**: `src/lsp/ts_server_direct.py` skips
+`typescript-language-server`'s notification layer (and its debounce) entirely and measures
+**19.7 ms median** on the same project — see the next subsection.
 
 See `scripts/bench_ts_lsp.py`, `scripts/probe_ts_lsp_debounce.py`, and the full per-op breakdown in
-`results/ts_lsp_bench.json` / `results/ts_lsp_debounce_probe.json`.
+`results/ts_lsp_bench.json` / `results/ts_lsp_debounce_probe.json`. `results/ts_lsp_bench.json`
+now carries both the `diagnostics` (LSP client) and `diagnostics_direct` (#279) columns, and both
+`verdict` and `verdict_direct`.
+
+### The direct-`tsserver` transport (#279)
+
+`src/lsp/ts_server_direct.py` is a **second** client to the same pinned TypeScript, speaking
+**tsserver's own protocol** to `node_modules/typescript/lib/tsserver.js` rather than LSP to
+`typescript-language-server`. It asks `syntacticDiagnosticsSync` + `semanticDiagnosticsSync`
+**synchronously**, so neither of #278's two client-side timers exists on its path at all.
+
+It is a separate module, not a flag on `jsonrpc.py`, because the wire protocol is genuinely
+asymmetric: tsserver reads **newline-delimited JSON** on stdin but writes **`Content-Length`-framed**
+JSON on stdout (so `jsonrpc.read_message` is reused unchanged and `encode_message` is *not* — a
+`Content-Length` header on tsserver's stdin hangs the child silently); responses correlate on
+`request_seq`, not `id`; unsolicited `projectLoadingStart`/`telemetry`/`configFileDiag` events
+interleave and must never resolve a waiter; and the diagnostic payload is 1-based `{line, offset}`
+with a string `category` where LSP is 0-based `{line, character}` with an integer `severity`.
+
+**Measured** (`scripts/bench_ts_lsp.py --n-files 5000 --warmup 20 --iters 200`, seed 0, same run
+as the table above, same synthetic project, same introduce/revert target rotation):
+
+| op | median | min | p95 | calls/s | non-empty rate |
+|---|---:|---:|---:|---:|---:|
+| `diagnostics` (LSP client, `TsLspService`) | 377.0 ms | 3.1 ms | 395.4 ms | 3.1 | 32% — `introduce` 64%, `revert` 0% |
+| `diagnostics_direct` (#279, `TsServerDirect`) | **19.7 ms** | 17.3 ms | 22.6 ms | 50.2 | 50% — `introduce` **100%**, `revert` 0% |
+
+`n_restarts = 0`, `n_timeouts = 0`, `n_command_errors = 0` on the direct transport; cold project
+load 1.08 s (vs the LSP client's 1.15 s — the cold load is tsserver's real work and is *not* what
+#279 addresses). The direct column carries its own BLIND guard (`_sanity_probe_direct`): a known
+`TS2339` must be detected and then cleared before any timing starts, because an unchecked fast zero
+would read as a spectacular win.
+
+**Does the type-aware arm's verdict change? Yes — as a counterfactual, and only for latency.**
+`verdict` stays **WARN** and keeps its meaning: it is the LSP-conformant client's SLA, the #277/#278
+record, and redefining it in place would rewrite that record rather than extend it.
+`verdict_direct`, the same `_verdict` function applied to the direct median, is **PASS** — 19.7 ms
+clears the 50 ms latency bar with a 2.5× margin, and `completions` at 3,146 calls/s (unchanged,
+still measured through the LSP client) clears the ≥200 calls/s throughput bar. This confirms #278's
+~11–33 ms projection from the other direction: with the debounce gone, the *genuine* recheck cost
+on a 5000-file warm program is ~20 ms.
+
+**What that does and does not unblock.** It removes *latency* as the reason the type-aware eval arm
+could not check per-candidate — that reason is now gone, measured, on a transport that exists.
+It does **not** by itself change any conclusion in this document: the arm may still batch candidates
+for reasons unrelated to latency, and nothing consumes `TsServerDirect` yet. Adoption — whether
+`CompositeOracle`, the harness, or the eval arm should switch transports, and what the
+`is_incomplete`/frontier behaviour looks like under whole-program rather than open-document
+semantics — is a separate decision that this issue deliberately did not make.
+
+**A second, quieter win: `[]` is an answer.** `TsLspService` cannot distinguish "the recheck came
+back clean" from "nothing was published" (`n_no_publish`, `cli.mjs:20524`, above). The `*Sync`
+commands always reply, so `TsServerDirect` has no `n_no_publish` analogue by construction — and the
+bench shows the practical consequence: the LSP client observed only **64%** of the introduced
+`TS2339`s (the residual in-flight notification race #278 could not fully close without an extra
+per-edit barrier), while the direct transport observed **100%**. That is a correctness difference in
+this regime, not only a latency one.
+
+**Parity.** `tests/test_ts_server_direct.py` gates the two clients against each other over all
+**96** records of the #194 labeled set in **both** directions (`prompt + error_completion` and
+`prompt + gold_completion`, 192 candidates): the sorted `(code, line, col)` sets are **identical on
+every candidate**, and the direct client independently reports each labeled record's
+`expected_diagnostic` — parity against a silent oracle would be vacuous, so both halves are asserted.
+The 64%-vs-100% gap above does **not** show up there: single-file candidates in a small project
+coalesce tsserver's syntactic and semantic passes into one push, so the LSP client's race has
+nothing to lose to. The divergence is a large-warm-program effect, which is exactly the regime the
+bench measures and the eval arm would run in.
+
+The CI gate is `tests/test_ts_server_direct_mechanism.py` — binary-free `os.pipe()` mechanism tests
+covering the framing asymmetry, `request_seq` correlation, event interleaving, timeout/EOF/refused-
+command handling, and every mapping trap — which runs with no `node` on `PATH` at all.
 
 ## Constrained decode: completion-list logit masking (#226)
 
@@ -977,9 +1050,9 @@ lean on the wrong term:
 - **`diagnostics`: no win is possible, by construction.** #278 (above) diagnosed ~350ms of the
   measured round trip as a hardcoded **client-side debounce inside `typescript-language-server`
   5.3.0** (`cli.mjs:17868`/`:20516`), not type-checking — that timer lives in the Node process on
-  the far side of the pipe, so no client-language rewrite touches it. #279 (a direct-`tsserver`
-  `semanticDiagnosticsSync` bypass) is the addressable path, and is a separate issue/transport
-  from #197.
+  the far side of the pipe, so no client-language rewrite touches it. #279's direct-`tsserver`
+  `semanticDiagnosticsSync` transport (`src/lsp/ts_server_direct.py`, landed, 19.7 ms median) is
+  the addressable path, and is a separate issue/transport from #197.
 - **`completions` client-side round trip: the term Swift can move**, but the Python reference is
   already 0.38ms median at 2,500+ calls/s (the #220 table above), so the ceiling on this term is
   sub-millisecond.
@@ -1054,14 +1127,14 @@ host (`swift-engine`, mlx-swift needs a compiled Metal shader library this Comma
 Mac cannot produce) — it is a correctness gate (every masked-span token is a member of that
 span's allowed set), not a timing one, so it does not change the attribution above.
 
-**Boundary with #279.** #279 (open, not built here) owns a **Python** client speaking
-**tsserver's own protocol** (`semanticDiagnosticsSync`) to bypass the debounce for the type-aware
-eval arm's *diagnostics*. #197 owns a **Swift** client speaking **LSP** to
-`typescript-language-server`, driving *completions* for the decode-time mask. Different
+**Boundary with #279.** #279 (landed under its own issue, no part of it built by #197) owns a
+**Python** client speaking **tsserver's own protocol** (`semanticDiagnosticsSync`, `src/lsp/ts_server_direct.py`) to bypass the
+debounce for the type-aware eval arm's *diagnostics*. #197 owns a **Swift** client speaking **LSP**
+to `typescript-language-server`, driving *completions* for the decode-time mask. Different
 language, different transport, different op, different consumer — the only shared surface is the
-LSP framing layer, which each side writes independently, so neither blocks the other. If #279
-lands and the raw-protocol bypass proves worth it, a Swift port of that transport is a follow-up
-issue, not scope creep into #197.
+LSP framing layer, which each side writes independently, so neither blocked the other. The
+raw-protocol bypass did prove worth it (377 ms → 19.7 ms); a Swift port of that transport is a
+follow-up issue, not scope creep into #197.
 
 ## Verdict
 
