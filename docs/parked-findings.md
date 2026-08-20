@@ -147,3 +147,9 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   the mitigation does not compose across pytest modules. Fixing it means process isolation for the
   MLX fixture modules (pytest-forked, or a separate CI job), which is test-infrastructure work.
   Found while verifying #298. Severity: CI reliability, non-blocking but recurring.
+
+- [2026-08-19] `.github/workflows/` (both files), `actionlint` is installed on the dev host and
+  reports both workflows clean, but nothing in CI or in the pytest suite runs it — workflow
+  syntax/expression errors are only caught by GitHub at dispatch time. Found while splitting
+  `ci.yml` for #302 (a move of 383 lines of YAML with no local schema gate). Severity: CI
+  tooling, non-blocking.

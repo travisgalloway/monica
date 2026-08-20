@@ -420,23 +420,84 @@ The #163 dependency order:
    #267 turns that into a standing gate without checking the 571 MB poc fixture into git:
    two new jobs, `poc-fixture-oracle` (macOS, Python+MLX, no Swift toolchain — generates the
    fixture, hashes it, uploads a ~2 KB sha256 manifest + `meta.json`) and `poc-parity`
-   (macOS, `needs: [swift-engine, poc-fixture-oracle]` so it restores swift-engine's warm
-   xcodebuild cache — regenerates its own independent copy, `cmp`s the two manifests, THEN
-   runs `monica-parity --fixtures` against the verified fixture). Measured on an M1 Pro
+   (macOS, `needs: [poc-fixture-oracle]` — regenerates its own independent copy, `cmp`s the
+   two manifests, THEN runs `monica-parity --fixtures` against the verified fixture; #267
+   also gave it a `needs: swift-engine` edge purely to inherit that job's warm xcodebuild
+   cache, which #302 dropped when the two jobs ended up in different workflow files —
+   `needs:` cannot cross files, and the cache is still shared via `restore-keys`). Measured
+   on an M1 Pro
    during planning: **5.2-5.8 s wall, ~2 GB peak RSS, 571 MB output**, and the two
    independent generations were **bit-identical, 7/7 files** — which is what makes the
    manifest `diff` a real guard against **#298** (MLX 0.32.0's deterministic-per-process
    buffer-reuse corruption) rather than a coin flip: two fresh processes on two runners would
-   have to corrupt identically to pass it. Both jobs are gated
-   `if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'` (a new
-   weekly Monday `schedule:` trigger) — **never `pull_request`/`push`** — because poc adds
+   have to corrupt identically to pass it. Both jobs run on `workflow_dispatch` or a weekly
+   Monday `schedule:` — **never `pull_request`/`push`** — because poc adds
    zero new *code-path* coverage over `toy` (pure Mamba, no attention/MoE/quant); what it adds
    is *scale* coverage of the tolerance contract (R2 below), which does not change PR to PR,
-   so per-PR cost (a second macOS mlx-swift build) isn't worth paying. `swift-engine` gains
+   so per-PR cost (a second macOS mlx-swift build) isn't worth paying. #267 expressed that as
+   an `if: github.event_name == …` guard on each job inside `ci.yml`; **#302 (entry 7 below)
+   replaced the guard with a separate workflow file that has no `pull_request`/`push` trigger
+   at all** — the exclusion is now structural. `swift-engine` gained
    no `needs:` and no existing job's cache key/`if:` changed. No change to
    `src/conformance/tolerances.py`, `scripts/export_parity_fixture.py`, or any checked-in
    fixture. See `swift/engine/Fixtures/README.md` §poc for the operator-facing version and
    the local reproduction command.
+7. **#302 — done: the weekly schedule now fires only the parity gate.** #267's `schedule:` was
+   declared at *workflow* level in `ci.yml`. GitHub fires the whole workflow on that event and the
+   four `if:` guards only filter the guarded jobs, so every Monday the other 8 jobs ran too —
+   including three macOS runners, one of them `swift-engine`'s 60-minute budget. The comment above
+   the trigger said the schedule existed for the poc gate; the behaviour disagreed. By the time
+   #302 was executed it was **4 of 12** jobs guarded, not the 2 of 10 the issue reported: #195/#293
+   had added the `train-fixture-oracle`/`-verify` pair after filing.
+
+   *Three options were on the table.* **(1)** Invert the guards: add
+   `if: github.event_name != 'schedule'` to the 8 unguarded jobs. **(2)** Move the 4 guarded jobs
+   into their own workflow file with its own `schedule:`, and delete `ci.yml`'s. **(3)** Keep the
+   behaviour and fix the misleading comment.
+
+   *Option 2 was chosen*, on the constraint CLAUDE.md states as hard — *the poc jobs must NEVER run
+   on `pull_request`/`push`*. Under option 1 that guarantee stays **expression-level**: it is an
+   assertion eight `if:` expressions have to keep true, and each one is a chance to typo a PR gate
+   into permanent silence (which is the failure mode the issue's own criterion 4 names). Under
+   option 2 it becomes **structural** — `scheduled-parity.yml` has no `pull_request` key, so there
+   is no event to be skipped under, and a PR produces no check entry for that workflow at all
+   rather than a skipped one. That is the same move the repo already makes elsewhere: `swift/`'s
+   zero-dependency property is preserved by *separating packages*, not by conditioning build edges.
+   Option 3 was rejected as contradicting the issue outright. **All four** guarded jobs moved, not
+   just #267's two: `ci.yml` lost its `schedule:`, so a `train-fixture-oracle` left behind would
+   have had a dead `|| github.event_name == 'schedule'` clause and would have silently degraded to
+   dispatch-only — verbatim the "gate stops running and nobody notices" failure.
+
+   *One accepted deviation.* The issue's criterion 3 asked that `workflow_dispatch` still fire
+   everything. It now takes **two** commands (`gh workflow run ci.yml`, `gh workflow run
+   scheduled-parity.yml`). The capability — every job manually dispatchable, no inputs — is intact;
+   the single command is not. That is inherent to option 2, and a `workflow_call` shim would
+   reintroduce the coupling the split exists to remove.
+
+   *What this deliberately gives up.* The weekly full run was not purely waste: it caught
+   **environmental drift** that per-PR CI attributes to flake. Two instances in the preceding week
+   — `swift selfcheck (macOS)`'s failure on PR #301 (the #279 tsserver/LSP debounce race) and
+   `swift model parity (macOS, mlx-swift)` failing once and passing on retry on PR #310 — are
+   exactly that class: read as noise against a changing diff, read as *the environment moved* when
+   they happen on unchanged `main`. After #302 nothing runs those jobs on a cadence. This is an
+   accepted, recorded cost, not an oversight; restoring the coverage is **#312**, parked rather
+   than built here because adding a cron back to `ci.yml` would re-open the exact behaviour #302
+   closed. Also dropped: `poc-parity`'s `needs: swift-engine` edge, which was cache-warming only
+   (`swift-engine` produces no artifact it consumes) and cannot cross workflow files — the cache is
+   still restored by the `swift-engine-${{ runner.os }}-` `restore-keys` prefix from the last push
+   to `main`, with a cold 20-40 min vendored-C++ build as the accepted worst case inside the
+   existing 90-minute timeout.
+
+   *The gate.* `act` was rejected (needs Docker, cannot model macOS runners, and would be a manual
+   step rather than a gate). Instead `tests/test_workflow_triggers.py` parses both workflow files
+   and asserts the full trigger×job matrix — it runs in `ci.yml`'s `portable` job on every PR, so
+   re-adding a `schedule:` to `ci.yml`, adding a `pull_request:` to `scheduled-parity.yml`, giving
+   any `ci.yml` job an `if:`, or losing a job in a future move all fail a test. Two details in it
+   are load-bearing: PyYAML's `safe_load` is YAML 1.1, where a bare `on:` key parses as the
+   **boolean `True`** rather than the string `"on"` (the loader looks under both and asserts it
+   found one, so a future PyYAML change fails loudly instead of reading as "no triggers, therefore
+   nothing runs, therefore everything passes"); and the `if:`-expression evaluator **raises** on any
+   form it does not recognise, because an unparsed guard is *unknown*, never *"the job runs"*.
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
 DPO/GRPO step factories.
@@ -577,7 +638,8 @@ DPO/GRPO step factories.
   toy's — mean the check only passes because the relative term (`rtol * |logit| ~= 2.4e-3`)
   carries it: the band has flipped to relative-dominated. Net headroom is still ~66x (vs
   toy's ~70x), so the contract holds *today*, and #267's `poc-parity` CI job (dispatch/
-  schedule-only, above) is what keeps that a monitored fact instead of a one-off measurement
+  schedule-only, in `.github/workflows/scheduled-parity.yml` since #302 — both above) is what
+  keeps that a monitored fact instead of a one-off measurement
   that silently goes stale. **If a future mlx-swift version introduces a benign op-order
   difference, this gate could trip at poc scale while every toy fixture stays green — that
   is a finding to triage (is the drift real, or just the relative term catching up), not a
@@ -712,7 +774,8 @@ DPO/GRPO step factories.
   UNCHANGED — the guard was correctly detecting a real defect throughout; it just wasn't
   the defect either the first CI diagnostic or its own follow-up initially concluded. The
   `train-fixture-oracle`/`train-fixture-oracle-verify` CI job pair (dispatch/schedule-only,
-  mirrors `poc-fixture-oracle`/`poc-parity`, #267) still exists but is **not load-bearing
+  mirrors `poc-fixture-oracle`/`poc-parity`, #267; all four live in
+  `.github/workflows/scheduled-parity.yml` since #302) still exists but is **not load-bearing
   for correctness** — it is a regression check that verifies this exporter's output on the
   specific host family where the column-major bug manifested, for this change and any
   future one; it would NOT have caught the original bug on its own, since both independent

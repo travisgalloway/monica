@@ -447,8 +447,9 @@ never showed the bug) and a real fix wherever it wasn't.
 
 The CI job pair `train-fixture-oracle` (generate) + `train-fixture-oracle-verify` (a
 numeric-tolerance cross-check at the SAME `train_rtol=2e-4`/`train_atol=1e-6` the
-production staleness guard uses) still exists in `.github/workflows/ci.yml`, dispatch/
-schedule-gated, but it is **not load-bearing for correctness** — it is a regression check
+production staleness guard uses) still exists in `.github/workflows/scheduled-parity.yml`
+(moved out of `ci.yml` by #302), dispatch/schedule-only, but it is **not load-bearing for
+correctness** — it is a regression check
 that lets this exporter's output be verified on the specific host family where the
 column-major bug manifested, for this change and any future one. It would NOT have
 caught the original bug on its own (both independent CI-runner generations were
@@ -522,8 +523,13 @@ At fp32 the `config/poc.yaml` fixture is **571 MB** total (`weights.safetensors`
 code paths with `toy` (pure Mamba, no attention, no MoE) at larger dimensions.
 
 It IS still gated in CI (#267), just not on every PR: jobs `poc-fixture-oracle` +
-`poc-parity` in `.github/workflows/ci.yml`, triggered only on `workflow_dispatch` or a
-weekly `schedule` (Monday 09:17 UTC) — **never on `pull_request` or `push`**. Generation is
+`poc-parity` in `.github/workflows/scheduled-parity.yml`, triggered only on
+`workflow_dispatch` or a weekly `schedule` (Monday 09:17 UTC) — **never on `pull_request` or
+`push`**. Since #302 that is structural, not an `if:` guard: the workflow declares no
+`pull_request`/`push` trigger at all, so a PR produces no check entry for it whatsoever.
+Dispatch it on its own — `gh workflow run scheduled-parity.yml`, no inputs; `gh workflow run
+ci.yml` fires the other 8 jobs (only workflows on the default branch are dispatchable).
+Generation is
 cheap (measured on an M1 Pro): **5.2-5.8 s wall**, ~2 GB peak RSS — not the ~10 minutes an
 earlier draft of this note assumed — so the fixture is never checked in, and the **571 MB
 fixture output itself never crosses the network**: `poc-fixture-oracle` generates it, hashes
@@ -560,5 +566,9 @@ sighting, not a flake to rerun past.
 
 **Why dispatch/schedule only, not per-PR.** `poc-parity` is a second macOS runner carrying
 an mlx-swift xcodebuild (warm-cache: minutes; cold: up to 40) plus a `pip install mlx` —
-against zero new code-path coverage over `toy`, that is not a per-PR trade worth making. See
+against zero new code-path coverage over `toy`, that is not a per-PR trade worth making.
+Since #302 the warm cache comes from whatever `ci.yml`'s `swift-engine` job wrote on the last
+push to `main` (the `swift-engine-${{ runner.os }}-` `restore-keys` prefix), not from an
+earlier job in the same run — so a `Package.resolved` or toolchain bump makes the next
+scheduled run pay the cold case, which the 90-minute timeout covers. See
 `docs/design/14-inference-engine.md` §Staged roadmap for the full record.
