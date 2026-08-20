@@ -72,7 +72,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 from .diagnostics import Diagnostic, line_col_to_offset
-from .jsonrpc import _Waiter, read_message
+from .jsonrpc import Waiter, read_message
 from .tsc import DEFAULT_TSCONFIG_PATH, SET_DIR
 
 TSSERVER_JS = SET_DIR / "node_modules" / "typescript" / "lib" / "tsserver.js"
@@ -184,7 +184,7 @@ class TsServerEndpoint:
         self._next_seq = 1
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._pending: Dict[int, _Waiter] = {}
+        self._pending: Dict[int, Waiter] = {}
         self._thread: Optional[threading.Thread] = None
         self._closed = False
 
@@ -239,7 +239,7 @@ class TsServerEndpoint:
         with self._lock:
             seq = self._next_seq
             self._next_seq += 1
-            waiter = _Waiter()
+            waiter = Waiter()
             self._pending[seq] = waiter
 
         self._write(_request_frame(seq, command, arguments))
@@ -518,18 +518,30 @@ class TsServerDirect:
         client has no reason to compute a diff; `TsLspService` sends full-text
         `didChange` for the same reason.) Returns the new version, kept for API
         symmetry with `TsLspService.update`; tsserver has no version concept of
-        its own on this path."""
+        its own on this path.
+
+        Never raises -- unlike `TsLspService.update()` (a fire-and-forget
+        `didChange` notify), `updateOpen` is a real request/response round
+        trip through `_request_retrying()`, so a timeout or a refused command
+        is counted (`n_timeouts` / `n_command_errors`, same buckets
+        `diagnostics()` uses) instead of propagating out of a caller that
+        expects `TsLspService.update()`'s non-raising contract."""
         self._ensure_alive()
         self._ensure_open(path)
         self._abs_path(path).write_text(text, encoding="utf-8")
         self._files[path] = text
         self._versions[path] += 1
-        self._request_retrying("updateOpen", {"openFiles": [{
-            "file": self._file(path),
-            "fileContent": text,
-            "scriptKindName": "TS",
-            "projectRootPath": str(self.scratch_dir),
-        }]})
+        try:
+            self._request_retrying("updateOpen", {"openFiles": [{
+                "file": self._file(path),
+                "fileContent": text,
+                "scriptKindName": "TS",
+                "projectRootPath": str(self.scratch_dir),
+            }]})
+        except (TimeoutError, ConnectionError, OSError):
+            self.n_timeouts += 1
+        except RuntimeError:
+            self.n_command_errors += 1
         return self._versions[path]
 
     # ----------------------------------------------------------------- #

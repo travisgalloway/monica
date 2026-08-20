@@ -84,13 +84,17 @@ def read_message(stream: BinaryIO) -> Optional[dict]:
     return json.loads(body.decode("utf-8"))
 
 
-class _Waiter:
+class Waiter:
     """One in-flight request's rendezvous point. `set()` is called at most once,
     from the reader thread (a response) or from `_fail_all_pending` (EOF/timeout
     cleanup); `wait()` is called from the requesting thread. `None` is never a
     legitimate value to `set()` (a JSON-RPC response is always a dict, and
     failures pass an `Exception`), so it safely doubles as the "still nothing"
     sentinel distinguishing a timeout from a real result.
+
+    Public (not `_Waiter`): `ts_server_direct.py` (#279) reuses this rendezvous
+    primitive verbatim for tsserver's own `request_seq`-keyed demux, so it is a
+    real cross-module type, not a private implementation detail of this file.
     """
 
     def __init__(self) -> None:
@@ -124,7 +128,7 @@ class JsonRpcEndpoint:
         self._next_id = 1
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._pending: Dict[int, _Waiter] = {}
+        self._pending: Dict[int, Waiter] = {}
         self._thread: Optional[threading.Thread] = None
         self._closed = False
 
@@ -191,7 +195,7 @@ class JsonRpcEndpoint:
         with self._lock:
             request_id = self._next_id
             self._next_id += 1
-            waiter = _Waiter()
+            waiter = Waiter()
             self._pending[request_id] = waiter
 
         msg: dict = {"jsonrpc": "2.0", "id": request_id, "method": method}

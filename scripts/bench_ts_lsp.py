@@ -514,6 +514,38 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _full_summary(*, verdict: str, verdict_direct: str,
+                  service: TsLspService, args: argparse.Namespace, probe: dict,
+                  direct: Optional[TsServerDirect], direct_skipped_reason: Optional[str],
+                  direct_probe: Optional[dict]) -> dict:
+    """The complete `summary` schema -- used on every `_write_results` call,
+    including the BLIND/early-exit paths. `verdict_direct`/`direct_*` are part
+    of the results schema now; a truncated dict on a BLIND exit would silently
+    break any consumer that assumes the schema is stable regardless of
+    outcome (a real risk here since a BLIND *is* the failure path, i.e. the
+    one most likely to be inspected by tooling after the fact)."""
+    return {
+        "verdict": verdict,
+        "verdict_direct": verdict_direct,
+        "direct_skipped_reason": direct_skipped_reason,
+        "direct_sanity_probe": direct_probe,
+        "direct_cold_load_s": direct.cold_load_s if direct is not None else None,
+        "direct_n_restarts": direct.n_restarts if direct is not None else None,
+        "direct_n_timeouts": direct.n_timeouts if direct is not None else None,
+        "direct_n_command_errors": (direct.n_command_errors
+                                    if direct is not None else None),
+        "n_files": args.n_files, "seed": args.seed,
+        "warmup": args.warmup, "iters": args.iters,
+        "edit_file_lines": args.edit_file_lines,
+        "cold_load_s": service.cold_load_s,
+        "server_sync_kind": service.server_sync_kind,
+        "diagnostic_provider": service.server_capabilities.get("diagnosticProvider"),
+        "sanity_probe": probe,
+        "n_restarts": service.n_restarts, "n_timeouts": service.n_timeouts,
+        "n_no_publish": service.n_no_publish,
+    }
+
+
 def main() -> int:
     args = _parse_args()
 
@@ -551,16 +583,19 @@ def main() -> int:
               f"server_sync_kind={service.server_sync_kind}  "
               f"diagnosticProvider={service.server_capabilities.get('diagnosticProvider')!r}")
 
+        direct_probe: Optional[dict] = None
         probe = _sanity_probe(service, files)
         if not probe["ok"]:
             print("BLIND: sanity probe failed -- nothing was measured.")
             for name, ok in probe["checks"].items():
                 print(f"  {name}: {'OK' if ok else 'FAILED'}")
-            _write_results(out_path, {"summary": {"verdict": "BLIND", "sanity_probe": probe},
-                                      "ops": {}})
+            blind_summary = _full_summary(
+                verdict="BLIND", verdict_direct="BLIND", service=service, args=args,
+                probe=probe, direct=direct, direct_skipped_reason=direct_skipped_reason,
+                direct_probe=direct_probe)
+            _write_results(out_path, {"summary": blind_summary, "ops": {}})
             raise SystemExit(2)
 
-        direct_probe: Optional[dict] = None
         if direct_skipped_reason is None:
             direct = TsServerDirect(timeout_s=args.timeout_s)
             direct.open_project(files)
@@ -572,10 +607,11 @@ def main() -> int:
                 print("BLIND: direct-tsserver sanity probe failed -- nothing was measured.")
                 for name, ok in direct_probe["checks"].items():
                     print(f"  {name}: {'OK' if ok else 'FAILED'}")
-                _write_results(out_path, {"summary": {"verdict": "BLIND",
-                                                      "sanity_probe": probe,
-                                                      "direct_sanity_probe": direct_probe},
-                                          "ops": {}})
+                blind_summary = _full_summary(
+                    verdict="BLIND", verdict_direct="BLIND", service=service, args=args,
+                    probe=probe, direct=direct, direct_skipped_reason=direct_skipped_reason,
+                    direct_probe=direct_probe)
+                _write_results(out_path, {"summary": blind_summary, "ops": {}})
                 raise SystemExit(2)
 
         ops = _run_measurements(service, files, args, direct=direct)
@@ -587,26 +623,10 @@ def main() -> int:
         verdict_direct = (
             _verdict(ops["diagnostics_direct"]["median_ms"], ops["completions"]["calls_per_s"])
             if "diagnostics_direct" in ops else "SKIPPED")
-        summary = {
-            "verdict": verdict,
-            "verdict_direct": verdict_direct,
-            "direct_skipped_reason": direct_skipped_reason,
-            "direct_sanity_probe": direct_probe,
-            "direct_cold_load_s": direct.cold_load_s if direct is not None else None,
-            "direct_n_restarts": direct.n_restarts if direct is not None else None,
-            "direct_n_timeouts": direct.n_timeouts if direct is not None else None,
-            "direct_n_command_errors": (direct.n_command_errors
-                                        if direct is not None else None),
-            "n_files": args.n_files, "seed": args.seed,
-            "warmup": args.warmup, "iters": args.iters,
-            "edit_file_lines": args.edit_file_lines,
-            "cold_load_s": service.cold_load_s,
-            "server_sync_kind": service.server_sync_kind,
-            "diagnostic_provider": service.server_capabilities.get("diagnosticProvider"),
-            "sanity_probe": probe,
-            "n_restarts": service.n_restarts, "n_timeouts": service.n_timeouts,
-            "n_no_publish": service.n_no_publish,
-        }
+        summary = _full_summary(
+            verdict=verdict, verdict_direct=verdict_direct, service=service, args=args,
+            probe=probe, direct=direct, direct_skipped_reason=direct_skipped_reason,
+            direct_probe=direct_probe)
         _write_results(out_path, {"summary": summary, "ops": ops})
         _print_report(summary, ops)
     finally:

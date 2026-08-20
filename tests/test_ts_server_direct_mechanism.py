@@ -527,6 +527,31 @@ def test_update_sends_whole_file_content_and_writes_through(fake):
     assert (svc.scratch_dir / "a.ts").read_text() == "const a = 2;\nconst b = 3;\n"
 
 
+def test_update_timeout_never_raises_and_counts(fake):
+    """`update()`'s `updateOpen` is a real request/response round trip
+    (unlike `TsLspService.update()`'s fire-and-forget `didChange` notify), so
+    a timeout must be counted rather than propagate out of `update()` and
+    crash a caller that expects `TsLspService.update()`'s non-raising
+    contract."""
+    svc, scripted = fake
+    svc.open_project({"a.ts": "const a = 1;\n"})
+    scripted.pending.add("updateOpen")
+    version = svc.update("a.ts", "const a = 2;\n")
+    assert version == 2
+    assert svc.n_timeouts == 1
+    assert svc.n_command_errors == 0
+
+
+def test_update_unsuccessful_command_never_raises_and_counts(fake):
+    svc, scripted = fake
+    svc.open_project({"a.ts": "const a = 1;\n"})
+    scripted.responses["updateOpen"] = _TsError("No Project.")
+    version = svc.update("a.ts", "const a = 2;\n")
+    assert version == 2
+    assert svc.n_command_errors == 1
+    assert svc.n_timeouts == 0
+
+
 def test_diagnostics_lazily_opens_an_untouched_document(fake):
     svc, scripted = fake
     svc.open_project({"a.ts": "const a = 1;\n", "b.ts": "const b = 1;\n"})
