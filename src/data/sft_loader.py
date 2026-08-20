@@ -29,11 +29,13 @@ def load_sft_records(jsonl_path: Path) -> List[dict]:
     """Read one JSONL record file, failing with the path and line number rather than a bare
     `json.JSONDecodeError` (#306).
 
-    Also rejects a structurally invalid record — a missing key, or three lists whose lengths
-    disagree. A length-mismatched record does not crash: `_collate` right-pads each field
-    independently, so a short `loss_mask` silently shifts the mask off its tokens and the run
-    trains on the prompt. That is exactly the silent-wrong-mask failure the #306 masking criterion
-    exists to prevent, so it is caught at load.
+    Also rejects a structurally invalid record — a missing key, a non-list value, a non-numeric
+    element, or three lists whose lengths disagree — with the same `path:line` context rather
+    than a bare `TypeError`/`ValueError` from deep inside collation. A length-mismatched record
+    does not crash on its own: `_collate` right-pads each field independently, so a short
+    `loss_mask` silently shifts the mask off its tokens and the run trains on the prompt. That is
+    exactly the silent-wrong-mask failure the #306 masking criterion exists to prevent, so it is
+    caught at load.
     """
     path = Path(jsonl_path)
     records: List[dict] = []
@@ -50,6 +52,16 @@ def load_sft_records(jsonl_path: Path) -> List[dict]:
                            if not isinstance(rec, dict) or k not in rec]
                 raise ValueError(f"{path}:{lineno}: SFT record is missing {missing} "
                                  f"(expected {list(_REQUIRED_KEYS)})")
+            not_list = [k for k in _REQUIRED_KEYS if not isinstance(rec[k], list)]
+            if not_list:
+                got = {k: type(rec[k]).__name__ for k in not_list}
+                raise ValueError(f"{path}:{lineno}: SFT record field(s) {not_list} must be "
+                                 f"lists, got {got}")
+            non_numeric = [k for k in _REQUIRED_KEYS
+                           if any(not isinstance(x, (int, float)) for x in rec[k])]
+            if non_numeric:
+                raise ValueError(f"{path}:{lineno}: SFT record field(s) {non_numeric} contain "
+                                 f"a non-numeric element — ids/mask must be numbers.")
             lengths = {k: len(rec[k]) for k in _REQUIRED_KEYS}
             if len(set(lengths.values())) != 1:
                 raise ValueError(f"{path}:{lineno}: SFT record field lengths disagree "

@@ -85,9 +85,10 @@ def _parse_args() -> argparse.Namespace:
                          "(the shared/sft forms never do); split is seeded by --seed")
     ap.add_argument("--max-len", type=int, default=None,
                     help="drop records longer than this, never truncate (0 = keep all; "
-                         "default: the config's seq_len). Applies to the shared/sft layout "
-                         "only — a generic train.jsonl/val.jsonl pair is passed through "
-                         "untouched.")
+                         "default: the config's seq_len). Applies to the shared/sft layout, "
+                         "and to a generic corpus missing val.jsonl (split here too, so the "
+                         "filter still applies); a generic train.jsonl+val.jsonl pair is the "
+                         "only case passed through untouched.")
     ap.add_argument("--out", type=Path, default=Path("runs/sft"))
     ap.add_argument("--init", type=Path, default=Path("runs/poc/weights.safetensors"),
                     help="pretrained base weights to initialize from (fresh run only)")

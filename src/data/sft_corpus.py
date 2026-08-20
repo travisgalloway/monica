@@ -263,6 +263,9 @@ def _split_to_corpus(names: List[str], records: List[dict], manifests: Dict[str,
                      val_frac: float, seed: int, max_len: Optional[int],
                      data_dir: Path) -> SFTCorpus:
     """Length-filter, fail loudly on empty, then split deterministically."""
+    if max_len is not None and max_len < 0:
+        raise ValueError(f"--max-len must be >= 0 (0 = keep all), got {max_len}")
+
     n_raw = len(records)
     if n_raw == 0:
         raise ValueError(f"empty SFT corpus: {data_dir} yielded 0 records for forms "
