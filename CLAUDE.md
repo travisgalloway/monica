@@ -55,10 +55,18 @@ There is no separate lint/format/build step — pytest is the gate, and it now r
 (`.github/workflows/ci.yml`, #249): a Linux `portable` job (`pytest -q -rs`, no mlx/torch —
 where `test_import_guard.py` is unambiguous), a Linux `smoke-linux` job (CPU-torch,
 `scripts/smoke_test.py --backend cuda`), a Linux `cuda-cpu` job (CPU-torch, the CUDA test
-suite), and a macOS `full-macos` job (mlx installed,
-`pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not installable on Linux;
-on a non-Mac host the MLX backend simply won't import (by design), and only the portable
-tests run. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
+suite), and a macOS `full-macos` job (`.[dev,data,mlx,cuda]` — the **only** job carrying
+**both** backends — `pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not
+installable on Linux; on a non-Mac host the MLX backend simply won't import (by design), and
+only the portable tests run. `full-macos` is therefore also the **cross-backend parity gate**
+(#303): the macOS-arm64 PyPI `torch` wheel is CPU-only, which is exactly the surface
+`src/model/cuda_backend.py` is compared on, so a dedicated step runs
+`tests/test_backend_parity.py` with `MONICA_REQUIRE_BOTH_BACKENDS=1` — under that flag the
+five MLX↔torch comparisons carry no skip marker, so a missing backend **errors** instead of
+skipping (they silently skipped in every job before #303). `tests/test_ci_backend_matrix.py`
+is the portable contract over that wiring and runs on `portable`, where neither backend
+exists. Note `cuda-cpu` also runs that file but still skips 5 of 6 — it is not parity
+coverage. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
 suite entirely: `swift-macos` and `swift-linux` (the official `swift:latest` container) each
 build the package and run `monica-selfcheck` — `swift test` is still a no-op, there is no
 `.testTarget` — then train a fixed fixture corpus (`swift/Fixtures/parity-corpus.jsonl`) into

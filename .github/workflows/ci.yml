@@ -132,11 +132,18 @@ jobs:
       - name: pytest (CUDA backend + backend_parity tests only)
         run: pytest -q -rs tests/test_cuda_*.py tests/test_backend_parity.py
 
-  # ── Job 4: full suite + smoke gate on macOS/MLX (arm64) ───────────────────
+  # ── Job 4: full suite + smoke gate + cross-backend parity (macOS) ─────────
   # macos-latest is arm64, so the mlx wheel installs and the ~19 mlx-gated
   # test files actually run instead of skipping.
+  #
+  # This is also the ONLY job carrying both backends (#303). The plain-PyPI
+  # torch wheel for macOS arm64 is CPU-only — no CUDA build exists for macOS —
+  # and CPU torch is exactly the surface src/model/cuda_backend.py is compared
+  # on (docs/design/03-conformance.md). So `.[dev,data,mlx,cuda]` makes the five
+  # real MLX-vs-torch comparisons in tests/test_backend_parity.py execute here;
+  # before #303 they skipped in every job while the checkmark stayed green.
   full-macos:
-    name: full suite + smoke gate (macOS, MLX)
+    name: full suite + smoke gate + cross-backend parity (macOS)
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -149,14 +156,30 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,data,mlx]"
+          # Plain PyPI, NOT download.pytorch.org/whl/cpu: that index carries no
+          # macos-arm64 wheels, and the default PyPI macOS wheel is already CPU-only.
+          pip install -e ".[dev,data,mlx,cuda]"
       - name: Build the Swift tokenizer (for the Parquet parity test)
         # This is the only job with both Python/pyarrow and a Swift toolchain, so it's what
         # turns tests/test_swift_parquet.py from a local check into a gate (#247). ~30s.
         working-directory: swift
         run: swift build
+      - name: Cross-backend parity — MLX vs CUDA/torch-CPU must RUN here (#303)
+        # The whole point of this job carrying BOTH backends, run as its own step so the
+        # evidence is legible in the log rather than buried in a 1600-test summary.
+        # MONICA_REQUIRE_BOTH_BACKENDS=1 removes the skipif markers (see
+        # tests/test_backend_parity.py's `requires_both_backends`), so a missing backend
+        # ERRORS instead of skipping; pytest's exit code 5 ("no tests collected") catches
+        # the file being deleted or renamed away. Expect `8 passed`, 0 skipped.
+        env:
+          MONICA_REQUIRE_BOTH_BACKENDS: "1"
+        run: pytest -q -rs tests/test_backend_parity.py
       - name: pytest
-        run: pytest -q -rs
+        # No MONICA_REQUIRE_BOTH_BACKENDS here on purpose: the rest of the suite keeps
+        # its normal skip semantics. tests/test_backend_parity.py is ignored here: it
+        # already ran (and gated) in the dedicated step above, and this job installs
+        # both backends, so an un-ignored run here would just duplicate it.
+        run: pytest -q -rs --ignore=tests/test_backend_parity.py
       - name: Build a fresh toy split
         run: |
           python -m src.data.download --dummy --out "$RUNNER_TEMP/toy/raw" --max-docs 2000
