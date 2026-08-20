@@ -24,7 +24,8 @@ mx = pytest.importorskip("mlx.core")
 # within one process — exactly what this file's tests do. One shared mitigation, whose
 # rationale and loud-failure contract live on the helper (see
 # `scripts/export_parity_fixture.py`); the confinement is checkable with
-# `git grep set_cache_limit -- src scripts tests`, which must name that file alone.
+# `git grep set_cache_limit -- src scripts tests`, which must show no CALL site outside
+# that file (the remaining hits here are prose and the fail-loud test's monkeypatch stubs).
 from scripts.export_parity_fixture import disable_buffer_cache_for_process  # noqa: E402
 
 disable_buffer_cache_for_process()

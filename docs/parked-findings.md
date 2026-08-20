@@ -131,3 +131,11 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   (`poc-fixture-oracle`/`poc-parity`, `train-fixture-oracle`/`-verify`,
   `.github/workflows/ci.yml`) are dispatch/schedule-only. Adding an always-on macOS job is a
   runtime-cost decision. Found while closing #298. Severity: coverage, non-blocking.
+
+- [2026-08-19] `CLAUDE.md` and `.claude/plans/issue-298.md`'s V8 both give the Swift gate as
+  `cd swift/engine && swift run monica-parity`, which cannot work: mlx-swift's `default.metallib`
+  is an Xcode-only build product, so `swift run` builds fine and then dies with "Failed to load
+  the default metallib". `.github/workflows/ci.yml:446-487` documents this and uses `xcodebuild`
+  + the product binary instead. On a host with only Command Line Tools installed the gate is not
+  runnable at all. Found while closing #298. Severity: docs/tooling, non-blocking (CI runs the
+  real form).

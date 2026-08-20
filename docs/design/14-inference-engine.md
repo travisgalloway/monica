@@ -834,9 +834,11 @@ in `train.safetensors` between runner instances.
 sites: `build_fixture`, `tests/test_mlx_mixing_matrix.py`, `tests/test_parity_fixture_export.py`,
 `tests/test_train_parity_fixture_export.py`, `tests/test_lowp_parity_band.py`. The issue text says
 two and the plan said three; both undercounted — #264's mitigation had already been copy-pasted
-into two more test modules. `git grep -n set_cache_limit -- src scripts tests` now names
-`export_parity_fixture.py` and nothing else, which is what makes the confinement an observation
-rather than an assumption. The helper **raises** (naming `mx.__version__`) if the limit does not
+into two more test modules. `git grep -n set_cache_limit -- src scripts tests` now returns **no
+call site** outside that one file: the remaining hits are prose comments plus the monkeypatch
+stubs in `test_mlx_mixing_matrix.py` that falsify the fail-loud check. That is what makes the
+confinement an observation rather than an assumption — and in particular there is no call on the
+training/inference path. The helper **raises** (naming `mx.__version__`) if the limit does not
 take effect, so an MLX API change fails loudly instead of silently no-op'ing; MLX 0.32.0 exposes no
 `get_cache_limit`, so it confirms via a second `set_cache_limit(0)` plus `get_cache_memory()`.
 
