@@ -1038,7 +1038,29 @@ def _double_export(args) -> None:
             target.write_bytes(bytes(blob))
             print(f"double-export: DEBUG corrupted {target} (negative control)")
 
-        verdicts = compare_trees(first, second)
+        try:
+            verdicts = compare_trees(first, second)
+        except (FileNotFoundError, ValueError) as exc:
+            # compare_trees (via digest_tree) raises rather than returning [] when a tree
+            # is missing/empty (the anti-blind rule) — that is not an "identical" verdict
+            # and not a "mismatch" verdict either, but it is still a case where neither
+            # export is verified, so it gets the same quarantine as a mismatch: nothing
+            # stays at `--out`.
+            one = Path(str(first) + ".mismatch-1")
+            two = Path(str(first) + ".mismatch-2")
+            for stale in (one, two):
+                if stale.exists():
+                    shutil.rmtree(stale)
+            first.rename(one)
+            partial_note = ""
+            if second.exists():
+                second.rename(two)
+                partial_note = f" (second export kept at {two})"
+            print(f"double-export: comparison failed ({exc}).\n"
+                  f"  The guard could not verify agreement, so neither export is "
+                  f"trustworthy — nothing was left at {first}; the first export is kept "
+                  f"for diagnosis at {one}{partial_note}.")
+            raise SystemExit(2)
         if not verdicts:
             # compare_trees() already digested (fully hashed) both trees above; count
             # files via a plain directory walk instead of re-hashing them a second time.
