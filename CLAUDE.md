@@ -69,9 +69,23 @@ jobs (#267), `poc-fixture-oracle` and `poc-parity`, gate the Swift/MLX model por
 checked-in toy fixtures `swift-engine` uses — the first job generates the 571 MB fixture on a
 macOS runner and uploads a ~2 KB sha256 manifest, the second regenerates it independently on a
 second runner and `cmp`s the two manifests (the #298 cross-process corruption guard) before
-running `monica-parity` against it. Both are **dispatch/schedule-only**
-(`workflow_dispatch` or a weekly `schedule:`) — **never `pull_request`/`push`** — so a green
-PR run never implies poc scale was exercised; see `swift/engine/Fixtures/README.md` §poc.
+running `monica-parity` against it.
+
+Those two poc jobs are **not** in `ci.yml`. Since #302 the repo has **two** workflow files, and
+the split is the guarantee: `.github/workflows/ci.yml` holds **8** jobs — the seven named above
+plus `swift-engine` (see the seam section) — and triggers on
+`pull_request`, `push` to `main`, and `workflow_dispatch` — it has **no `schedule:`** and no job in
+it carries an `if:`, so no PR gate can silently stop running.
+`.github/workflows/scheduled-parity.yml` holds **4** heavy jobs — `poc-fixture-oracle`/`poc-parity`
+(#267) and `train-fixture-oracle`/`train-fixture-oracle-verify` (#195) — and triggers **only** on
+`workflow_dispatch` and a weekly `schedule:` (Monday 09:17 UTC). It declares **no
+`pull_request`/`push` trigger at all**, so those jobs are structurally unreachable from a PR rather
+than merely `if:`-guarded — **a green PR run never implies poc scale was exercised**; see
+`swift/engine/Fixtures/README.md` §poc. A manual full run is therefore two commands
+(`gh workflow run ci.yml` and `gh workflow run scheduled-parity.yml`), neither taking inputs. The
+whole trigger×job matrix is asserted by `tests/test_workflow_triggers.py`, which runs inside the
+`portable` job on every PR — re-adding a `schedule:` to `ci.yml`, or a `pull_request:` to
+`scheduled-parity.yml`, fails that test.
 
 ## The seam — the most important architectural rule
 

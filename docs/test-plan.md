@@ -8,8 +8,8 @@ Columns match what this repository actually runs:
 - **Unit** — a `tests/test_*.py`, or a case in the Swift `monica-selfcheck` / `monica-lsp
   --self-test` runners (`swift/` deliberately has no `.testTarget`; `swift test` is a no-op).
 - **Integration** — a test wiring two or more subsystems, or a `src/conformance/` check.
-- **E2E** — `scripts/smoke_test.py`, a job in `.github/workflows/ci.yml`, or `monica-parity` /
-  `monica-bench`.
+- **E2E** — `scripts/smoke_test.py`, a job in `.github/workflows/ci.yml` or
+  `.github/workflows/scheduled-parity.yml`, or `monica-parity` / `monica-bench`.
 
 `n/a` means the tier cannot exist for that capability; `none` means it could and does not. The
 two are never interchangeable. An empty Gaps cell is a claim, so it is only written when true.
@@ -131,7 +131,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ENGINE-3 | n/a | n/a | `monica-parity` MoE sections | load counting, route-bias write-back | none |
 | ENGINE-4 | n/a | n/a | `monica-parity` | fp16/bf16 tolerance band | none |
 | ENGINE-5 | n/a | n/a | `monica-parity` extras | `mixing_matrix`, `hidden_states`, `verify_block` | none |
-| ENGINE-6 | n/a | n/a | CI `poc-fixture-oracle` + `poc-parity` | 571 MB poc-scale fixture, cross-process corruption guard (#298) | **dispatch/schedule-only** — never on `pull_request`/`push`, so a green PR never implies poc-scale parity |
+| ENGINE-6 | n/a | `test_workflow_triggers.py` (the trigger matrix) | `scheduled-parity.yml`'s `poc-fixture-oracle` + `poc-parity` | 571 MB poc-scale fixture, cross-process corruption guard (#298) | **dispatch/schedule-only** — since #302 these live in a workflow with no `pull_request`/`push` trigger at all, so a green PR never implies poc-scale parity |
 | ENGINE-7 | n/a | `scripts/check_swift_checkpoint.py` | CI `swift-engine` Swift→Python round-trip (GATE) | the direction `monica-parity` alone cannot prove | none |
 | ENGINE-8 | n/a | n/a | n/a | n/a | n/a — not built (#171) |
 | ENGINE-9 | n/a | n/a | n/a | n/a | n/a — only the `verifyBlock` prerequisite exists (#172) |
@@ -152,5 +152,5 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
 | OPS-1 | n/a | n/a | `scripts/smoke_test.py`, CI `smoke-linux` + `full-macos` | resume exactness + eval | does not cover `train.py`'s stream-resume (see TRAIN-2) |
-| OPS-2 | n/a | n/a | `.github/workflows/ci.yml`, 10 jobs | portable/seam guard, both backends, Swift parity | 2 of 10 jobs never run on PR/push (see ENGINE-6) |
+| OPS-2 | `test_workflow_triggers.py` | n/a | `ci.yml` (8 jobs, PR/push) + `scheduled-parity.yml` (4 jobs, dispatch/schedule) | portable/seam guard, both backends, Swift parity; the trigger×job matrix itself | 4 of 12 jobs are in a workflow with no PR/push trigger (see ENGINE-6); no job runs on a cadence any more (#312) |
 | OPS-3 | `test_bench_config_export.py`, `test_bench_context.py` | none | `monica-bench` CI steps (informational) | provenance tagging | nothing checks `docs/benchmarks.md` stays in sync with CI bench output |
