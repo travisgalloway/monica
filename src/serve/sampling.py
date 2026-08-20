@@ -61,6 +61,9 @@ def sample(
 
     `allowed_ids` (constrained decode, #226): restrict the draw to exactly this id set.
     `None` is a no-op. An empty sequence raises `ValueError` — see the module docstring.
+    Duplicate ids are dropped, first occurrence winning, so the id set keeps the
+    caller's order and the fallback draw below is uniform over *distinct* allowed ids
+    rather than weighted by how often a caller happened to list one (#285).
     Ids outside `[0, vocab)` are dropped, mirroring the repetition block's own
     out-of-range guard — but if that drops every id (all of `allowed_ids` was
     out-of-range), the result is the same as an empty `allowed_ids` and raises
@@ -79,6 +82,12 @@ def sample(
                 "constraint set (that is a masker bug, not 'nothing is valid'; the "
                 "caller should bypass the mask for this step instead)")
         ids = np.asarray(list(allowed_ids), dtype=np.int64)
+        # Dedupe preserving first-seen order (#285): duplicates are harmless for the
+        # mask (writing 0.0 twice to a slot is the same mask) but bias the uniform
+        # `rng.choice` fallback below toward whatever the caller happened to list
+        # twice. `np.unique` with `return_index` gives the index of each value's
+        # FIRST occurrence; taking those indices in sorted order restores input order.
+        ids = ids[np.sort(np.unique(ids, return_index=True)[1])]
         ids = ids[(ids >= 0) & (ids < logits.size)]
         if ids.size == 0:
             raise ValueError(
