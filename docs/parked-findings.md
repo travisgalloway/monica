@@ -139,3 +139,11 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   + the product binary instead. On a host with only Command Line Tools installed the gate is not
   runnable at all. Found while closing #298. Severity: docs/tooling, non-blocking (CI runs the
   real form).
+
+- [2026-08-19] `tests/test_parity_fixture_export.py:90`, the macOS suite is flaky at ~1-in-4 when
+  `tests/test_mlx_mixing_matrix.py` runs before it in the same process (3/12 measured on `main`,
+  0/12 for the export module alone). The failure is `greedy_ids` as EXACT ints — 16/16 wrong, by
+  222 — i.e. #298 corruption, not a tolerance. Both modules already apply `set_cache_limit(0)`, so
+  the mitigation does not compose across pytest modules. Fixing it means process isolation for the
+  MLX fixture modules (pytest-forked, or a separate CI job), which is test-infrastructure work.
+  Found while verifying #298. Severity: CI reliability, non-blocking but recurring.

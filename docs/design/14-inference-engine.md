@@ -861,7 +861,7 @@ export --trials 20` regenerates `toy` twenty times and diffs every `mixing.{i}` 
 | `mixing.1` | 0.0 | 0/20 |
 | `forward_logits` | 0.0 | 0/20 |
 
-**Branch fired: no drift reproduces, so nothing is loosened.** No tolerance changed — not for
+**Branch fired for the isolated exporter: no drift reproduces there, so nothing is loosened.** No tolerance changed — not for
 `mixing.*`, and certainly not for `forward_logits`/`step_logits`/`greedy_ids`.
 `src/conformance/tolerances.py` is untouched by #298. The near-zero concern is real in principle
 (the causal mixing matrix's strict upper triangle is *exactly* zero, so at `|b| ~ 0` the
@@ -869,12 +869,47 @@ export --trials 20` regenerates `toy` twenty times and diffs every `mixing.{i}` 
 ~2.7x over) — but widening a band to absorb an unreproduced failure would be picking a number to
 make a run green, which is the one thing the tolerance contract forbids.
 
-What that leaves open, stated plainly: the CI failure was **not** reproduced here, so its cause is
-undetermined. The two live hypotheses are a #298 sighting on the CI runner (in which case the
-right response is the guard, not a tolerance) and fp32 accumulation-order nondeterminism specific
-to that runner's hardware. Given the drift magnitudes measured above — #298 corrupts by **6-9**,
-not by 2.7e-05 — the second is the more likely of the two, and neither is closed. If it recurs,
-re-run `--pattern export --trials 20` on the runner that saw it before touching any band.
+**But the CI flake IS reproducible — in a populated pytest process, and it is worse than the CI
+report suggested.** `build_fixture` in isolation is clean; run it after a module that exercises the
+interpretability accessors and it corrupts. Measured on `main` (i.e. this **pre-dates** #298's
+guard and is not caused by it), 12 runs each:
+
+| pytest invocation | failures |
+|---|---|
+| `pytest tests/test_parity_fixture_export.py` | **0/12** |
+| `pytest tests/test_mlx_mixing_matrix.py tests/test_parity_fixture_export.py` | **3/12** |
+
+```bash
+# reproduce (~3 s per run; expect roughly 1 in 4 to fail)
+.venv/bin/python -m pytest tests/test_mlx_mixing_matrix.py \
+    tests/test_parity_fixture_export.py -q -p no:cacheprovider
+```
+
+The failing assertion is **not** `mixing.N` and **not** a tolerance at all — it is `greedy_ids`,
+compared as exact integers:
+
+```
+greedy_ids drifted from the checked-in Swift-parity oracle
+Mismatched elements: 16 / 16 (100%)
+ [0]: 222 (ACTUAL), 4 (DESIRED)
+```
+
+16 of 16 ids wrong, by 222 rather than by one — the same catastrophic signature as the `mixing`
+probe's 6-9 logit drift, not the 2.694e-05 the CI comment reported. So **D4's third branch is the
+one that fires**: this is a live recurrence of #298, and the correct response is to record it, not
+to loosen anything. No band moved.
+
+Two consequences worth stating explicitly, because both are easy to assume away:
+
+1. **`set_cache_limit(0)` does not compose across pytest modules.** Both modules in the failing
+   pair apply the process-wide disable at import, and the corruption still occurs. The 0/40 clean
+   results in D1-D3 were all measured in *dedicated* processes; a long-lived pytest process that
+   has already run ~19 other MLX modules is a different regime, and the mitigation is not known to
+   hold there.
+2. **The CI comment's `mixing.1 max|d| = 2.694e-05` is therefore probably a *different* event**
+   from the one reproduced here — a near-miss at the atol floor rather than this wholesale
+   corruption. That one is still unreproduced (0/20 fresh exports), and widening a band to absorb
+   an unreproduced near-miss would be picking a number to make a run green. Left alone.
 
 ### D5 — What stays open
 
@@ -888,6 +923,11 @@ re-run `--pattern export --trials 20` on the runner that saw it before touching 
   fixtures are covered — but a caller invoking `mixing_matrices` outside the exporter and the four
   test modules is **not** protected by the barrier alone. Parked in `docs/parked-findings.md`;
   changing it is a behaviour decision beyond #298's contract.
+- **The `full-macos` suite is flaky at ~1-in-4 for the module pair above**, pre-dating this work.
+  #298's guard protects what gets *committed* as an oracle; it does nothing for a test process that
+  corrupts mid-run. Making the suite robust (process isolation for the MLX fixture modules, e.g.
+  `pytest-forked`/`-p xdist --forked`, or dropping the accessor tests into their own job) is a
+  test-infrastructure decision beyond this issue's contract. Parked.
 - Pinning `mlx==` in `pyproject.toml`. Out of scope for #298 (a repo-wide dependency decision) and
   pointless as a remedy anyway, since all three tested versions are affected.
 - A PR-time CI job for the double-export. The guard is in the CLI the regeneration command already
