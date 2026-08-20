@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.conformance.fixture_digest import compare_trees, digest_tree
+from src.conformance.fixture_digest import compare_trees
 from src.conformance.forward_step_parity import check_forward_step_parity
 from src.conformance.prefill_decode_parity import check_prefill_decode_parity
 from src.conformance.quant_parity import check_quant_parity
@@ -993,7 +993,10 @@ def _double_export(args) -> None:
 
     On disagreement both trees are preserved (`--out.mismatch-1`, `--out.mismatch-2`) for
     diagnosis, the per-file verdicts are printed, and the process exits 2. Nothing is left
-    at `--out`, so a corrupted oracle cannot be checked in unnoticed.
+    at `--out`, so a corrupted oracle cannot be checked in unnoticed. The same holds if the
+    second export's subprocess itself fails (MLX import error, OOM, non-zero exit, ...): the
+    guard never got to compare, so the first export is unverified and is likewise moved out
+    of `--out` rather than left in place.
 
     Scope: intra-machine determinism — two processes on ONE host. Cross-machine byte
     identity is not claimed (see `src/conformance/fixture_digest.py`).
@@ -1005,7 +1008,25 @@ def _double_export(args) -> None:
     try:
         argv = _child_argv(args, str(second))
         print(f"double-export: re-exporting in a fresh process -> {second}")
-        subprocess.run(argv, check=True)
+        try:
+            subprocess.run(argv, check=True)
+        except subprocess.CalledProcessError as exc:
+            one = Path(str(first) + ".mismatch-1")
+            if one.exists():
+                shutil.rmtree(one)
+            first.rename(one)
+            partial_note = ""
+            if second.exists():
+                two = Path(str(first) + ".mismatch-2")
+                if two.exists():
+                    shutil.rmtree(two)
+                second.rename(two)
+                partial_note = f" (partial child output kept at {two})"
+            print(f"double-export: the second export subprocess failed ({exc}).\n"
+                  f"  The guard never got to compare, so the first export is unverified — "
+                  f"nothing is left at {first}; it is kept for diagnosis at {one}"
+                  f"{partial_note}.")
+            raise SystemExit(2)
 
         if args._corrupt_after_first:
             # Hidden negative control (#298 verification V4): flip one byte in the first
@@ -1019,7 +1040,9 @@ def _double_export(args) -> None:
 
         verdicts = compare_trees(first, second)
         if not verdicts:
-            n = len(digest_tree(first))
+            # compare_trees() already digested (fully hashed) both trees above; count
+            # files via a plain directory walk instead of re-hashing them a second time.
+            n = sum(1 for p in first.rglob("*") if p.is_file())
             print(f"double-export: {n} files identical across two fresh processes")
             shutil.rmtree(second)
             return
