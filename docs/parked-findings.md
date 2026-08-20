@@ -81,3 +81,21 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   torch") while naming the other nine. An omission rather than a false claim, so it was corrected
   in the same pass; recorded here because the pattern — a doc listing jobs by hand — will drift
   again the next time a job is added. Severity: process, low.
+
+- [2026-08-19] `src/lsp/ts_service.py:578` (`TsLspService.diagnostics`), the #278 residual
+  in-flight notification race costs measurably more signal than previously quantified: on the
+  5000-file bench project the LSP client observes only **64%** of introduced `TS2339`s while
+  `TsServerDirect` observes **100%** on the identical edit cycle. Found while adding #279's
+  `diagnostics_direct` bench column. Severity: correctness, non-blocking (the direct transport
+  sidesteps it; closing it in the LSP client needs a per-edit request/response barrier).
+
+- [2026-08-19] `src/lsp/oracle.py` / `src/lsp/harness.py`, nothing consumes
+  `src/lsp/ts_server_direct.py` yet — `CompositeOracle`'s `"ts"` arm is still `TsLspOracle`.
+  #279 deliberately scoped adoption out; whether the eval arm should switch transports (and what
+  `is_incomplete`/frontier filtering looks like under whole-program rather than open-document
+  semantics) is an unmade decision. Found while closing #279. Severity: scope, deferred.
+
+- [2026-08-19] `tests/test_ts_server_direct.py`, the parity gate costs ~74 s of the macOS suite,
+  ~70 s of which is the LSP client's own #278 debounce paid 192 times. There is no `slow`/`live`
+  pytest marker in this repo to gate it behind. Found while adding the gate. Severity: test
+  runtime, non-blocking.

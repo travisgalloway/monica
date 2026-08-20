@@ -48,9 +48,19 @@ size -- a control probe sweeping project size (roughly flat ~350-380ms
 across 10..5000 files) and edit-file length (tracking the clamp's own
 formula from 350ms to 850ms) confirms this; the genuine recheck cost once
 the debounce is subtracted out is ~11-31ms, inside a 50ms bar. See
-`scripts/probe_ts_lsp_debounce.py` and #279 (a direct-`tsserver`
-`semanticDiagnosticsSync` bypass that would sidestep the client-side
-debounce entirely).
+`scripts/probe_ts_lsp_debounce.py`.
+
+**If you need that cost without the debounce, use
+`ts_server_direct.TsServerDirect` (#279)** -- a second transport speaking
+tsserver's own protocol to the same pinned TypeScript, asking
+`semanticDiagnosticsSync` synchronously so neither timer is on the path.
+It measures **19.7ms median** where this class measures 377ms on the same
+5000-file project, and its `[]` is an unambiguous answer rather than a
+possible `n_no_publish` (below). It implements only `open_project`/`update`/
+`diagnostics`, with signatures matching this class's; THIS class remains the
+LSP-conformant client of record and the only one with `definition`/
+`references`/`completions`/`quickinfo`/`document_symbols`. See
+`docs/design/12-lsp-in-the-loop.md`, "The direct-`tsserver` transport (#279)".
 
 Not safe for concurrent use -- one service instance == one sequential
 open/edit/query stream, matching `TsLspOracle`'s contract.

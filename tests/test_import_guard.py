@@ -103,6 +103,7 @@ PORTABLE_MODULES = [
     "src.lsp.jsonrpc",
     "src.lsp.ts_lsp",
     "src.lsp.ts_service",
+    "src.lsp.ts_server_direct",
     "src.lsp.opengrep",
     "src.serve.constrained",
     "src.lsp.completion_mask",
