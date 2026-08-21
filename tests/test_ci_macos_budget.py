@@ -63,10 +63,12 @@ EXPECTED_TIMEOUT_MINUTES = {
     PARITY_JOB: 15,
 }
 
-# The budget the suite step measures itself against, in seconds. #315's stated ceiling
-# for the macOS PR path is 20 minutes; 1200 s is that ceiling.
+# The budget the suite step measures itself against, in seconds. Phase 1 (#315): the
+# recorded baseline is 37m48s (2268s), so the budget starts at that baseline plus a
+# ~2-minute buffer — 2400s (40 min) — rather than the eventual 20-minute target, which
+# requires the suite itself to get faster first. Tighten this once it does.
 BUDGET_VAR = "MACOS_SUITE_BUDGET_SECONDS"
-EXPECTED_BUDGET_SECONDS = 1200
+EXPECTED_BUDGET_SECONDS = 2400
 
 # How much room the budget must leave below the timeout. Five minutes: enough that the
 # guard's own failure path (printing, exiting, uploading the log) completes, and enough

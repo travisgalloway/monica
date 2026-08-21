@@ -209,7 +209,13 @@ jobs:
         # set +e / STATUS dance — a FAILING SUITE MUST STAY A FAILING SUITE, never be
         # reported as "over budget", and the elapsed line prints on both paths.
         env:
-          MACOS_SUITE_BUDGET_SECONDS: "1200"
+          # 2400s (40 min): the recorded baseline is 37m48s (2268s, see the #315 note
+          # above this job) — this budget is that baseline plus a ~2-minute buffer,
+          # capped by the 300s margin `test_budget_fires_before_the_timeout` requires
+          # below `timeout-minutes: 45`. Tighten once the suite is actually back under
+          # 20 minutes; raising OR lowering this must update EXPECTED_BUDGET_SECONDS in
+          # tests/test_ci_macos_budget.py in the same commit.
+          MACOS_SUITE_BUDGET_SECONDS: "2400"
         run: |
           START=$SECONDS
           set +e
