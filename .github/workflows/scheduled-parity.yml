@@ -13,10 +13,14 @@ name: Scheduled parity
 # The converse also motivated the split: ci.yml's workflow-level `schedule:` fired the
 # WHOLE workflow every Monday, so the 8 PR/push jobs (three of them macOS) ran weekly
 # too — the four `if:`s only filtered the guarded jobs. That weekly full run did have
-# real value (it caught environmental drift PR CI attributes to "flake"); giving it up is
-# a deliberate, recorded trade — see docs/design/14-inference-engine.md's #302 entry.
+# real value (it caught environmental drift PR CI attributes to "flake"), and #312 gave
+# that half back: ci.yml now carries its OWN monthly cron ("43 9 3 * *"), firing only its
+# 8 gates. The two crons are independent — different files, different concurrency groups,
+# different minutes — and a cron in ci.yml still cannot reach the jobs below, because the
+# split, not the absence of a trigger, is what keeps them off PRs. See
+# docs/design/14-inference-engine.md's #302 and #312 entries.
 #
-# Manual runs are now two commands, by design:
+# Manual runs are two commands, by design:
 #   gh workflow run ci.yml                 # the 8 PR/push gates
 #   gh workflow run scheduled-parity.yml   # the 4 jobs below
 # The trigger x job matrix is asserted by tests/test_workflow_triggers.py, which runs in

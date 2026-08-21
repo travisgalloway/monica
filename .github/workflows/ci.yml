@@ -10,19 +10,34 @@ name: CI
 # (#195's training-fixture oracle pair, #267's poc-scale parity pair) are NOT here:
 # #302 moved them to .github/workflows/scheduled-parity.yml. Job banner numbers below
 # are unchanged by that move, so existing "see job 4/5/6" references stay valid.
+#
+# Since #312 these 8 jobs ALSO run on a monthly cron, against unchanged `main`, to
+# catch environmental drift (runner-image, Xcode, Homebrew, npm, mlx-swift moves) that
+# per-PR CI reads as flake. That cron is safe here precisely because of #302's split:
+# what keeps the heavy jobs off pull requests is that they live in a different file
+# with no pull_request/push trigger — not the absence of a `schedule:` key here.
 
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
-# No `schedule:` here, deliberately (#302). This workflow's 8 jobs are the PR/push
-# gates and nothing else; the heavy dispatch/schedule-only parity jobs live in the
-# sibling .github/workflows/scheduled-parity.yml, which has no pull_request/push
-# trigger at all. tests/test_workflow_triggers.py asserts both halves of that.
+  # #312: environmental-drift coverage on a STABLE ref. 09:43 UTC on the 3rd of each
+  # month — off-the-hour to dodge the Actions scheduler crunch, off the 1st, and a
+  # different minute from scheduled-parity.yml's "17 9 * * 1". This fires ONLY this
+  # file's 8 PR/push gates: the 4 heavy parity jobs are in the sibling workflow and are
+  # unreachable from here (tests/test_workflow_triggers.py asserts both halves).
+  # Note GitHub arms `schedule:` only for workflows on the default branch, and disables
+  # scheduled workflows in public repos after 60 days of no repository activity.
+  schedule:
+    - cron: "43 9 3 * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # #312: `github.event_name` is in the group so a scheduled drift run does not share a
+  # group with push-to-main runs. GitHub keeps at most one in-progress + one pending run
+  # per group and CANCELS the older pending one, so without this the monthly run can be
+  # silently cancelled by the next push and leave no signal at all.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

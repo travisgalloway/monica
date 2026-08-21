@@ -152,5 +152,5 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | ID | Capability | Portable | MLX | CUDA | Swift | Status | Issue | Design |
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
 | OPS-1 | A person can run the M4 smoke gate (resume exactness + eval) | done | done | done | n/a | Shipped | — | design/06 |
-| OPS-2 | A person gets every gate run automatically in CI | done | done | done | done | Shipped | #249, #302 | design/06 |
+| OPS-2 | A person gets every gate run automatically in CI | done | done | done | done | Shipped | #249, #302, #312 | design/06 |
 | OPS-3 | A person can read a provenance-tagged benchmark ledger | done | n/a | n/a | done | Shipped | #170 | benchmarks |

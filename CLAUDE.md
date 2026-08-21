@@ -82,18 +82,21 @@ running `monica-parity` against it.
 Those two poc jobs are **not** in `ci.yml`. Since #302 the repo has **two** workflow files, and
 the split is the guarantee: `.github/workflows/ci.yml` holds **8** jobs — the seven named above
 plus `swift-engine` (see the seam section) — and triggers on
-`pull_request`, `push` to `main`, and `workflow_dispatch` — it has **no `schedule:`** and no job in
-it carries an `if:`, so no PR gate can silently stop running.
+`pull_request`, `push` to `main`, `workflow_dispatch`, and (since #312) a **monthly `schedule:`**
+(09:43 UTC on the 3rd) that runs those same 8 jobs against unchanged `main` as environmental-drift
+coverage. No job in it carries an `if:`, so no PR gate can silently stop running.
 `.github/workflows/scheduled-parity.yml` holds **4** heavy jobs — `poc-fixture-oracle`/`poc-parity`
 (#267) and `train-fixture-oracle`/`train-fixture-oracle-verify` (#195) — and triggers **only** on
 `workflow_dispatch` and a weekly `schedule:` (Monday 09:17 UTC). It declares **no
 `pull_request`/`push` trigger at all**, so those jobs are structurally unreachable from a PR rather
 than merely `if:`-guarded — **a green PR run never implies poc scale was exercised**; see
-`swift/engine/Fixtures/README.md` §poc. A manual full run is therefore two commands
+`swift/engine/Fixtures/README.md` §poc. Note what carries that guarantee: the **file split**, not
+the absence of a cron in `ci.yml` — `ci.yml`'s monthly cron fires only `ci.yml`'s own 8 jobs, and
+the two crons are independent. A manual full run is therefore two commands
 (`gh workflow run ci.yml` and `gh workflow run scheduled-parity.yml`), neither taking inputs. The
 whole trigger×job matrix is asserted by `tests/test_workflow_triggers.py`, which runs inside the
-`portable` job on every PR — re-adding a `schedule:` to `ci.yml`, or a `pull_request:` to
-`scheduled-parity.yml`, fails that test.
+`portable` job on every PR — adding a `pull_request:` to `scheduled-parity.yml`, giving a `ci.yml`
+job an `if:`, or retiming either cron fails that test.
 
 ## The seam — the most important architectural rule
 
