@@ -485,10 +485,11 @@ The #163 dependency order:
    — `swift selfcheck (macOS)`'s failure on PR #301 (the #279 tsserver/LSP debounce race) and
    `swift model parity (macOS, mlx-swift)` failing once and passing on retry on PR #310 — are
    exactly that class: read as noise against a changing diff, read as *the environment moved* when
-   they happen on unchanged `main`. After #302 nothing runs those jobs on a cadence. This is an
-   accepted, recorded cost, not an oversight; restoring the coverage is **#312**, parked rather
-   than built here because adding a cron back to `ci.yml` would re-open the exact behaviour #302
-   closed. Also dropped: `poc-parity`'s `needs: swift-engine` edge, which was cache-warming only
+   they happen on unchanged `main`. After #302 nothing ran those jobs on a cadence. That was an
+   accepted, recorded cost, not an oversight, and it was **restored by #312** — see entry 8: once
+   the files are split, a cron on `ci.yml` fires only `ci.yml`'s own 8 jobs and cannot reach a
+   heavy one, so the coverage comes back without re-opening what #302 closed. Also dropped:
+   `poc-parity`'s `needs: swift-engine` edge, which was cache-warming only
    (`swift-engine` produces no artifact it consumes) and cannot cross workflow files — the cache is
    still restored by the `swift-engine-${{ runner.os }}-` `restore-keys` prefix from the last push
    to `main`, with a cold 20-40 min vendored-C++ build as the accepted worst case inside the
@@ -497,13 +498,73 @@ The #163 dependency order:
    *The gate.* `act` was rejected (needs Docker, cannot model macOS runners, and would be a manual
    step rather than a gate). Instead `tests/test_workflow_triggers.py` parses both workflow files
    and asserts the full trigger×job matrix — it runs in `ci.yml`'s `portable` job on every PR, so
-   re-adding a `schedule:` to `ci.yml`, adding a `pull_request:` to `scheduled-parity.yml`, giving
-   any `ci.yml` job an `if:`, or losing a job in a future move all fail a test. Two details in it
+   adding a `pull_request:` to `scheduled-parity.yml`, giving any `ci.yml` job an `if:`, retiming
+   either cron (#312), or losing a job in a future move all fail a test. Two details in it
    are load-bearing: PyYAML's `safe_load` is YAML 1.1, where a bare `on:` key parses as the
    **boolean `True`** rather than the string `"on"` (the loader looks under both and asserts it
    found one, so a future PyYAML change fails loudly instead of reading as "no triggers, therefore
    nothing runs, therefore everything passes"); and the `if:`-expression evaluator **raises** on any
    form it does not recognise, because an unparsed guard is *unknown*, never *"the job runs"*.
+8. **#312 — done: the drift cadence is back, on `ci.yml` only.** Entry 7 recorded the cost of the
+   split as accepted; this reverses that half of it. `ci.yml` gained
+   `schedule: - cron: "43 9 3 * *"` — 09:43 UTC on the 3rd of each month — which fires its own 8
+   PR/push gates against **unchanged `main`**. That stable ref is the whole point: the failure
+   class being detected (the hosted runner image moved — Xcode, Homebrew, npm, the mlx-swift
+   toolchain) is attributed to *flake* when it lands on a changing diff and to *the environment
+   moved* when it lands on a diff-free run. The two instances entry 7 names (PR #301, PR #310) are
+   that class.
+
+   *Three shapes were on the table*, from the issue. **(1)** A `schedule:` on `ci.yml`.
+   **(2)** A third `drift.yml`. **(3)** Convert the two observed failures into deterministic tests
+   and keep no cadence.
+
+   *Shape 1 was chosen.* The key point, and the reason entry 7's parenthetical was **wrong as
+   written** (it said a cron on `ci.yml` would re-open what #302 closed, and it is corrected in
+   place above rather than annotated): what #302 removed was *coupling* — one workflow-level cron
+   in a file holding both the cheap gates and the heavy poc gate, with the separation carried by
+   four `if:` expressions. The file split removed that coupling **structurally**. A cron on
+   `ci.yml` today fires exactly its 8 jobs and cannot reach a heavy job, because the heavy jobs are
+   in a different file with its own trigger set. Shape 1 therefore restores only the half of the
+   old weekly run that was worth keeping.
+
+   *Shape 2 was rejected.* Duplicating the macOS job bodies into a second file creates a copy that
+   silently drifts from the real ones — a drift detector running a stale copy of the job it is
+   meant to watch is the BLIND-monitor failure, worse than no detector. The non-duplicating
+   variant (a `workflow_call:` on `ci.yml` with `drift.yml` calling it) adds a trigger and a whole
+   caller file to obtain what one `schedule:` key gives for free, and entry 7 already rejected a
+   `workflow_call` shim as reintroducing the coupling the split exists to remove.
+
+   *Shape 3 was rejected as a substitute*, and is partly already done: #279 is closed — the
+   tsserver debounce race got a real fix — and closing it restored no cadence. The #310 mlx-swift
+   retry-pass is not reducible to a deterministic test, because "the runner image moved" is not
+   something an in-repo test can encode. Shape 3 also produces no stable-ref signal, which is the
+   specific thing that was lost.
+
+   *Monthly, not weekly.* Cost is not the deciding factor — `monica` is public, so GitHub-hosted
+   macOS minutes are free. Signal-to-noise is: a red run on unchanged `main` has to be rare enough
+   that someone reads it, and the drift sources move on a multi-week cadence. Going weekly later is
+   a one-token edit to the cron plus the literal in the test.
+
+   *The concurrency fix is part of the coverage, not a tidy-up.* `ci.yml`'s group was
+   `${{ github.workflow }}-${{ github.ref }}`, shared by push and schedule runs on
+   `refs/heads/main`. GitHub allows one in-progress plus one pending run per group and **cancels
+   the previously pending run** when a newer one queues, so a monthly drift run queued behind an
+   in-flight push run is cancellable by the next push — vanishing with no failure and no signal,
+   which is exactly the BLIND failure this cadence exists to remove. The group now ends in
+   `-${{ github.event_name }}`; `cancel-in-progress` still evaluates true only for `pull_request`,
+   so PR-supersede behaviour is unchanged.
+
+   *The gate.* `tests/test_workflow_triggers.py` grew two tests (the cron literal, the concurrency
+   group) and DoD-1 was **rewritten, not weakened**: the deleted assertion was
+   `"schedule" not in _triggers(ci.yml)`, and it is replaced by the property that assertion stood
+   in for — a `schedule` event in `ci.yml` fires exactly `PR_PUSH_JOBS` and intersects `HEAVY_JOBS`
+   in nothing. Trigger absence was the *mechanism* #302 happened to use; not-reaching-a-heavy-job
+   is the *property*, and asserting it directly is strictly stronger. The two crons collide
+   harmlessly — different files, different concurrency groups, different minutes (43 vs 17).
+   Two limits are recorded in the `ci.yml` comment rather than left to be rediscovered: GitHub
+   arms `schedule:` only from the default branch (so the first real run is post-merge, on the 3rd,
+   checked with `gh run list --workflow=ci.yml --event=schedule`), and it disables scheduled
+   workflows in public repos after 60 days of repository inactivity.
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
 DPO/GRPO step factories.

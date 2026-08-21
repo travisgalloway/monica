@@ -17,6 +17,19 @@ That is only a guarantee if something checks it. GitHub itself will not tell us 
 Monday after a bad merge, so this module parses both workflow files and asserts the full
 matrix: which jobs would run, for each event, in each file.
 
+#312 and the assertion that changed shape
+-----------------------------------------
+``ci.yml`` now has a ``schedule:`` of its own — a monthly cron that runs its 8 gates against
+unchanged ``main`` to catch environmental drift (a runner-image, Xcode or toolchain move that
+per-PR CI reads as flake). This module used to assert ``"schedule" not in _triggers(CI)``, and
+deleting that line is **not** a weakening: trigger absence was never what protected the heavy
+jobs, it was an artifact of how #302 happened to be implemented. What protects them is the file
+split, and that property is asserted directly — a ``schedule`` event in ``ci.yml`` fires exactly
+``PR_PUSH_JOBS`` and intersects ``HEAVY_JOBS`` in nothing (DoD-1), and no file holding a heavy job
+declares ``pull_request``/``push`` at all (DoD-5). The cron literal and ``ci.yml``'s concurrency
+group are pinned too, because a cadence that can be silently retimed or silently cancelled is the
+BLIND monitor this coverage exists to avoid.
+
 Deliberate design notes
 -----------------------
 * The id sets (``ALL_JOBS``/``PR_PUSH_JOBS``/``HEAVY_JOBS``) are written out **literally**.
@@ -139,18 +152,69 @@ def _jobs_for(name: str, event: str) -> set[str]:
 
 
 # ── DoD-1 ─────────────────────────────────────────────────────────────────────
-def test_schedule_runs_only_the_heavy_parity_jobs() -> None:
-    """A `schedule` event fires the four heavy jobs and nothing else.
+def test_schedule_fires_the_right_job_set_in_each_workflow() -> None:
+    """Each file's cron fires exactly its own jobs, and ci.yml's can never reach a heavy one.
 
-    Both halves matter. The scheduled workflow must contain exactly the heavy set, and
-    ci.yml must have no `schedule:` key — otherwise the weekly cron still drags all 8
-    PR/push jobs (including three macOS runners) along with it, which is #302 itself.
+    Each workflow now carries a cron: scheduled-parity.yml's weekly one for the 4 heavy
+    gates, ci.yml's monthly one for #312's drift coverage over the 8 PR/push gates. #302's
+    guarantee is the third assertion — a `schedule` in ci.yml cannot fire a heavy job,
+    because the heavy jobs are in another file. That is the *property* #302 protected;
+    "ci.yml has no `schedule:`" was merely the *mechanism* it happened to use, and asserting
+    the property directly is strictly stronger than asserting the mechanism.
     """
     assert _jobs_for(SCHEDULED, "schedule") == HEAVY_JOBS
-    assert "schedule" not in _triggers(_load(CI), CI), (
-        "ci.yml has regained a `schedule:` trigger — the weekly cron would once again run "
-        "every unguarded job, which is exactly what #302 removed"
+    assert _jobs_for(CI, "schedule") == PR_PUSH_JOBS, (
+        "ci.yml's monthly drift cron (#312) must fire exactly the 8 PR/push gates"
     )
+    assert HEAVY_JOBS & _jobs_for(CI, "schedule") == set(), (
+        "a heavy parity job became reachable from ci.yml's cron — #302's split is the only "
+        "thing keeping it off pull requests too"
+    )
+
+
+# ── DoD-1b (#312) ─────────────────────────────────────────────────────────────
+def test_ci_drift_cadence_is_the_recorded_monthly_cron() -> None:
+    """ci.yml's drift cadence is monthly, and retiming it takes a deliberate edit here.
+
+    The literal is written out for the same reason the job-id sets are: this is a contract,
+    not a mirror. Turning "43 9 3 * *" into "* * * * *" — 8 jobs, three of them macOS, every
+    minute — must fail a test rather than merge as a one-character YAML change.
+    """
+    schedule = _triggers(_load(CI), CI)["schedule"]
+    assert isinstance(schedule, list) and len(schedule) == 1, (
+        f"ci.yml should declare exactly one cron entry, found {schedule!r}"
+    )
+    cron = schedule[0]["cron"]
+    assert cron == "43 9 3 * *", f"ci.yml's drift cadence changed to {cron!r} (#312 recorded 43 9 3 * *)"
+    day_of_month = cron.split()[2]
+    assert day_of_month != "*", (
+        f"ci.yml's cron day-of-month is {day_of_month!r} — the cadence is no longer monthly"
+    )
+
+
+# ── DoD-5b (#312) ─────────────────────────────────────────────────────────────
+def test_scheduled_ci_run_cannot_be_cancelled_by_a_push() -> None:
+    """The monthly run gets its own concurrency group, so a push cannot silently eat it.
+
+    GitHub keeps at most one in-progress plus one pending run per concurrency group, and
+    queuing a third **cancels the older pending one**. With the group keyed only on workflow
+    and ref, a drift run queued behind an in-flight push-to-main run is cancellable by the
+    next push: no failure, no signal, a monitor that reads healthy while blind. Keying the
+    group on `github.event_name` separates the two populations.
+    """
+    concurrency = _load(CI)["concurrency"]
+    assert "github.event_name" in concurrency["group"], (
+        f"ci.yml's concurrency group is {concurrency['group']!r} — without github.event_name "
+        f"a scheduled drift run shares a group with push-to-main runs and can be cancelled "
+        f"pending, leaving no signal (#312)"
+    )
+    # PR-supersede behaviour is unchanged: every run on a PR ref carries the same event name,
+    # so they still share a group and still cancel in progress.
+    assert _evaluates_true(str(concurrency["cancel-in-progress"]), "pull_request")
+    for event in ("push", "schedule", "workflow_dispatch"):
+        assert not _evaluates_true(str(concurrency["cancel-in-progress"]), event), (
+            f"ci.yml would now cancel an in-progress {event} run"
+        )
 
 
 # ── DoD-2 ─────────────────────────────────────────────────────────────────────
