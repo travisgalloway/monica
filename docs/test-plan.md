@@ -21,7 +21,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
-| DATA-1 | `test_download_sources.py`, `test_filters.py`, `test_dedup.py`, `test_cleaned_jsonl.py` | `test_data_pipeline.py` | CI `smoke-linux`/`full-macos` `--dummy` step | offline byte-fallback | live HF download path has no CI coverage (by design, `--dummy` only) |
+| DATA-1 | `test_download_sources.py`, `test_filters.py`, `test_dedup.py`, `test_cleaned_jsonl.py` | `test_data_pipeline.py` | CI `smoke-linux`/`parity-macos` `--dummy` step | offline byte-fallback | live HF download path has no CI coverage (by design, `--dummy` only) |
 | DATA-2 | none | `test_data_pipeline.py` | CI `--byte-fallback` tokenize step | byte fallback, dtype selection | no unit test isolating `src/data/tokenize.py` from the pipeline |
 | DATA-3 | `test_shard.py`, `test_packing_dtype.py` | `test_data_pipeline.py` | CI pack step | uint16/uint32 boundary at vocab 65536 | none |
 | DATA-4 | `test_split_shards.py` | `test_data_pipeline.py` | CI split step feeding `smoke_test.py` | shard-boundary split, val-token count | none |
@@ -41,7 +41,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | TOK-1 | `monica-selfcheck` | n/a (zero-dependency package by design) | CI `swift-macos`/`swift-linux` train-the-parity-corpus step | merge-order determinism | none |
 | TOK-2 | `monica-selfcheck` | `test_swift_fim.py` (build-gated) | CI FIM-pack steps | shard layout vs `src/data/shard.py` | none |
 | TOK-3 | n/a (cross-platform property) | n/a | CI `swift-parity` (`cmp` of `tokenizer.json` + FIM shards) | byte-identity Mac vs Linux | none — the strongest-gated capability in the repo |
-| TOK-4 | `test_swift_parquet.py` | n/a | CI `full-macos` (only job with both pyarrow and a Swift toolchain) | skips when `monica-tokenize` unbuilt | Linux CI never builds Swift, so Parquet parity is macOS-only |
+| TOK-4 | `test_swift_parquet.py` | n/a | CI `full-macos` (the suite job — still the only one with both pyarrow and a Swift toolchain; #315's split moved the parity/smoke gates off it, not this) | skips when `monica-tokenize` unbuilt | Linux CI never builds Swift, so Parquet parity is macOS-only |
 | TOK-5 | `test_swift_fim.py` | CI FIM-pack | CI `swift-parity` diff | FIM span selection | none |
 
 ## Model and the seam
@@ -49,7 +49,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
 | MODEL-1 | none dedicated | `load_config()` in `test_mlx_parity.py`, `test_cuda_parity.py`, `test_bench_config_export.py` | `scripts/smoke_test.py` | valid configs only | no test asserts `MambaConfig.validate()` **raises** on an invalid config (e.g. `head_dim ∤ d_inner`) |
-| MODEL-2 | `test_mlx_parity.py` | `test_mlx_parity.py` | `smoke_test.py --backend mlx` (CI `full-macos`) | chunk-boundary, seg_ids packing | none |
+| MODEL-2 | `test_mlx_parity.py` | `test_mlx_parity.py` | `smoke_test.py --backend mlx` (CI `parity-macos`) | chunk-boundary, seg_ids packing | none |
 | MODEL-3 | `test_mlx_parity.py` (`forward_step_parity`) | same | same smoke gate | stacked-step vs forward | none |
 | MODEL-4 | `test_cuda_parity.py`, `test_cuda_train_step.py`, `test_cuda_compile.py` | `test_backend_parity.py` (torch self-check half only) | `smoke_test.py --backend cuda` (CI `smoke-linux`, CPU torch) | CPU-torch path | real-GPU path (fused mamba-ssm kernel, MPS) skip-gated in CI — no GPU on hosted runners |
 | MODEL-5 | `test_moe.py`, `test_moe_routing.py`, `test_moe_balance.py`, `test_moe_balance_mlx.py`, `test_cuda_moe.py`, `test_cuda_moe_balance.py`, `test_cuda_moe_gather.py` | `test_cuda_moe_fixture_parity.py`, `test_backend_parity.py` | CI `smoke-linux` MoE-config smoke step | dropless grouped-gather, shared expert, route-bias | none |
@@ -61,7 +61,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
-| TRAIN-1 | `test_train_loop.py` | `test_train_loop.py` | `scripts/smoke_test.py` (CI `smoke-linux`/`full-macos`) | grad accum, grad checkpointing | none |
+| TRAIN-1 | `test_train_loop.py` | `test_train_loop.py` | `scripts/smoke_test.py` (CI `smoke-linux`/`parity-macos`) | grad accum, grad checkpointing | none |
 | TRAIN-2 | `test_train_loop.py` resume tests | `test_checkpoint.py` | `scripts/smoke_test.py` (resume exactness is its headline check) | bit-exact fp32 resume at toy scale | `scripts/train.py`'s **stream-resume** path (data position rebuilt from seed+step) is a separate code path the smoke gate does not cover |
 | TRAIN-3 | `test_loss_scale.py`, `test_lowp_parity_band.py` | `test_mlx_train_step.py`, `test_cuda_train_step.py` | `scripts/smoke_test.py` | overflow skip, scale halving | smoke gate runs `toy.yaml` (fp32), so the overflow/skip path never executes end to end |
 | TRAIN-4 | `test_stream.py` | none | none | shard rotation | real R2 streaming untested in CI (credentials-gated) |
@@ -142,7 +142,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
 | CONF-1 | `test_mlx_parity.py`, `test_cuda_parity.py` | `src/conformance/forward_step_parity.py` | `scripts/smoke_test.py` | fp32 ~1e-4 rel | none |
-| CONF-2 | `test_backend_parity.py`, `test_ci_backend_matrix.py` (portable YAML contract) | `test_backend_parity.py` | CI `full-macos` — step *"Cross-backend parity"*, `MONICA_REQUIRE_BOTH_BACKENDS=1` over `.[dev,data,mlx,cuda]` | the 5 real MLX↔torch comparisons (logits, hybrid/attention, `seg_ids` packing, portable-weights round-trip both directions, MoE routing-entropy) at fp32 `rtol=1e-4/atol=1e-5` on `config/toy.yaml`/`toy-hybrid`/`toy-moe`; plus the torch self-check on `cuda-cpu`; a missing backend on the designated job **errors** rather than skips, and re-adding a skip marker or dropping the flag from `ci.yml` is caught on the Linux `portable` job | Gated at **toy scale, fp32 only** (`B=2, L=24`) against **torch on CPU** — real-GPU CUDA kernels and poc-scale shapes are compared by **no** job. `cuda-cpu` (Linux) still skips 5 of 6: mlx has no Linux wheel, so it is not parity coverage |
+| CONF-2 | `test_backend_parity.py`, `test_ci_backend_matrix.py` (portable YAML contract), `test_ci_macos_budget.py` (portable wall-clock contract, #315) | `test_backend_parity.py` | CI `parity-macos` (#315) — step *"Cross-backend parity"*, `MONICA_REQUIRE_BOTH_BACKENDS=1` over `.[dev,data,mlx,cuda]`, ~2 min against `timeout-minutes: 15` | the 5 real MLX↔torch comparisons (logits, hybrid/attention, `seg_ids` packing, portable-weights round-trip both directions, MoE routing-entropy) at fp32 `rtol=1e-4/atol=1e-5` on `config/toy.yaml`/`toy-hybrid`/`toy-moe`; plus the torch self-check on `cuda-cpu`; a missing backend on the designated job **errors** rather than skips, and re-adding a skip marker or dropping the flag from `ci.yml` is caught on the Linux `portable` job. #315 split this gate off `full-macos` so a 35-min suite can no longer kill it as an unexplained `ETIMEDOUT`; `test_ci_macos_budget.py` pins the budget literal, both `timeout-minutes`, and `budget + 300s <= timeout` so the legible guard fires first | Gated at **toy scale, fp32 only** (`B=2, L=24`) against **torch on CPU** — real-GPU CUDA kernels and poc-scale shapes are compared by **no** job. `cuda-cpu` (Linux) still skips 5 of 6: mlx has no Linux wheel, so it is not parity coverage. The budget contract checks the *shape* of the guard from `ci.yml`, never a runner's actual wall clock — only a real macOS run measures that |
 | CONF-3 | `test_doc_boundary_parity.py`, `test_cuda_doc_boundary_parity.py` | `src/conformance/doc_boundary_parity.py` | none | seg_ids block-diagonal masking | none |
 | CONF-4 | `test_mlx_parity.py`, `test_cuda_parity.py` | `src/conformance/prefill_decode_parity.py` | `monica-parity` | prefill vs stacked step | none |
 | CONF-5 | `test_quant_parity.py` | `src/conformance/quant_parity.py` | CI `swift-engine` | int8 tolerance | none |
@@ -151,6 +151,6 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
-| OPS-1 | n/a | n/a | `scripts/smoke_test.py`, CI `smoke-linux` + `full-macos` | resume exactness + eval | does not cover `train.py`'s stream-resume (see TRAIN-2) |
+| OPS-1 | n/a | n/a | `scripts/smoke_test.py`, CI `smoke-linux` + `parity-macos` | resume exactness + eval | does not cover `train.py`'s stream-resume (see TRAIN-2) |
 | OPS-2 | `test_workflow_triggers.py` | n/a | `ci.yml` (8 jobs, PR/push + monthly schedule) + `scheduled-parity.yml` (4 jobs, dispatch/weekly schedule) | portable/seam guard, both backends, Swift parity; the trigger×job matrix itself; `ci.yml`'s cron literal `"43 9 3 * *"` and its event-scoped `concurrency.group` (#312) | 4 of 12 jobs are in a workflow with no PR/push trigger (see ENGINE-6); the monthly cadence bounds drift-detection latency to ~1 month, and nothing alerts on a red scheduled run beyond GitHub's default notification |
 | OPS-3 | `test_bench_config_export.py`, `test_bench_context.py` | none | `monica-bench` CI steps (informational) | provenance tagging | nothing checks `docs/benchmarks.md` stays in sync with CI bench output |

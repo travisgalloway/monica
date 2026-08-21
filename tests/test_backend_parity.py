@@ -11,7 +11,7 @@ SKIP cleanly, so the suite stays green:
 **One host is exempt from that, deliberately (#303).** Skipping is the right default,
 but it is also how these five comparisons sat dormant in *every* CI job for the whole
 M12 build: a check that cannot observe its target reads identical to the good outcome.
-So the CI job designated as the cross-backend gate (`full-macos`, which installs
+So the CI job designated as the cross-backend gate (`parity-macos`, which installs
 `.[dev,data,mlx,cuda]`) sets ``MONICA_REQUIRE_BOTH_BACKENDS=1``. Under that flag
 ``requires_both_backends`` attaches **no marker at all**, so a missing backend raises
 ImportError from the test body — an error, not a silent `s`.
@@ -42,7 +42,7 @@ from src.conformance.backend_parity import check_backend_parity
 
 CFG = "config/toy.yaml"
 
-# #303: set by exactly one CI job (ci.yml's `full-macos`, guarded by
+# #303/#315: set by exactly one CI job (ci.yml's `parity-macos`, guarded by
 # tests/test_ci_backend_matrix.py). On that host a missing backend must be an ERROR.
 REQUIRE_BOTH = os.environ.get("MONICA_REQUIRE_BOTH_BACKENDS") == "1"
 
@@ -268,7 +268,7 @@ def test_designated_job_has_both_backends():
     """Layer 1. On the host that *declares* it carries both backends, not having them is
     a failure with a message naming the cause — never a skip.
 
-    Without this, a botched install line on `full-macos` would leave the five comparisons
+    Without this, a botched install line on `parity-macos` would leave the five comparisons
     erroring only via ImportError deep in a test body; this says it once, up front.
     """
     if not REQUIRE_BOTH:
@@ -276,7 +276,7 @@ def test_designated_job_has_both_backends():
     assert HAVE_MLX, (
         "MONICA_REQUIRE_BOTH_BACKENDS=1 but `import mlx.core` failed — this job is the "
         "cross-backend parity gate and its install step must resolve an mlx wheel "
-        "(ci.yml `full-macos`: pip install -e '.[dev,data,mlx,cuda]')"
+        "(ci.yml `parity-macos`: pip install -e '.[dev,data,mlx,cuda]')"
     )
     assert HAVE_TORCH, (
         "MONICA_REQUIRE_BOTH_BACKENDS=1 but `import torch` failed — this job is the "

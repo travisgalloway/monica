@@ -55,18 +55,27 @@ There is no separate lint/format/build step — pytest is the gate, and it now r
 (`.github/workflows/ci.yml`, #249): a Linux `portable` job (`pytest -q -rs`, no mlx/torch —
 where `test_import_guard.py` is unambiguous), a Linux `smoke-linux` job (CPU-torch,
 `scripts/smoke_test.py --backend cuda`), a Linux `cuda-cpu` job (CPU-torch, the CUDA test
-suite), and a macOS `full-macos` job (`.[dev,data,mlx,cuda]` — the **only** job carrying
-**both** backends — `pytest -q -rs` + `scripts/smoke_test.py --backend mlx`). `mlx` is not
-installable on Linux; on a non-Mac host the MLX backend simply won't import (by design), and
-only the portable tests run. `full-macos` is therefore also the **cross-backend parity gate**
-(#303): the macOS-arm64 PyPI `torch` wheel is CPU-only, which is exactly the surface
-`src/model/cuda_backend.py` is compared on, so a dedicated step runs
-`tests/test_backend_parity.py` with `MONICA_REQUIRE_BOTH_BACKENDS=1` — under that flag the
-five MLX↔torch comparisons carry no skip marker, so a missing backend **errors** instead of
-skipping (they silently skipped in every job before #303). `tests/test_ci_backend_matrix.py`
-is the portable contract over that wiring and runs on `portable`, where neither backend
-exists. Note `cuda-cpu` also runs that file but still skips 5 of 6 — it is not parity
-coverage. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
+suite), and **two** macOS jobs, both on `.[dev,data,mlx,cuda]`: `full-macos` runs the suite
+(`pytest -q -rs`) and `parity-macos` runs the cross-backend parity step plus
+`scripts/smoke_test.py --backend mlx`. `mlx` is not installable on Linux; on a non-Mac host
+the MLX backend simply won't import (by design), and only the portable tests run.
+`parity-macos` is the **cross-backend parity gate** (#303, split onto its own job by #315):
+it is the **only** job carrying **both** backends, because the macOS-arm64 PyPI `torch` wheel
+is CPU-only, which is exactly the surface `src/model/cuda_backend.py` is compared on. Its
+dedicated step runs `tests/test_backend_parity.py` with `MONICA_REQUIRE_BOTH_BACKENDS=1` —
+under that flag the five MLX↔torch comparisons carry no skip marker, so a missing backend
+**errors** instead of skipping (they silently skipped in every job before #303).
+`tests/test_ci_backend_matrix.py` is the portable contract over that wiring and runs on
+`portable`, where neither backend exists. Note `cuda-cpu` also runs that file but still
+skips 5 of 6 — it is not parity coverage. **Why two jobs (#315):** #303's both-backend
+install also un-skipped a large torch-gated set and took the combined job from 9m16s to
+37m48s against `timeout-minutes: 45`, while the gates it exists for cost 14 seconds. A
+timeout kill on the parity job would read as flake, not as a parity regression — CONF-2's
+original failure shape again. So the suite job now measures itself against
+`MACOS_SUITE_BUDGET_SECONDS` and fails with a legible `::error::`, and
+`tests/test_ci_macos_budget.py` (portable) pins the budget, both `timeout-minutes`, and the
+margin between them. `full-macos` keeps the `cuda` extra: four torch-gated files fall
+outside `cuda-cpu`'s glob and have no other coverage. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
 suite entirely: `swift-macos` and `swift-linux` (the official `swift:latest` container) each
 build the package and run `monica-selfcheck` — `swift test` is still a no-op, there is no
 `.testTarget` — then train a fixed fixture corpus (`swift/Fixtures/parity-corpus.jsonl`) into
@@ -80,10 +89,10 @@ second runner and `cmp`s the two manifests (the #298 cross-process corruption gu
 running `monica-parity` against it.
 
 Those two poc jobs are **not** in `ci.yml`. Since #302 the repo has **two** workflow files, and
-the split is the guarantee: `.github/workflows/ci.yml` holds **8** jobs — the seven named above
+the split is the guarantee: `.github/workflows/ci.yml` holds **9** jobs — the eight named above
 plus `swift-engine` (see the seam section) — and triggers on
 `pull_request`, `push` to `main`, `workflow_dispatch`, and (since #312) a **monthly `schedule:`**
-(09:43 UTC on the 3rd) that runs those same 8 jobs against unchanged `main` as environmental-drift
+(09:43 UTC on the 3rd) that runs those same 9 jobs against unchanged `main` as environmental-drift
 coverage. No job in it carries an `if:`, so no PR gate can silently stop running.
 `.github/workflows/scheduled-parity.yml` holds **4** heavy jobs — `poc-fixture-oracle`/`poc-parity`
 (#267) and `train-fixture-oracle`/`train-fixture-oracle-verify` (#195) — and triggers **only** on
@@ -91,7 +100,7 @@ coverage. No job in it carries an `if:`, so no PR gate can silently stop running
 `pull_request`/`push` trigger at all**, so those jobs are structurally unreachable from a PR rather
 than merely `if:`-guarded — **a green PR run never implies poc scale was exercised**; see
 `swift/engine/Fixtures/README.md` §poc. Note what carries that guarantee: the **file split**, not
-the absence of a cron in `ci.yml` — `ci.yml`'s monthly cron fires only `ci.yml`'s own 8 jobs, and
+the absence of a cron in `ci.yml` — `ci.yml`'s monthly cron fires only `ci.yml`'s own 9 jobs, and
 the two crons are independent. A manual full run is therefore two commands
 (`gh workflow run ci.yml` and `gh workflow run scheduled-parity.yml`), neither taking inputs. The
 whole trigger×job matrix is asserted by `tests/test_workflow_triggers.py`, which runs inside the
