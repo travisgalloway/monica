@@ -177,18 +177,84 @@ free, but free-tier concurrency caps macOS at 5 jobs and `ci.yml` already ran th
 queue time would start eating the gain, which is why partitioning the suite across another
 macOS runner is explicitly the last resort rather than the first.
 
-**What it deliberately does not fix.** The suite is still slow — the split bounds the
-damage rather than removing it. Why the hosted runner is ~6× slower than an M1 Pro on the
-same suite is unexplained and out of scope. `pytest-xdist` was considered and rejected
-here: it adds a dependency and scheduling nondeterminism to a repo whose central claim is
-bit-exact parity. The ~1-in-4 `full-macos` flake recorded in
-`docs/design/14-inference-engine.md` is untouched. All three are parked in
-`docs/parked-findings.md`.
+**What #315 deliberately did not fix.** The split bounded the damage rather than removing
+it: the suite was still ~35 minutes, and the ~1-in-4 `full-macos` flake recorded in
+`docs/design/14-inference-engine.md` is untouched and still parked in
+`docs/parked-findings.md`. The runner-speed question #315 left open ("~6× slower than an
+M1 Pro, unexplained") is answered below, and #322 took the suite itself down.
 
 The `cuda` extra stays on `full-macos` even though the parity gate left: `test_upcycle.py`,
 `test_parallel.py`, `test_bench_config_export.py` and `test_bfcl_adapter.py` are torch-gated
 and fall outside `cuda-cpu`'s `tests/test_cuda_*.py tests/test_backend_parity.py` glob, so
 dropping it would delete their only coverage.
+
+### Cutting the suite, and making the ceiling mechanical (#322)
+
+#315 left two numbers in the tree that contradicted each other: its DoD-3 stated *"the
+macOS PR path completes in ≤ 20 minutes"*, and the guard it shipped enforced
+`MACOS_SUITE_BUDGET_SECONDS: 2400` — 40 minutes. **The stated ceiling and the enforced
+ceiling disagreed by a factor of two, and nothing observed it.** That is the same defect
+one level up from CONF-2's own: a number that no check compares against the number it is
+supposed to represent.
+
+**The profile, from the runner's own `--durations=25` table.** Run 32542924915 (`main`,
+2026-08-22), job `full suite (macOS)`: `1681 passed, 98 skipped … in 2086.73s`.
+
+| test file | hosted macOS | share |
+|---|---|---|
+| `tests/test_cuda_distributed.py` | **1610.94 s** | **77.2 %** |
+| `tests/test_swift_parquet.py` | 143.28 s | 6.9 % |
+| `tests/test_retrieval_probe.py` | 101.98 s | 4.9 % |
+| `tests/test_cuda_compile.py` | 99.62 s | 4.8 % |
+| `tests/test_moe_balance_mlx.py` | 55.73 s | 2.7 % |
+| everything else (~1670 tests) | ≈ 75 s | 3.6 % |
+
+**The ~6× gap is not an environment gap.** The same file takes **19.06 s locally** — an
+~85× penalty on that one file, while the rest of the suite runs at ≈1.4× (CI 441 s vs
+local 339 s). The cause is `torch.multiprocessing.spawn`: macOS has no `fork` start
+method for this path, so each of the ~26 gloo worker subprocesses re-imports torch (and,
+in this job, mlx) from an editable install on a slow hosted filesystem — 1610.94 s / ~26
+spawns ≈ 62 s of pure import per worker.
+
+**The decision: ignore that one file on `full-macos`, because it is duplicated, not
+unwanted.** `cuda-cpu` runs `tests/test_cuda_*.py tests/test_backend_parity.py` on Linux;
+`test_cuda_distributed.py` matches that glob and runs there with **no skip originating in
+it**, inside a 149 s job. The file exercises gloo/CPU collectives, FSDP2 sharding and DCP
+resume — OS-portable plumbing whose target hardware is Linux/CUDA. **This is not a
+coverage trade.** The genuinely macOS-specific item in the `test_cuda_*` family,
+`tests/test_cuda_parity.py::test_forward_step_parity_mps`, lives in a file that is *not*
+ignored and costs 1.85 s. If a macOS-arm torch surface is ever wanted for the distributed
+path, the cheap place is a scheduled job in `scheduled-parity.yml`, never the PR path.
+
+Result: the suite step's budget drops from 2400 s to **720 s** (the post-cut suite
+measured **441 s** on PR #324's own run, plus a 4-minute buffer, rounded to a whole
+minute; that run's `full suite (macOS)` job took 8m30s wall clock and every other macOS
+job 1m4s–2m39s, so the whole PR path is now inside the 20-minute ceiling), `full-macos`'s `timeout-minutes` from 45 to **17**, and `swift-engine`'s
+from 60 to **20** — a 60-minute ceiling over a measured 2m40s job being the same
+illegible shape #315 was filed about.
+
+**The ceiling is now mechanical.** `tests/test_ci_macos_budget.py` carries
+`PR_PATH_CEILING_SECONDS = 1200` and asserts it against the budget plus a job-overhead
+allowance, and against **every** macOS job's `timeout-minutes` — with the macOS job *set*
+pinned, so a fifth macOS job cannot join the PR critical path silently. Raising that
+literal to fit a slow suite is the failure #322 was filed about; the recorded remedy is to
+cut the suite or amend the target explicitly, on the issue and here.
+`test_suite_ignores_never_delete_coverage` is the anti-BLIND guard for the cut itself: it
+pins the `--ignore` set exactly and, for each entry, re-derives the covering job from
+`cuda-cpu`'s **parsed** arguments (or `parity-macos`'s script for the parity file), because
+pytest accepts an `--ignore` for a renamed or deleted file in silence.
+
+**Option 2 — amend the 20-minute target — was considered and rejected.** #322 offered it,
+and the measurement above makes it unnecessary: the PR path now fits with ~5 minutes to
+spare, so weakening a stated guarantee to match an unexamined cost would have been the
+wrong trade.
+
+**`pytest-xdist` was considered and rejected, now on evidence rather than taste.** Beyond
+the dependency and the test-scheduling nondeterminism it adds to a repo whose central
+claim is bit-exact parity, the measured cost here was **not schedulable test time** — it
+was nested-subprocess import time. `-n 3` on a 3-core hosted runner whose slowest tests
+each already spawn two gloo workers would oversubscribe it, not parallelise it. That
+parked item is closed by this decision rather than re-parked.
 
 Skipping remains the behaviour everywhere else, and that is correct: a Linux/CUDA box has
 no mlx wheel, a Mac without torch has no second backend. In particular the Linux

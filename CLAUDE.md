@@ -73,9 +73,24 @@ install also un-skipped a large torch-gated set and took the combined job from 9
 timeout kill on the parity job would read as flake, not as a parity regression — CONF-2's
 original failure shape again. So the suite job now measures itself against
 `MACOS_SUITE_BUDGET_SECONDS` and fails with a legible `::error::`, and
-`tests/test_ci_macos_budget.py` (portable) pins the budget, both `timeout-minutes`, and the
-margin between them. `full-macos` keeps the `cuda` extra: four torch-gated files fall
-outside `cuda-cpu`'s glob and have no other coverage. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
+`tests/test_ci_macos_budget.py` (portable) pins the budget, every macOS job's
+`timeout-minutes`, and the margin between them. **#322 then cut the suite itself and made
+the ceiling mechanical:** #315's `--durations=25` profile showed
+`tests/test_cuda_distributed.py` was 1610.94s of a 2086.73s macOS suite (77.2%; 19.06s
+locally) because macOS has no `fork` start method for `torch.multiprocessing.spawn`, so
+each of its ~26 gloo workers re-imports torch/mlx. That file already runs, with zero skips,
+in the 149s Linux `cuda-cpu` job, so `full-macos`'s pytest step now carries
+`--ignore=tests/test_backend_parity.py --ignore=tests/test_cuda_distributed.py` (different
+reasons — the first would look like coverage while five comparisons skip; the second is a
+pure duplicate) and the suite lands at 441s measured (8m30s job wall clock). Budget 2400s→**720s**, `full-macos`
+`timeout-minutes` 45→**17**, `swift-engine` 60→**20**. The budget test also pins
+`PR_PATH_CEILING_SECONDS = 1200` — #315's stated 20-minute PR-path ceiling — against the
+budget and every macOS job's timeout, plus the macOS job *set*, so the stated and enforced
+ceilings can no longer disagree (they differed 2× under #315), and
+`test_suite_ignores_never_delete_coverage` re-derives each ignore's cover from `cuda-cpu`'s
+parsed glob so a "CI speedup" cannot delete a gate. `full-macos` keeps the `cuda` extra:
+four torch-gated files (`test_upcycle.py`, `test_parallel.py`, `test_bench_config_export.py`,
+`test_bfcl_adapter.py`) fall outside `cuda-cpu`'s glob and have no other coverage. Three more jobs (#246) gate the `swift/` native tokenizer, outside this Python
 suite entirely: `swift-macos` and `swift-linux` (the official `swift:latest` container) each
 build the package and run `monica-selfcheck` — `swift test` is still a no-op, there is no
 `.testTarget` — then train a fixed fixture corpus (`swift/Fixtures/parity-corpus.jsonl`) into

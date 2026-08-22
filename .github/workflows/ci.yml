@@ -163,9 +163,21 @@ jobs:
   # So the two fast gates moved to `parity-macos` below (Job 4b), and this job is now
   # only the macOS test suite. Trade-off taken: one more macOS job (4 of the free-tier
   # cap of 5 concurrent), in exchange for a ~2-minute parity gate that suite growth can
-  # no longer starve. What this deliberately does NOT fix: why the hosted runner is ~6×
-  # slower than an M1 Pro on the same suite, and the ~1-in-4 flake recorded in
-  # docs/design/14-inference-engine.md:1056. Both are parked.
+  # no longer starve.
+  #
+  # #322 THEN CUT THE SUITE ITSELF, from the --durations=25 table #315 wired up. Run
+  # 32542924915 on `main` reported `1681 passed, 98 skipped … in 2086.73s` and
+  # tests/test_cuda_distributed.py alone accounted for 1610.94s of it — 77.2%. The same
+  # file takes 19.06s locally (~85x), because macOS has no `fork` start method for
+  # torch.multiprocessing.spawn: each of its ~26 gloo workers re-imports torch and mlx
+  # from an editable install on a slow hosted filesystem, ~62s apiece. That file is
+  # ALREADY fully gated on Linux by `cuda-cpu` (it matches its `tests/test_cuda_*.py`
+  # glob and runs there with zero skips in a 149s job), so it is ignored below — 27 of
+  # this job's 35 minutes were a duplicate. The rest of the suite runs at ~1.4x local,
+  # so the "hosted runner is ~6x slower" note this comment used to carry was an
+  # artefact of that one file, not an environment gap. See
+  # docs/design/03-conformance.md#322. Still NOT fixed: the ~1-in-4 flake recorded in
+  # docs/design/14-inference-engine.md:1056. Parked.
   # The `cuda` extra STAYS here: test_upcycle.py, test_parallel.py,
   # test_bench_config_export.py and test_bfcl_adapter.py are torch-gated and outside
   # `cuda-cpu`'s `tests/test_cuda_*.py tests/test_backend_parity.py` glob, so dropping it
@@ -173,11 +185,12 @@ jobs:
   full-macos:
     name: full suite (macOS)
     runs-on: macos-latest
-    # #315 phase 1: still 45 while the runner's own --durations=25 profile is collected.
-    # Tightening this before the profile exists would ETIMEDOUT the very run that has to
-    # print the table. The budget guard below is the legible ceiling; see
-    # tests/test_ci_macos_budget.py, which pins both numbers and the margin between them.
-    timeout-minutes: 45
+    # #322: the profile exists now, and the cut below took the suite from ~2087s to
+    # 441s measured on PR #324's own run, so this drops 45 -> 17 (budget 720s + the 300s margin
+    # tests/test_ci_macos_budget.py requires). The budget guard below is the legible
+    # ceiling; that test pins both numbers, the margin between them, and — new in #322 —
+    # that this job stays under the 20-minute PR-path ceiling #315's DoD-3 stated.
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -196,12 +209,29 @@ jobs:
         # turns tests/test_swift_parquet.py from a local check into a gate (#247). ~30s.
         working-directory: swift
         run: swift build
-      - name: pytest (budgeted — #315)
+      - name: pytest (budgeted — #315, trimmed — #322)
         # No MONICA_REQUIRE_BOTH_BACKENDS here on purpose: the rest of the suite keeps
-        # its normal skip semantics. tests/test_backend_parity.py is ignored here: it
-        # already ran (and gated) on `parity-macos`, and this job installs both backends,
-        # so an un-ignored run here would duplicate it WITHOUT the flag — a run that looks
-        # like coverage and silently skips five comparisons.
+        # its normal skip semantics.
+        #
+        # THE TWO --ignore FLAGS HAVE DIFFERENT JUSTIFICATIONS. Conflating them is how a
+        # future reader deletes real coverage, so they are spelled out separately, and
+        # tests/test_ci_macos_budget.py::test_suite_ignores_never_delete_coverage pins
+        # the set and re-derives the second one's cover from `cuda-cpu`'s own glob:
+        #
+        #  * tests/test_backend_parity.py — ignored because this job installs both
+        #    backends but does NOT set the flag, so an un-ignored run here would look
+        #    like coverage while five comparisons silently skip (#303). It already ran,
+        #    and gated, on `parity-macos`.
+        #  * tests/test_cuda_distributed.py — ignored because it is DUPLICATE, not
+        #    unwanted: `cuda-cpu` runs it on Linux (it matches that job's
+        #    `tests/test_cuda_*.py` glob) with zero skips inside a 149s job. On the
+        #    hosted macOS runner torch.multiprocessing.spawn costs ~62s of re-import per
+        #    gloo worker (no `fork` start method on macOS), which made this one file
+        #    1610.94s — 77.2% — of a 2086.73s suite for zero additional surface. It is
+        #    gloo/CPU collectives, FSDP2 sharding and DCP resume: OS-portable plumbing
+        #    whose target hardware is Linux/CUDA. The genuinely macOS-specific item in
+        #    the test_cuda_* family, test_cuda_parity.py::test_forward_step_parity_mps,
+        #    lives in a file that is NOT ignored. See docs/design/03-conformance.md#322.
         #
         # The budget guard is the point of #315: `timeout-minutes` alone kills the job with
         # no explanation, and an unexplained kill reads as flake. This measures its own wall
@@ -209,17 +239,23 @@ jobs:
         # set +e / STATUS dance — a FAILING SUITE MUST STAY A FAILING SUITE, never be
         # reported as "over budget", and the elapsed line prints on both paths.
         env:
-          # 2400s (40 min): the recorded baseline is 37m48s (2268s, see the #315 note
-          # above this job) — this budget is that baseline plus a ~2-minute buffer,
-          # capped by the 300s margin `test_budget_fires_before_the_timeout` requires
-          # below `timeout-minutes: 45`. Tighten once the suite is actually back under
-          # 20 minutes; raising OR lowering this must update EXPECTED_BUDGET_SECONDS in
-          # tests/test_ci_macos_budget.py in the same commit.
-          MACOS_SUITE_BUDGET_SECONDS: "2400"
+          # 720s (12 min) — #322. The pre-cut baseline was 2086.73s; removing the
+          # duplicated tests/test_cuda_distributed.py (1610.94s of it) left 441s measured on
+          # PR #324's own run (MACOS_SUITE_WALL_CLOCK_SECONDS=441), and
+          # this budget is that measurement plus a 4-minute buffer, rounded to a whole
+          # minute. It must also satisfy budget + JOB_OVERHEAD_ALLOWANCE_SECONDS <=
+          # PR_PATH_CEILING_SECONDS (1200s = the 20-minute PR-path ceiling #315's DoD-3
+          # stated), which is what stops the stated and the enforced ceiling drifting
+          # apart again — the defect #322 was filed about. Raising OR lowering this must
+          # update EXPECTED_BUDGET_SECONDS in tests/test_ci_macos_budget.py in the same
+          # commit, and if it can no longer fit under the ceiling that is a decision to
+          # take on the record, not by relaxing the ceiling.
+          MACOS_SUITE_BUDGET_SECONDS: "720"
         run: |
           START=$SECONDS
           set +e
-          pytest -q -rs --ignore=tests/test_backend_parity.py --durations=25
+          pytest -q -rs --ignore=tests/test_backend_parity.py \
+                        --ignore=tests/test_cuda_distributed.py --durations=25
           STATUS=$?
           set -e
           ELAPSED=$(( SECONDS - START ))
@@ -552,9 +588,17 @@ jobs:
   swift-engine:
     name: swift model parity (macOS, mlx-swift)
     runs-on: macos-latest
-    # mlx-swift builds the vendored `mlx` C++ tree from source; a COLD runner
-    # build is plausibly 20-40 min, hence the generous timeout and the cache.
-    timeout-minutes: 60
+    # mlx-swift builds the vendored `mlx` C++ tree from source, so this job leans on
+    # the cache below; its measured warm wall clock is 2m40s (run 32542924915).
+    # #322 lowered this 60 -> 20: #315's DoD-3 measures the macOS PR path as the max
+    # over every macOS job, and a 60-minute ceiling on a 2m40s job is exactly the
+    # illegible-ceiling shape #315 was filed about. 20 is ~7x headroom over the warm
+    # build and is pinned by tests/test_ci_macos_budget.py::MACOS_JOBS.
+    # ROLLBACK: the failure mode is a cache miss on a cold/slow runner (a
+    # Package.resolved or toolchain-version change invalidates the key). If this ever
+    # times out, raise it back WITH the recorded evidence — in this file, MACOS_JOBS and
+    # PR_PATH_CEILING_SECONDS's rationale — never silently.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
