@@ -11,18 +11,18 @@ name: Scheduled parity
 # key, so there is no event to be skipped under. Do not add one.
 #
 # The converse also motivated the split: ci.yml's workflow-level `schedule:` fired the
-# WHOLE workflow every Monday, so the 8 PR/push jobs (three of them macOS) ran weekly
+# WHOLE workflow every Monday, so the 9 PR/push jobs (four of them macOS) ran weekly
 # too — the four `if:`s only filtered the guarded jobs. That weekly full run did have
 # real value (it caught environmental drift PR CI attributes to "flake"), and #312 gave
 # that half back: ci.yml now carries its OWN monthly cron ("43 9 3 * *"), firing only its
-# 8 gates. The two crons are independent — different files, different concurrency groups,
+# 9 gates. The two crons are independent — different files, different concurrency groups,
 # different minutes — and a cron in ci.yml still cannot reach the jobs below, because the
 # split, not the absence of a trigger, is what keeps them off PRs. See
 # docs/design/14-inference-engine.md's #302 and #312 entries.
 #
 # Manual runs are two commands, by design:
-#   gh workflow run ci.yml                 # the 8 PR/push gates
-#   gh workflow run scheduled-parity.yml   # the 4 jobs below
+#   gh workflow run ci.yml                 # the 9 PR/push gates
+#   gh workflow run scheduled-parity.yml   # the 5 jobs below
 # The trigger x job matrix is asserted by tests/test_workflow_triggers.py, which runs in
 # ci.yml's `portable` job on every PR.
 
@@ -426,3 +426,141 @@ jobs:
           OUT=$(swift package show-dependencies --format flatlist)
           echo "output: '$OUT'"
           [ -z "$OUT" ]
+
+  # ── Job 11: the #298 buffer-reuse probe, on a hosted macOS runner ─────────
+  # WHY. Every number in docs/design/14-inference-engine.md §"MLX 0.32.0 buffer reuse
+  # (#298)" §§D1-D5 came from ONE host (an M1 Pro dev Mac). #298's escalation asked for a
+  # second host, and this is it: the hosted macos-latest runner family — a different chip
+  # generation, a different macOS image and a different MLX wheel from the dev Mac, and
+  # the family that actually runs `full-macos`/`parity-macos`, where the defect shows up
+  # as flake. A defect measured on one machine is a property of that machine until a
+  # second one says otherwise.
+  #
+  # WHY --report-only, AND WHY THAT IS NOT `|| true`. Reproduction is shape-dependent
+  # (§D1: toy-moe/toy-hybrid at seq=129 reproduce on the dev host; toy.yaml and seq=512 do
+  # not), so a hosted runner may legitimately be BLIND — the positive control not firing
+  # is a MEASUREMENT, and a measurement must not be a build failure. --report-only records
+  # `"blind": true` with its reason in the JSON and exits 0 for that one case only.
+  # Everything else — no MLX wheel, an unloadable config, an import error — still exits
+  # non-zero and reddens the job, because that is a probe that could not run rather than a
+  # probe that ran and saw nothing. There is deliberately NO `|| true` and no
+  # `continue-on-error:` anywhere below; an exit status is never discarded.
+  #
+  # NO `needs:`. This job must not sit between poc-fixture-oracle and poc-parity, and must
+  # not be able to delay them. Bounded at --trials 20 / --seq 129.
+  #
+  # WHY timeout-minutes IS 45 AND NOT 20. Measured, not guessed, and the measurement is
+  # itself worth recording: the SAME control step (3 configs x 20 trials) took **5 seconds**
+  # on the runner for run 32583285323 and **over 20 minutes** — a timeout kill — on the
+  # runner for run 32583406103, twelve minutes apart, from the same commit. Locally the same
+  # command is 0.26 s per config. So the hosted macos-latest family has multi-hundred-x wall
+  # clock variance on this workload, and a 20 minute ceiling turns that into a red job that
+  # reads as a probe regression. That is CONF-2's failure shape (#315): a timeout kill
+  # masquerading as a signal. 45 minutes leaves headroom for the slow tail while still
+  # bounding the job, and this comment is the record of why the number is what it is — do not
+  # lower it without re-measuring.
+  #
+  # DISPATCH/SCHEDULE ONLY, like every job in this file — see the `on:` block at the top.
+  # It is registered in tests/test_workflow_triggers.py's HEAVY_JOBS, which asserts exactly
+  # that.
+  mlx-buffer-reuse-probe:
+    name: "#298 buffer-reuse probe (macOS, Python MLX, report-only)"
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      # The probe imports `scripts.export_parity_fixture`, and `scripts/` is not a
+      # distributed package — `pip install -e .` does not put it on the path. Same
+      # PYTHONPATH the reproduce commands in design/14 §D1 carry. Without it every probe
+      # invocation below dies on ModuleNotFoundError, which is a probe that could not RUN
+      # and therefore (correctly) a red job, not a BLIND measurement.
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (mlx only — the probe needs no torch and no data extra)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlx]"
+      - name: Host provenance (transcribed into design/14 §D6 alongside the numbers)
+        # A number without its host is not a measurement. Recorded as a file so the
+        # artifact carries it, and echoed so it is readable in the log.
+        run: |
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "runner_image=${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "runner_arch=$(uname -m)"
+            echo "commit=${{ github.sha }}"
+            python -c "import mlx.core as mx; print('mlx=' + mx.__version__)"
+            echo "cpu=$(sysctl -n machdep.cpu.brand_string)"
+            sw_vers
+          } | tee "$RUNNER_TEMP/host.txt"
+      - name: "Positive control (--pattern mixing) across all three toy configs"
+        # The control is run on THREE configs because reproduction is shape-dependent and a
+        # single blind config would be indistinguishable from a clean host. Each writes its
+        # own JSON; `blind` is present in every one of them.
+        run: |
+          mkdir -p "$RUNNER_TEMP/probe"
+          for cfg in toy toy-hybrid toy-moe; do
+            python scripts/probe_mlx_buffer_reuse.py \
+              --pattern mixing --trials 20 --seq 129 \
+              --config "config/$cfg.yaml" --report-only --json \
+              | tee "$RUNNER_TEMP/probe/mixing-$cfg.json"
+          done
+      - name: "Hot path (--pattern hotpath) across all three toy configs"
+        # The §D2 decision's measured half, re-measured on this host. Read it ONLY against
+        # the control above: a clean hotpath from a blind instrument is no evidence at all.
+        run: |
+          for cfg in toy toy-hybrid toy-moe; do
+            python scripts/probe_mlx_buffer_reuse.py \
+              --pattern hotpath --trials 20 --seq 129 \
+              --config "config/$cfg.yaml" --report-only --json \
+              | tee "$RUNNER_TEMP/probe/hotpath-$cfg.json"
+          done
+      - name: "Verdict — warn (never pass silently) if the control could not see the defect"
+        # The anti-BLIND rule at the job level. If NO control config reproduced, this
+        # runner's hotpath results are unknown, not good news, and the log has to say so in
+        # a form a person scanning a green run will notice.
+        run: |
+          python3 - "$RUNNER_TEMP/probe" <<'PYEOF'
+          import glob, json, os, sys
+
+          d = sys.argv[1]
+          paths = sorted(glob.glob(os.path.join(d, "*.json")))
+          if len(paths) != 6:
+              print(f"BLIND: expected 6 probe JSON files, found {len(paths)}")
+              sys.exit(2)          # a missing measurement is a job failure, not a warning
+
+          reproduced = []
+          for p in paths:
+              r = json.load(open(p))
+              name = os.path.basename(p)
+              print(f"{name}: pattern={r['pattern']} config={r['config']} "
+                    f"mlx={r['mlx_version']} failures={r['failures']}/{r['trials']} "
+                    f"blind={r['blind']}")
+              if r["blind"]:
+                  print(f"  blind_reason: {r['blind_reason']}")
+              if r["pattern"] == "mixing" and not r["blind"] and r["failures"] > 0:
+                  reproduced.append((r["config"], r["failures"], r["trials"]))
+
+          if reproduced:
+              for cfg, f, t in reproduced:
+                  print(f"::notice::#298 positive control reproduced on this runner: "
+                        f"{cfg} {f}/{t} trials corrupt")
+          else:
+              print("::warning::#298 positive control did NOT reproduce on this macOS "
+                    "runner in any of the three toy configs. The probe is BLIND here, so "
+                    "the hotpath results in this run are UNKNOWN, not clean. Do not record "
+                    "them as evidence the runner is unaffected.")
+          PYEOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-buffer-reuse-probe
+          path: |
+            ${{ runner.temp }}/probe
+            ${{ runner.temp }}/host.txt
+          retention-days: 30
+          if-no-files-found: error      # an empty artifact must never read as a clean run

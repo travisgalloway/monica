@@ -44,6 +44,36 @@ from typing import Dict, List
 # read here is streamed — never `Path.read_bytes()` on a fixture file.
 _CHUNK = 1 << 20
 
+# The regeneration policy (#298), kept HERE rather than restated in each test module so a
+# person hitting a red oracle gate reads the same rule wherever they hit it, and so the
+# rule itself is pinned by one portable test (`tests/test_fixture_digest.py`).
+#
+# Why it exists: #298 makes a red staleness gate ambiguous. The gate compares a fresh
+# export against the checked-in oracle, and a per-process buffer-reuse corruption produces
+# exactly the same red — catastrophically wrong `greedy_ids`, or a near-atol `mixing.*`
+# drift — as a genuine backend change would. The cheap, wrong response is to regenerate the
+# oracle until the gate goes green, which launders the corruption into the contract every
+# downstream Swift gate is measured against. So: confirm the change is real, in two fresh
+# processes, BEFORE regenerating anything.
+REGEN_ADVICE = (
+    "\n\n"
+    "#298 REGENERATION POLICY — read before regenerating any fixture.\n"
+    "A red oracle gate on macOS/MLX is ambiguous: an intended backend change and a #298 "
+    "per-process buffer-reuse corruption look identical from here (see "
+    "docs/design/14-inference-engine.md, section 'MLX 0.32.0 buffer reuse (#298)'). "
+    "Regenerating the oracle to make this gate green is how a corrupted value becomes the "
+    "contract.\n"
+    "1. Re-run this test in a FRESH process, on its own "
+    "(`pytest <this file> -q -p no:cacheprovider`). #298 is deterministic per process and "
+    "varies between them, so a failure that does not survive process isolation is #298, "
+    "not a real drift — do NOT regenerate.\n"
+    "2. Only if it reproduces in isolation, and only if you intended the change, "
+    "regenerate with `scripts/export_parity_fixture.py` and its DEFAULT --double-export "
+    "(two fresh processes, byte-for-byte; it refuses to write --out on disagreement). "
+    "Never pass --no-double-export to get a fixture written.\n"
+    "3. Never widen a tolerance in src/conformance/tolerances.py to absorb this."
+)
+
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()

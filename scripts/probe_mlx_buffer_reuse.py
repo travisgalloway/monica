@@ -44,6 +44,14 @@ a clean `hotpath` result is *no evidence at all*. In that case the probe prints 
 exits non-zero, rather than reporting "clean" — a check that cannot observe its target must
 say so.
 
+`--report-only` (used by the `mlx-buffer-reuse-probe` CI job in
+`.github/workflows/scheduled-parity.yml`) records `"blind": true` plus `"blind_reason"` in
+the emitted JSON and exits **0** instead of 3, so a scheduled run captures the measurement
+without a red job. It suppresses *only* the BLIND exit — a probe that cannot run at all
+(no MLX wheel, unloadable config, import error) still fails loudly, because that is not a
+measurement. `"blind"` is present on every run, blind or not, so a consumer never has to
+read blindness out of a missing key.
+
 MLX-only, like `scripts/smoke_test.py`: it does not run on a Linux/CUDA host.
 """
 
@@ -52,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -326,6 +335,14 @@ def main() -> None:
                         "(with #264's mx.eval(h) barrier) instead of the unbarriered copy, "
                         "to measure whether the shipped fix holds")
     p.add_argument("--json", action="store_true", help="emit the result dict as JSON only")
+    p.add_argument("--report-only", action="store_true",
+                   help="record BLIND in the result dict ('blind': true, with "
+                        "'blind_reason') and exit 0 instead of 3. For a CI step that must "
+                        "CAPTURE the measurement without turning the job red — a hosted "
+                        "runner whose shape does not reproduce the defect is a legitimate "
+                        "measurement, not a build failure. It suppresses ONLY the BLIND "
+                        "exit: a probe that cannot run at all (no MLX, bad config, import "
+                        "error) still fails, because that is not a measurement.")
     args = p.parse_args()
 
     import mlx.core as mx
@@ -361,32 +378,59 @@ def main() -> None:
     result = {"pattern": args.pattern, "cache_limit": args.cache_limit,
               "mlx_version": mx.__version__, "config": config_label, **result}
 
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        print(json.dumps(result, indent=2))
-
-    # The anti-blind rule. `mixing` with the cache ON is the positive control: it is the
-    # ONE pattern known to reproduce. If it does not, this instrument cannot see the defect
-    # on this host, and every other pattern's clean result is unknown rather than good news.
+    # The anti-blind rule, decided BEFORE the JSON is printed so `blind`/`blind_reason` ride
+    # in the emitted dict rather than only in stderr-adjacent prose. `mixing` with the cache
+    # ON is the positive control: it is the ONE pattern known to reproduce. If it does not,
+    # this instrument cannot see the defect on this host, and every other pattern's clean
+    # result is unknown rather than good news.
+    blind_reason = None
     if args.pattern in ("mixing", "hotpath") and not result.get("reference_stable", True):
-        print("BLIND: the reference value itself moved between its two computations, so "
-              "no trial verdict in this run means anything. Do not report it.")
-        raise SystemExit(3)
+        blind_reason = (
+            "the reference value itself moved between its two computations, so no trial "
+            "verdict in this run means anything. Do not report it.")
+    elif (args.pattern == "mixing" and args.cache_limit == "default"
+            and not args.barrier and result["failures"] == 0):
+        blind_reason = (
+            "the positive control did NOT reproduce on this host "
+            f"({result['trials']} trials, mlx {mx.__version__}, {args.config}, "
+            f"seq={args.seq}). A clean `hotpath` result is therefore NOT evidence "
+            "that the hot path is immune — the instrument cannot detect the defect "
+            "at all here. Do not report this run as 'clean'. Reproduction is "
+            "shape-dependent: toy-moe.yaml and toy-hybrid.yaml at seq=129 DO "
+            "reproduce on the M1 Pro dev host; toy.yaml and seq=512 do not.")
+
+    # `blind` is recorded on EVERY run, not only the blind ones, so a consumer reading the
+    # JSON never has to infer blindness from a missing key — absence would be indistinguish-
+    # able from "this build of the probe predates the flag", which is the same BLIND-reads-
+    # healthy failure the flag exists to make visible.
+    result["blind"] = blind_reason is not None
+    result["blind_reason"] = blind_reason
+
+    print(json.dumps(result, indent=2))
+
+    # Under --json, stdout must be PARSEABLE JSON and nothing else — the CI job `tee`s it
+    # straight into a .json file the verdict step reads back. Every human-readable line
+    # below therefore goes to stderr in that mode; it is still shown in the workflow log,
+    # it just stops corrupting the machine-readable half. (`--json` claimed "JSON only"
+    # before this and did not deliver it.)
+    def say(text: str) -> None:
+        print(text, file=sys.stderr if args.json else sys.stdout)
+
+    if blind_reason is not None:
+        say(f"BLIND: {blind_reason}")
+        # --report-only suppresses ONLY this exit. Everything above — an MLX that will not
+        # import, a config that will not load, a pattern that raises — has already failed
+        # loudly by the time we get here, and stays failing.
+        if not args.report_only:
+            raise SystemExit(3)
+        say("--report-only: exiting 0 so the measurement is captured; the BLIND verdict "
+            "above is the result, NOT a clean bill of health.")
+        return
 
     if args.pattern == "mixing" and args.cache_limit == "default" and not args.barrier:
-        if result["failures"] == 0:
-            print("BLIND: the positive control did NOT reproduce on this host "
-                  f"({result['trials']} trials, mlx {mx.__version__}, {args.config}, "
-                  f"seq={args.seq}). A clean `hotpath` result is therefore NOT evidence "
-                  "that the hot path is immune — the instrument cannot detect the defect "
-                  "at all here. Do not report this run as 'clean'. Reproduction is "
-                  "shape-dependent: toy-moe.yaml and toy-hybrid.yaml at seq=129 DO "
-                  "reproduce on this host; toy.yaml and seq=512 do not.")
-            raise SystemExit(3)
-        print(f"positive control reproduced: {result['failures']}/{result['trials']} "
-              "trials diverged from the accessor-free reference — the instrument can see "
-              "the defect.")
+        say(f"positive control reproduced: {result['failures']}/{result['trials']} "
+            "trials diverged from the accessor-free reference — the instrument can see "
+            "the defect.")
 
 
 if __name__ == "__main__":

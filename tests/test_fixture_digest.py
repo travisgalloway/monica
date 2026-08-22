@@ -11,9 +11,11 @@ no fixture can be produced at all.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from src.conformance.fixture_digest import compare_trees, digest_tree
+from src.conformance.fixture_digest import REGEN_ADVICE, compare_trees, digest_tree
 
 
 def _tree(root, files):
@@ -138,3 +140,54 @@ def test_empty_files_still_count_as_files(tmp_path):
     b = _tree(tmp_path / "b", {"empty.bin": b""})
     assert compare_trees(a, b) == []
     assert list(digest_tree(a)) == ["empty.bin"]
+
+
+# ── The #298 regeneration policy (DoD-6) ──────────────────────────────────────
+# Portable, and deliberately so: the two modules that *use* REGEN_ADVICE are MLX-gated and
+# skip on the Linux `portable` job, so without these cases the policy's content would be
+# unenforced everywhere the fixtures cannot be built. These read the two modules as TEXT
+# rather than importing them, for exactly that reason.
+
+_TESTS_DIR = Path(__file__).resolve().parent
+_ADVICE_CONSUMERS = ("test_parity_fixture_export.py", "test_train_parity_fixture_export.py")
+
+
+def test_regen_advice_states_the_policy():
+    """The advice must carry the three load-bearing instructions, not merely exist.
+
+    A red oracle gate and a #298 corruption are indistinguishable from the assertion, so the
+    message has to say: reproduce in a fresh process first, regenerate only through the
+    two-fresh-process `--double-export`, and never widen a tolerance to absorb it. Pinning
+    the content here is what stops it decaying into "regenerate the fixtures".
+    """
+    advice = REGEN_ADVICE
+    assert "#298" in advice
+    # 1. fresh-process confirmation BEFORE regenerating — the whole point.
+    assert "fresh process" in advice.lower()
+    # 2. the two-process guard is named, and its opt-out is named as a thing NOT to reach for.
+    assert "--double-export" in advice
+    assert "--no-double-export" in advice
+    # 3. no loosening.
+    assert "tolerances.py" in advice
+    # The ordering that makes it a policy rather than three facts: confirm, then regenerate.
+    assert advice.lower().index("fresh process") < advice.index("--double-export"), (
+        "the advice must tell a reader to confirm in a fresh process BEFORE it tells them "
+        "how to regenerate — reversed, it reads as 'regenerate, and by the way…'")
+    assert advice.startswith("\n\n"), (
+        "REGEN_ADVICE is appended to existing failure messages; it must open its own block")
+
+
+@pytest.mark.parametrize("module", _ADVICE_CONSUMERS)
+def test_oracle_staleness_modules_use_the_shared_constant(module):
+    """Both MLX oracle-staleness modules reference the constant, not a restated copy.
+
+    Two divergent copies of a policy is the same failure as no policy: the next reader
+    follows whichever one they hit, and only one of them gets updated.
+    """
+    source = (_TESTS_DIR / module).read_text()
+    assert "from src.conformance.fixture_digest import REGEN_ADVICE" in source, (
+        f"{module} does not import the shared #298 regeneration policy")
+    assert source.count("REGEN_ADVICE") >= 2, (
+        f"{module} imports REGEN_ADVICE but never appends it to a failure message")
+    assert "#298 REGENERATION POLICY" not in source, (
+        f"{module} restates the policy text instead of using the shared constant")
