@@ -552,9 +552,17 @@ jobs:
   swift-engine:
     name: swift model parity (macOS, mlx-swift)
     runs-on: macos-latest
-    # mlx-swift builds the vendored `mlx` C++ tree from source; a COLD runner
-    # build is plausibly 20-40 min, hence the generous timeout and the cache.
-    timeout-minutes: 60
+    # mlx-swift builds the vendored `mlx` C++ tree from source, so this job leans on
+    # the cache below; its measured warm wall clock is 2m40s (run 32542924915).
+    # #322 lowered this 60 -> 20: #315's DoD-3 measures the macOS PR path as the max
+    # over every macOS job, and a 60-minute ceiling on a 2m40s job is exactly the
+    # illegible-ceiling shape #315 was filed about. 20 is ~7x headroom over the warm
+    # build and is pinned by tests/test_ci_macos_budget.py::MACOS_JOBS.
+    # ROLLBACK: the failure mode is a cache miss on a cold/slow runner (a
+    # Package.resolved or toolchain-version change invalidates the key). If this ever
+    # times out, raise it back WITH the recorded evidence — in this file, MACOS_JOBS and
+    # PR_PATH_CEILING_SECONDS's rationale — never silently.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
