@@ -447,7 +447,18 @@ jobs:
   # `continue-on-error:` anywhere below; an exit status is never discarded.
   #
   # NO `needs:`. This job must not sit between poc-fixture-oracle and poc-parity, and must
-  # not be able to delay them. Bounded at --trials 20 / --seq 129 and 20 minutes.
+  # not be able to delay them. Bounded at --trials 20 / --seq 129.
+  #
+  # WHY timeout-minutes IS 45 AND NOT 20. Measured, not guessed, and the measurement is
+  # itself worth recording: the SAME control step (3 configs x 20 trials) took **5 seconds**
+  # on the runner for run 32583285323 and **over 20 minutes** — a timeout kill — on the
+  # runner for run 32583406103, twelve minutes apart, from the same commit. Locally the same
+  # command is 0.26 s per config. So the hosted macos-latest family has multi-hundred-x wall
+  # clock variance on this workload, and a 20 minute ceiling turns that into a red job that
+  # reads as a probe regression. That is CONF-2's failure shape (#315): a timeout kill
+  # masquerading as a signal. 45 minutes leaves headroom for the slow tail while still
+  # bounding the job, and this comment is the record of why the number is what it is — do not
+  # lower it without re-measuring.
   #
   # DISPATCH/SCHEDULE ONLY, like every job in this file — see the `on:` block at the top.
   # It is registered in tests/test_workflow_triggers.py's HEAVY_JOBS, which asserts exactly
@@ -455,7 +466,7 @@ jobs:
   mlx-buffer-reuse-probe:
     name: "#298 buffer-reuse probe (macOS, Python MLX, report-only)"
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       # The probe imports `scripts.export_parity_fixture`, and `scripts/` is not a
       # distributed package — `pip install -e .` does not put it on the path. Same
