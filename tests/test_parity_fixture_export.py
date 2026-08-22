@@ -33,9 +33,11 @@ disable_buffer_cache_for_process()
 from safetensors.numpy import load_file            # noqa: E402
 
 from scripts.export_parity_fixture import build_fixture   # noqa: E402
-# The #298 regeneration policy, appended to every staleness-failure message below. It lives
-# in the portable module rather than being restated here, so the rule a person hits on a red
-# gate is the same rule wherever they hit it (see tests/test_fixture_digest.py, which pins it).
+# The #298 regeneration policy, appended to most staleness-failure messages below (the
+# exact-count assertions using assert_array_equal/plain assert are the exception — see
+# individual call sites). It lives in the portable module rather than being restated here,
+# so the rule a person hits on a red gate is the same rule wherever they hit it (see
+# tests/test_fixture_digest.py, which pins it).
 from src.conformance.fixture_digest import REGEN_ADVICE   # noqa: E402
 from src.conformance.tolerances import band_for           # noqa: E402
 
