@@ -109,8 +109,10 @@ plus `swift-engine` (see the seam section) — and triggers on
 `pull_request`, `push` to `main`, `workflow_dispatch`, and (since #312) a **monthly `schedule:`**
 (09:43 UTC on the 3rd) that runs those same 9 jobs against unchanged `main` as environmental-drift
 coverage. No job in it carries an `if:`, so no PR gate can silently stop running.
-`.github/workflows/scheduled-parity.yml` holds **4** heavy jobs — `poc-fixture-oracle`/`poc-parity`
-(#267) and `train-fixture-oracle`/`train-fixture-oracle-verify` (#195) — and triggers **only** on
+`.github/workflows/scheduled-parity.yml` holds **5** heavy jobs — `poc-fixture-oracle`/`poc-parity`
+(#267), `train-fixture-oracle`/`train-fixture-oracle-verify` (#195) and `mlx-buffer-reuse-probe`
+(#298 — the buffer-reuse probe on a hosted macOS runner, `--report-only` so a BLIND host is
+recorded as a measurement rather than a red job) — and triggers **only** on
 `workflow_dispatch` and a weekly `schedule:` (Monday 09:17 UTC). It declares **no
 `pull_request`/`push` trigger at all**, so those jobs are structurally unreachable from a PR rather
 than merely `if:`-guarded — **a green PR run never implies poc scale was exercised**; see

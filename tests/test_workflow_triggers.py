@@ -8,7 +8,8 @@ green PR run never implies poc scale was exercised. Before #302 that constraint 
 by an ``if: github.event_name == …`` expression on each heavy job — one typo away from
 either silently skipping a PR gate or silently running a 90-minute macOS job on every PR.
 
-#302 made it *structural* instead: the four heavy jobs live in
+#302 made it *structural* instead: the heavy jobs (four at the time, five since #298's
+probe joined them) live in
 ``.github/workflows/scheduled-parity.yml``, whose ``on:`` block has no ``pull_request`` and
 no ``push`` key at all. There is nothing to skip under, so there is nothing to get wrong in
 an expression.
@@ -70,14 +71,20 @@ PR_PUSH_JOBS = {
     "swift-engine",
 }
 
-# The 4 heavy dispatch/schedule-only jobs (#195's training-fixture oracle pair and
-# #267's poc-scale parity pair). These are the ones CLAUDE.md says must never run on
-# pull_request/push.
+# The 5 heavy dispatch/schedule-only jobs (#195's training-fixture oracle pair, #267's
+# poc-scale parity pair, and #298's macOS buffer-reuse probe). These are the ones CLAUDE.md
+# says must never run on pull_request/push.
+#
+# `mlx-buffer-reuse-probe` (#298) belongs here rather than in ci.yml for two reasons, and
+# both are deliberate: it is a *measurement* of an upstream MLX defect this repo cannot fix
+# — a PR must never be gated on whether a hosted runner happens to reproduce it — and it
+# costs a macOS runner slot, which the weekly cron already budgets for.
 HEAVY_JOBS = {
     "train-fixture-oracle",
     "train-fixture-oracle-verify",
     "poc-fixture-oracle",
     "poc-parity",
+    "mlx-buffer-reuse-probe",
 }
 
 ALL_JOBS = PR_PUSH_JOBS | HEAVY_JOBS
@@ -156,7 +163,7 @@ def _jobs_for(name: str, event: str) -> set[str]:
 def test_schedule_fires_the_right_job_set_in_each_workflow() -> None:
     """Each file's cron fires exactly its own jobs, and ci.yml's can never reach a heavy one.
 
-    Each workflow now carries a cron: scheduled-parity.yml's weekly one for the 4 heavy
+    Each workflow now carries a cron: scheduled-parity.yml's weekly one for the 5 heavy
     gates, ci.yml's monthly one for #312's drift coverage over the 9 PR/push gates. #302's
     guarantee is the third assertion — a `schedule` in ci.yml cannot fire a heavy job,
     because the heavy jobs are in another file. That is the *property* #302 protected;
@@ -221,7 +228,12 @@ def test_scheduled_ci_run_cannot_be_cancelled_by_a_push() -> None:
 # ── DoD-2 ─────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("event", ["pull_request", "push"])
 def test_pull_request_and_push_job_sets_unchanged(event: str) -> None:
-    """PR/push behaviour is what it was before #302, plus #315's split: 9 jobs, no heavy job."""
+    """PR/push behaviour is what it was before #302, plus #315's split: 9 jobs, no heavy job.
+
+    #298's `mlx-buffer-reuse-probe` is the newest heavy job and this is the assertion that
+    keeps it off pull requests — not by an `if:` on the job, but because the file holding it
+    declares no `pull_request`/`push` trigger at all (see DoD-5 below).
+    """
     assert _jobs_for(CI, event) == PR_PUSH_JOBS
     assert _jobs_for(SCHEDULED, event) == set()
 
@@ -296,8 +308,9 @@ def test_needs_edges_resolve_within_their_workflow(name: str) -> None:
 
 
 def test_every_job_is_accounted_for() -> None:
-    """Anti-BLIND: nothing was lost when #302 moved four jobs between files."""
-    assert len(ALL_JOBS) == 13
+    """Anti-BLIND: nothing was lost when #302 moved four jobs between files, or when #298
+    added a fifth heavy job to the same file."""
+    assert len(ALL_JOBS) == 14
     ci_jobs = set(_load(CI)["jobs"])
     scheduled_jobs = set(_load(SCHEDULED)["jobs"])
     assert ci_jobs and scheduled_jobs, "one of the workflows parsed with no jobs"
