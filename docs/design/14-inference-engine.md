@@ -1133,7 +1133,56 @@ exits 0 for **that one case only**. A probe that cannot run at all — no MLX wh
 config, import error — still exits non-zero and reddens the job. There is no `|| true` and no
 `continue-on-error:` in the job; an exit status is never discarded.
 
-<!--D6-CI-NUMBERS-->
+**First real run: 2026-08-22, run [32584500428](https://github.com/travisgalloway/monica/actions/runs/32584500428), commit `1b353122`.**
+Runner provenance, from the job's own `host.txt` artifact: image `macos26 20260728.0273.1`,
+**Apple M1 (Virtual)**, macOS 26.5.2 (build 25F84), arm64, **mlx 0.32.1** — note the runner
+installs the newest wheel, so this is a *different MLX build* from the dev host's 0.32.0 as well as
+a different machine.
+
+`--pattern mixing` (positive control, barrier removed, buffer cache on), 20 trials each:
+
+| config | corrupt trials | `max\|d\|` | verdict |
+|---|---|---|---|
+| `toy.yaml` | 0/20 | 0.0 | **BLIND** — control did not fire |
+| `toy-hybrid.yaml` | **3/20** | 1.679 | reproduced |
+| `toy-moe.yaml` | 0/20 | 0.0 | **BLIND** — control did not fire |
+
+`--pattern hotpath` (forward / prefill / stacked `step` / real `make_train_step`), 20 trials each:
+
+| config | corrupt trials |
+|---|---|
+| `toy.yaml` | 0/20 |
+| `toy-hybrid.yaml` | 0/20 |
+| `toy-moe.yaml` | 0/20 |
+
+**What this second host establishes.**
+
+1. **The defect is not an artifact of one machine.** It reproduces on a virtualised M1 GitHub
+   runner, on mlx 0.32.1, at 3/20 — the same catastrophic magnitude (`max|d|` 1.679 on fp32 logits,
+   not `1e-5`), not a marginal drift.
+2. **§D2's hot-path conclusion holds on a second host, and holds *as evidence*.** 0/20 on all three
+   configs, from an instrument that demonstrably saw the defect on this same runner in this same
+   run. That is the whole reason the control runs alongside the hot path; a clean hot path from a
+   blind instrument would have been worth nothing.
+3. **Shape-dependence is real and the ranking is host-dependent — which is why one config would
+   have been useless.** On the M1 Pro dev host `toy.yaml` is the *strongest* reproducer (27–35/40)
+   and `toy-hybrid` among the weakest; on this runner it inverts exactly — `toy.yaml` and
+   `toy-moe` are both BLIND and only `toy-hybrid` fires. A probe that ran the control on a single
+   config would have reported BLIND here and, worse, would have reported "clean hot path" from a
+   blind instrument. Any future minimisation attempt has to carry its own positive control for the
+   same reason.
+4. **The rate is lower here (3/20 vs 11–35/40), and that is not reassurance.** Two of three
+   configs could not see the defect at all on this runner, so 3/20 is a floor on what this host
+   does, not a measurement of how often it bites in a real long-lived pytest process.
+
+**An incidental finding worth recording, because it shaped the job's configuration.** The identical
+control step took **5 seconds** on run 32583285323's runner and **over 20 minutes** — a timeout
+kill — on run 32583406103's, twelve minutes apart from the same commit, against 0.26 s per config
+locally. The hosted `macos-latest` family therefore has multi-hundred-fold wall-clock variance on
+this workload. `timeout-minutes` is 45 rather than 20 for that reason, recorded in the job's own
+comment: a timeout kill on a measurement job would read as a probe regression, which is CONF-2's
+failure shape (#315) all over again.
+
 
 #### Did #303 raise the trigger rate? (with the sample size)
 

@@ -157,9 +157,24 @@ paths rather than applying it globally.
 
 The same probe runs on a hosted GitHub Actions `macos-latest` runner via the
 `mlx-buffer-reuse-probe` job in `.github/workflows/scheduled-parity.yml` (`--report-only`, so a
-runner that does not reproduce is recorded as **BLIND**, never as clean). Its numbers, with runner
-image, MLX version and run id, are in
-[`../design/14-inference-engine.md`](../design/14-inference-engine.md) §D6.
+runner that does not reproduce is recorded as **BLIND**, never as clean).
+
+First run: 2026-08-22, run id `32584500428`, image `macos26 20260728.0273.1`, **Apple M1
+(Virtual)**, macOS 26.5.2 (25F84), arm64, **mlx 0.32.1**. Positive control, 20 trials per config:
+
+| config | corrupt trials | `max\|d\|` |
+|---|---|---|
+| `toy` | 0/20 (BLIND — control did not fire) | 0.0 |
+| `toy-hybrid` | **3/20** | 1.679 |
+| `toy-moe` | 0/20 (BLIND — control did not fire) | 0.0 |
+
+**So it reproduces on a second, virtualised machine, on a different MLX build (0.32.1), at the same
+catastrophic magnitude.** Note the shape ranking *inverts* between hosts: `toy` is the strongest
+reproducer on the M1 Pro (27–35/40) and cannot see the defect at all on this runner, while
+`toy-hybrid` does the opposite. Any attempt to minimise this repro must carry its own positive
+control, or it will conclude "cannot reproduce" from a blind configuration.
+
+Full record: [`../design/14-inference-engine.md`](../design/14-inference-engine.md) §D6.
 
 ## Upstream search — what was searched, and the result
 
