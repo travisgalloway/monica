@@ -1,4 +1,4 @@
-"""The macOS CI wall-clock ceiling, as an executable contract (#315).
+"""The macOS CI wall-clock ceiling, as an executable contract (#315, #322).
 
 Why this file exists
 --------------------
@@ -27,6 +27,26 @@ a budget that drifts above its timeout is a guard that never runs, which is exac
 BLIND monitor this repo's standing rules warn about. Hence
 ``test_budget_fires_before_the_timeout``.
 
+What #322 added, and why
+------------------------
+#315 stated a ceiling in prose — its DoD-3, *"the macOS PR path completes in ≤ 20
+minutes"* — and then enforced ``MACOS_SUITE_BUDGET_SECONDS: 2400`` (40 minutes). **The
+stated ceiling and the enforced ceiling disagreed by a factor of two and nothing in the
+tree noticed**, which is the same defect one level up: a guard whose number no one checks
+against the number it is supposed to represent.
+
+So the 20 minutes is now a literal here — ``PR_PATH_CEILING_SECONDS`` — asserted against
+the budget (plus a job-overhead allowance, because the ceiling is a *job* wall clock and
+the budget only measures the pytest step) and against **every** macOS job's
+``timeout-minutes``. The macOS job set itself is pinned, so a new macOS job joining the PR
+critical path is a reviewed edit here rather than a silent addition.
+
+The other half of #322 is the cut that made the ceiling reachable: the ``--ignore`` set on
+the suite step. "Make CI fast by ignoring tests" is the obvious way to regress this, so
+``test_suite_ignores_never_delete_coverage`` requires every ignored path to be covered by
+another job, re-deriving ``cuda-cpu``'s coverage from that job's own parsed pytest
+arguments rather than from a hard-coded belief about them.
+
 Deliberate design notes
 -----------------------
 * The job ids, the ``timeout-minutes`` values and the budget literal are written out
@@ -42,6 +62,9 @@ Deliberate design notes
 
 from __future__ import annotations
 
+import fnmatch
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -53,22 +76,57 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 CI = "ci.yml"
 
 # The macOS Python jobs #315 split apart, with their recorded timeouts. Literal on
-# purpose (see above). `swift-macos`/`swift-engine` are macOS too but carry no Python
-# suite and no budget; they are out of this contract's scope.
+# purpose (see above). `swift-macos`/`swift-engine` carry no Python suite and no budget,
+# so they stay outside the *budget* half of this contract — but #315's DoD-3 names them,
+# so they are inside the *ceiling* half (MACOS_JOBS below).
 SUITE_JOB = "full-macos"
 PARITY_JOB = "parity-macos"
 
 EXPECTED_TIMEOUT_MINUTES = {
-    SUITE_JOB: 45,
+    SUITE_JOB: 17,
     PARITY_JOB: 15,
 }
 
-# The budget the suite step measures itself against, in seconds. Phase 1 (#315): the
-# recorded baseline is 37m48s (2268s), so the budget starts at that baseline plus a
-# ~2-minute buffer — 2400s (40 min) — rather than the eventual 20-minute target, which
-# requires the suite itself to get faster first. Tighten this once it does.
+# The budget the suite step measures itself against, in seconds. #322: the pre-cut
+# baseline was 2086.73s, of which tests/test_cuda_distributed.py — now ignored on this
+# job because `cuda-cpu` already runs it — was 1610.94s, leaving ~476s. The budget is
+# that measurement plus a 4-minute buffer, rounded to a whole minute.
 BUDGET_VAR = "MACOS_SUITE_BUDGET_SECONDS"
-EXPECTED_BUDGET_SECONDS = 2400
+EXPECTED_BUDGET_SECONDS = 720
+
+# #315's DoD-3, as a literal instead of a sentence: "the macOS PR path completes in
+# ≤ 20 minutes, measured as the max wall clock over full-macos, parity-macos,
+# swift-macos, swift-engine". #322 exists because that sentence and
+# MACOS_SUITE_BUDGET_SECONDS: 2400 disagreed and nothing observed it. RAISING THIS IS
+# THE FAILURE #322 WAS FILED ABOUT — if a suite can no longer fit under it, that is a
+# decision to amend the target on the record (issue #322 option 2), not a test edit.
+PR_PATH_CEILING_SECONDS = 1200
+
+# The budget covers the pytest step only; the ceiling covers the whole job. The gap is
+# checkout + `pip install -e` + `swift build`, ~110s observed on `full-macos` — allowed
+# 240s so ordinary runner variance in the install does not silently eat the margin.
+JOB_OVERHEAD_ALLOWANCE_SECONDS = 240
+
+# Every job in ci.yml on a macOS runner, i.e. every job on the macOS PR critical path
+# DoD-3 measures, with its recorded `timeout-minutes`. Pinned as a SET, not just as
+# values: a new macOS job must be a deliberate edit here, never a silent addition to the
+# critical path.
+MACOS_JOBS = {
+    SUITE_JOB: 17,
+    PARITY_JOB: 15,
+    "swift-macos": 20,
+    "swift-engine": 20,
+}
+
+# What `full-macos`'s suite step may skip. Each entry must be justified by coverage
+# somewhere else — see test_suite_ignores_never_delete_coverage.
+EXPECTED_SUITE_IGNORES = {
+    "tests/test_backend_parity.py",
+    "tests/test_cuda_distributed.py",
+}
+
+# The job that must cover everything ignored above other than the parity file.
+CUDA_JOB = "cuda-cpu"
 
 # How much room the budget must leave below the timeout. Five minutes: enough that the
 # guard's own failure path (printing, exiting, uploading the log) completes, and enough
@@ -249,3 +307,144 @@ def test_the_split_survived() -> None:
         f"{CI}: {PARITY_JOB} no longer builds a fresh toy split — scripts/smoke_test.py "
         f"needs one, and must never be pointed at data/split (the real OLMo corpus)"
     )
+
+
+# ── #322: the stated ceiling and the enforced budget, as one assertion ────────
+def _pytest_step(job_id: str) -> dict[str, Any]:
+    """The one step of ``job_id`` that invokes pytest.
+
+    Hard failure on zero or many, for the same reason ``_budget_step`` asserts exactly
+    one: "I could not find the pytest step" must never degrade into "nothing is ignored,
+    therefore nothing was lost".
+    """
+    steps = _job(job_id).get("steps") or []
+    assert steps, f"{CI}: {job_id} has no steps"
+    running = [
+        step
+        for step in steps
+        if isinstance(step, dict) and re.search(r"(^|\s)pytest\s", str(step.get("run", "")))
+    ]
+    assert len(running) == 1, (
+        f"{CI}: expected exactly one pytest step in {job_id}, found {len(running)} "
+        f"({[s.get('name') for s in running] or 'none'}) — this contract cannot check "
+        f"what it cannot locate, so an unparseable job is a failure, never a default"
+    )
+    return running[0]
+
+
+def _suite_ignores() -> set[str]:
+    script = str(_budget_step(_job(SUITE_JOB)).get("run", ""))
+    assert script.strip(), f"{CI}: the {BUDGET_VAR} step has an empty `run:` block"
+    return set(re.findall(r"--ignore=(\S+)", script))
+
+
+def _cuda_job_test_globs() -> list[str]:
+    """The path arguments ``cuda-cpu`` actually passes to pytest.
+
+    Parsed from that job's own step rather than hard-coded here: the point of the
+    cross-check is that it keeps telling the truth when `cuda-cpu`'s glob changes.
+    """
+    script = str(_pytest_step(CUDA_JOB).get("run", ""))
+    globs = [
+        token
+        for token in shlex.split(script)
+        if token.startswith("tests/") and not token.startswith("-")
+    ]
+    assert globs, (
+        f"{CI}: could not parse any test-path argument out of {CUDA_JOB}'s pytest step "
+        f"({script!r}) — without it, nothing here can prove the paths {SUITE_JOB} "
+        f"ignores are still covered somewhere"
+    )
+    return globs
+
+
+def test_the_budget_leaves_the_pr_path_under_its_stated_ceiling() -> None:
+    """#322, in one line: the stated ceiling and the enforced budget must agree.
+
+    #315 stated ≤20 minutes and enforced 40. Both numbers were in the tree, they
+    contradicted each other, and every check stayed green. This is the assertion that
+    makes that contradiction red on the Linux `portable` job.
+    """
+    worst_case = EXPECTED_BUDGET_SECONDS + JOB_OVERHEAD_ALLOWANCE_SECONDS
+    assert worst_case <= PR_PATH_CEILING_SECONDS, (
+        f"{SUITE_JOB}'s budget ({EXPECTED_BUDGET_SECONDS}s) plus job overhead "
+        f"({JOB_OVERHEAD_ALLOWANCE_SECONDS}s) is {worst_case}s, over the "
+        f"{PR_PATH_CEILING_SECONDS}s ceiling #315's DoD-3 states. Do NOT raise "
+        f"PR_PATH_CEILING_SECONDS to fix this — that is precisely the failure #322 was "
+        f"filed about. Either cut the suite (see #322's --durations profile) or amend "
+        f"the 20-minute target explicitly, on the issue and in "
+        f"docs/design/03-conformance.md"
+    )
+
+
+def test_every_macos_job_stays_under_the_pr_path_ceiling() -> None:
+    """DoD-3 measures the *max* over every macOS job, so every macOS job is pinned.
+
+    The set equality matters as much as the values: a fifth macOS job would join the PR
+    critical path (and the free-tier concurrency cap) without any other test noticing.
+    """
+    jobs = _ci_jobs()
+    found = {
+        job_id
+        for job_id, job in jobs.items()
+        if isinstance(job, dict) and str(job.get("runs-on", "")).startswith("macos-")
+    }
+    assert found == set(MACOS_JOBS), (
+        f"{CI}: the macOS jobs are {sorted(found)}, this contract records "
+        f"{sorted(MACOS_JOBS)}. Adding or removing a macOS job changes the PR path "
+        f"#315's DoD-3 measures, so it must be a deliberate edit here (#322)"
+    )
+    for job_id, expected in sorted(MACOS_JOBS.items()):
+        timeout = _job(job_id).get("timeout-minutes")
+        assert timeout == expected, (
+            f"{CI}: {job_id} timeout-minutes is {timeout!r}, #322 recorded {expected}"
+        )
+        assert expected * 60 <= PR_PATH_CEILING_SECONDS, (
+            f"{CI}: {job_id}'s {expected}-minute timeout exceeds the "
+            f"{PR_PATH_CEILING_SECONDS}s PR-path ceiling — a timeout above the ceiling "
+            f"is a job allowed to blow it, which is what #322 is about"
+        )
+
+
+def test_suite_ignores_never_delete_coverage() -> None:
+    """The anti-BLIND guard for #322's cut.
+
+    "Make CI fast by ignoring tests" is the obvious way to regress this change, and
+    pytest accepts an ``--ignore`` for a renamed or deleted file in silence. So: pin the
+    ignore set exactly, and for each entry prove the coverage lives somewhere else —
+    ``test_backend_parity.py`` on ``parity-macos`` (where the flag makes it gate), and
+    everything else inside the glob ``cuda-cpu`` really runs, parsed from that job.
+    """
+    ignores = _suite_ignores()
+    assert ignores == EXPECTED_SUITE_IGNORES, (
+        f"{CI}: {SUITE_JOB} ignores {sorted(ignores)}, this contract records "
+        f"{sorted(EXPECTED_SUITE_IGNORES)}. Every ignored path must be justified by "
+        f"coverage on another job; adding one silently is how a 'CI speedup' deletes a "
+        f"gate (#322)"
+    )
+
+    repo_root = WORKFLOWS.parents[1]
+    parity_script = "\n".join(
+        str(step.get("run", "")) for step in _job(PARITY_JOB).get("steps") or []
+    )
+    cuda_globs = _cuda_job_test_globs()
+
+    for path in sorted(ignores):
+        assert (repo_root / path).is_file(), (
+            f"{CI}: {SUITE_JOB} ignores {path}, which does not exist. pytest accepts a "
+            f"stale --ignore in silence, so a rename would quietly leave the file "
+            f"running here again — or, worse, leave the ignore pointing at nothing "
+            f"while the reason for it is forgotten (#322)"
+        )
+        if path == "tests/test_backend_parity.py":
+            assert path in parity_script, (
+                f"{CI}: {path} is ignored on {SUITE_JOB} but {PARITY_JOB} no longer "
+                f"runs it — the five MLX↔torch comparisons would now run on NO job "
+                f"(#303)"
+            )
+            continue
+        assert any(fnmatch.fnmatch(path, glob) for glob in cuda_globs), (
+            f"{CI}: {SUITE_JOB} ignores {path}, but it does not match any path "
+            f"{CUDA_JOB} runs ({cuda_globs}) — ignoring it here would delete its only "
+            f"coverage rather than move it (#322)"
+        )

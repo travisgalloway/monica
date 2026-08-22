@@ -142,7 +142,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | ID | Capability | Portable | MLX | CUDA | Swift | Status | Issue | Design |
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
 | CONF-1 | A person can prove forward and step agree | done | done | done | done | Shipped | — | design/03 |
-| CONF-2 | A person can prove MLX and CUDA agree numerically | done | done | done | n/a | Shipped | #303, #315 | design/03 |
+| CONF-2 | A person can prove MLX and CUDA agree numerically | done | done | done | n/a | Shipped | #303, #315, #322 | design/03 |
 | CONF-3 | A person can prove document boundaries are respected | done | done | done | n/a | Shipped | — | design/03 |
 | CONF-4 | A person can prove prefill and decode agree | done | done | done | done | Shipped | — | design/03 |
 | CONF-5 | A person can prove a quantized model stays in tolerance | done | done | n/a | done | Shipped | #196 | design/03 |

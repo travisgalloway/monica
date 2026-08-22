@@ -232,3 +232,22 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   20 skipped in 361 s locally): *fewer* tests, six times the wall clock. Unexplained, and the
   single largest term in the macOS CI budget. Found while profiling for #315. Severity:
   CI throughput, non-blocking.
+
+- [2026-08-22] RESOLVED by #322 — the 2026-08-21 "`full-macos`: the hosted macOS runner is ~6×
+  slower than an M1 Pro" finding above. It is not an environment gap: `--durations=25` on run
+  32542924915 shows `tests/test_cuda_distributed.py` alone is 1610.94s of a 2086.73s suite (19.06s
+  locally, ~85×) because macOS has no `fork` start method for `torch.multiprocessing.spawn` and its
+  ~26 gloo workers each re-import torch/mlx (~62s apiece). Everything else runs at ≈1.4× local. The
+  file is `--ignore`d on `full-macos` (it is already gated on `cuda-cpu`). See
+  `docs/design/03-conformance.md` §"Cutting the suite".
+
+- [2026-08-22] RESOLVED by #322 — the 2026-08-21 "`pytest-xdist` (`-n 3`) is the obvious next
+  lever" finding above. Rejected on evidence, not taste: the measured cost was nested-subprocess
+  import time, not schedulable test time, and `-n 3` on a 3-core runner whose slowest tests each
+  spawn two gloo workers would oversubscribe it. The decision is recorded in
+  `docs/design/03-conformance.md`; this item is closed rather than re-parked.
+
+- [2026-08-22] `.github/workflows/ci.yml`, `swift-macos` (`swift selfcheck (macOS)`) fails
+  spuriously — run 32542924915 on unchanged `main` is red on that job with the rest of `main`
+  green, and it also failed on PR #323. Found while cutting the macOS suite for #322 (explicitly
+  out of its scope). Severity: CI reliability, non-blocking.
