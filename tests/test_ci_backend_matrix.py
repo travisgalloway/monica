@@ -9,10 +9,17 @@ build no CI job installed both, so those five skipped in every job while the che
 stayed green. A check that cannot observe its target is indistinguishable from the good
 outcome; that is the most expensive failure shape there is.
 
-#303 fixes it by giving `full-macos` both backends (`.[dev,data,mlx,cuda]` — the macOS
+#303 fixes it by giving a macOS job both backends (`.[dev,data,mlx,cuda]` — the macOS
 arm64 torch wheel is CPU-only, which is exactly the surface the CUDA backend is compared
 on) and a dedicated step carrying ``MONICA_REQUIRE_BOTH_BACKENDS=1``, under which
 ``requires_both_backends`` attaches no marker and a missing backend errors.
+
+#315 moved that step off `full-macos` onto its own `parity-macos` job. The reason is this
+module's own subject matter: coupled to a 35-minute suite, the 9-second parity gate died as
+an `ETIMEDOUT` that reads as infrastructure flake — CONF-2's original failure shape wearing
+a different hat. Splitting it gives the gate ~13 minutes of headroom on a ~2-minute job.
+``DESIGNATED_JOB`` below is the literal that had to be edited to allow it, which is exactly
+the behaviour this contract was designed for.
 
 That flag protects the job that sets it — but nothing stops someone deleting the flag,
 the step, or the `cuda` extra, which would return the gate to silent skipping without a
@@ -29,7 +36,9 @@ Deliberate design notes
   failure, never a default** — otherwise "I could not find the env var" degrades into
   "no job declares it wrongly, therefore pass".
 * Job topology is *not* this module's business; ``test_workflow_triggers.py`` owns the
-  trigger×job matrix. #303 adds no job, so that file is unedited.
+  trigger×job matrix — #315 adds a job, so that file's ``PR_PUSH_JOBS`` grew to 9 in the
+  same commit. The macOS wall-clock ceiling is likewise not this module's business;
+  ``test_ci_macos_budget.py`` owns it.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 CI = "ci.yml"
 
 # The one job designated to carry both backends. Literal on purpose (see above).
-DESIGNATED_JOB = "full-macos"
+DESIGNATED_JOB = "parity-macos"
 FLAG = "MONICA_REQUIRE_BOTH_BACKENDS"
 
 # The extras that job's install step must request. `mlx` brings the MLX backend; `cuda`
@@ -85,7 +94,7 @@ def _declaring_jobs(jobs: dict[str, Any]) -> dict[str, list[str]]:
     return found
 
 
-# ── DoD-4, layer 3: exactly one job declares the flag, and it is `full-macos` ──
+# ── DoD-4, layer 3: exactly one job declares the flag, and it is `parity-macos` ──
 def test_exactly_one_job_declares_the_both_backends_flag() -> None:
     """One gate, named. Zero means the parity tests are back to skipping silently in
     every job; two means the "designated job" is no longer a single observable thing."""

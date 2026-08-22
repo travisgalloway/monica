@@ -211,3 +211,24 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   `src/data/sft_corpus.py` — #306 gave the masked SFT forms a driver, but DPO and GRPO over the same
   corpora still have no path. Found while closing #306 (explicitly out of its scope). Severity:
   missing consumer, non-blocking.
+
+- [2026-08-21] `.github/workflows/ci.yml`, `full-macos` — `pytest-xdist` (`-n 3`, the hosted macOS
+  runner is 3-core) is the obvious next lever on the macOS suite's wall clock and was deliberately
+  not taken in #315: it adds a dependency and test-scheduling nondeterminism to a repo whose
+  central claim is bit-exact parity. Found while splitting the macOS job for #315. Severity: CI
+  throughput, non-blocking.
+
+- [2026-08-21] `docs/design/14-inference-engine.md:1056`, the recorded ~1-in-4 `full-macos` flake
+  for the engine module pair pre-dates #303 and is untouched by #315's split — a flaky suite job
+  now also consumes the budget guard's headroom on a rerun. Found while splitting the macOS job
+  for #315. Severity: CI reliability, non-blocking.
+
+- [2026-08-21] `docs/test-plan.md:100`, `MONICA_EXTERNAL_LIVE=1` is still wired into no CI job; the
+  row defers this citing #315, which did not take it on. Found while auditing the test-plan rows
+  that name CI jobs for #315. Severity: missing coverage, non-blocking.
+
+- [2026-08-21] `.github/workflows/ci.yml`, `full-macos` — the hosted macOS runner is ~6× slower
+  than an M1 Pro on this same suite (1577 passed / 90 skipped in 2165 s on CI vs 1759 passed /
+  20 skipped in 361 s locally): *fewer* tests, six times the wall clock. Unexplained, and the
+  single largest term in the macOS CI budget. Found while profiling for #315. Severity:
+  CI throughput, non-blocking.

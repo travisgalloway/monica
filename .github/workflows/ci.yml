@@ -9,9 +9,10 @@ name: CI
 # so no gate here can silently stop running. The heavy, dispatch/schedule-only gates
 # (#195's training-fixture oracle pair, #267's poc-scale parity pair) are NOT here:
 # #302 moved them to .github/workflows/scheduled-parity.yml. Job banner numbers below
-# are unchanged by that move, so existing "see job 4/5/6" references stay valid.
+# are unchanged by that move, so existing "see job 4/5/6" references stay valid — and
+# #315's new job is numbered "4b" for the same reason, rather than renumbering 5-8.
 #
-# Since #312 these 8 jobs ALSO run on a monthly cron, against unchanged `main`, to
+# Since #312 these 9 jobs ALSO run on a monthly cron, against unchanged `main`, to
 # catch environmental drift (runner-image, Xcode, Homebrew, npm, mlx-swift moves) that
 # per-PR CI reads as flake. That cron is safe here precisely because of #302's split:
 # what keeps the heavy jobs off pull requests is that they live in a different file
@@ -25,7 +26,7 @@ on:
   # #312: environmental-drift coverage on a STABLE ref. 09:43 UTC on the 3rd of each
   # month — off-the-hour to dodge the Actions scheduler crunch, off the 1st, and a
   # different minute from scheduled-parity.yml's "17 9 * * 1". This fires ONLY this
-  # file's 8 PR/push gates: the 4 heavy parity jobs are in the sibling workflow and are
+  # file's 9 PR/push gates: the 4 heavy parity jobs are in the sibling workflow and are
   # unreachable from here (tests/test_workflow_triggers.py asserts both halves).
   # Note GitHub arms `schedule:` only for workflows on the default branch, and disables
   # scheduled workflows in public repos after 60 days of no repository activity.
@@ -147,19 +148,35 @@ jobs:
       - name: pytest (CUDA backend + backend_parity tests only)
         run: pytest -q -rs tests/test_cuda_*.py tests/test_backend_parity.py
 
-  # ── Job 4: full suite + smoke gate + cross-backend parity (macOS) ─────────
+  # ── Job 4: full test suite (macOS) ────────────────────────────────────────
   # macos-latest is arm64, so the mlx wheel installs and the ~19 mlx-gated
   # test files actually run instead of skipping.
   #
-  # This is also the ONLY job carrying both backends (#303). The plain-PyPI
-  # torch wheel for macOS arm64 is CPU-only — no CUDA build exists for macOS —
-  # and CPU torch is exactly the surface src/model/cuda_backend.py is compared
-  # on (docs/design/03-conformance.md). So `.[dev,data,mlx,cuda]` makes the five
-  # real MLX-vs-torch comparisons in tests/test_backend_parity.py execute here;
-  # before #303 they skipped in every job while the checkmark stayed green.
+  # #315 SPLIT THE JOB — the decision, and what it costs.
+  # Before #315 this job also carried the cross-backend parity gate and the MLX smoke
+  # gate. #303 gave it both backends, which un-skipped a large torch-gated set and took
+  # its wall clock from 9m16s to 37m48s against `timeout-minutes: 45`. The two gates this
+  # job exists for cost **14 s combined**; the suite costs ~35 min. Coupling them means
+  # the MLX↔CUDA parity guarantee — the thing CONF-2 is about — dies as an `ETIMEDOUT`
+  # that reads as infrastructure flake, which is the same illegible shape as CONF-2's
+  # original defect (a green check hiding five silent skips).
+  # So the two fast gates moved to `parity-macos` below (Job 4b), and this job is now
+  # only the macOS test suite. Trade-off taken: one more macOS job (4 of the free-tier
+  # cap of 5 concurrent), in exchange for a ~2-minute parity gate that suite growth can
+  # no longer starve. What this deliberately does NOT fix: why the hosted runner is ~6×
+  # slower than an M1 Pro on the same suite, and the ~1-in-4 flake recorded in
+  # docs/design/14-inference-engine.md:1056. Both are parked.
+  # The `cuda` extra STAYS here: test_upcycle.py, test_parallel.py,
+  # test_bench_config_export.py and test_bfcl_adapter.py are torch-gated and outside
+  # `cuda-cpu`'s `tests/test_cuda_*.py tests/test_backend_parity.py` glob, so dropping it
+  # would delete their only coverage.
   full-macos:
-    name: full suite + smoke gate + cross-backend parity (macOS)
+    name: full suite (macOS)
     runs-on: macos-latest
+    # #315 phase 1: still 45 while the runner's own --durations=25 profile is collected.
+    # Tightening this before the profile exists would ETIMEDOUT the very run that has to
+    # print the table. The budget guard below is the legible ceiling; see
+    # tests/test_ci_macos_budget.py, which pins both numbers and the margin between them.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -179,6 +196,73 @@ jobs:
         # turns tests/test_swift_parquet.py from a local check into a gate (#247). ~30s.
         working-directory: swift
         run: swift build
+      - name: pytest (budgeted — #315)
+        # No MONICA_REQUIRE_BOTH_BACKENDS here on purpose: the rest of the suite keeps
+        # its normal skip semantics. tests/test_backend_parity.py is ignored here: it
+        # already ran (and gated) on `parity-macos`, and this job installs both backends,
+        # so an un-ignored run here would duplicate it WITHOUT the flag — a run that looks
+        # like coverage and silently skips five comparisons.
+        #
+        # The budget guard is the point of #315: `timeout-minutes` alone kills the job with
+        # no explanation, and an unexplained kill reads as flake. This measures its own wall
+        # clock and fails with an ::error:: naming the cause and the remedy. Note the
+        # set +e / STATUS dance — a FAILING SUITE MUST STAY A FAILING SUITE, never be
+        # reported as "over budget", and the elapsed line prints on both paths.
+        env:
+          # 2400s (40 min): the recorded baseline is 37m48s (2268s, see the #315 note
+          # above this job) — this budget is that baseline plus a ~2-minute buffer,
+          # capped by the 300s margin `test_budget_fires_before_the_timeout` requires
+          # below `timeout-minutes: 45`. Tighten once the suite is actually back under
+          # 20 minutes; raising OR lowering this must update EXPECTED_BUDGET_SECONDS in
+          # tests/test_ci_macos_budget.py in the same commit.
+          MACOS_SUITE_BUDGET_SECONDS: "2400"
+        run: |
+          START=$SECONDS
+          set +e
+          pytest -q -rs --ignore=tests/test_backend_parity.py --durations=25
+          STATUS=$?
+          set -e
+          ELAPSED=$(( SECONDS - START ))
+          echo "MACOS_SUITE_WALL_CLOCK_SECONDS=$ELAPSED (budget ${MACOS_SUITE_BUDGET_SECONDS}s)"
+          [ "$STATUS" -eq 0 ] || exit "$STATUS"
+          [ "$ELAPSED" -le "$MACOS_SUITE_BUDGET_SECONDS" ] || {
+            echo "::error::#315 budget: the macOS suite took ${ELAPSED}s, over its ${MACOS_SUITE_BUDGET_SECONDS}s budget. Re-profile from this run's --durations=25 table and either cut the cost or raise the budget deliberately in BOTH ci.yml and tests/test_ci_macos_budget.py."
+            exit 1
+          }
+
+  # ── Job 4b: cross-backend parity + smoke gate (macOS) — #315 ──────────────
+  # Split out of `full-macos` so the 14 seconds of gate this repo's core invariant rests
+  # on is not hostage to a 35-minute test suite. Same environment as Job 4 (macos-latest,
+  # `.[dev,data,mlx,cuda]`) — it MUST install both extras or MONICA_REQUIRE_BOTH_BACKENDS
+  # makes every run error instead of gating.
+  #
+  # This is the ONLY job carrying both backends (#303). The plain-PyPI torch wheel for
+  # macOS arm64 is CPU-only — no CUDA build exists for macOS — and CPU torch is exactly
+  # the surface src/model/cuda_backend.py is compared on (docs/design/03-conformance.md).
+  # So `.[dev,data,mlx,cuda]` makes the five real MLX-vs-torch comparisons in
+  # tests/test_backend_parity.py execute here; before #303 they skipped in every job
+  # while the checkmark stayed green.
+  #
+  # Expected wall clock ~2 min against `timeout-minutes: 15` — ~13 min of headroom, which
+  # is the whole point of the split. tests/test_ci_backend_matrix.py pins this job id as
+  # DESIGNATED_JOB, on the Linux `portable` job where neither backend exists.
+  parity-macos:
+    name: cross-backend parity + smoke gate (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # Plain PyPI, NOT download.pytorch.org/whl/cpu: that index carries no
+          # macos-arm64 wheels, and the default PyPI macOS wheel is already CPU-only.
+          pip install -e ".[dev,data,mlx,cuda]"
       - name: Cross-backend parity — MLX vs CUDA/torch-CPU must RUN here (#303)
         # The whole point of this job carrying BOTH backends, run as its own step so the
         # evidence is legible in the log rather than buried in a 1600-test summary.
@@ -189,12 +273,6 @@ jobs:
         env:
           MONICA_REQUIRE_BOTH_BACKENDS: "1"
         run: pytest -q -rs tests/test_backend_parity.py
-      - name: pytest
-        # No MONICA_REQUIRE_BOTH_BACKENDS here on purpose: the rest of the suite keeps
-        # its normal skip semantics. tests/test_backend_parity.py is ignored here: it
-        # already ran (and gated) in the dedicated step above, and this job installs
-        # both backends, so an un-ignored run here would just duplicate it.
-        run: pytest -q -rs --ignore=tests/test_backend_parity.py
       - name: Build a fresh toy split
         run: |
           python -m src.data.download --dummy --out "$RUNNER_TEMP/toy/raw" --max-docs 2000

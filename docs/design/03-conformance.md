@@ -137,16 +137,58 @@ CUDA backend on torch-CPU). `backend_parity` is implemented and exercised by
 `tests/test_backend_parity.py`. `doc_boundary_parity` is implemented and has its own
 dedicated tests.
 
-**Cross-backend parity is automated (#303).** The `full-macos` job in
-`.github/workflows/ci.yml` installs `.[dev,data,mlx,cuda]` — on macOS arm64 the PyPI
-`torch` wheel is CPU-only, which is precisely the surface above — and runs a dedicated
-step with `MONICA_REQUIRE_BOTH_BACKENDS=1`. Under that flag the five cross-backend tests
-carry **no skip marker**, so a missing backend raises ImportError and the step goes red;
-`test_designated_job_has_both_backends` says the same thing up front with a message
-naming the cause, and pytest's exit code 5 catches the file disappearing. Nothing outside
-that job can police the flag, so `tests/test_ci_backend_matrix.py` parses `ci.yml` and
-asserts exactly one job declares it, that it is `full-macos` on a `macos-*` runner
-installing both extras — portable, so it runs on the Linux `portable` job.
+**Cross-backend parity is automated (#303), on its own job (#315).** The `parity-macos`
+job in `.github/workflows/ci.yml` installs `.[dev,data,mlx,cuda]` — on macOS arm64 the
+PyPI `torch` wheel is CPU-only, which is precisely the surface above — and runs a
+dedicated step with `MONICA_REQUIRE_BOTH_BACKENDS=1`. Under that flag the five
+cross-backend tests carry **no skip marker**, so a missing backend raises ImportError and
+the step goes red; `test_designated_job_has_both_backends` says the same thing up front
+with a message naming the cause, and pytest's exit code 5 catches the file disappearing.
+Nothing outside that job can police the flag, so `tests/test_ci_backend_matrix.py` parses
+`ci.yml` and asserts exactly one job declares it, that it is `parity-macos` on a `macos-*`
+runner installing both extras — portable, so it runs on the Linux `portable` job.
+
+### Why the gate has its own job (#315), and what that decision costs
+
+The gate originally lived on `full-macos`, the macOS full-suite job. Giving that job both
+backends (#303) worked, but the same install un-skipped a large torch-gated set and took
+the job from **9m16s to 37m48s** against its own `timeout-minutes: 45`. The two gates the
+job existed for — the parity step and the MLX smoke gate — cost **14 seconds combined**;
+everything else was the suite.
+
+That coupling has a specific failure mode. When the suite eventually crosses the timeout,
+GitHub kills the job with no explanation, and an unexplained kill on the one job carrying
+the MLX↔CUDA guarantee reads as infrastructure flake rather than as a parity regression —
+the same illegible shape as CONF-2's original defect, where a green check hid five silent
+skips. `timeout-minutes` is a stop, not a signal.
+
+**The decision:** split the job (#315's option 2). `parity-macos` carries the parity step
+and the smoke gate at ~2 minutes against `timeout-minutes: 15`; `full-macos` keeps its id
+and is now only the suite. Alongside it, the suite's pytest step measures its own wall
+clock against `MACOS_SUITE_BUDGET_SECONDS` and fails with an `::error::` naming #315 and
+the remedy, so a breach is legible rather than a silent kill.
+`tests/test_ci_macos_budget.py` pins the budget literal, both `timeout-minutes` literals,
+and the invariant `budget + 300s <= timeout` — so the legible guard always fires first,
+and raising the budget is a reviewed test edit rather than a one-line YAML change.
+
+**What it costs.** A fourth macOS job. The repo is public, so hosted macOS minutes are
+free, but free-tier concurrency caps macOS at 5 jobs and `ci.yml` already ran three
+(`full-macos`, `swift-macos`, `swift-engine`). Four is inside the cap; a fifth is where
+queue time would start eating the gain, which is why partitioning the suite across another
+macOS runner is explicitly the last resort rather than the first.
+
+**What it deliberately does not fix.** The suite is still slow — the split bounds the
+damage rather than removing it. Why the hosted runner is ~6× slower than an M1 Pro on the
+same suite is unexplained and out of scope. `pytest-xdist` was considered and rejected
+here: it adds a dependency and scheduling nondeterminism to a repo whose central claim is
+bit-exact parity. The ~1-in-4 `full-macos` flake recorded in
+`docs/design/14-inference-engine.md` is untouched. All three are parked in
+`docs/parked-findings.md`.
+
+The `cuda` extra stays on `full-macos` even though the parity gate left: `test_upcycle.py`,
+`test_parallel.py`, `test_bench_config_export.py` and `test_bfcl_adapter.py` are torch-gated
+and fall outside `cuda-cpu`'s `tests/test_cuda_*.py tests/test_backend_parity.py` glob, so
+dropping it would delete their only coverage.
 
 Skipping remains the behaviour everywhere else, and that is correct: a Linux/CUDA box has
 no mlx wheel, a Mac without torch has no second backend. In particular the Linux

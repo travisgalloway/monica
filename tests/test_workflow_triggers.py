@@ -19,7 +19,7 @@ matrix: which jobs would run, for each event, in each file.
 
 #312 and the assertion that changed shape
 -----------------------------------------
-``ci.yml`` now has a ``schedule:`` of its own — a monthly cron that runs its 8 gates against
+``ci.yml`` now has a ``schedule:`` of its own — a monthly cron that runs its 9 gates against
 unchanged ``main`` to catch environmental drift (a runner-image, Xcode or toolchain move that
 per-PR CI reads as flake). This module used to assert ``"schedule" not in _triggers(CI)``, and
 deleting that line is **not** a weakening: trigger absence was never what protected the heavy
@@ -57,12 +57,13 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 CI = "ci.yml"
 SCHEDULED = "scheduled-parity.yml"
 
-# The 8 jobs that gate every pull request and every push to main.
+# The 9 jobs that gate every pull request and every push to main.
 PR_PUSH_JOBS = {
     "portable",
     "smoke-linux",
     "cuda-cpu",
     "full-macos",
+    "parity-macos",
     "swift-macos",
     "swift-linux",
     "swift-parity",
@@ -156,7 +157,7 @@ def test_schedule_fires_the_right_job_set_in_each_workflow() -> None:
     """Each file's cron fires exactly its own jobs, and ci.yml's can never reach a heavy one.
 
     Each workflow now carries a cron: scheduled-parity.yml's weekly one for the 4 heavy
-    gates, ci.yml's monthly one for #312's drift coverage over the 8 PR/push gates. #302's
+    gates, ci.yml's monthly one for #312's drift coverage over the 9 PR/push gates. #302's
     guarantee is the third assertion — a `schedule` in ci.yml cannot fire a heavy job,
     because the heavy jobs are in another file. That is the *property* #302 protected;
     "ci.yml has no `schedule:`" was merely the *mechanism* it happened to use, and asserting
@@ -164,7 +165,7 @@ def test_schedule_fires_the_right_job_set_in_each_workflow() -> None:
     """
     assert _jobs_for(SCHEDULED, "schedule") == HEAVY_JOBS
     assert _jobs_for(CI, "schedule") == PR_PUSH_JOBS, (
-        "ci.yml's monthly drift cron (#312) must fire exactly the 8 PR/push gates"
+        "ci.yml's monthly drift cron (#312) must fire exactly the 9 PR/push gates"
     )
     assert HEAVY_JOBS & _jobs_for(CI, "schedule") == set(), (
         "a heavy parity job became reachable from ci.yml's cron — #302's split is the only "
@@ -177,7 +178,7 @@ def test_ci_drift_cadence_is_the_recorded_monthly_cron() -> None:
     """ci.yml's drift cadence is monthly, and retiming it takes a deliberate edit here.
 
     The literal is written out for the same reason the job-id sets are: this is a contract,
-    not a mirror. Turning "43 9 3 * *" into "* * * * *" — 8 jobs, three of them macOS, every
+    not a mirror. Turning "43 9 3 * *" into "* * * * *" — 9 jobs, four of them macOS, every
     minute — must fail a test rather than merge as a one-character YAML change.
     """
     schedule = _triggers(_load(CI), CI)["schedule"]
@@ -220,7 +221,7 @@ def test_scheduled_ci_run_cannot_be_cancelled_by_a_push() -> None:
 # ── DoD-2 ─────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("event", ["pull_request", "push"])
 def test_pull_request_and_push_job_sets_unchanged(event: str) -> None:
-    """PR/push behaviour is what it was before #302: the same 8 jobs, and no heavy job."""
+    """PR/push behaviour is what it was before #302, plus #315's split: 9 jobs, no heavy job."""
     assert _jobs_for(CI, event) == PR_PUSH_JOBS
     assert _jobs_for(SCHEDULED, event) == set()
 
@@ -296,7 +297,7 @@ def test_needs_edges_resolve_within_their_workflow(name: str) -> None:
 
 def test_every_job_is_accounted_for() -> None:
     """Anti-BLIND: nothing was lost when #302 moved four jobs between files."""
-    assert len(ALL_JOBS) == 12
+    assert len(ALL_JOBS) == 13
     ci_jobs = set(_load(CI)["jobs"])
     scheduled_jobs = set(_load(SCHEDULED)["jobs"])
     assert ci_jobs and scheduled_jobs, "one of the workflows parsed with no jobs"
