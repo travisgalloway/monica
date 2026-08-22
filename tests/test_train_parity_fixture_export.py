@@ -31,6 +31,9 @@ disable_buffer_cache_for_process()
 from safetensors.numpy import load_file            # noqa: E402
 
 from scripts.export_parity_fixture import build_fixture   # noqa: E402
+# The #298 regeneration policy, appended to the staleness-failure messages below — same
+# constant `tests/test_parity_fixture_export.py` uses, defined once in the portable module.
+from src.conformance.fixture_digest import REGEN_ADVICE   # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[1] / "swift" / "engine" / "Fixtures" / "toy"
 
@@ -53,11 +56,11 @@ def test_checked_in_toy_train_fixture_matches_todays_train_step(tmp_path):
     assert set(fresh.keys()) == set(ref.keys()), (
         "train.safetensors keys drifted — the micro-batch/step/parameter structure no "
         "longer matches the checked-in training oracle. If the change is intended, "
-        "regenerate the fixtures — see swift/engine/Fixtures/README.md.")
+        "regenerate the fixtures — see swift/engine/Fixtures/README.md." + REGEN_ADVICE)
     for key in ref:
         assert np.allclose(fresh[key], ref[key], rtol=rtol, atol=atol), (
             f"train.safetensors[{key!r}] drifted from the checked-in Swift training-parity "
             f"oracle (max|d| = {np.abs(fresh[key] - ref[key]).max():.3e}). If the "
             "mlx_train_step.py/mlx_backend.py change is intended, regenerate the fixtures "
-            "— see swift/engine/Fixtures/README.md — and re-run `swift run monica-train`."
+            "— see swift/engine/Fixtures/README.md — and re-run `swift run monica-train`." + REGEN_ADVICE
         )

@@ -251,3 +251,18 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   spuriously — run 32542924915 on unchanged `main` is red on that job with the rest of `main`
   green, and it also failed on PR #323. Found while cutting the macOS suite for #322 (explicitly
   out of its scope). Severity: CI reliability, non-blocking.
+
+- [2026-08-22] `.github/workflows/scheduled-parity.yml`, `train-fixture-oracle` (job 9a) fails at
+  its "Export all three training fixtures" step — observed on run 32583285323, a dispatch of the
+  workflow from `feat/298-mlx-buffer-reuse-corruption` with no changes to that job or to
+  `scripts/export_parity_fixture.py`. Found while dispatching the workflow for #298's new
+  `mlx-buffer-reuse-probe` job (out of #298's contract, which touches neither). The job is
+  dispatch/schedule-only, so a red weekly run is the only place it surfaces. Severity: CI
+  reliability, non-blocking.
+
+- [2026-08-22] `docs/design/14-inference-engine.md` §D6 and `.claude/plans/issue-298.md` disagreed
+  on which change trimmed `full-macos`'s `--ignore` set: the plan (and `CLAUDE.md`) attribute it to
+  #322, but #322's commits (`3384930`, `bec9bae`) are not ancestors of `main` — the live trim
+  landed as #324 (`6a260c5`). §D6 records the correct attribution; the stale `#322` references
+  elsewhere in `CLAUDE.md` and `docs/design/03-conformance.md` were not swept. Found while building
+  #298's post-#303 CI run inventory. Severity: docs accuracy, non-blocking.

@@ -126,16 +126,27 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 
 | ID | Capability | Portable | MLX | CUDA | Swift | Status | Issue | Design |
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
-| ENGINE-1 | A person gets Swift logits provably identical to Python/MLX | n/a | done | n/a | done | Shipped | #166 | design/14 |
+| ENGINE-1 | A person gets Swift logits provably identical to Python/MLX † | n/a | done | n/a | done | Shipped | #166 | design/14 |
 | ENGINE-2 | A person can benchmark prefill/decode/memory natively | n/a | n/a | n/a | done | Shipped | #170 | benchmarks |
 | ENGINE-3 | A person can run an MoE model in the Swift engine | n/a | n/a | n/a | done | Shipped | #265 | design/14 |
 | ENGINE-4 | A person gets a stated fp16/bf16 parity contract in Swift | n/a | n/a | n/a | done | Shipped | #266 | design/14 |
 | ENGINE-5 | A person can read mixing matrices and hidden states in Swift | n/a | n/a | n/a | done | Shipped | — | design/14 |
-| ENGINE-6 | A person gets Swift/MLX parity gated at real poc scale | n/a | done | n/a | done | Shipped | #267 | design/14 |
+| ENGINE-6 | A person gets Swift/MLX parity gated at real poc scale † | n/a | done | n/a | done | Shipped | #267 | design/14 |
 | ENGINE-7 | A person can round-trip a checkpoint Swift to Python | done | done | n/a | done | Shipped | #196 | design/14 |
 | ENGINE-8 | A person gets a fused Metal SSD-scan/conv kernel | n/a | n/a | n/a | none | Planned | #171 | design/14 |
 | ENGINE-9 | A person can decode speculatively in the Swift engine | n/a | n/a | n/a | none | Planned | #172 | design/14 |
-| ENGINE-10 | A person can trust a checked-in parity oracle was not silently corrupted | done | done | n/a | n/a | Shipped | #298 | design/14 |
+| ENGINE-10 | A person can trust a checked-in parity oracle was not silently corrupted † | done | done | n/a | n/a | Shipped | #298 | design/14 |
+
+**† The Swift/MLX model-parity gate is nondeterministically unreliable on macOS while
+[#298](https://github.com/travisgalloway/monica/issues/298) is open.** An unfixed MLX buffer-reuse
+defect can silently corrupt a computation inside a long-lived process — correct shapes, no
+exception, catastrophically wrong numbers — and it is deterministic per process, so a rerun makes
+it disappear. **A green parity run therefore proves the corruption did not fire that time; it does
+not prove parity holds.** Status stays *Shipped* because the capability exists and the gates run;
+the caveat is about how much a single green run is worth. ENGINE-10's double-export guard covers
+what gets *committed* as an oracle and does nothing for a test process that corrupts mid-run.
+Measured rates, the mitigation's limits, and the rerun policy (never regenerate an oracle to make a
+red gate green) are in `docs/design/14-inference-engine.md` §§D1–D6.
 
 ## Conformance
 

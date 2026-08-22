@@ -33,6 +33,10 @@ disable_buffer_cache_for_process()
 from safetensors.numpy import load_file            # noqa: E402
 
 from scripts.export_parity_fixture import build_fixture   # noqa: E402
+# The #298 regeneration policy, appended to every staleness-failure message below. It lives
+# in the portable module rather than being restated here, so the rule a person hits on a red
+# gate is the same rule wherever they hit it (see tests/test_fixture_digest.py, which pins it).
+from src.conformance.fixture_digest import REGEN_ADVICE   # noqa: E402
 from src.conformance.tolerances import band_for           # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[1] / "swift" / "engine" / "Fixtures" / "toy"
@@ -56,7 +60,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             f"{key} drifted from the checked-in Swift-parity oracle "
             f"(max|d| = {np.abs(fresh[key] - meta_ref[key]).max():.3e}). If the backend "
             "change is intended, regenerate the fixtures — see "
-            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
         )
 
     # #264: extend the staleness check to every hidden.{i} and mixing.{i} key. A silently
@@ -69,7 +73,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
         f"reference.safetensors key set drifted from the checked-in Swift-parity oracle "
         f"(missing={sorted(ref_keys - fresh_keys)}, extra={sorted(fresh_keys - ref_keys)}). "
         "If the backend change is intended, regenerate the fixtures — see "
-        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
     )
     for key in sorted(ref_keys):
         if not (key.startswith("hidden.") or key.startswith("mixing.")):
@@ -78,7 +82,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             f"reference.safetensors[{key!r}] drifted from the checked-in Swift-parity "
             f"oracle (max|d| = {np.abs(fresh[key] - meta_ref[key]).max():.3e}). If the "
             "backend change is intended, regenerate the fixtures — see "
-            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
         )
 
     # #167: extend the staleness check to the greedy-id oracle. Unlike the logits above,
@@ -91,7 +95,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
         fresh_gen["greedy_ids"], gen_ref["greedy_ids"],
         err_msg="greedy_ids drifted from the checked-in Swift-parity oracle. If the backend "
                 "change is intended, regenerate the fixtures — see "
-                "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`.")
+                "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE)
     np.testing.assert_array_equal(fresh_gen["prompt_ids"], gen_ref["prompt_ids"])
 
     # #169: extend the staleness check to the prefill state-handoff oracle — the same
@@ -108,7 +112,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
             f"prefill.safetensors[{key!r}] drifted from the checked-in Swift-parity oracle "
             f"(max|d| = {np.abs(fresh_pre[key] - pre_ref[key]).max():.3e}). If the backend "
             "change is intended, regenerate the fixtures — see "
-            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+            "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
         )
 
     # #68/#263: extend the staleness check to the packed (seg_ids) oracle — same
@@ -133,7 +137,7 @@ def test_checked_in_toy_fixture_matches_todays_backend(tmp_path):
         f"oracle (max|d| = "
         f"{np.abs(fresh_packed['packed_logits'] - packed_ref['packed_logits']).max():.3e})"
         ". If the backend change is intended, regenerate the fixtures — see "
-        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+        "swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
     )
 
 
@@ -178,7 +182,7 @@ def test_checked_in_toy_fp16_fixture_matches_todays_backend(tmp_path):
             f"Swift-parity oracle (max|d| = "
             f"{np.abs(fresh[key] - meta_ref[key]).max():.3e}, band rtol={rtol} "
             f"atol={atol}). If the backend change is intended, regenerate the fixtures "
-            "— see swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`."
+            "— see swift/engine/Fixtures/README.md — and re-run `swift run monica-parity`." + REGEN_ADVICE
         )
 
 

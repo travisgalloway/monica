@@ -126,7 +126,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
-| ENGINE-1 | n/a | n/a | CI `swift-engine` `monica-parity` forward + stacked-step | fp32 `rtol=1e-4/atol=1e-5` | none |
+| ENGINE-1 | n/a | n/a | CI `swift-engine` `monica-parity` forward + stacked-step | fp32 `rtol=1e-4/atol=1e-5` | **nondeterministically unreliable on macOS while #298 is open** — an unfixed MLX buffer-reuse defect can silently corrupt the computation this gate compares, so a green run proves the corruption did not fire, not that parity holds (design/14 §§D1–D6) |
 | ENGINE-2 | `monica-bench --self-test` | n/a | CI `swift-engine` `--mode all` (informational) | argmax agreement gated | timing regressions are informational only, never threshold-gated |
 | ENGINE-3 | n/a | n/a | `monica-parity` MoE sections | load counting, route-bias write-back | none |
 | ENGINE-4 | n/a | n/a | `monica-parity` | fp16/bf16 tolerance band | none |
@@ -135,7 +135,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo: 81 capabilities × 131 te
 | ENGINE-7 | n/a | `scripts/check_swift_checkpoint.py` | CI `swift-engine` Swift→Python round-trip (GATE) | the direction `monica-parity` alone cannot prove | none |
 | ENGINE-8 | n/a | n/a | n/a | n/a | n/a — not built (#171) |
 | ENGINE-9 | n/a | n/a | n/a | n/a | n/a — only the `verifyBlock` prerequisite exists (#172) |
-| ENGINE-10 | `test_fixture_digest.py` (portable), `test_mlx_mixing_matrix.py`'s `disable_buffer_cache` cases | `test_parity_fixture_export.py`, `test_train_parity_fixture_export.py` | `export_parity_fixture.py --double-export` (default on); CI `poc-fixture-oracle` + `poc-parity`, `train-fixture-oracle` + `-verify` | flipped byte, dropped file, size mismatch, nested file, **empty tree is BLIND not clean**, MLX API change fails loudly, near-zero `mixing.*` entries | **intra-machine only** — two processes on ONE host; cross-machine determinism is not claimed and `train.safetensors` is known to drift ~1e-8 across runner instances. No PR-time CI job runs the double-export; the underlying MLX defect is unfixed upstream (design/14 §#298) |
+| ENGINE-10 | `test_fixture_digest.py` (portable), `test_mlx_mixing_matrix.py`'s `disable_buffer_cache` cases | `test_parity_fixture_export.py`, `test_train_parity_fixture_export.py` | `export_parity_fixture.py --double-export` (default on); CI `poc-fixture-oracle` + `poc-parity`, `train-fixture-oracle` + `-verify` | flipped byte, dropped file, size mismatch, nested file, **empty tree is BLIND not clean**, MLX API change fails loudly, near-zero `mixing.*` entries | **intra-machine only** — two processes on ONE host; cross-machine determinism is not claimed and `train.safetensors` is known to drift ~1e-8 across runner instances. No PR-time CI job runs the double-export; the underlying MLX defect is unfixed upstream (design/14 §§D1–D6) and **cannot be fixed here**. The guard covers what gets *committed* as an oracle; it does nothing for a test process that corrupts mid-run, so the macOS parity gate stays nondeterministically unreliable — a green run proves the corruption did not fire that time. Confirmed live: run 32353544909 on `main` (2026-08-20) failed `test_parity_fixture_export.py` at `mixing.1 max|d| = 1.561e-05`. `mlx-buffer-reuse-probe` measures the defect on a hosted macOS runner (report-only, weekly); the rerun policy `REGEN_ADVICE` forbids regenerating an oracle to answer a red gate |
 
 ## Conformance
 

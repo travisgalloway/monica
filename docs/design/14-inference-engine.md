@@ -905,6 +905,17 @@ bugs — #3866 (int32 corruption under `async_eval` + in-place slice updates, cl
 unusable buffers — a memory-growth bug, not a correctness one). This is a **documented negative**:
 no upstream fix exists to wait for, and no upstream issue has been filed by this project either.
 
+**Re-run 2026-08-22 (round 2).** The same query set, plus a check for any MLX release later than
+0.32.1: **there is none** — 0.32.1 (2026-08-18) is still the newest on both the GitHub releases
+list and PyPI. The negative stands. Two *new* near neighbours appeared since 2026-08-19 and were
+checked against this defect: #4370 (`mx.dequantize` wrong results on a non-contiguous slice, a
+0.32.1 regression, open) and #3856 (silent numerical corruption on a quantized MoE when
+`seq %% 32 != 0`, open). Neither applies — this repro is fp32, unquantized, no custom kernels, no
+`async_eval`. The full query/hit table and the reproduce instructions now live in a
+maintainer-actionable report at [`../upstream/mlx-buffer-reuse-report.md`](../upstream/mlx-buffer-reuse-report.md),
+written so that filing it upstream is a one-step human decision. **It has not been filed** — see
+§D6.
+
 ### D2 — Does the barrier belong on the training/inference path? **No.**
 
 **Decision: the `mx.eval(h)` barrier and `mx.set_cache_limit(0)` both stay OFF the
@@ -1044,7 +1055,9 @@ Two consequences worth stating explicitly, because both are easy to assume away:
 ### D5 — What stays open
 
 - The upstream MLX defect itself. Unfixed in 0.31.2, 0.32.0 and 0.32.1; no upstream issue found;
-  none filed from here. **#298 remains open as an upstream-tracking item.**
+  none filed from here. The report is now *written* —
+  [`../upstream/mlx-buffer-reuse-report.md`](../upstream/mlx-buffer-reuse-report.md) — and
+  deliberately **not posted**; see §D6. **#298 remains open as an upstream-tracking item.**
 - **#264's `mx.eval(h)` barrier is not sufficient on its own.** With the barrier in place and the
   buffer cache on, the probe still measures 18/40 (toy.yaml) and 20/40 (toy-moe.yaml) corrupt
   trials; only 0/40 for toy-hybrid.yaml. The mitigation that actually holds on this host is
@@ -1064,6 +1077,136 @@ Two consequences worth stating explicitly, because both are easy to assume away:
   invokes, and the dispatch-only `poc-fixture-oracle`/`poc-parity` and `train-fixture-oracle`/
   `-verify` pairs already do the cross-runner form; an always-on macOS job is a runtime-cost
   decision for the user.
+
+### D6 — Round 2: scope, second host, the #303/#315 question, and the rerun policy
+
+Round 1 (#311) answered D1–D5. Round 2 answers the four escalation items added to #298 on
+2026-08-20, and states plainly what this repository can and cannot do about the defect.
+
+#### What is ours and what is upstream
+
+**This repository cannot fix MLX's buffer-cache allocator, and this round attempts no fix.** The defect lives in MLX's Metal allocator/graph machinery; we have no patch to apply, no
+released version to move to (D1: 0.31.2, 0.32.0 and 0.32.1 all reproduce at the same order), and
+minimising it to a standalone upstream repro is unbounded research that was deliberately not
+started. What *is* ours, and what round 2 delivers, is four things: **measurement** (the probe, now
+on a second host), **guarding** (the two-fresh-process export check from round 1), **truthful
+status** (the feature-matrix and test-plan rows below), and a **prepared upstream report**. No
+tolerance moved, no fixture was regenerated, and no `set_cache_limit` call site moved.
+
+#### Is the current mitigation sufficient? Stated, not implied
+
+**No — not universally, and the gap is named.** The mitigation that actually holds on this host is
+the `mx.eval(h)` barrier **plus** `mx.set_cache_limit(0)`. The barrier alone still leaves **18/40**
+(`toy.yaml`) and **20/40** (`toy-moe.yaml`) trials corrupt (D5); only the combination reaches 0/40
+on all three configs.
+
+`git grep -n set_cache_limit -- src scripts tests` (2026-08-22, unchanged from round 1) returns the
+helper's own definition in `scripts/export_parity_fixture.py` plus prose and the monkeypatch stubs
+in `tests/test_mlx_mixing_matrix.py` that falsify the fail-loud check. The **five call sites** are
+`build_fixture` and four test modules (`test_mlx_mixing_matrix.py`, `test_parity_fixture_export.py`,
+`test_train_parity_fixture_export.py`, `test_lowp_parity_band.py`) — every one of them an
+oracle-writing or oracle-checking path. **No training or inference path carries it**, by the §D2
+decision, and that decision stands.
+
+The consequence, stated so it is not assumed away: **a caller that invokes `mixing_matrices` or
+`hidden_states` outside the exporter and those four test modules is protected by the barrier alone,
+which is not enough.** `hidden_states` in particular has never been measured — it forks a lazy `h`
+the same way `mixing_matrices` does, and its rate is **unquantified**, not zero. Both remain parked
+in `docs/parked-findings.md`; widening the mitigation is a behaviour-and-throughput decision (D2's
++13.0%/+30.5%) beyond #298's contract.
+
+#### The probe on a second host (CI macOS runner)
+
+Every number in D1–D5 came from one M1 Pro dev Mac. `mlx-buffer-reuse-probe` in
+`.github/workflows/scheduled-parity.yml` now runs the same instrument on a hosted `macos-latest`
+runner — a different chip generation, image and wheel, and the family that actually runs
+`full-macos`/`parity-macos`. It runs `--pattern mixing` (the positive control) and
+`--pattern hotpath` across all three toy configs at `--trials 20 --seq 129`, uploads the JSON plus
+host provenance, and emits a `::warning::` if **no** control config reproduced. It is
+dispatch/schedule-only (it lives in the file with no `pull_request`/`push` trigger) and carries no
+`needs:`, so it cannot delay `poc-parity`.
+
+`--report-only` is what makes this honest rather than green-by-default: reproduction is
+shape-dependent (D1), so a hosted runner may legitimately fail to reproduce, and that is a
+*measurement*, not a build failure. The flag records `"blind": true` with its reason in the JSON and
+exits 0 for **that one case only**. A probe that cannot run at all — no MLX wheel, unloadable
+config, import error — still exits non-zero and reddens the job. There is no `|| true` and no
+`continue-on-error:` in the job; an exit status is never discarded.
+
+<!--D6-CI-NUMBERS-->
+
+#### Did #303 raise the trigger rate? (with the sample size)
+
+**Verdict: #298 fired once in the 8 post-#303 `ci.yml` runs on `main`, at the near-`atol`
+magnitude, and has not fired in the 3 runs since #315/#324 — a sample far too small to claim the
+rate moved either way. The mechanism is unchanged.**
+
+Post-merge `ci.yml` runs on `main` from #303's fix (PR #314, `0cd860b`, 2026-08-20) to 2026-08-22:
+
+| run id | sha | conclusion | failing job | #298? |
+|---|---|---|---|---|
+| 32339694911 | `0cd860b5` | failure | `swift selfcheck (macOS)` | no |
+| 32353544909 | `93c187c8` | failure | `full suite + smoke gate + cross-backend parity (macOS)` | **YES** — `test_parity_fixture_export.py:77`, `reference.safetensors['mixing.1']` `max\|d\| = 1.561e-05` |
+| 32365170104 | `88a7b89d` | success | — | no |
+| 32371858248 | `c79ca58d` | failure | `swift selfcheck (macOS)` | no |
+| 32536027371 | `cc373669` | success | — | no |
+| 32540044632 | `9e1666fc` | success | — | no |
+| 32542924915 | `6ceb8c80` | failure | `swift selfcheck (macOS)` | no |
+| 32582697121 | `6a260c54` | success | — | no |
+
+What that supports, and what it does not:
+
+- **1 of 8** post-#303 runs failed on #298, and it is the *same* signature as the pre-#303 event
+  D4 records (run 31806256071, `mixing.1 max|d| = 2.694e-05`): a near-`atol` `mixing.*` drift, not
+  the catastrophic `greedy_ids` corruption D4 reproduced locally. So D4's "still unreproduced by a
+  fresh export" note now has a second CI instance, and the local reproduction still gives no
+  fresh-export drift. Both remain untouched — no band moved.
+- **3 runs** have completed since #315 split the both-backend install off the suite job (`9e1666f`)
+  and #324 trimmed the suite further, with 0 events. Three runs is not evidence of improvement.
+  "Not reproduced in 3 runs" is the honest statement; "no longer an issue" is not.
+- **The mechanism is unchanged.** `full-macos`'s `--ignore` set is `test_backend_parity.py` and
+  `test_cuda_distributed.py` only, so `tests/test_mlx_mixing_matrix.py` and
+  `tests/test_parity_fixture_export.py` **still share one process** — exactly the pair D4 reproduces
+  at 3/12. Nothing about #303, #315 or #324 addressed that, and none of them tried to.
+- Note the plan for this round attributed the `--ignore` trim to #322; #322's commits are not on
+  `main`. The trim that is live landed as **#324** (`6a260c5`). Recorded here rather than left as a
+  discrepancy for the next reader.
+
+Bottom line: **#303's both-backend install plausibly changed the process's allocation profile, but
+the run inventory cannot resolve a rate change at this sample size, and the module pair that
+carries the risk was never separated.** The escalation item is answered; the underlying flake is
+still parked.
+
+#### The rerun / regeneration policy
+
+**A red oracle gate is never answered by regenerating the oracle.** #298 makes a red
+staleness gate ambiguous — an intended backend change and a per-process corruption produce the same
+red — and regenerating until green is how a corrupted value becomes the contract every downstream
+Swift gate is measured against.
+
+The policy is `REGEN_ADVICE` in the portable `src/conformance/fixture_digest.py`, appended to every
+staleness-failure message in `tests/test_parity_fixture_export.py` and
+`tests/test_train_parity_fixture_export.py`, so a person hits it exactly where the decision is made:
+
+1. **Re-run the failing test in a fresh process, on its own.** #298 is deterministic per process and
+   varies between them; a failure that does not survive process isolation is #298, not drift, and
+   nothing should be regenerated.
+2. **Only if it reproduces in isolation, and only if the change was intended**, regenerate through
+   `scripts/export_parity_fixture.py` with its default `--double-export` (two fresh processes,
+   byte-for-byte; it refuses to write `--out` on disagreement). Never pass `--no-double-export` to
+   get a fixture written.
+3. **Never widen a tolerance in `src/conformance/tolerances.py` to absorb it.**
+
+The content is pinned by `tests/test_fixture_digest.py`, which runs on the Linux `portable` job —
+deliberately, since the two modules that *use* the constant are MLX-gated and skip there.
+
+#### What round 2 did not do
+
+Filing on `ml-explore/mlx` was **not** done. The report is written and checked in at
+[`../upstream/mlx-buffer-reuse-report.md`](../upstream/mlx-buffer-reuse-report.md); opening an issue
+on a third-party repository is a maintainer decision, not a coding-session action. Suite process
+isolation (`pytest-forked`, or a dedicated job for the MLX fixture modules) stays parked, as does
+the unmeasured `hidden_states` case. **#298 stays open.**
 
 ## See also
 
