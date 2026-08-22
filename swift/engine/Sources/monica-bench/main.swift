@@ -11,7 +11,14 @@
 //   monica-bench --config Benchmarks/configs/poc.config.json --quantize 8 --mode decode
 //   monica-bench --weights <w.safetensors> --mode prefill \
 //       --baseline Benchmarks/baselines.json [--tolerance 0.15] [--strict]
+//   monica-bench --weights <w.safetensors> --mode spec --gamma 4 [--max-n 8]
 //   monica-bench --self-test
+//
+// `--mode spec` (#172) runs speculative decode against plain greedy on the same prompt and
+// asserts the two id arrays are byte-identical (a GATE — `Bench.spec` exits non-zero on a
+// mismatch); its speedup/accept-rate numbers are informational, like every other timing
+// here. It is deliberately excluded from `--mode all` so `--baseline`/`--strict` keeps
+// comparing exactly the metrics it always did.
 //
 // Style follows `monica-generate`/`monica-parity`: hand-rolled arg parsing (no
 // swift-argument-parser — see Package.swift's header on why this target has no
@@ -295,11 +302,121 @@ func runSelfTest() -> Never {
         }
     }
 
+    // --- #172 criterion 1: PromptLookupDrafter.propose is a faithful port of
+    //     src/serve/spec_decode.py:propose (mirrors tests/test_spec_decode.py::test_propose_*)
+    do {
+        let d8 = PromptLookupDrafter(maxN: 8)
+        // Copies the tokens following the most recent EARLIER occurrence of the tail.
+        eq(d8.propose(context: [1, 2, 3, 4, 9, 9, 1, 2], gamma: 2), [3, 4],
+           "propose: copies after the most recent earlier match")
+        // Prefers the LONGER pattern: both [2] and [1,2] recur; [1,2] -> [3] must win.
+        eq(d8.propose(context: [1, 2, 3, 7, 2, 5, 1, 2], gamma: 1), [3],
+           "propose: prefers the longer pattern")
+        // Capped by gamma: tail [1,2,3] recurs at 0, but only 2 tokens are taken.
+        eq(d8.propose(context: [1, 2, 3, 1, 2, 3], gamma: 2), [1, 2],
+           "propose: result is capped by gamma")
+        // No tail recurs at all.
+        eq(d8.propose(context: [5, 6, 7, 8], gamma: 2), [],
+           "propose: no recurring tail returns []")
+        // Respects the maxN window: tail [3,4], earlier [3,4] at index 3.
+        eq(d8.propose(context: Array(0..<10) + [3, 4], gamma: 2), [5, 6],
+           "propose: respects the maxN window")
+        // maxN caps the pattern length: with maxN=1 only the tail [2] is tried, whose most
+        // recent earlier occurrence is at index 4 -> [5], NOT the [1,2] -> [3] the
+        // maxN=8 case above finds. This is the window doing real work, not a no-op flag.
+        eq(PromptLookupDrafter(maxN: 1).propose(context: [1, 2, 3, 7, 2, 5, 1, 2], gamma: 1),
+           [5], "propose: maxN=1 restricts matching to the single-token pattern")
+        // Edge cases: too-short context, non-positive gamma.
+        eq(d8.propose(context: [1], gamma: 2), [], "propose: context.count < 2 returns []")
+        eq(d8.propose(context: [], gamma: 2), [], "propose: empty context returns []")
+        eq(d8.propose(context: [1, 2, 1, 2], gamma: 0), [], "propose: gamma == 0 returns []")
+        eq(d8.propose(context: [1, 2, 1, 2], gamma: -3), [], "propose: gamma < 0 returns []")
+        // Fall-through to a SHORTER n when the longer tails have no earlier occurrence
+        // (the reachable half of the `break`-vs-`continue` hazard the port calls out):
+        // only [2,3] recurs here, at index 1, so the draft is what followed it.
+        eq(d8.propose(context: [1, 2, 3, 4, 2, 3], gamma: 2), [4, 2],
+           "propose: falls through to a shorter pattern when longer tails do not recur")
+    }
+
+    // --- #172 criterion 2: SpecDecode.firstMismatch is a faithful port of the greedy
+    //     accept rule (mirrors tests/test_spec_decode.py::test_first_mismatch_*)
+    do {
+        eq(SpecDecode.firstMismatch([1, 2, 3], [1, 2, 3]), 3, "firstMismatch: all agree")
+        eq(SpecDecode.firstMismatch([1, 2, 3], [1, 9, 3]), 1, "firstMismatch: mismatch at 1")
+        eq(SpecDecode.firstMismatch([1, 2, 3], [9, 2, 3]), 0, "firstMismatch: immediate mismatch")
+        eq(SpecDecode.firstMismatch([], []), 0, "firstMismatch: both empty")
+        // Unequal lengths truncate to the shorter, exactly as Python's `zip` does.
+        eq(SpecDecode.firstMismatch([1, 2, 3, 4], [1, 2]), 2,
+           "firstMismatch: draft longer than preds truncates like zip")
+        eq(SpecDecode.firstMismatch([1, 2], [1, 2, 3, 4]), 2,
+           "firstMismatch: preds longer than draft truncates like zip")
+        eq(SpecDecode.firstMismatch([1, 2, 3], []), 0, "firstMismatch: empty preds accepts none")
+    }
+
+    // --- #172 criterion 3: the Drafter seam exists and is consumed through the PROTOCOL,
+    //     not the concrete type. `SpecDecode.generate` takes `drafter: Drafter`, so this
+    //     records that a Drafter-typed value drives the draft calls (the MLX loop itself is
+    //     CI-only: it cannot evaluate an MLXArray on a Command-Line-Tools-only host).
+    do {
+        /// Records every `propose` call so the seam's call shape is observable without MLX.
+        final class RecordingDrafter: Drafter {
+            var calls: [(context: [Int], gamma: Int)] = []
+            let inner = PromptLookupDrafter(maxN: 8)
+            func propose(context: [Int], gamma: Int) -> [Int] {
+                calls.append((context, gamma))
+                return inner.propose(context: context, gamma: gamma)
+            }
+        }
+        let recorder = RecordingDrafter()
+        let seam: Drafter = recorder       // must be usable through the existential
+        let out = seam.propose(context: [1, 2, 3, 1, 2], gamma: 3)
+        eq(out, [3, 1, 2], "Drafter seam: an existential Drafter proposes through propose(context:gamma:)")
+        eq(recorder.calls.count, 1, "Drafter seam: the call reached the recording implementation")
+        eq(recorder.calls.first?.gamma, 3, "Drafter seam: gamma is passed through unchanged")
+        // A drafter that always abstains is legal — the loop then takes one ordinary step.
+        struct NullDrafter: Drafter {
+            func propose(context: [Int], gamma: Int) -> [Int] { [] }
+        }
+        let null: Drafter = NullDrafter()
+        eq(null.propose(context: [1, 2, 3], gamma: 4), [],
+           "Drafter seam: an abstaining drafter is legal and returns []")
+    }
+
+    // --- #172: SpecStats derives its ratios (and never divides by zero) ---
+    do {
+        let s = SpecStats(rounds: 4, drafted: 10, accepted: 7, generated: 12)
+        eq(s.acceptRate, 0.7, "SpecStats: acceptRate = accepted/drafted")
+        eq(s.tokensPerRound, 3.0, "SpecStats: tokensPerRound = generated/rounds")
+        let empty = SpecStats(rounds: 0, drafted: 0, accepted: 0, generated: 0)
+        eq(empty.acceptRate, 0.0, "SpecStats: acceptRate is 0 when nothing was drafted")
+        eq(empty.tokensPerRound, 0.0, "SpecStats: tokensPerRound is 0 with no rounds")
+    }
+
+    // --- #172: a BenchRecord written before `spec` existed must still decode ---
+    do {
+        let legacy = #"""
+            [{"mode":"decode","machine":{"architecture":"Apple M1","memorySizeBytes":1,
+              "hwModel":"m","cpuCores":8,"osVersion":"14","swiftVersion":"6","device":"metal"},
+              "ci":false,"randomInit":false,"quantized":false,"timestamp":"t"}]
+            """#
+        let decoded = try? JSONDecoder().decode([BenchRecord].self,
+                                                from: Data(legacy.utf8))
+        check(decoded?.count == 1,
+             "BenchRecord: JSON without a `spec` key still decodes (old --baseline files)")
+        check(decoded?.first?.spec == nil, "BenchRecord: a missing `spec` key decodes as nil")
+    }
+
     // --- flag parsing sanity (no MLX involved) ---
     do {
         let f = parseFlags(["--mode", "decode", "--quantize", "8"])
         eq(f["mode"], "decode", "--mode parses")
         eq(intFlag(f, "quantize", default: 0), 8, "--quantize parses as an int")
+        let s = parseFlags(["--mode", "spec", "--gamma", "4", "--max-n", "8"])
+        eq(s["mode"], "spec", "--mode spec parses")
+        eq(intFlag(s, "gamma", default: 0), 4, "--gamma parses as an int")
+        eq(intFlag(s, "max-n", default: 0), 8, "--max-n parses as an int")
+        eq(intFlag(parseFlags([]), "gamma", default: 4), 4, "--gamma defaults to 4")
+        eq(intFlag(parseFlags([]), "max-n", default: 8), 8, "--max-n defaults to 8")
     }
 
     if failures.isEmpty {
@@ -429,6 +546,7 @@ func runMain(_ flags: [String: String]) {
         var prefillR: PrefillResult? = nil
         var decodeR: DecodeResult? = nil
         var memoryR: MemoryResult? = nil
+        var specR: SpecResult? = nil
 
         switch m {
         case "prefill":
@@ -467,14 +585,52 @@ func runMain(_ flags: [String: String]) {
                 + "analytic-state=\(r.analyticStateBytes) bytes  "
                 + "analytic-kv=\(r.analyticKvBytes.map(String.init) ?? "n/a") bytes  "
                 + "weights=\(r.totalWeightBytes) bytes  context_length=\(r.contextLength)")
+        case "spec":
+            // #172. Deliberately NOT part of `--mode all`: `all`'s JSON feeds
+            // `--baseline`/`--strict` regression comparison, and adding a new noisy timing
+            // section there would be a gratuitous risk to an existing gate. `spec` must be
+            // asked for by name.
+            let promptLen = intFlag(flags, "bench-prompt-len", default: 32)
+            let maxNew = intFlag(flags, "max-new-tokens", default: 64)
+            let gamma = intFlag(flags, "gamma", default: 4)
+            let maxN = intFlag(flags, "max-n", default: 8)
+            if gamma < 1 { fail("--gamma must be >= 1, got \(gamma)") }
+            if maxN < 1 { fail("--max-n must be >= 1, got \(maxN)") }
+            let r: SpecResult
+            do {
+                r = try Bench.spec(model: built.model, promptLen: promptLen,
+                                   maxNewTokens: maxNew, gamma: gamma, maxN: maxN)
+            } catch {
+                fail("monica-bench spec: \(error)")
+            }
+            specR = r
+            print(String(format: "monica-bench spec: prompt_len=%d max_new=%d gamma=%d "
+                         + "max_n=%d", r.promptLen, r.maxNewTokens, r.gamma, r.maxN))
+            print(String(format: "monica-bench spec: plain=%.1f tok/s  speculative=%.1f tok/s"
+                         + "  speedup=%.2fx (INFORMATIONAL — no threshold is asserted)",
+                         r.plainTokPerSec, r.specTokPerSec, r.speedup))
+            print(String(format: "monica-bench spec: accepted %d/%d draft tokens (%.1f%%), "
+                         + "%.2f tokens/round over %d rounds",
+                         r.accepted, r.drafted, r.acceptRate * 100.0, r.tokensPerRound,
+                         r.rounds))
+            // `Bench.spec` already fails loud on a mismatch, so reaching here means the
+            // ids matched. Print the claim so the CI log carries the gate's verdict, and
+            // guard the field anyway rather than trusting a struct we just built.
+            if !r.identical {
+                fail("monica-bench spec: identical=false — speculative output is NOT "
+                    + "byte-identical to plain greedy decode")
+            }
+            print("monica-bench spec: speculative output is byte-identical to plain greedy "
+                + "decode (GATE)")
         default:
-            fail("--mode must be one of prefill, decode, memory, all — got '\(m)'")
+            fail("--mode must be one of prefill, decode, memory, spec, all — got '\(m)'")
         }
 
         records.append(BenchRecord(
             mode: m, machine: machine, ci: ci, gitSha: sha, source: sourceName(built.source),
             randomInit: built.randomInit, quantized: built.quantized, quantBits: built.quantBits,
-            timestamp: timestamp, prefill: prefillR, decode: decodeR, memory: memoryR))
+            timestamp: timestamp, prefill: prefillR, decode: decodeR, memory: memoryR,
+            spec: specR))
     }
 
     if let jsonPath = flags["json"] {

@@ -88,7 +88,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | SERVE-2 | A person can control sampling (temp/top-p/repetition) | done | done | done | done | Shipped | — | design/14 |
 | SERVE-3 | A person can rewind a session to a turn boundary and branch | done | done | none | none | Shipped | #305, #318 | design/14 |
 | SERVE-4 | A person can constrain decoding to an allowed id set | done | done | done | done | Shipped | #226 | design/12 |
-| SERVE-5 | A person can decode speculatively | done | done | n/a | none | In progress | #172 | design/14 |
+| SERVE-5 | A person can decode speculatively | done | done | n/a | done | In progress | #172 | design/14 |
 
 ## Evaluation
 
@@ -134,7 +134,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 | ENGINE-6 | A person gets Swift/MLX parity gated at real poc scale † | n/a | done | n/a | done | Shipped | #267 | design/14 |
 | ENGINE-7 | A person can round-trip a checkpoint Swift to Python | done | done | n/a | done | Shipped | #196 | design/14 |
 | ENGINE-8 | A person gets a fused Metal SSD-scan/conv kernel | n/a | n/a | n/a | none | Planned | #171 | design/14 |
-| ENGINE-9 | A person can decode speculatively in the Swift engine | n/a | n/a | n/a | none | Planned | #172 | design/14 |
+| ENGINE-9 | A person can decode speculatively in the Swift engine | n/a | n/a | n/a | done | Shipped | #172 | design/14 |
 | ENGINE-10 | A person can trust a checked-in parity oracle was not silently corrupted † | done | done | n/a | n/a | Shipped | #298 | design/14 |
 
 **† The Swift/MLX model-parity gate is nondeterministically unreliable on macOS while

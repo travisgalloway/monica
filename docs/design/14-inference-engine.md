@@ -419,7 +419,8 @@ The #163 dependency order:
    I/O) — in parallel once #166 lands.
 4. **#197** (LSP harness — **done**), **#168** (quantization — **done**), **#169** (Swift
    prefill — **done**), **#170** (Apple-Silicon benchmark harness — **done**).
-5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding).
+5. Stretch: **#171** (fused Metal kernel), **#172** (speculative decoding — **done**, see
+   "#172 — speculative decoding in the Swift engine" below).
 6. **#267 — done: the poc-scale Swift parity gate, generate-on-runner (CI, dispatch/schedule
    only).** #166 gated `swift-engine` against four checked-in *toy*-scale fixtures and
    verified `config/poc.yaml` (d_model 768, 24 layers, vocab 50280) manually, once, locally.
@@ -568,6 +569,68 @@ The #163 dependency order:
 
 **Deferred set:** Linux/CUDA for the Swift engine, the ggml port, continuous batching, and Swift
 DPO/GRPO step factories.
+
+## #172 — speculative decoding in the Swift engine
+
+Batch-1 SSM decode is bounded by per-token kernel launch/sync (the #30 ~94.7 tok/s record).
+Greedy speculative decoding amortizes that: a cheap drafter proposes γ tokens, the model verifies
+the whole block in ONE graph eval, and greedy acceptance keeps the emitted ids **byte-identical to
+plain greedy decode**. The Python side has had this since #52 (`src/serve/spec_decode.py` +
+`scripts/spec_decode.py`); #172 is the Swift port.
+
+**`verifyBlock` was pre-landed by #264 and is reused unchanged.** `MonicaModel.verifyBlock`
+(`MonicaModel.swift`) already consumes a token block through the `step` recurrence in one
+`MLX.eval`, returns every intermediate state so a caller can roll back to an accepted prefix
+without recompute, guards batch-1 over every state leaf (`LayerState.arrays`, also #264), and
+contracts `([], [])` for empty input. `monica-parity` already gates it against the Python oracle
+on logits, final state and intermediate-state rollback. #172 consumes it and adds nothing to it.
+
+**The file split is the provability boundary, and that is deliberate.**
+
+| File | Contents | Where it can be proven |
+|---|---|---|
+| `Sources/MonicaEngine/SpecDecode.swift` | the `Drafter` protocol, `PromptLookupDrafter.propose`, `SpecDecode.firstMismatch`, `SpecStats` — **no `import MLX`** | **locally**, via `swift run monica-bench --self-test` |
+| `Sources/MonicaEngine/SpecDecodeLoop.swift` | `SpecDecode.generate` (draft-and-verify) and `SpecDecode.greedyReference` — imports MLX | **CI only** (`swift-engine`) |
+
+The reason is the same host constraint recorded under #195 and in `docs/benchmarks.md`: mlx-swift's
+`default.metallib` is an **Xcode-only build product**, so on a Command-Line-Tools-only Mac any
+`MLXArray` evaluation aborts. Confirmed by experiment on the dev host on 2026-08-22, at
+`swift/engine`:
+
+| Command | Result |
+|---|---|
+| `swift build` | `Build complete!` |
+| `swift run monica-bench --self-test` | `OK — all checks passed` |
+| `swift run monica-parity` | **fails**: `MLX error: Failed to load the default metallib` |
+| `xcode-select -p` | `/Library/Developer/CommandLineTools` (no Xcode ⇒ no Metal toolchain) |
+
+So the drafter and the accept rule sit in a file that compiles and runs anywhere — the port's
+faithfulness to the Python is a **local** claim — while the loop, and therefore the byte-identity
+claim, is gated by the `swift-engine` CI step `monica-bench --mode spec` and **nowhere else**. The
+same caveat `docs/test-plan.md` ENGINE-1 carries applies: a green run proves #298's buffer-reuse
+corruption did not fire on that run, not that it cannot.
+
+Two porting hazards are called out in the code because both produce *plausible but different*
+output rather than a crash. In `propose`, a pattern that recurs only at the very end must fall
+through to a **shorter** `n` (`break`, not `continue`) — unreachable given the search bound, but
+kept line-for-line with the Python. In the loop, `blockStates[k]` is the state after consuming
+`draft[0...k]`, so rolling back to an accepted prefix of length `m` uses index `m-1`, and `m == 0`
+means the pre-block state; wrong indexing here is caught only by the CI identity gate. A third
+trap is performance rather than correctness: all γ+1 greedy predictions are taken in ONE host
+transfer (stack → `argMax` → `asArray`), because a per-position `.item()` would undo exactly the
+single-eval win `verifyBlock` exists for.
+
+**Greedy only.** `firstMismatch` compares draft tokens against the verifier's *argmax*, so what is
+preserved is the greedy decode. Temperature>0 rejection sampling (Leviathan et al.) is **not**
+implemented and stays a follow-up, as #172 itself scoped it.
+
+**Speedup is informational, and there is no local Apple-Silicon number.** `monica-bench --mode
+spec` reports plain tok/s, speculative tok/s, speedup and accept rate, and emits them in `--json`;
+no step asserts a threshold on any of them, matching every other `monica-bench` CI step. A number
+measured on a hosted runner is not an Apple-Silicon performance record by this repo's own
+provenance convention, and this host cannot execute the engine at all — so `docs/benchmarks.md`
+records the **absence** and its reason rather than a fabricated figure. `spec` is also deliberately
+excluded from `--mode all`, whose JSON feeds `--baseline`/`--strict` regression comparison.
 
 ## Risks & open questions
 

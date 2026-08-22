@@ -103,6 +103,46 @@ public struct MemoryResult: Codable, Sendable {
     }
 }
 
+public struct SpecResult: Codable, Sendable {
+    public let promptLen: Int
+    public let maxNewTokens: Int
+    public let gamma: Int
+    public let maxN: Int
+    public let plainTokPerSec: Double
+    public let specTokPerSec: Double
+    /// Wall-clock ratio `plainSeconds / specSeconds`. **Informational only** — no CI step
+    /// asserts a threshold on it (hosted-runner timing is noisy; see `docs/benchmarks.md`).
+    public let speedup: Double
+    public let drafted: Int
+    public let accepted: Int
+    public let acceptRate: Double
+    public let tokensPerRound: Double
+    public let rounds: Int
+    /// #172's headline criterion: speculative ids == plain greedy ids, element for
+    /// element. `Bench.spec` fails loud before this can ever be recorded `false`; the field
+    /// exists so the JSON record carries the claim explicitly rather than by omission.
+    public let identical: Bool
+
+    public init(promptLen: Int, maxNewTokens: Int, gamma: Int, maxN: Int,
+                plainTokPerSec: Double, specTokPerSec: Double, speedup: Double,
+                drafted: Int, accepted: Int, acceptRate: Double, tokensPerRound: Double,
+                rounds: Int, identical: Bool) {
+        self.promptLen = promptLen
+        self.maxNewTokens = maxNewTokens
+        self.gamma = gamma
+        self.maxN = maxN
+        self.plainTokPerSec = plainTokPerSec
+        self.specTokPerSec = specTokPerSec
+        self.speedup = speedup
+        self.drafted = drafted
+        self.accepted = accepted
+        self.acceptRate = acceptRate
+        self.tokensPerRound = tokensPerRound
+        self.rounds = rounds
+        self.identical = identical
+    }
+}
+
 /// Machine identity — stamped onto every JSON record so `--baseline` can refuse to
 /// compare across machines rather than silently reading a hosted-runner number against
 /// a developer laptop's baseline (or vice versa).
@@ -128,7 +168,7 @@ public struct MachineID: Codable, Sendable, Equatable {
 }
 
 public struct BenchRecord: Codable, Sendable {
-    public let mode: String           // "prefill" | "decode" | "memory"
+    public let mode: String           // "prefill" | "decode" | "memory" | "spec"
     public let machine: MachineID
     public let ci: Bool
     public let gitSha: String?
@@ -140,10 +180,14 @@ public struct BenchRecord: Codable, Sendable {
     public let prefill: PrefillResult?
     public let decode: DecodeResult?
     public let memory: MemoryResult?
+    /// #172's `spec` mode. Optional so previously-written baseline/record JSON (which has
+    /// no `spec` key) still decodes — `--baseline` must not start failing on old files.
+    public let spec: SpecResult?
 
     public init(mode: String, machine: MachineID, ci: Bool, gitSha: String?, source: String?,
                randomInit: Bool, quantized: Bool, quantBits: Int?, timestamp: String,
-               prefill: PrefillResult?, decode: DecodeResult?, memory: MemoryResult?) {
+               prefill: PrefillResult?, decode: DecodeResult?, memory: MemoryResult?,
+               spec: SpecResult? = nil) {
         self.mode = mode
         self.machine = machine
         self.ci = ci
@@ -156,6 +200,7 @@ public struct BenchRecord: Codable, Sendable {
         self.prefill = prefill
         self.decode = decode
         self.memory = memory
+        self.spec = spec
     }
 }
 
@@ -314,6 +359,77 @@ public enum Bench {
         return DecodeResult(warmupTokens: warmupTokens, measuredTokens: measuredTokens,
                             tokPerSec: tokPerSec, generateTokPerSec: generateTokPerSec,
                             generateTokens: generateTokens)
+    }
+
+    // MARK: spec (#172)
+
+    /// Speculative decode vs plain greedy decode on the SAME prompt and the SAME model
+    /// instance, then a **byte-identity assertion** on the two id arrays.
+    ///
+    /// The identity check — not the timing — is what this mode exists for, and it is the
+    /// one part of #172 that cannot be observed on a Command-Line-Tools-only host: it needs
+    /// mlx-swift's Metal `default.metallib`, an Xcode-only build product. Hence the
+    /// assertion lives HERE (in the code CI runs) and fails loud, in the same shape as
+    /// `Bench.prefill`'s argmax-agreement assertion, rather than being reported as a field
+    /// somebody has to remember to read.
+    ///
+    /// Timing follows the file's warm-up-then-time convention: one untimed spec run and one
+    /// untimed greedy prefill precede the measured windows. The speedup is informational —
+    /// no caller asserts a threshold on it.
+    public static func spec(
+        model: MonicaModel, promptLen: Int = 32, maxNewTokens: Int = 64,
+        gamma: Int = 4, maxN: Int = 8
+    ) throws -> SpecResult {
+        let vocab = model.config.vocabSize
+        let clampedLen = max(1, promptLen)
+        let clampedNew = max(1, maxNewTokens)
+        var rng = SystemRandomNumberGenerator()
+        // A random prompt gives the prompt-lookup drafter little to match, but the
+        // model's own greedy continuation is highly repetitive at toy scale, so tails do
+        // recur once decoding starts — and a low accept rate weakens only the (already
+        // informational) speedup, never the identity claim.
+        let promptIds = (0..<clampedLen).map { _ in Int.random(in: 0..<vocab, using: &rng) }
+        let drafter = PromptLookupDrafter(maxN: max(1, maxN))
+
+        // Warm-up (untimed): first-call graph compile/dispatch must not land in a window.
+        _ = try SpecDecode.generate(model: model, promptIds: promptIds, maxNewTokens: 4,
+                                    gamma: gamma, drafter: drafter)
+        _ = try SpecDecode.greedyReference(model: model, promptIds: promptIds,
+                                           maxNewTokens: 4)
+
+        let plainStart = Date()
+        let plain = try SpecDecode.greedyReference(model: model, promptIds: promptIds,
+                                                   maxNewTokens: clampedNew)
+        let plainElapsed = Date().timeIntervalSince(plainStart)
+
+        let specStart = Date()
+        let (specIds, stats) = try SpecDecode.generate(
+            model: model, promptIds: promptIds, maxNewTokens: clampedNew,
+            gamma: gamma, drafter: drafter)
+        let specElapsed = Date().timeIntervalSince(specStart)
+
+        // #172's headline criterion. Fail loud, naming the first differing index — a
+        // silent `identical: false` in a JSON record would be exactly the "a check that
+        // cannot observe its target must not read healthy" failure inverted.
+        precondition(specIds.count == plain.count,
+                    "Bench.spec: speculative produced \(specIds.count) tokens, plain greedy "
+                    + "produced \(plain.count) — speculative decoding is NOT output-preserving")
+        for (i, (a, b)) in zip(plain, specIds).enumerated() where a != b {
+            preconditionFailure(
+                "Bench.spec: SPEC DECODE MISMATCH at token \(i): plain=\(a) spec=\(b) — "
+                + "speculative decoding is NOT output-preserving")
+        }
+
+        let plainTps = plainElapsed > 0 ? Double(plain.count) / plainElapsed : 0
+        let specTps = specElapsed > 0 ? Double(specIds.count) / specElapsed : 0
+        let speedup = specElapsed > 0 ? plainElapsed / specElapsed : Double.infinity
+
+        return SpecResult(
+            promptLen: clampedLen, maxNewTokens: clampedNew, gamma: max(1, gamma),
+            maxN: max(1, maxN), plainTokPerSec: plainTps, specTokPerSec: specTps,
+            speedup: speedup, drafted: stats.drafted, accepted: stats.accepted,
+            acceptRate: stats.acceptRate, tokensPerRound: stats.tokensPerRound,
+            rounds: stats.rounds, identical: true)
     }
 
     // MARK: memory
