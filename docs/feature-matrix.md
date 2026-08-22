@@ -86,7 +86,7 @@ Last audited 2026-08-18 (`/closure-audit`, whole repo).
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
 | SERVE-1 | A person can generate text from a checkpoint | done | done | done | done | Shipped | — | design/14 |
 | SERVE-2 | A person can control sampling (temp/top-p/repetition) | done | done | done | done | Shipped | — | design/14 |
-| SERVE-3 | A person can rewind a session to a turn boundary and branch | done | done | none | none | Shipped | #305 | design/14 |
+| SERVE-3 | A person can rewind a session to a turn boundary and branch | done | done | none | none | Shipped | #305, #318 | design/14 |
 | SERVE-4 | A person can constrain decoding to an allowed id set | done | done | done | done | Shipped | #226 | design/12 |
 | SERVE-5 | A person can decode speculatively | done | done | n/a | none | In progress | #172 | design/14 |
 

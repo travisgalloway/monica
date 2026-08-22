@@ -127,6 +127,7 @@ def interactive_repl(
         for stale in [node_id for node_id in transcript if node_id not in retained]:
             del transcript[stale]
 
+    root: Optional[int] = None                # this session's own turn-0 node id (#318)
     if rewind_enabled:
         if history is None:
             raise ValueError("rewind_enabled=True requires a SessionHistory")
@@ -140,6 +141,7 @@ def interactive_repl(
     emit("interactive mode — type text to continue the session; /help for commands.")
 
     fresh = True
+    turns_committed = 0                       # wall-clock turns, NOT retained depth (#318)
     while True:
         line = read_line()
         if line is None:
@@ -153,6 +155,7 @@ def interactive_repl(
             fresh = False
             if rewind_enabled:
                 node_id = history.commit_turn()
+                turns_committed += 1
                 transcript[node_id] = text + out
                 _prune_transcript()
                 emit(f"[committed #{node_id}; depth {history.depth()}, "
@@ -195,18 +198,31 @@ def interactive_repl(
                     command_args[0] if command_args else "1")
                 if absolute:
                     target = history.rewind_to(count)
-                elif count == 1 and history.depth() <= 1:
-                    # DoD 6b: nothing committed beyond the root, and the default `/rewind`
-                    # (count 1) asked for exactly the one hop that doesn't exist. Restore the
-                    # root (a real set_state, not a no-op) and say why there is nothing to
-                    # rewind past. A larger count (e.g. `/rewind 2` at the root) falls through
-                    # to `rewind_turns` below instead, so it gets the precise "cannot rewind N
-                    # turn(s) ... at most 0 rewind hop(s) are possible" error rather than being
-                    # collapsed into this same message regardless of how far past the root it
-                    # asked to go.
-                    target = history.rewind_to(history.current())
-                    emit("session is empty — you are at the root (turn 0); there is no "
-                         "earlier boundary to rewind past. Restored the root state.")
+                elif count == 1 and history.current() == root:
+                    # DoD 6b: we are standing on THIS session's turn-0 node and the default
+                    # `/rewind` (count 1) asked for exactly the one hop that doesn't exist.
+                    # Restore the root (a real set_state, not a no-op) and say why there is
+                    # nothing to rewind past.
+                    #
+                    # #318: the predicate keys on the root NODE ID, not on `history.depth()`.
+                    # `depth()` counts *retained* ancestors, so `--rewind-depth 1` evicting
+                    # turn 0 collapses it back to 1 while a real turn exists — which made this
+                    # branch claim "session is empty" about a session with turns in it. The
+                    # current node is never evicted and ids are never reused, so
+                    # `current() == root` is exactly "on turn 0, and turn 0 is still retained".
+                    # An evicted root therefore falls through to `rewind_turns` below and gets
+                    # the precise hop-count error instead. So does a larger count (e.g.
+                    # `/rewind 2` at the root), rather than being collapsed into this message
+                    # regardless of how far past the root it asked to go.
+                    target = history.rewind_to(root)
+                    if turns_committed == 0:
+                        emit("session is empty — nothing has been committed beyond the root "
+                             "(turn 0); there is no earlier boundary to rewind past. "
+                             "Restored the root state.")
+                    else:
+                        # Turns exist, we just rewound back onto turn 0. Not empty (#318).
+                        emit("you are at the root (turn 0); there is no earlier boundary to "
+                             "rewind past. Restored the root state.")
                 else:
                     target = history.rewind_turns(count)
             except (ValueError, LookupError) as exc:
