@@ -779,6 +779,30 @@ jobs:
             --json "$RUNNER_TEMP/monica-bench-toy.json")
           echo "$OUT"
           [ -n "$OUT" ]
+      - name: monica-bench --mode spec on Fixtures/toy (byte-identity GATE, informational timing)
+        # #172. This step IS the byte-identity gate: `Bench.spec` runs speculative decode
+        # and plain greedy decode over the same prompt and model instance and fails loud
+        # (naming the first differing index) if the two id arrays differ, so a
+        # non-output-preserving speculative loop exits non-zero here.
+        #
+        # It has to be a CI step and cannot be a local one: evaluating any MLXArray needs
+        # mlx-swift's `default.metallib`, an Xcode-only build product (see the "Ensure
+        # Metal toolchain" step above), so `swift run monica-bench --mode spec` fails on a
+        # Command-Line-Tools-only dev host with "Failed to load the default metallib".
+        # The pure-Swift halves (the drafter and the accept rule) ARE locally provable and
+        # are covered by the `--self-test` step above.
+        #
+        # The printed speedup/accept-rate are INFORMATIONAL, matching every other
+        # monica-bench CI step — no threshold is asserted (hosted-runner timing is noisy;
+        # see docs/benchmarks.md).
+        working-directory: swift/engine
+        run: |
+          OUT=$("$MONICA_BENCH_BIN" --weights Fixtures/toy/weights.safetensors --mode spec \
+            --gamma 4 --json "$RUNNER_TEMP/monica-bench-toy-spec.json")
+          echo "$OUT"
+          # A gate that cannot observe its target must not read green: assert non-empty
+          # output, not just a zero exit code.
+          [ -n "$OUT" ]
       - name: monica-bench --mode decode on Fixtures/toy-moe-int8 (quantized path, informational)
         # Exercises the quantized checkpoint path (Checkpoint.load applies the `quant`
         # sidecar automatically) — informational for the same reason as the step above.
@@ -794,6 +818,7 @@ jobs:
           name: monica-bench-records
           path: |
             ${{ runner.temp }}/monica-bench-toy.json
+            ${{ runner.temp }}/monica-bench-toy-spec.json
             ${{ runner.temp }}/monica-bench-toy-moe-int8.json
           retention-days: 90
       # ── #196: checkpoint I/O — the Swift WRITER round-trips into Python ──

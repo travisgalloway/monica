@@ -266,3 +266,17 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   landed as #324 (`6a260c5`). §D6 records the correct attribution; the stale `#322` references
   elsewhere in `CLAUDE.md` and `docs/design/03-conformance.md` were not swept. Found while building
   #298's post-#303 CI run inventory. Severity: docs accuracy, non-blocking.
+
+- [2026-08-22] `swift/engine/Sources/MonicaEngine/Generator.swift:100` and
+  `swift/engine/Sources/MonicaEngine/Bench.swift:220` each carry a private/public copy of
+  `evalTargets(_ s: LayerState)`, which #264's `LayerState.arrays`
+  (`swift/engine/Sources/MonicaEngine/LayerState.swift:22`) already provides — three spellings of
+  one switch. #172's `SpecDecodeLoop.swift` uses `.arrays` directly; the two older copies were
+  left alone. Found while porting speculative decoding. Severity: duplication, non-blocking.
+
+- [2026-08-22] `src/serve/spec_decode.py:47-50` — the `break` in `propose`'s empty-draft branch is
+  unreachable: the start bound `range(L - n - 1, ...)` already excludes the tail occurrence, so a
+  hit always leaves at least one following token and `draft` is never empty. Harmless, and the
+  Swift port keeps it line-for-line, but the comment reads as if it guards a live case. Found while
+  fuzz-comparing the Swift port against this function (250k random cases, 0 mismatches). Severity:
+  dead code / misleading comment, non-blocking.

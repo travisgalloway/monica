@@ -19,6 +19,7 @@ cd swift/engine
 swift run monica-bench --weights Fixtures/toy/weights.safetensors --mode all
 swift run monica-bench --config Benchmarks/configs/poc.config.json --mode all --json bench.json
 swift run monica-bench --config Benchmarks/configs/poc.config.json --quantize 8 --mode decode
+swift run monica-bench --weights Fixtures/toy/weights.safetensors --mode spec --gamma 4
 swift run monica-bench --self-test   # deterministic, hardware-independent — runs anywhere
 
 # Python / MLX (runs on Apple Silicon with the project venv; no Xcode needed):
@@ -37,6 +38,8 @@ swift run monica-bench --self-test   # deterministic, hardware-independent — r
 | prefill | poc-scale (`Benchmarks/configs/poc.config.json`) | — | — | **not yet measured** — needs a developer Mac with Xcode installed (see host constraint below); command: `swift run monica-bench --config Benchmarks/configs/poc.config.json --mode prefill` |
 | decode | poc-scale, fp vs `--quantize 8`/`--quantize 4` | — | — | **not yet measured** — same constraint; command: `swift run monica-bench --config Benchmarks/configs/poc.config.json --mode decode [--quantize 8]` |
 | memory | poc-scale peak/analytic | — | — | **not yet measured** — same constraint; command: `swift run monica-bench --config Benchmarks/configs/poc.config.json --mode memory` |
+| spec (#172) | speculative vs plain greedy tok/s, speedup, accept rate | — | GitHub-hosted `macos-latest` runner | **CI runner, informational** — emitted per run by `swift-engine`'s `monica-bench --mode spec` step (`Fixtures/toy`, `--gamma 4`) into the `monica-bench-records` artifact (`monica-bench-toy-spec.json`); no figure is promoted into this table, because a hosted-runner timing is not a hardware claim. **What that step DOES gate is correctness, not speed:** speculative output byte-identical to plain greedy (`Bench.spec` exits non-zero naming the first differing index) |
+| spec (#172) | speculative decode on developer Apple Silicon | — | — | **no local Apple-Silicon measurement exists, and none can be taken on this host** — see the host constraint below: `SpecDecodeLoop.swift` evaluates `MLXArray`s, so `swift run monica-bench --mode spec` fails here with `Failed to load the default metallib`. A real number needs a developer Mac with Xcode installed; command: `swift run monica-bench --weights Fixtures/toy/weights.safetensors --mode spec --gamma 4` |
 
 The 55.30x row is #169's AC3, carried forward unchanged: `monica-bench`'s prefill mode calls the
 same `Bench.prefill` `monica-generate --bench-prefill` calls, so this figure stays the comparable
@@ -77,7 +80,7 @@ are real **developer Apple Silicon** numbers.
 
 - **CI runner (GitHub-hosted `macos-latest`, `xcodebuild`)**: the Swift-engine prefill row
   (55.30x, run 31777284815) and, going forward, every `swift-engine` CI run's `monica-bench
-  --mode all` / `--mode decode` JSON artifact (uploaded per-run, not yet promoted into this
+  --mode all` / `--mode decode` / `--mode spec` JSON artifact (uploaded per-run, not yet promoted into this
   table — informational only, no timing threshold gates CI).
 - **Developer Apple Silicon (MacBookPro18,3 / Apple M1 Pro / 32 GB / macOS 26.5.2)**: every
   Python/MLX row above. These are the only rows in this document that can honestly be called a
