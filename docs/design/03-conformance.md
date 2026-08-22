@@ -210,8 +210,8 @@ supposed to represent.
 | everything else (~1670 tests) | ≈ 75 s | 3.6 % |
 
 **The ~6× gap is not an environment gap.** The same file takes **19.06 s locally** — an
-~85× penalty on that one file, while the rest of the suite runs at ≈1.4× (CI 476 s vs
-local 342 s). The cause is `torch.multiprocessing.spawn`: macOS has no `fork` start
+~85× penalty on that one file, while the rest of the suite runs at ≈1.4× (CI 441 s vs
+local 339 s). The cause is `torch.multiprocessing.spawn`: macOS has no `fork` start
 method for this path, so each of the ~26 gloo worker subprocesses re-imports torch (and,
 in this job, mlx) from an editable install on a slow hosted filesystem — 1610.94 s / ~26
 spawns ≈ 62 s of pure import per worker.
@@ -226,8 +226,10 @@ coverage trade.** The genuinely macOS-specific item in the `test_cuda_*` family,
 ignored and costs 1.85 s. If a macOS-arm torch surface is ever wanted for the distributed
 path, the cheap place is a scheduled job in `scheduled-parity.yml`, never the PR path.
 
-Result: the suite step's budget drops from 2400 s to **720 s** (measured ≈476 s plus a
-4-minute buffer), `full-macos`'s `timeout-minutes` from 45 to **17**, and `swift-engine`'s
+Result: the suite step's budget drops from 2400 s to **720 s** (the post-cut suite
+measured **441 s** on PR #324's own run, plus a 4-minute buffer, rounded to a whole
+minute; that run's `full suite (macOS)` job took 8m30s wall clock and every other macOS
+job 1m4s–2m39s, so the whole PR path is now inside the 20-minute ceiling), `full-macos`'s `timeout-minutes` from 45 to **17**, and `swift-engine`'s
 from 60 to **20** — a 60-minute ceiling over a measured 2m40s job being the same
 illegible shape #315 was filed about.
 

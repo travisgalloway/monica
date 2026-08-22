@@ -89,7 +89,8 @@ EXPECTED_TIMEOUT_MINUTES = {
 
 # The budget the suite step measures itself against, in seconds. #322: the pre-cut
 # baseline was 2086.73s, of which tests/test_cuda_distributed.py — now ignored on this
-# job because `cuda-cpu` already runs it — was 1610.94s, leaving ~476s. The budget is
+# job because `cuda-cpu` already runs it — was 1610.94s. The post-cut suite MEASURED
+# 441s on PR #324's own run (MACOS_SUITE_WALL_CLOCK_SECONDS=441). The budget is
 # that measurement plus a 4-minute buffer, rounded to a whole minute.
 BUDGET_VAR = "MACOS_SUITE_BUDGET_SECONDS"
 EXPECTED_BUDGET_SECONDS = 720

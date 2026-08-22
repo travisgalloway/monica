@@ -82,7 +82,7 @@ each of its ~26 gloo workers re-imports torch/mlx. That file already runs, with 
 in the 149s Linux `cuda-cpu` job, so `full-macos`'s pytest step now carries
 `--ignore=tests/test_backend_parity.py --ignore=tests/test_cuda_distributed.py` (different
 reasons — the first would look like coverage while five comparisons skip; the second is a
-pure duplicate) and the suite lands at ~476s. Budget 2400s→**720s**, `full-macos`
+pure duplicate) and the suite lands at 441s measured (8m30s job wall clock). Budget 2400s→**720s**, `full-macos`
 `timeout-minutes` 45→**17**, `swift-engine` 60→**20**. The budget test also pins
 `PR_PATH_CEILING_SECONDS = 1200` — #315's stated 20-minute PR-path ceiling — against the
 budget and every macOS job's timeout, plus the macOS job *set*, so the stated and enforced

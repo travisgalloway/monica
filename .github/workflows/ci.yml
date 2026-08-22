@@ -186,7 +186,7 @@ jobs:
     name: full suite (macOS)
     runs-on: macos-latest
     # #322: the profile exists now, and the cut below took the suite from ~2087s to
-    # ~476s, so this drops 45 -> 17 (budget 720s + the 300s margin
+    # 441s measured on PR #324's own run, so this drops 45 -> 17 (budget 720s + the 300s margin
     # tests/test_ci_macos_budget.py requires). The budget guard below is the legible
     # ceiling; that test pins both numbers, the margin between them, and — new in #322 —
     # that this job stays under the 20-minute PR-path ceiling #315's DoD-3 stated.
@@ -240,7 +240,8 @@ jobs:
         # reported as "over budget", and the elapsed line prints on both paths.
         env:
           # 720s (12 min) — #322. The pre-cut baseline was 2086.73s; removing the
-          # duplicated tests/test_cuda_distributed.py (1610.94s of it) leaves ~476s, and
+          # duplicated tests/test_cuda_distributed.py (1610.94s of it) left 441s measured on
+          # PR #324's own run (MACOS_SUITE_WALL_CLOCK_SECONDS=441), and
           # this budget is that measurement plus a 4-minute buffer, rounded to a whole
           # minute. It must also satisfy budget + JOB_OVERHEAD_ALLOWANCE_SECONDS <=
           # PR_PATH_CEILING_SECONDS (1200s = the 20-minute PR-path ceiling #315's DoD-3
