@@ -290,6 +290,24 @@ its children are reparented onto its grandparent so deeper branches survive, whi
 "parent hop" can skip a turn that no longer exists. Asking for more hops than exist is an error
 naming the available depth — it never clamps to the root.
 
+**At the root.** A bare `/rewind` with no earlier boundary to reach has three distinct outcomes,
+because "there is nothing behind me" and "the session is empty" are not the same thing (#318):
+
+- **Nothing committed yet** — `session is empty — nothing has been committed beyond the root
+  (turn 0); …  Restored the root state.` The root snapshot is reinstalled (a real `set_state`, not
+  a no-op).
+- **Standing on turn 0 with turns behind you** (you rewound back to it) — `you are at the root
+  (turn 0); …  Restored the root state.` Same restore, but the session is *not* empty, so it does
+  not say so.
+- **Turn 0 has been evicted** by a tight `--rewind-depth` (e.g. `--rewind-depth 1` after one
+  turn) — no special case at all: it falls through to the ordinary hop-count error, `error: cannot
+  rewind 1 turn(s): … at most 0 rewind hop(s) are possible (retained ids: [1])`.
+
+A rejected rewind — that third case, and any over-deep `/rewind n` — **leaves the session
+untouched**: the error is raised before any state is installed, so the live recurrent state is
+still exactly what the last committed turn left behind and the next turn continues as if the
+`/rewind` had never been typed.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config` | `config/poc.yaml` | Model config (must match the weights) |

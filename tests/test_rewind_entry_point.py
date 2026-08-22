@@ -203,6 +203,42 @@ def test_rewind_multiple_at_root_reports_over_deep_not_empty():
                           np.asarray(repl.model.init_state(1)))
 
 
+def test_evicted_root_reports_the_hop_count_not_an_empty_session():
+    """#318: `--rewind-depth 1` evicts turn 0, which is not the same as an empty session.
+
+    Committing turn 1 under a depth-1 cap evicts turn 0 and reparents turn 1 onto None, so
+    `history.depth()` collapses back to 1 — the predicate this branch used to key on. A real
+    turn exists, so the bare `/rewind` must fall through to `rewind_turns` and report the
+    precise hop count, never claim the session is empty.
+    """
+    repl = ScriptedRepl(["aa", "/rewind"], rewind_depth=1).run()
+    assert "session is empty" not in repl.chrome
+    assert "cannot rewind 1 turn(s)" in repl.chrome
+    assert "at most 0 rewind hop(s) are possible" in repl.chrome
+    # The rejected rewind touched nothing: `rewind_turns` raises before any `set_state`, so
+    # the live state is still exactly what the committed turn left behind.
+    assert np.array_equal(np.asarray(repl.boundary_states[0]),
+                          np.asarray(repl.store.get_state(repl.sid)))
+
+
+def test_rejected_rewind_leaves_generation_unchanged():
+    """The behavioural half of #318's benign-state property: the next turn is unaffected."""
+    with_rejected = ScriptedRepl(["aa", "/rewind", "bb"], rewind_depth=1).run()
+    without = ScriptedRepl(["aa", "bb"], rewind_depth=1).run()
+    assert with_rejected.continuation(1) == without.continuation(1)
+
+
+def test_at_the_root_after_a_rewind_is_not_reported_as_empty():
+    """#318: standing on turn 0 with turns behind you is not an empty session either."""
+    repl = ScriptedRepl(["aa", "/rewind 1", "/rewind"]).run()
+    assert "you are at the root (turn 0)" in repl.chrome
+    assert "session is empty" not in repl.chrome
+    assert "Restored the root state." in repl.chrome
+    # The root snapshot really was reinstalled: it is the freshly-created (zero) state.
+    assert np.array_equal(np.asarray(repl.store.get_state(repl.sid)),
+                          np.asarray(repl.model.init_state(1)))
+
+
 @pytest.mark.parametrize("argument", ["0", "-1"])
 def test_rewind_non_positive_count_is_rejected(argument):
     repl = ScriptedRepl([LINE_A, LINE_X, f"/rewind {argument}"]).run()
