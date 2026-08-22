@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -407,21 +408,29 @@ def main() -> None:
 
     print(json.dumps(result, indent=2))
 
+    # Under --json, stdout must be PARSEABLE JSON and nothing else — the CI job `tee`s it
+    # straight into a .json file the verdict step reads back. Every human-readable line
+    # below therefore goes to stderr in that mode; it is still shown in the workflow log,
+    # it just stops corrupting the machine-readable half. (`--json` claimed "JSON only"
+    # before this and did not deliver it.)
+    def say(text: str) -> None:
+        print(text, file=sys.stderr if args.json else sys.stdout)
+
     if blind_reason is not None:
-        print(f"BLIND: {blind_reason}")
+        say(f"BLIND: {blind_reason}")
         # --report-only suppresses ONLY this exit. Everything above — an MLX that will not
         # import, a config that will not load, a pattern that raises — has already failed
         # loudly by the time we get here, and stays failing.
         if not args.report_only:
             raise SystemExit(3)
-        print("--report-only: exiting 0 so the measurement is captured; the BLIND verdict "
-              "above is the result, NOT a clean bill of health.")
+        say("--report-only: exiting 0 so the measurement is captured; the BLIND verdict "
+            "above is the result, NOT a clean bill of health.")
         return
 
     if args.pattern == "mixing" and args.cache_limit == "default" and not args.barrier:
-        print(f"positive control reproduced: {result['failures']}/{result['trials']} "
-              "trials diverged from the accessor-free reference — the instrument can see "
-              "the defect.")
+        say(f"positive control reproduced: {result['failures']}/{result['trials']} "
+            "trials diverged from the accessor-free reference — the instrument can see "
+            "the defect.")
 
 
 if __name__ == "__main__":
