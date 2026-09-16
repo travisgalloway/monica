@@ -188,15 +188,21 @@ def bucket_of(value: int,
     raise ValueError(f"value {value} falls in no bucket of {[b[0] for b in buckets]}")
 
 
-def attention_after_suffix(n_layers: int, attn_every: Optional[int]) -> bool:
+def attention_after_suffix(n_layers: int, attn_every: Optional[int],
+                           attn_layers: Optional[Sequence[int]] = None) -> bool:
     """True when the model's **final** block is an attention block.
 
     From `src/model/blocks.py:192`, layer `i` is attention iff `attn_every and (i+1) % attn_every
-    == 0`; the last layer is `i = n_layers - 1`, so the condition is `n_layers % attn_every == 0`.
+    == 0` (or `i in attn_layers`); the last layer is `i = n_layers - 1`, so the condition is
+    `n_layers % attn_every == 0` or `(n_layers - 1) in attn_layers`.
     Advisory only (see the module docstring): PSM consumes the suffix before the middle, so a
     top attention block is what lets the middle re-read it rather than recall it from SSM state.
     """
-    if not attn_every or attn_every <= 0 or n_layers <= 0:
+    if n_layers <= 0:
+        return False
+    if attn_layers is not None:
+        return (n_layers - 1) in attn_layers
+    if not attn_every or attn_every <= 0:
         return False
     return n_layers % attn_every == 0
 
@@ -394,10 +400,14 @@ def _architecture_advisory(model) -> Optional[str]:
     n_layers = getattr(config, "n_layers", None)
     if not isinstance(n_layers, int):
         return None
+    if hasattr(config, "is_attention_layer") and callable(config.is_attention_layer):
+        if config.is_attention_layer(n_layers - 1):
+            return None
     attn_every = getattr(config, "attn_every", None)
-    if attention_after_suffix(n_layers, attn_every):
+    attn_layers = getattr(config, "attn_layers", None)
+    if attention_after_suffix(n_layers, attn_every, attn_layers):
         return None
-    return (f"final block is not attention (n_layers={n_layers}, attn_every={attn_every}); "
+    return (f"final block is not attention (n_layers={n_layers}, attn_every={attn_every}, attn_layers={attn_layers}); "
             "in PSM the suffix is consumed before the middle, so the top block should be "
             "attention — see src/eval/fim_eval.py and docs/design/13-code-model-moe.md")
 

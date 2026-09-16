@@ -19,6 +19,7 @@
   "grad_checkpoint": true,
   "torch_compile": null,
   "attn_every": null,
+  "attn_layers": null,
   "n_attn_heads": null,
   "moe_every": null,
   "n_experts": 0,

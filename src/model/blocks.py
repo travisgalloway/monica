@@ -114,10 +114,14 @@ class MambaConfig:
     # attention block INSTEAD OF a Mamba block (n_layers unchanged). Pure SSMs lag on
     # exact copying / in-context retrieval; a few attention layers (Jamba pattern ~1
     # attn per 7 Mamba => attn_every 8) recover it. None = pure Mamba (current default).
-    # Layer i is attention iff `attn_every and (i+1) % attn_every == 0`.
+    # Layer i is attention iff `attn_every and (i+1) % attn_every == 0` (or if `attn_layers`
+    # is set, iff `i in attn_layers`).
     attn_every: Optional[int] = None
+    # Arbitrary attention layer indices (#219). List of 0-indexed layer positions.
+    # Mutually exclusive with `attn_every`.
+    attn_layers: Optional[list[int]] = None
     # Heads for the attention blocks. None => d_model // 64 (so attn_head_dim ~= 64).
-    # Must divide d_model. Unused when attn_every is None.
+    # Must divide d_model. Unused when attn_every is None and attn_layers is None.
     n_attn_heads: Optional[int] = None
 
     # --- sparse Mixture-of-Experts (#53) ---
@@ -213,10 +217,14 @@ class MambaConfig:
 
     def is_attention_layer(self, i: int) -> bool:
         """True if block `i` (0-indexed) is a causal-attention block, not a Mamba block."""
+        if self.attn_layers is not None:
+            return i in self.attn_layers
         return bool(self.attn_every) and (i + 1) % self.attn_every == 0
 
     @property
     def n_attention_layers(self) -> int:
+        if self.attn_layers is not None:
+            return len(self.attn_layers)
         if not self.attn_every:
             return 0
         return self.n_layers // self.attn_every
@@ -368,6 +376,17 @@ class MambaConfig:
             raise ValueError("chunk_size must be positive or None")
         if self.long_ctx_factor < 1.0:
             raise ValueError("long_ctx_factor must be >= 1.0 (1.0 = off)")
+        if not isinstance(self.d_state, int) or isinstance(self.d_state, bool) or self.d_state <= 0:
+            raise ValueError(f"d_state={self.d_state} must be a positive integer")
+        if self.d_state > 256:
+            raise ValueError(
+                f"d_state={self.d_state} exceeds maximum supported bound of 256 "
+                "(note memory/state sizing bounds; see docs/design/02-model-ssm.md)"
+            )
+        if self.d_state % 8 != 0 and (self.d_state & (self.d_state - 1)) != 0:
+            raise ValueError(
+                f"d_state={self.d_state} must be aligned (multiple of 8 or power of 2 <= 256)"
+            )
         if self.d_conv < 1:
             raise ValueError("d_conv must be >= 1")
         if self.head_dim <= 0 or self.d_inner % self.head_dim != 0:
@@ -375,6 +394,8 @@ class MambaConfig:
                 f"head_dim={self.head_dim} must divide d_inner={self.d_inner} "
                 "(d_inner = expand*d_model)."
             )
+        if self.attn_every is not None and self.attn_layers is not None:
+            raise ValueError("cannot specify both attn_every and attn_layers")
         if self.attn_every is not None:
             if self.attn_every <= 0:
                 raise ValueError("attn_every must be a positive int or None")
@@ -384,6 +405,27 @@ class MambaConfig:
                     f"n_attn_heads={nah} must divide d_model={self.d_model} "
                     "(attn_head_dim = d_model // n_attn_heads)."
                 )
+        if self.attn_layers is not None:
+            if not isinstance(self.attn_layers, (list, tuple)):
+                raise ValueError(
+                    f"attn_layers must be a list or tuple of ints, got {type(self.attn_layers).__name__}"
+                )
+            for idx in self.attn_layers:
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    raise ValueError(f"attn_layers elements must be ints, got {idx!r}")
+                if not (0 <= idx < self.n_layers):
+                    raise ValueError(
+                        f"attn_layers index {idx} out of range [0, {self.n_layers})"
+                    )
+            if len(self.attn_layers) != len(set(self.attn_layers)):
+                raise ValueError(f"attn_layers contains duplicate indices: {self.attn_layers}")
+            if self.attn_layers:
+                nah = self.n_attn_heads_resolved
+                if nah <= 0 or self.d_model % nah != 0:
+                    raise ValueError(
+                        f"n_attn_heads={nah} must divide d_model={self.d_model} "
+                        "(attn_head_dim = d_model // n_attn_heads)."
+                    )
         if self.moe_impl not in ("auto", "dense", "gather"):
             raise ValueError(
                 f"unknown moe_impl {self.moe_impl!r} (expected one of auto, dense, gather)"
