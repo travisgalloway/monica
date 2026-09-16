@@ -801,6 +801,30 @@ for dir in fixtureDirs {
             print("\(name): MoE load counts — SKIP (\(hasMoeBlocks ? "quantized fixture" : "no MoE layers"))")
         }
 
+        // --- #328: MoE sparse gather vs dense evaluation parity ----------------------
+        if hasMoeBlocks && meta.quant_bits == nil {
+            do {
+                var denseConfig = model.config
+                denseConfig.moeImpl = "dense"
+                let (modelDense, _) = try Checkpoint.load(weights: weights, config: denseConfig)
+                let denseLogits = modelDense.forward(tokens)
+                MLX.eval(denseLogits)
+                let moeCmp = compare(
+                    denseLogits.asType(.float32).asArray(Float.self),
+                    fwd.asType(.float32).asArray(Float.self),
+                    rtol: fxRtol, atol: fxAtol)
+                if moeCmp.ok {
+                    print(String(format: "%@: MoE gather vs dense parity max|d| = %.3e  OK", name, moeCmp.maxAbs))
+                } else {
+                    failures.append(String(
+                        format: "%@: MoE gather vs dense parity FAIL (max|d| = %.3e, rtol=%.1e, atol=%.1e)",
+                        name, moeCmp.maxAbs, fxRtol, fxAtol))
+                }
+            } catch {
+                failures.append("\(name): MoE gather vs dense check threw: \(error)")
+            }
+        }
+
         // --- #169: prefill (parallel-scan) checks -------------------------------------
         // A missing prefill.safetensors is a FAILURE, not a skip — same rule the file
         // already applies to generation.safetensors.

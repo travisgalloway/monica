@@ -68,9 +68,17 @@ public final class MoEBlock: Block {
 
     /// See `LoadCounter` above for why this is boxed rather than a stored `MLXArray`.
     let loadCounter: LoadCounter
+    let useGather: Bool
 
     public init(_ config: MambaConfig) {
         self.config = config
+        if config.moeImpl == "dense" {
+            self.useGather = false
+        } else if config.moeImpl == "gather" {
+            self.useGather = true
+        } else { // "auto"
+            self.useGather = !(config.topK >= config.nExperts || config.nExperts <= 1)
+        }
         self._norm.wrappedValue = RMSNorm(config.dModel)
         self._router.wrappedValue = Linear(config.dModel, config.nExperts, bias: false)
         let dFF = config.moeDFFResolved
@@ -110,6 +118,53 @@ public final class MoEBlock: Block {
         return out
     }
 
+    func moeDense(_ xn: MLXArray, _ gate: MLXArray, _ cd: DType) -> MLXArray {
+        let outs = stacked(experts.map { $0(xn, cd) }, axis: -2)        // (..., E, dModel)
+        let y = MLX.sum(gate.expandedDimensions(axis: -1) * f32(outs), axis: -2)
+        return cast(y, cd)
+    }
+
+    func moeGather(_ xn: MLXArray, _ topkIds: MLXArray, _ gateKept: MLXArray, _ cd: DType) -> MLXArray {
+        let e = config.nExperts
+        let k = config.topK
+        let d = xn.dim(-1)
+        let leadShape = Array(xn.shape.dropLast())
+        let flatX = xn.reshaped([-1, d])
+        let n = flatX.dim(0)
+        let flatIds = topkIds.reshaped([n, k])
+        let flatGate = gateKept.reshaped([n, k])
+
+        let dispatch = broadcast(flatX.expandedDimensions(axis: 1), to: [n, k, d]).reshaped([n * k, d])
+        let dispatchExpert = flatIds.reshaped([-1])
+
+        let perm = argSort(dispatchExpert)
+        let sortedX = dispatch[perm]
+
+        MLX.eval(dispatchExpert)
+        let expertIds = dispatchExpert.asType(.int32).asArray(Int32.self)
+        var counts = [Int](repeating: 0, count: e)
+        for id in expertIds {
+            counts[Int(id)] += 1
+        }
+
+        var chunks = [MLXArray]()
+        chunks.reserveCapacity(e)
+        var offset = 0
+        for expertIndex in 0..<e {
+            let c = counts[expertIndex]
+            let expertInput = sortedX[offset ..< (offset + c)]
+            chunks.append(experts[expertIndex](expertInput, cd))
+            offset += c
+        }
+        let outSorted = concatenated(chunks, axis: 0)
+
+        let invPerm = argSort(perm)
+        let outDispatch = outSorted[invPerm].reshaped([n, k, d])
+        let combined = MLX.sum(f32(outDispatch) * flatGate.expandedDimensions(axis: -1), axis: 1)
+        let y = combined.reshaped(leadShape + [d])
+        return cast(y, cd)
+    }
+
     /// `_moe` (`:676-726`).
     func moe(_ xn: MLXArray) -> MLXArray {
         let cd = config.cd
@@ -117,56 +172,39 @@ public final class MoEBlock: Block {
         let k = config.topK
         let logits = f32(linear(router, xn, cd))            // (..., E) — route in fp32
         let probs = softmax(logits, axis: -1)               // UNBIASED — always the gate weight
-        var gate: MLXArray
         if k < e {
             // Loss-Free-Balancing (#213 D2): when active, rank by the BIASED selection score
             // `logits + routeBias`; the gate weight stays `probs` (unbiased). The bias steers
             // ROUTING only, never the combination weight.
-            //
-            // The DOUBLE ARGSORT is load-bearing: a plain `probs >= kth` threshold keeps MORE
-            // than k experts on ties (uniform routing early in training), breaking the top_k
-            // contract and the active-FLOP count. Ranking breaks ties by index, so exactly k
-            // survive.
-            let ranks: MLXArray
+            let order: MLXArray
             if let bias = routeBias {
                 let sel = logits + MLXArray(bias)
-                ranks = argSort(argSort(-sel, axis: -1), axis: -1)
+                order = argSort(-sel, axis: -1)
             } else {
-                ranks = argSort(argSort(-probs, axis: -1), axis: -1)
+                order = argSort(-probs, axis: -1)
             }
+            let ranks = argSort(order, axis: -1)
             let mask = ranks .< MLXArray(Int32(k))
-            gate = which(mask, probs, MLXArray(Float(0)).asType(probs.dtype))
-            gate = gate / MLX.sum(gate, axis: -1, keepDims: true)   // renormalize the kept gates
             if loadCounter.enabled {
-                // Per-expert load bookkeeping for the balancer (`:765-784`): how many tokens
-                // (summed over every non-expert axis) this forward routed to each expert,
-                // detached from the graph (`stopGradient` — a count must never become a
-                // training signal) and accumulated; `popLoad()` reads + resets it. Counted
-                // only here, in the `k < E` branch: at `k == E` every expert takes every
-                // token and balancing is vacuous (no mask exists).
-                //
-                // Two known, benign inexactnesses carried over from Python unchanged (there
-                // is no `grad_checkpoint`/training step in this engine to exercise them, but
-                // the reasoning is recorded so a future port does not "fix" a divergence that
-                // isn't one):
-                //  * With `grad_checkpoint: true` each layer's forward is RECOMPUTED in
-                //    backward, so every count doubles (#213 D5). Both consumers are invariant
-                //    to a uniform positive scale, so this is harmless.
-                //  * On an fp16 overflow-skipped training step the counts are not popped, so
-                //    they carry into the next pop. Harmless: the routing really did happen.
                 let axes = Array(0..<(mask.ndim - 1))
                 loadCounter.counts = loadCounter.counts + stopGradient(
                     MLX.sum(mask.asType(.float32), axes: axes))
             }
+            if useGather {
+                let topkIds = sorted(order[.ellipsis, 0 ..< k], axis: -1)
+                let flatProbs = probs.reshaped([-1, e])
+                let flatIds = topkIds.reshaped([-1, k])
+                var gateKept = takeAlong(flatProbs, flatIds, axis: -1)
+                gateKept = gateKept / MLX.sum(gateKept, axis: -1, keepDims: true)
+                return moeGather(xn, topkIds, gateKept, cd)
+            } else {
+                var gate = which(mask, probs, MLXArray(Float(0)).asType(probs.dtype))
+                gate = gate / MLX.sum(gate, axis: -1, keepDims: true)   // renormalize the kept gates
+                return moeDense(xn, gate, cd)
+            }
         } else {
-            gate = probs                                    // softmax already sums to 1
+            return moeDense(xn, probs, cd)
         }
-        // Every expert is evaluated and the top_k gates select the combination — a DENSE
-        // compute with a SPARSE combination. Exact and FLOP-accountable, but not a
-        // production MoE kernel; this mirrors the Python semantics and must, for parity.
-        let outs = stacked(experts.map { $0(xn, cd) }, axis: -2)        // (..., E, dModel)
-        let y = MLX.sum(gate.expandedDimensions(axis: -1) * f32(outs), axis: -2)
-        return cast(y, cd)
     }
 
     /// `forward_seq` (`:728-729`) — pointwise, so `segIds` is accepted (the `Block` seam

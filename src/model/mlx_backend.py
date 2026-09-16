@@ -656,16 +656,14 @@ class MoEBlock(nn.Module):
 
     def __init__(self, config: MambaConfig):
         super().__init__()
-        if config.moe_impl == "gather":
-            # Grouped-gather routing is a real dispatch-kernel change (CUDA-only, #214) —
-            # not something the dense MLX path can silently approximate. Fail loudly at
-            # construction rather than quietly falling back to dense under an explicit
-            # request for a different compute strategy.
-            raise NotImplementedError(
-                "moe_impl='gather' is CUDA-only (grouped-gather routing, #214); the MLX "
-                "backend only implements the dense (auto/dense) path."
-            )
         self.config = config
+        E = config.n_experts
+        if config.moe_impl == "dense":
+            self._use_gather = False
+        elif config.moe_impl == "gather":
+            self._use_gather = True
+        else:  # "auto"
+            self._use_gather = not (config.top_k >= E or E <= 1)
         self.norm = RMSNorm(config.d_model)
         self.router = nn.Linear(config.d_model, config.n_experts, bias=False)
         d_ff = config.moe_d_ff_resolved
@@ -762,6 +760,47 @@ class MoEBlock(nn.Module):
         self._n_routed = 0
         return {"load": load, "entropy": (total / n) if n else None, "n_tokens": int(n)}
 
+    def _moe_dense(self, xn: Array, cd, gate: Array) -> Array:
+        outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
+        return mx.sum(gate[..., None] * _f32(outs), axis=-2)    # combine in fp32
+
+    def _moe_gather(self, xn: Array, cd, topk_ids: Array, gate_kept: Array) -> Array:
+        """Grouped-gather routing (#328): dispatch each token only to its top_k chosen
+        experts, instead of `_moe_dense`'s evaluate-every-expert-then-mask.
+
+        Two-step gather — `broadcast_to` then index permutation (`dispatch[perm]`) —
+        mirrors `cuda_backend.py:919-969`. Deterministic backward sums over the k repeats.
+        Loops over ALL E experts without skipping zero-count ones to guarantee finite,
+        well-defined gradients matching the dense path.
+        """
+        E, k = self.config.n_experts, self.config.top_k
+        D = xn.shape[-1]
+        lead_shape = xn.shape[:-1]
+        flat_x = xn.reshape(-1, D)
+        N = flat_x.shape[0]
+        flat_ids = topk_ids.reshape(N, k)
+        flat_gate = gate_kept.reshape(N, k)
+
+        dispatch = mx.broadcast_to(flat_x[:, None, :], (N, k, D)).reshape(N * k, D)
+        dispatch_expert = flat_ids.reshape(-1)
+
+        perm = mx.argsort(dispatch_expert)
+        sorted_x = dispatch[perm]
+
+        counts = np.bincount(np.array(dispatch_expert), minlength=E).tolist()
+        chunks = []
+        offset = 0
+        for e in range(E):
+            c = counts[e]
+            chunks.append(self.experts[e](sorted_x[offset:offset + c], cd))
+            offset += c
+        out_sorted = mx.concatenate(chunks, axis=0)
+
+        inv_perm = mx.argsort(perm)
+        out_dispatch = out_sorted[inv_perm].reshape(N, k, D)
+        combined = mx.sum(_f32(out_dispatch) * flat_gate[..., None], axis=1)
+        return combined.reshape(*lead_shape, D)
+
     def _moe(self, xn: Array) -> Array:
         cd = _DTYPES[self.config.precision]
         E, k = self.config.n_experts, self.config.top_k
@@ -794,18 +833,11 @@ class MoEBlock(nn.Module):
             # per row and preserves ties), so a zero bias does not perturb routing.
             if self._bias_active:
                 sel = logits + self._route_bias
-                ranks = mx.argsort(mx.argsort(-sel, axis=-1), axis=-1)
             else:
-                # Rank each expert by descending prob (double argsort), keep ranks < k. A
-                # plain `probs >= kth` threshold would keep MORE than k experts on ties
-                # (e.g. uniform routing early in training), breaking the top_k contract and
-                # the active-FLOP count; ranking breaks ties by index so exactly k survive.
-                # (The biased branch above uses the same double argsort for the same
-                # reason.)
-                ranks = mx.argsort(mx.argsort(-probs, axis=-1), axis=-1)
+                sel = probs
+            order = mx.argsort(-sel, axis=-1)
+            ranks = mx.argsort(order, axis=-1)
             mask = ranks < k
-            gate = mx.where(mask, probs, mx.zeros_like(probs))
-            gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
             if self._count_loads:
                 # Per-expert load bookkeeping for the balancer: how many tokens (summed
                 # over every non-expert axis) this forward routed to each expert, detached
@@ -813,23 +845,22 @@ class MoEBlock(nn.Module):
                 # signal) and accumulated; `pop_load()` reads + resets it after the step.
                 # Counted only here, in the `k < E` branch: with `k == E` every expert takes
                 # every token and balancing is vacuous (no mask exists).
-                # Two known, benign inexactnesses:
-                #  * With `grad_checkpoint: true` each layer's forward is RECOMPUTED in
-                #    backward, so every count doubles (#213 D5). Both consumers are
-                #    invariant to a uniform positive scale — `update` uses
-                #    `sign(mean - load_i)` and `utilization_variance` normalizes to
-                #    fractions — and the recompute uses the same inputs and the same bias,
-                #    so the factor is exactly 2 for every expert of every MoE layer.
-                #  * On an fp16 overflow-skipped step `_accumulate_and_step` returns before
-                #    popping, so those counts carry into the next pop. Harmless: the update
-                #    is sign-based and the routing really did happen.
                 axes = tuple(range(mask.ndim - 1))
                 self._load_counts = self._load_counts + mx.stop_gradient(
                     mx.sum(mask.astype(mx.float32), axis=axes))
+            if self._use_gather:
+                topk_ids = mx.sort(order[..., :k], axis=-1)
+                flat_probs = probs.reshape(-1, E)
+                flat_ids = topk_ids.reshape(-1, k)
+                flat_gate = mx.take_along_axis(flat_probs, flat_ids, axis=-1)
+                flat_gate = flat_gate / mx.sum(flat_gate, axis=-1, keepdims=True)
+                y = self._moe_gather(xn, cd, topk_ids, flat_gate)
+            else:
+                gate = mx.where(mask, probs, mx.zeros_like(probs))
+                gate = gate / mx.sum(gate, axis=-1, keepdims=True)   # renormalize the kept gates
+                y = self._moe_dense(xn, cd, gate)
         else:
-            gate = probs                                          # softmax already sums to 1
-        outs = mx.stack([e(xn, cd) for e in self.experts], axis=-2)   # (..., E, d_model)
-        y = mx.sum(gate[..., None] * _f32(outs), axis=-2)    # combine in fp32
+            y = self._moe_dense(xn, cd, probs)            # softmax already sums to 1
         if self.shared_experts:
             # Additive, OUTSIDE the router softmax/top-k renormalization (DeepSeek-V2/V3
             # form): shared experts see every token and are never gated. Guarded by the
