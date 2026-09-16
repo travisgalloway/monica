@@ -149,9 +149,9 @@ def analytic_state_bytes(cfg, length: int) -> int:
     """
     from src.serve.sessions import per_session_state_bytes
 
-    if not cfg.attn_every:
+    if cfg.n_attention_layers == 0:
         return per_session_state_bytes(cfg, conservative_fp32=False)
-    n_attn_layers = cfg.n_layers // cfg.attn_every
+    n_attn_layers = cfg.n_attention_layers
     return n_attn_layers * 2 * cfg.n_attn_heads_resolved * cfg.attn_head_dim * length * 4
 
 

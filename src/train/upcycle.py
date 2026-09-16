@@ -48,7 +48,7 @@ from ..model.blocks import MambaConfig
 _MUST_MATCH = (
     "d_model", "n_layers", "d_state", "expand", "d_conv", "head_dim",
     "dt_rank_resolved", "d_inner", "n_heads", "vocab_size", "tie_embeddings",
-    "attn_every", "n_attn_heads_resolved", "moe_every", "moe_d_ff_resolved",
+    "attn_every", "attn_layers", "n_attn_heads_resolved", "moe_every", "moe_d_ff_resolved",
 )
 
 _EXPERT_LINS = ("gate", "up", "down")
@@ -86,6 +86,11 @@ def check_upcycle_compatible(src_cfg: MambaConfig, dst_cfg: MambaConfig) -> None
         sv, dv = getattr(src_cfg, name), getattr(dst_cfg, name)
         if sv != dv:
             mismatches.append((name, sv, dv))
+
+    src_attn = {i for i in range(src_cfg.n_layers) if src_cfg.is_attention_layer(i)}
+    dst_attn = {i for i in range(dst_cfg.n_layers) if dst_cfg.is_attention_layer(i)}
+    if src_attn != dst_attn:
+        mismatches.append(("attention_layer_indices", sorted(src_attn), sorted(dst_attn)))
 
     src_moe = {i for i in range(src_cfg.n_layers) if src_cfg.is_moe_layer(i)}
     dst_moe = {i for i in range(dst_cfg.n_layers) if dst_cfg.is_moe_layer(i)}

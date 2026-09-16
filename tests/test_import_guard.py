@@ -90,6 +90,7 @@ PORTABLE_MODULES = [
     "src.eval.olmes_adapter",
     "src.eval.bfcl_adapter",
     "src.eval.retrieval_probe",
+    "src.eval.ablation_sweep",
     "src.eval.probes",
     "src.eval.ts_error_eval",
     "src.eval.lsp_eval",
