@@ -34,9 +34,9 @@ public enum Checkpoint {
     /// `Quantization.apply` to reshape the fresh model's `Linear`/`Embedding` leaves
     /// into their quantized counterparts BEFORE `loadInto` — see that function's
     /// docstring for why the ordering is load-bearing.
-    public static func load(weights weightsURL: URL) throws -> (MonicaModel, Set<String>) {
+    public static func load(weights weightsURL: URL, config configOverride: MambaConfig? = nil) throws -> (MonicaModel, Set<String>) {
         let sidecar = URL(fileURLWithPath: weightsURL.path + ".config.json")
-        let config = try MambaConfig.load(sidecar: sidecar)
+        let config = try configOverride ?? MambaConfig.load(sidecar: sidecar)
         let model = try MonicaModel(config)
         let spec = try QuantSpec.load(sidecar: sidecar)
         let keys = try loadInto(model, weights: weightsURL, spec: spec)

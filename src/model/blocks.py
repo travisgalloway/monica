@@ -150,11 +150,10 @@ class MambaConfig:
     # 0 (default) = OFF, byte-identical to pre-#214 (no shared_experts params exist).
     n_shared_experts: int = 0
     # Expert-compute strategy: "auto" (default) picks dense when top_k >= n_experts or
-    # n_experts == 1, else a grouped-gather kernel (CUDA-only, #214); "dense" forces the
-    # evaluate-every-expert-then-mask path (both backends; the MLX/Swift reference
-    # implementation, so it stays available as the oracle gather is checked against);
-    # "gather" forces the grouped-gather kernel explicitly (CUDA-only — the MLX backend
-    # raises NotImplementedError rather than silently downgrading to dense).
+    # n_experts == 1, else a grouped-gather kernel (CUDA #214, MLX/Swift #328); "dense"
+    # forces the evaluate-every-expert-then-mask path (all backends; stays available as
+    # the reference oracle gather is checked against); "gather" forces the grouped-gather
+    # kernel explicitly.
     moe_impl: str = "auto"
     # fp8 expert GEMMs via NVIDIA Transformer Engine (#240), CUDA/Hopper-only. A separate
     # bool rather than a `precision` value: fp8 applies ONLY to the three expert linears

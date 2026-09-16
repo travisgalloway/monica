@@ -132,6 +132,7 @@ public struct MambaConfig: Decodable, Encodable, Equatable, Sendable {
     public var nExperts: Int = 0
     public var topK: Int = 2
     public var moeDFF: Int? = nil
+    public var moeImpl: String = "auto"
 
     // --- dt-projection bias init (LOAD-BEARING; see blocks.py:156-161) ---
     public var dtMin: Float = 1e-3
@@ -173,6 +174,7 @@ public struct MambaConfig: Decodable, Encodable, Equatable, Sendable {
         case nExperts = "n_experts"
         case topK = "top_k"
         case moeDFF = "moe_d_ff"
+        case moeImpl = "moe_impl"
         case dtMin = "dt_min"
         case dtMax = "dt_max"
         case dtInitFloor = "dt_init_floor"
@@ -229,6 +231,9 @@ public struct MambaConfig: Decodable, Encodable, Equatable, Sendable {
         if dModel <= 0 { throw ConfigError.invalid("d_model=\(dModel) must be >= 1") }
         if !["fp32", "fp16", "bf16"].contains(precision) {
             throw ConfigError.invalid("unknown precision '\(precision)'")
+        }
+        if !["auto", "dense", "gather"].contains(moeImpl) {
+            throw ConfigError.invalid("unknown moe_impl '\(moeImpl)' (expected one of auto, dense, gather)")
         }
         if dConv < 1 { throw ConfigError.invalid("d_conv must be >= 1") }
         if headDim <= 0 || dInner % headDim != 0 {

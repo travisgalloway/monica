@@ -273,23 +273,58 @@ def test_shared_experts_zero_is_byte_identical():
 
 
 @requires_mlx
-def test_moe_impl_gather_raises_on_mlx():
+def test_moe_impl_gather_supported_on_mlx():
+    """#328: moe_impl='gather' sparse routing is supported on MLX and matches dense."""
     from src.model.mlx_backend import MLXMambaModel
-    cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl="gather")
-    with pytest.raises(NotImplementedError):
-        MLXMambaModel(cfg)
-
-
-@requires_mlx
-def test_moe_impl_auto_and_dense_unchanged():
-    from src.model.mlx_backend import MLXMambaModel
-    for impl in ("auto", "dense"):
+    for impl in ("auto", "dense", "gather"):
         cfg = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl=impl)
         mx.random.seed(0)
         model = MLXMambaModel(cfg)
         tokens = mx.array(np.arange(32).reshape(1, 32) % 256)
         y = np.array(model.forward(tokens))
         assert np.all(np.isfinite(y))
+
+
+@requires_mlx
+def test_mlx_dense_vs_gather_parity():
+    """Bare MoEBlock dense vs gather numerical parity (#328)."""
+    from src.model.mlx_backend import MoEBlock
+    cfg_d = _cfg(d_model=64, n_experts=8, top_k=2, moe_impl="dense")
+    cfg_g = _cfg(d_model=64, n_experts=8, top_k=2, moe_impl="gather")
+    mx.random.seed(42)
+    bd = MoEBlock(cfg_d)
+    mx.random.seed(42)
+    bg = MoEBlock(cfg_g)
+
+    xn = mx.random.normal((3, 17, 64))
+    yd = np.array(bd._moe(xn))
+    yg = np.array(bg._moe(xn))
+    assert np.allclose(yd, yg, rtol=1e-5, atol=1e-6)
+
+    # With route bias
+    bias = [0.5, -1.0, 1.5, -2.0, 0.2, -0.3, 1.1, -0.8]
+    bd.set_route_bias(bias)
+    bg.set_route_bias(bias)
+    yd_bias = np.array(bd._moe(xn))
+    yg_bias = np.array(bg._moe(xn))
+    assert np.allclose(yd_bias, yg_bias, rtol=1e-5, atol=1e-6)
+
+
+@requires_mlx
+def test_mlx_dense_vs_gather_full_model_parity():
+    """Full MLXMambaModel dense vs gather numerical parity (#328)."""
+    from src.model.mlx_backend import MLXMambaModel
+    cfg_d = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl="dense")
+    cfg_g = _cfg(moe_every=2, n_experts=4, top_k=2, moe_impl="gather")
+    mx.random.seed(0)
+    md = MLXMambaModel(cfg_d)
+    mx.random.seed(0)
+    mg = MLXMambaModel(cfg_g)
+
+    tokens = mx.array(np.arange(32).reshape(2, 16) % 256)
+    yd = np.array(md.forward(tokens))
+    yg = np.array(mg.forward(tokens))
+    assert np.allclose(yd, yg, rtol=1e-4, atol=1e-5)
 
 
 # --------------------------------------------------------------------------- #
