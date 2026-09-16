@@ -4,6 +4,7 @@ gate — the shards compose with the existing tokenize/pack/split stages.
 Pure numpy + pyarrow (no backend). Skips cleanly where pyarrow is absent.
 """
 
+import json
 import subprocess
 import sys
 
@@ -89,3 +90,110 @@ def test_cli_dummy_then_tokenize_consumes_shards(tmp_path):
                         capture_output=True, text=True)
     assert r2.returncode == 0, r2.stderr
     assert packed.exists() and open_packed(packed).shape[0] > 0
+
+
+# --- MHM Training Corpus Sample Shards & Decontamination (#252) -----------------------
+
+def test_decontamination_eval_sets():
+    """Verify decontamination logic against both humaneval_ts and ts_error_injection eval sets."""
+    import json
+    from pathlib import Path
+    from src.data.dedup import Decontaminator
+
+    blocklist_path = Path(__file__).resolve().parents[1] / "eval_sets/decontam/blocklist.txt"
+    assert blocklist_path.exists(), f"missing decontamination blocklist: {blocklist_path}"
+
+    with open(blocklist_path, encoding="utf-8") as f:
+        decon = Decontaminator.from_texts(f)
+
+    # 1. Probe humaneval_ts: prompt from benchmark must be detected as contaminated
+    humaneval_path = Path(__file__).resolve().parents[1] / "eval_sets/humaneval_ts/humaneval_ts.jsonl"
+    assert humaneval_path.exists()
+    with open(humaneval_path, encoding="utf-8") as f:
+        h_row = json.loads(f.readline())
+    assert decon.contaminated(h_row["prompt"]), "humaneval_ts benchmark prompt was not flagged contaminated"
+
+    # 2. Probe ts_error_injection: prompt from benchmark must be detected as contaminated
+    ts_error_path = Path(__file__).resolve().parents[1] / "eval_sets/ts_error_injection/eval.jsonl"
+    assert ts_error_path.exists()
+    with open(ts_error_path, encoding="utf-8") as f:
+        ts_row = json.loads(f.readline())
+    assert decon.contaminated(ts_row["prompt"]), "ts_error_injection prompt was not flagged contaminated"
+
+    # 3. Clean synthetic code must pass uncontaminated
+    clean_code = "export function multiplyByTwo(val: number): number { return val * 2; }\n"
+    assert not decon.contaminated(clean_code), "clean code was falsely flagged as contaminated"
+
+
+def test_mhm_sample_shards_layout_and_loader():
+    """Verify that sample shards match src/data/shard.py layout and are readable by PackedLoader."""
+    from pathlib import Path
+    from src.data.shard import open_shard, read_manifest
+
+    shards_dir = Path(__file__).resolve().parents[1] / "data/mhm_sample_shards"
+    if not (shards_dir / "manifest.json").exists():
+        pytest.skip("data/mhm_sample_shards not generated yet; run scripts/build_corpus.py --pack")
+
+    manifest = read_manifest(shards_dir)
+
+    # Schema & layout assertions
+    assert manifest["dtype"] == "uint16"
+    assert manifest["tokenizer"] == "code"
+    assert manifest["seq_len"] > 0
+    assert manifest["n_tokens"] > 0
+    assert manifest["n_documents"] > 0
+    assert manifest["n_sequences"] > 0
+    assert len(manifest["shards"]) >= 1
+
+    # Manifest records per-language mix and filter rate (#252 acceptance)
+    assert "language_mix" in manifest and len(manifest["language_mix"]) > 0
+    assert "filter_rate" in manifest
+    assert "drop_rate" in manifest["filter_rate"]
+    assert "decontamination" in manifest
+    assert manifest["decontamination"]["applied"] is True
+
+    # Shard binary and boundary files match
+    first_shard = manifest["shards"][0]["name"]
+    toks, bnds = open_shard(shards_dir, first_shard)
+    assert toks.dtype == np.uint16
+    assert bnds.dtype == np.uint8
+    assert len(toks) == len(bnds)
+    assert len(toks) == manifest["shards"][0]["n_tokens"]
+
+    # PackedLoader directly consumes shard without code changes
+    loader = PackedLoader(shards_dir / f"{first_shard}.bin",
+                          seq_len=manifest["seq_len"], batch_size=2, shuffle=False)
+    inputs, targets = next(iter(loader.epoch()))
+    assert inputs.shape == (2, manifest["seq_len"])
+    assert targets.shape == (2, manifest["seq_len"])
+
+
+def test_mhm_sample_shards_split_val_tokens(tmp_path):
+    """Verify split_shards carves out a val split readable by PackedLoader."""
+    from pathlib import Path
+    from src.data.shard import pack_sequences
+    from src.data.split import split_shards
+
+    # Create a small multi-shard test corpus if data/mhm_sample_shards is not present
+    shards_dir = Path(__file__).resolve().parents[1] / "data/mhm_sample_shards"
+    if not (shards_dir / "manifest.json").exists():
+        shards_dir = tmp_path / "shards"
+        docs = [[i % 1000 + 1 for i in range(256)] for _ in range(8)]
+        pack_sequences(docs, shards_dir, seq_len=64, shard_size_mb=1, tokenizer="code")
+
+    split_dir = tmp_path / "split"
+    val_tokens = 512
+    tr_path, va_path = split_shards(shards_dir, split_dir, val_tokens=val_tokens)
+
+    assert tr_path.exists() and va_path.exists()
+    assert (split_dir / "val.meta.json").exists()
+
+    val_meta = json.loads((split_dir / "val.meta.json").read_text())
+    assert val_meta["n_tokens"] == val_tokens
+
+    # Both train and val are readable by PackedLoader
+    tr_loader = PackedLoader(tr_path, seq_len=64, batch_size=2, shuffle=False)
+    va_loader = PackedLoader(va_path, seq_len=64, batch_size=2, shuffle=False)
+    t_in, t_tgt = next(iter(tr_loader.epoch()))
+    v_in, v_tgt = next(iter(va_loader.epoch()))
+    assert t_in.shape == (2, 64) and v_in.shape == (2, 64)

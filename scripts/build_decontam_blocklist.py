@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 #: The largest n-gram `Decontaminator` uses. A text shorter than this yields no n-gram of
 #: that size, so it can never match — keeping it would only inflate the file.
