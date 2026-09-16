@@ -139,10 +139,24 @@ def fineweb_edu_reader(*, limit: int = -1, streaming: bool = True, split: str = 
     )
 
 
+def jsonl_reader(path, *, limit: int = -1, text_key: str = "text",
+                 id_key: str = "id", default_metadata: dict | None = None):
+    """A datatrove reader over a local JSONL file or directory of JSONL files."""
+    from datatrove.pipeline.readers import JsonlReader
+    return JsonlReader(
+        data_folder=str(path),
+        limit=limit,
+        text_key=text_key,
+        id_key=id_key,
+        default_metadata=default_metadata,
+    )
+
+
 def clean_pipeline(reader, out_uri, *, quality: bool = False, license_filter: bool = False,
                    drop_minified: bool = False, drop_autogen: bool = False, scrub: bool = False,
                    decontaminator=None, thresholds: QualityThresholds = DEFAULT_THRESHOLDS,
-                   output_filename: str = "${rank}.jsonl.gz") -> list:
+                   output_filename: str = "${rank}.jsonl.gz",
+                   compression: str | None = "gzip") -> list:
     """Stages 2–5 as a datatrove pipeline: reader -> enabled filters/scrub -> cleaned JSONL shards
     under `<out_uri>/cleaned`. `out_uri` is a `storage.py` class root (`file://` local,
     `s3://monica-training/...` on a pod). Filters are opt-in, mirroring `corpus.build_corpus`."""
@@ -161,7 +175,8 @@ def clean_pipeline(reader, out_uri, *, quality: bool = False, license_filter: bo
     if scrub:
         steps.append(blocks["SecretScrubber"]())
     cleaned_dir = f"{str(out_uri).rstrip('/')}/cleaned"
-    steps.append(JsonlWriter(output_folder=_folder(cleaned_dir), output_filename=output_filename))
+    steps.append(JsonlWriter(output_folder=_folder(cleaned_dir), output_filename=output_filename,
+                             compression=compression))
     return steps
 
 

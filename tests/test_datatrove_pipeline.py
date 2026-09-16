@@ -10,6 +10,7 @@ absent in the main py3.14 env, so this whole module skips there and runs in the 
 import glob
 import gzip
 import json
+from pathlib import Path
 
 import pytest
 
@@ -98,3 +99,79 @@ def test_minhash_dedup_removes_duplicate(tmp_path):
     out = _read_out(f"{tmp_path}/dd/deduplicated")
     ids = {d["id"] for d in out}
     assert len(out) == 2 and "c" in ids           # one of the identical pair removed, distinct kept
+
+def test_run_corpus_pipeline_sample_end_to_end(tmp_path):
+    """End-to-end integration test: clean -> decontam -> scrub -> pack -> split (#252)."""
+    from scripts.build_corpus import run_corpus_pipeline
+    from src.data.loader import PackedLoader
+    from src.data.shard import open_shard, read_manifest
+
+    # Read a real contaminated prompt from humaneval_ts fixture
+    humaneval_path = Path(__file__).resolve().parents[1] / "eval_sets/humaneval_ts/humaneval_ts.jsonl"
+    with open(humaneval_path, encoding="utf-8") as f:
+        contam_prompt = json.loads(f.readline())["prompt"]
+
+    sample_file = tmp_path / "sample.jsonl"
+    docs = [
+        {"text": GOOD, "id": "good_en", "metadata": {"lang": "en", "license": "odc-by"}},
+        {"text": "export function computeHypotenuseLength(legAlpha: number, legBeta: number): number { return Math.hypot(legAlpha, legBeta); }\n" * 10,
+         "id": "good_ts", "metadata": {"lang": "typescript", "license": "mit", "is_code": True}},
+        {"text": contam_prompt, "id": "contam",
+         "metadata": {"lang": "typescript", "license": "mit", "is_code": True}},
+        {"text": "$$$ ### %%% @@@ &&& *** !!! " * 10, "id": "junk",
+         "metadata": {"lang": "en", "license": "odc-by"}},
+        {"text": SECRET, "id": "secret_en", "metadata": {"lang": "en", "license": "odc-by"}},
+    ]
+    with open(sample_file, "w", encoding="utf-8") as f:
+        for d in docs:
+            f.write(json.dumps(d) + "\n")
+
+    out_dir = tmp_path / "clean_out"
+    shards_dir = tmp_path / "shards_out"
+
+    res = run_corpus_pipeline(
+        source="jsonl",
+        from_jsonl=sample_file,
+        out_dir=out_dir,
+        quality=True,
+        license_filter=True,
+        scrub=True,
+        decontam=True,
+        pack=True,
+        shards_out=shards_dir,
+        seq_len=64,
+        val_tokens=128,
+    )
+
+    # 1. Verification of filter and decontam results
+    assert res["filter_rate"]["n_source"] == 5
+    assert res["filter_rate"]["n_cleaned"] == 3   # junk and contam dropped
+    assert res["decontamination"]["applied"] is True
+
+    # 2. Verification of language mix in manifest
+    assert "language_mix" in res
+    assert "en" in res["language_mix"]
+    assert "typescript" in res["language_mix"]
+
+    # 3. Verification of packed shards layout and reading via PackedLoader
+    manifest = read_manifest(shards_dir)
+    assert manifest["dtype"] == "uint16"
+    assert manifest["seq_len"] == 64
+    assert manifest["n_tokens"] >= 64
+    assert len(manifest["shards"]) >= 1
+
+    toks, bnds = open_shard(shards_dir, manifest["shards"][0]["name"])
+    assert toks.dtype == "uint16"
+    assert bnds.dtype == "uint8"
+
+    loader = PackedLoader(shards_dir / f"{manifest['shards'][0]['name']}.bin",
+                          seq_len=64, batch_size=1, shuffle=False)
+    batch_in, batch_tgt = next(iter(loader.epoch()))
+    assert batch_in.shape == (1, 64) and batch_tgt.shape == (1, 64)
+
+    # 4. Verification of validation split
+    assert "split" in res
+    tr_loader = PackedLoader(Path(res["split"]["train_bin"]), seq_len=64, batch_size=1, shuffle=False)
+    va_loader = PackedLoader(Path(res["split"]["val_bin"]), seq_len=64, batch_size=1, shuffle=False)
+    assert len(tr_loader) >= 1
+    assert len(va_loader) >= 1
