@@ -35,6 +35,8 @@ def generate(
     on_token: Optional[Callable[[int], None]] = None,
     pass_context: bool = False,
     prefill: bool = True,
+    sampler_hook: Optional[Callable[..., Optional[np.ndarray]] | Sequence[Callable[..., Optional[np.ndarray]]]] = None,
+    sampler_hooks: Optional[Sequence[Callable[..., Optional[np.ndarray]]]] = None,
 ) -> List[int]:
     """Generate up to `max_new_tokens` continuation ids for `session_id`.
 
@@ -62,6 +64,12 @@ def generate(
     `pass_context=True` calls `sampler(logits, previous_tokens=prompt + generated)` so a
     repetition-aware sampler can penalize already-emitted tokens; the default keeps the
     bare `sampler(logits)` contract the lm-eval adapter relies on.
+
+    `sampler_hook` / `sampler_hooks` (#200): optional callback(s) executed before each
+    sampling step. Each hook receives `(logits, previous_tokens=...)` if `pass_context`
+    is True, or `(logits)`. If a hook returns a non-None array, it replaces the logits
+    for subsequent hooks and the sampler; returning None leaves logits untouched
+    (observational/telemetry hook).
     """
     if len(prompt_ids) == 0:
         raise ValueError("prompt_ids must be non-empty")
@@ -73,11 +81,33 @@ def generate(
         for tok_id in prompt:
             logits = store.step(session_id, tok_id)
 
+    hooks: List[Callable] = []
+    if sampler_hook is not None:
+        if isinstance(sampler_hook, Sequence) and not isinstance(sampler_hook, (str, bytes)):
+            hooks.extend(sampler_hook)
+        else:
+            hooks.append(sampler_hook)
+    if sampler_hooks is not None:
+        hooks.extend(sampler_hooks)
+
     generated: List[int] = []
     for _ in range(max_new_tokens):
         row = to_numpy(logits)[0]  # (1, vocab) -> (vocab,)
-        nxt = sampler(row, previous_tokens=prompt + generated) if pass_context \
-            else sampler(row)
+        for hook in hooks:
+            ctx = prompt + generated
+            try:
+                mod = hook(row, previous_tokens=ctx) if pass_context else hook(row)
+            except TypeError:
+                mod = hook(row)
+            if mod is not None:
+                row = np.asarray(mod)
+        if pass_context:
+            try:
+                nxt = sampler(row, previous_tokens=prompt + generated)
+            except TypeError:
+                nxt = sampler(row)
+        else:
+            nxt = sampler(row)
         if eos_id is not None and nxt == eos_id:
             break
         generated.append(nxt)
@@ -90,3 +120,6 @@ def generate(
             break
 
     return generated
+
+
+custom_generate = generate

@@ -447,3 +447,57 @@ def test_resume_beats_init(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "[init] IGNORED" in out
     assert "[resume] from step 1" in out
+
+
+# --------------------------------------------------------------------------- #
+# code-small-dense upcycle compatibility & dry-run (#200)
+# --------------------------------------------------------------------------- #
+def test_check_upcycle_compatible_accepts_code_small_dense_with_targets():
+    src_cfg = load_config(str(REPO_ROOT / "config/code-small-dense.yaml"))
+    moe_cfg = load_config(str(REPO_ROOT / "config/code-small-moe.yaml"))
+    large_cfg = load_config(str(REPO_ROOT / "config/code-large-a.yaml"))
+    check_upcycle_compatible(src_cfg, moe_cfg)
+    check_upcycle_compatible(src_cfg, large_cfg)
+
+
+def test_upcycle_dry_run_cli_code_small_dense(tmp_path, monkeypatch, capsys):
+    """acceptance test for #200: scripts/upcycle.py --src <ckpt> --config <target> --dry-run
+    exits cleanly against the intended targets."""
+    spec = importlib.util.spec_from_file_location("_scripts_upcycle",
+                                                   REPO_ROOT / "scripts/upcycle.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+
+    src_cfg = load_config(str(REPO_ROOT / "config/code-small-dense.yaml"))
+    fake_ckpt = tmp_path / "dense_weights.safetensors"
+    save_weights({}, str(fake_ckpt), config=src_cfg)
+
+    # Test against #222 target (code-small-moe.yaml)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["upcycle.py", "--src", str(fake_ckpt),
+         "--config", str(REPO_ROOT / "config/code-small-moe.yaml"),
+         "--out", str(tmp_path / "upcycled.safetensors"),
+         "--seed", "200", "--dry-run"]
+    )
+    mod.main()
+    out = capsys.readouterr().out
+    assert "--dry-run: exiting before reading --src or writing --out" in out
+    assert "experts per MoE layer: 1 -> 8" in out
+
+    # Test against #223 target (code-large-a.yaml)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["upcycle.py", "--src", str(fake_ckpt),
+         "--config", str(REPO_ROOT / "config/code-large-a.yaml"),
+         "--out", str(tmp_path / "upcycled.safetensors"),
+         "--seed", "200", "--dry-run"]
+    )
+    mod.main()
+    out = capsys.readouterr().out
+    assert "--dry-run: exiting before reading --src or writing --out" in out
+    assert "experts per MoE layer: 1 -> 64" in out

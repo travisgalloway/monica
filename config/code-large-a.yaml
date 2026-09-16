@@ -1,0 +1,45 @@
+# Sparse-upcycle TARGET config for #223 (Large A, ~3.88B total / 710M active):
+# Upcycled from config/code-small-dense.yaml (#200's dense checkpoint) via scripts/upcycle.py.
+# Dimensions resolved by #272 (2026-08-09): re-shaped to d_model 768, 56 layers,
+# moe_every 3, 64 experts top-8 + 1 shared expert, moe_d_ff = d_inner (1536).
+#
+# IDENTICAL to config/code-small-dense.yaml in EVERY dimension check_upcycle_compatible
+# requires to match:
+#   (d_model, n_layers, d_state, expand, d_conv, head_dim, dt_rank_resolved, d_inner,
+#    n_heads, vocab_size, tie_embeddings, attn_every, n_attn_heads_resolved,
+#    moe_every, moe_d_ff_resolved)
+# ONLY n_experts, top_k, n_shared_experts, and moe_balance_rate differ.
+
+d_model: 768           # d_inner = expand * d_model = 1536
+n_layers: 56           # 56 % 8 == 0 (7 attention layers, final block is attention)
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 1536
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 1536/64 = 24 heads (scalar A per head)
+dt_rank: auto
+
+# Hybrid attention: every 8th layer is full attention (7 attention layers, 12.5%)
+attn_every: 8
+n_attn_heads: null     # d_model // 64 = 12 attention heads
+
+# Sparse MoE: every 3rd layer is MoE (16 MoE layers, 33 Mamba survive)
+moe_every: 3
+n_experts: 64          # Large A: 64 routed experts
+top_k: 8               # top-8 routing per token
+n_shared_experts: 1    # 1 shared expert (DeepSeek-V2/V3 form)
+moe_d_ff: 1536         # full width = d_inner (MUST match code-small-dense.yaml)
+moe_balance_rate: 0.001 # Loss-Free-Balancing active
+
+# Native cross-platform Swift tokenizer (#191/#245/#251, uint16 packing)
+vocab_size: 49152
+seq_len: 2048
+tie_embeddings: true
+
+precision: fp32
+chunk_size: null
+grad_checkpoint: true
+
+# dt-projection bias init (load-bearing — identical across the config family)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
