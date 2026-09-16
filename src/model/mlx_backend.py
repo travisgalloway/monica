@@ -31,6 +31,12 @@ import numpy as np
 
 from .blocks import MambaConfig
 from .interface import ModelInterface, State, Array
+from .metal_kernels import (
+    is_metal_fast_available,
+    fused_chunked_ssd_scan,
+    fused_conv_step,
+    fused_ssm_recurrence,
+)
 
 
 def _silu(x: Array) -> Array:
@@ -196,7 +202,8 @@ class SelectiveSSM(nn.Module):
         return delta, a, B, C
 
     def parallel(self, x: Array, seg_ids: Array = None, *,
-                 return_state: bool = False) -> Array | Tuple[Array, Array]:
+                 return_state: bool = False,
+                 fused: bool | None = None) -> Array | Tuple[Array, Array]:
         """SSD chunked-matmul scan. x: (B, L, d_inner) -> (B, L, d_inner).
 
         Pads L up to a multiple of the chunk length Q (padded steps carry zero
@@ -243,6 +250,22 @@ class SelectiveSSM(nn.Module):
         Bc = Bm.reshape(B_, nc, Q, N)
         Cc = Cm.reshape(B_, nc, Q, N)
         Acum = mx.cumsum(gc, axis=-1)                        # (B,H,nc,Q)
+
+        # Fused Metal fast path (#171)
+        if fused is None:
+            # return_state=True is the prefill inference path (#165, no backward).
+            # Training forward_seq uses generic ops unless fused=True is requested
+            # because mx.fast.metal_kernel has no autodiff VJP.
+            use_fused = return_state and is_metal_fast_available()
+        else:
+            use_fused = fused and is_metal_fast_available()
+        if use_fused:
+            seg_mask = _chunk_seg_mask(seg_ids, B_, Q, nc, pad) if seg_ids is not None else None
+            return fused_chunked_ssd_scan(
+                Xc=Xc, Bc=Bc, Cc=Cc, gc=gc, Acum=Acum, X=X, D=self.D,
+                B=B_, L=L, Lp=Lp, nc=nc, H=H, P=P, Q=Q, N=N, d_inner=d_inner,
+                cd=cd, seg_mask=seg_mask, return_state=return_state, segsum_fn=_segsum,
+            )
 
         # 1) intra-chunk diagonal block (attention-like, within each chunk)
         Lmask = mx.exp(_segsum(gc))                          # (B,H,nc,Q,Q)
@@ -297,13 +320,19 @@ class SelectiveSSM(nn.Module):
         eye = mx.eye(L, dtype=M.dtype)
         return M + self.D[None, :, None, None] * eye[None, None]     # + D skip on the diagonal
 
-    def recurrence(self, x: Array, state: State) -> Tuple[Array, State]:
+    def recurrence(self, x: Array, state: State, *,
+                   fused: bool | None = None) -> Tuple[Array, State]:
         """One timestep. x: (B, d_inner), state h: (B, H, P, N) -> y: (B, d_inner)."""
         B_ = x.shape[0]
-        H, P = self.config.n_heads, self.config.head_dim
+        H, P, N = self.config.n_heads, self.config.head_dim, self.config.d_state
         cd = _DTYPES[self.config.precision]
         delta, a, Bm, Cm = self._project(x)        # delta (B,H); Bm,Cm (B,N) — fp32
         Xh = _f32(x).reshape(B_, H, P)             # scan + state stay fp32
+
+        use_fused = (fused if fused is not None else is_metal_fast_available())
+        if use_fused:
+            return fused_ssm_recurrence(state, delta, a, Xh, Bm, Cm, self.D, B_, H, P, N, cd)
+
         dA = mx.exp(delta * a)                      # (B,H)
         dBx = (delta[..., None] * Xh)[..., None] * Bm[:, None, None, :]  # (B,H,P,N)
         h = dA[:, :, None, None] * state + dBx      # (B,H,P,N) — fp32 state
@@ -418,7 +447,7 @@ class MambaBlock(nn.Module):
         xn = self.norm(x)
         x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)   # (B,L,di) each
         xc = _silu(self._conv_seq(x_main, cd)[:, :L])
-        y, ssm_state = self.ssm.parallel(xc, seg_ids, return_state=True)
+        y, ssm_state = self.ssm.parallel(xc, seg_ids, return_state=True, fused=True)
         y = y * _silu(z)
         out = x + _linear(self.out_proj, y, cd)
         return out, (_conv_window(x_main, self.config.d_conv), ssm_state)
@@ -434,11 +463,26 @@ class MambaBlock(nn.Module):
         xc = _silu(self._conv_seq(x_main, cd)[:, :L])
         return self.ssm.mixing_matrix(xc)
 
-    def step(self, x: Array, state: State) -> Tuple[Array, State]:
+    def step(self, x: Array, state: State, *,
+             fused: bool | None = None) -> Tuple[Array, State]:
         conv_state, ssm_state = state                        # (B,k-1,di), (B,di,ds)
         cd = _DTYPES[self.config.precision]
         xn = self.norm(x)
         x_main, z = mx.split(_linear(self.in_proj, xn, cd), 2, axis=-1)    # (B,di) each
+
+        use_fused = (fused if fused is not None else is_metal_fast_available())
+        if use_fused:
+            B_ = x.shape[0]
+            wk = self.conv.weight[:, :, 0].T
+            bias = self.conv.bias
+            xc, new_conv = fused_conv_step(
+                conv_state, x_main, wk, bias, B_, self.config.d_inner, self.config.d_conv
+            )
+            y, new_ssm = self.ssm.recurrence(xc, ssm_state, fused=True)
+            y = y * _silu(z)
+            out = x + _linear(self.out_proj, y, cd)
+            return out, (new_conv, new_ssm)
+
         window = mx.concatenate([conv_state, x_main[:, None, :]], axis=1)  # (B,k,di)
         # depthwise conv at this timestep: sum over kernel positions (in cd to match
         # the conv in forward_seq; cast no-ops for fp32).
@@ -446,7 +490,7 @@ class MambaBlock(nn.Module):
         conv_out = (mx.sum(window.astype(cd) * wk.astype(cd)[None], axis=1)
                     + self.conv.bias.astype(cd))              # (B, di)
         xc = _silu(conv_out)
-        y, new_ssm = self.ssm.recurrence(xc, ssm_state)
+        y, new_ssm = self.ssm.recurrence(xc, ssm_state, fused=False)
         y = y * _silu(z)
         out = x + _linear(self.out_proj, y, cd)
         return out, (window[:, 1:], new_ssm)
