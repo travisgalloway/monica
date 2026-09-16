@@ -540,7 +540,7 @@ class MambaBlock(nn.Module):
             acc = torch.zeros((B_, L, x.shape[-1]), dtype=cd, device=x.device)
         return acc + c.bias.to(cd)
 
-    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+    def forward(self, x: Array, seg_ids: Array = None) -> Array:
         L = x.shape[1]
         cd = _DTYPES[self.config.precision]
         xn = self.norm(x)
@@ -555,6 +555,8 @@ class MambaBlock(nn.Module):
         y = self.ssm.parallel(xc, seg_ids)
         y = y * _silu(z)
         return x + _linear(self.out_proj, y, cd)
+
+    forward_seq = forward
 
     def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
         """`forward_seq` plus the (conv_state, ssm_state) pair `step` would have left (#165)
@@ -657,7 +659,7 @@ class AttentionBlock(nn.Module):
             return _f32(t).reshape(B, T, self.H, self.Dh).permute(0, 2, 1, 3)
         return heads(q), heads(k), heads(v)
 
-    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+    def forward(self, x: Array, seg_ids: Array = None) -> Array:
         cd = _DTYPES[self.config.precision]
         L = x.shape[1]
         xn = self.norm(x)
@@ -684,6 +686,8 @@ class AttentionBlock(nn.Module):
                 q, k, v, attn_mask=allow[:, None], scale=scale)      # (B,H,L,Dh)
         out = out.permute(0, 2, 1, 3).reshape(x.shape[0], L, self.H * self.Dh)
         return x + _linear(self.o_proj, _cast(out, cd), cd)
+
+    forward_seq = forward
 
     def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
         """`forward_seq` plus the (k_cache, v_cache) pair `step` would have built (#165).
@@ -1110,8 +1114,10 @@ class MoEBlock(nn.Module):
                 y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
         return _cast(y, cd)
 
-    def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+    def forward(self, x: Array, seg_ids: Array = None) -> Array:
         return x + self._moe(self.norm(x))                   # pointwise: seg_ids irrelevant
+
+    forward_seq = forward
 
     def forward_prefill(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
         # Stateless: emit the SAME placeholder pair `init_state` builds for a MoE layer.
@@ -1197,29 +1203,18 @@ class CUDAMambaModel(ModelInterface, nn.Module):
 
     @staticmethod
     def _fsdp_unshard(module) -> None:
-        """FSDP2 (#271) hazard, discovered on this host: `fully_shard` unshards a
-        wrapped module's params via a forward PRE-HOOK registered on `nn.Module.
-        __call__`. This model's block API (`forward_seq`/`step`/`forward_prefill`) is
-        invoked directly on the layer object, never through `layer(...)`/`__call__` —
-        by design, so `forward` and `step` can share the exact same underlying compute
-        without an nn.Module dispatch layer in between (see the module docstring's
-        SSD/train-infer-parity note). That means FSDP2's unshard hook never fires, and
-        a sharded DTensor param hits an op against a plain (unsharded) activation:
-        `RuntimeError: aten.mul.Tensor got mixed torch.Tensor and DTensor` — reproduced
-        in-session with a 2-rank gloo run (`tests/test_cuda_distributed.py`'s V6).
+        """FSDP2 (#271/#288) helper: `fully_shard` unshards a wrapped module's params via
+        forward pre-hooks registered on `nn.Module.__call__`. Under #288, the model's block
+        sequence passes through standard `forward()` / `__call__` invocations (both in eager
+        execution and under `torch.utils.checkpoint`), allowing FSDP2's auto-unshard and
+        auto-reshard hooks to cycle per-layer parameters automatically.
 
-        Calling `.unshard()` explicitly, right before any DIRECT (non-`__call__`)
-        access to a `fully_shard`-wrapped module's params, fixes it. Deliberately does
-        NOT call the matching `.reshard()` afterward — under `grad_checkpoint`, the
-        SAME direct call recomputes in backward, by which point a paired reshard would
-        have already re-sharded the params out from under that recompute. Leaving
-        params materialized (relying on the NEXT `unshard()` to be a cheap no-op, or on
-        FSDP2's own end-of-backward reshard) trades peak memory for correctness here —
-        the actual memory-reclaim timing under this codebase's direct-dispatch
-        convention is UNRESOLVED and left as a CUDA-host follow-up (see
-        `cuda_distributed.wrap_backbone`'s docstring), not claimed as solved by this
-        method. A plain (non-FSDP) module has no `.unshard` attribute, so this is a
-        strict no-op at world_size == 1 — unchanged from every pre-#271 call site.
+        For direct non-`__call__` access to `fully_shard`-wrapped parameters outside the
+        standard block sequence — specifically `_head`'s tied-embedding weight transpose
+        matmul (`h @ self.embedding.weight.t()`), and the stateful inference methods
+        `prefill` and `step` which bypass `__call__` — explicit `.unshard()` is still
+        required to materialize sharded DTensors into full tensors. A plain (non-FSDP) module
+        has no `.unshard` attribute, so this is a strict no-op at world_size == 1.
         """
         unshard = getattr(module, "unshard", None)
         if unshard is not None:
@@ -1237,12 +1232,14 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             return h @ self.embedding.weight.t()
         return self.lm_head(h)
 
-    def _layer_forward(self, layer: "MambaBlock | AttentionBlock", h: Array,
+    def _layer_forward(self, layer: "MambaBlock | AttentionBlock | MoEBlock", h: Array,
                        seg_ids: Array = None) -> Array:
         # Gradient checkpointing: recompute the layer's forward in backward instead of
         # retaining its activations. Only meaningful under autograd; use_reentrant=False
         # runs normally in no-grad (eval/parity) contexts.
-        self._fsdp_unshard(layer)
+        # Calling layer through __call__ (rather than .forward_seq) triggers FSDP2's (#271/#288)
+        # pre-forward and post-forward hooks automatically, cleanly cycling unshard and
+        # reshard states per block during both forward and backward recomputation.
         if self.config.grad_checkpoint and torch.is_grad_enabled():
             if self.config.fp8_experts and fp8_status() and isinstance(layer, MoEBlock):
                 # `transformer_engine.pytorch.checkpoint`, NOT `torch.utils.checkpoint`
@@ -1256,12 +1253,14 @@ class CUDAMambaModel(ModelInterface, nn.Module):
                 # below, matching `MoEBlock._fp8_ctx`'s own fp8_status() gate.
                 import transformer_engine.pytorch as te
                 if seg_ids is None:
-                    return te.checkpoint(layer.forward_seq, h)
-                return te.checkpoint(layer.forward_seq, h, seg_ids)
+                    return te.checkpoint(layer, h)
+                return te.checkpoint(layer, h, seg_ids)
             if seg_ids is None:
-                return _checkpoint(layer.forward_seq, h, use_reentrant=False)
-            return _checkpoint(layer.forward_seq, h, seg_ids, use_reentrant=False)
-        return layer.forward_seq(h, seg_ids)
+                return _checkpoint(layer, h, use_reentrant=False)
+            return _checkpoint(layer, h, seg_ids, use_reentrant=False)
+        if seg_ids is None:
+            return layer(h)
+        return layer(h, seg_ids)
 
     def _forward_compute(self, h: Array, seg: Array = None) -> Array:
         """Pure-tensor forward (layer loop + final norm + head) — the region torch.compile

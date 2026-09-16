@@ -414,13 +414,11 @@ Verification section for the full state table; none of this is CI-testable):**
 - [ ] **Bit-exact resume at a FIXED world size > 1 under NCCL** — the smoke gate's multi-GPU
       analogue; `tests/test_cuda_distributed.py`'s V8 proves the DCP reshard mechanism works on
       gloo/CPU, not that it is bit-exact under real NCCL collectives.
-- [ ] **The `fully_shard`-bypasses-`__call__` workaround** (`CUDAMambaModel._fsdp_unshard`, see
-      its docstring) under `grad_checkpoint: true` — the gloo-sim tests deliberately run with
-      `grad_checkpoint: false` (the recompute-in-backward path is a documented, UNRESOLVED gap:
-      the checkpointed recompute calls `layer.forward_seq` directly, bypassing the `unshard()`
-      call `_layer_forward` does on the FIRST pass). Do not enable `grad_checkpoint` with FSDP2
-      until this is fixed and verified — it will crash with the same "mixed Tensor and DTensor"
-      error V6 originally hit.
+- [x] **The `fully_shard`-bypasses-`__call__` workaround resolved (#288)** — refactored block
+      invocation to standard `forward()` protocol so `__call__` hooks fire automatically.
+      FSDP2 unshard and reshard cycle per-layer properly under `grad_checkpoint: true`
+      (verified in `tests/test_cuda_distributed.py` V6b with 2-rank gloo loss parity and
+      DTensor reshard checks).
 
 ### Manual verification: 8-bit optimizer + fp8 experts (#214)
 
