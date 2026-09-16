@@ -33,10 +33,8 @@ tie_embeddings: true
 
 precision: fp32
 chunk_size: null
-grad_checkpoint: false   # #271: the direct forward_seq/step dispatch (see
-                         # cuda_backend.py's _fsdp_unshard docstring) does not yet
-                         # compose with grad_checkpoint's recompute under FSDP2 —
-                         # CUDA-host follow-up, keep off here.
+grad_checkpoint: false   # #271/#288: standard forward() protocol composes with FSDP2
+                         # (verified with 2-rank gloo test_v6b). Default false for toy runs.
 
 dt_min: 0.001
 dt_max: 0.1

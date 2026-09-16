@@ -213,6 +213,85 @@ def test_v6_fsdp_backbone_shards_params_and_trains(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# V6b — FSDP2 + gradient checkpointing (#288):
+# 1. Block invocations through __call__ automatically trigger FSDP2 unshard/reshard.
+# 2. Parameters are correctly resharded between layers during forward and recomputation.
+# 3. 2-rank gloo step with grad_checkpoint: true passes loss parity with fp32 tolerance.
+# --------------------------------------------------------------------------- #
+def _v6b_worker(rank, world_size, tmp_path):
+    from src.model.cuda_distributed import build_mesh, wrap_backbone
+    from torch.distributed.tensor import DTensor
+
+    torch.manual_seed(0)
+    tokens = np.random.default_rng(0).integers(0, 64, size=(2, 8)).astype(np.int32)
+
+    # 1. Baseline model without checkpointing
+    torch.manual_seed(42)
+    cfg_no_ckpt = _cfg(moe_every=None, n_layers=2, grad_checkpoint=False)
+    model_no_ckpt = CUDAMambaModel(cfg_no_ckpt, ep_size=1, ep_rank=0)
+    init_weights = {k: v.clone() for k, v in model_no_ckpt.state_dict().items()}
+    mesh = build_mesh(dp_size=world_size, ep_size=1)
+    wrap_backbone(model_no_ckpt, mesh["dp"], reshard_after_forward=True)
+
+    logits_no_ckpt = model_no_ckpt.forward(tokens)
+    loss_no_ckpt = logits_no_ckpt.float().sum()
+    loss_no_ckpt.backward()
+
+    # 2. Checkpointed model with grad_checkpoint=True
+    torch.manual_seed(42)
+    cfg_ckpt = _cfg(moe_every=None, n_layers=2, grad_checkpoint=True)
+    model_ckpt = CUDAMambaModel(cfg_ckpt, ep_size=1, ep_rank=0)
+    model_ckpt.load_state_dict(init_weights)
+    wrap_backbone(model_ckpt, mesh["dp"], reshard_after_forward=True)
+
+    # Pre-forward hook on layer 1: verify that when layer 1 executes, layer 0's parameters
+    # have already been resharded back to DTensor (verifying per-layer unshard/reshard cycle).
+    layer0_resharded_states = []
+    def check_layer0_resharded(module, args):
+        p0 = model_ckpt.layers[0].in_proj.weight
+        layer0_resharded_states.append(isinstance(p0, DTensor))
+
+    model_ckpt.layers[1].register_forward_pre_hook(check_layer0_resharded)
+
+    logits_ckpt = model_ckpt.forward(tokens)
+    p0_after_forward = model_ckpt.layers[0].in_proj.weight
+    p1_after_forward = model_ckpt.layers[1].in_proj.weight
+
+    loss_ckpt = logits_ckpt.float().sum()
+    loss_ckpt.backward()
+    p0_after_bwd = model_ckpt.layers[0].in_proj.weight
+    p1_after_bwd = model_ckpt.layers[1].in_proj.weight
+
+    torch.save({
+        "loss_no_ckpt": float(loss_no_ckpt.detach()),
+        "loss_ckpt": float(loss_ckpt.detach()),
+        "finite": bool(torch.isfinite(logits_ckpt).all()),
+        "layer0_resharded_states": layer0_resharded_states,
+        "p0_after_forward_is_dtensor": isinstance(p0_after_forward, DTensor),
+        "p1_after_forward_is_dtensor": isinstance(p1_after_forward, DTensor),
+        "p0_after_bwd_is_dtensor": isinstance(p0_after_bwd, DTensor),
+        "p1_after_bwd_is_dtensor": isinstance(p1_after_bwd, DTensor),
+    }, str(tmp_path / f"v6b_{rank}.pt"))
+
+
+def test_v6b_fsdp_grad_checkpoint_parity_and_layer_resharding(tmp_path):
+    world_size = 2
+    _spawn_gloo(_v6b_worker, world_size=world_size, tmp_path=tmp_path)
+    results = [torch.load(str(tmp_path / f"v6b_{r}.pt")) for r in range(world_size)]
+    for r in results:
+        assert r["finite"]
+        # Inter-layer parameter resharding: hook fired on both forward and backward recomputation,
+        # and in both cases layer 0 was already resharded to DTensor before layer 1 ran.
+        assert len(r["layer0_resharded_states"]) >= 2
+        assert all(r["layer0_resharded_states"])
+        # Parameters remain sharded DTensors after forward and after backward
+        assert r["p0_after_forward_is_dtensor"] and r["p1_after_forward_is_dtensor"]
+        assert r["p0_after_bwd_is_dtensor"] and r["p1_after_bwd_is_dtensor"]
+        # Loss parity between checkpointed and non-checkpointed path to fp32 tolerance
+        torch.testing.assert_close(r["loss_ckpt"], r["loss_no_ckpt"], rtol=1e-5, atol=1e-5)
+
+
+# --------------------------------------------------------------------------- #
 # V7 — Muon under FSDP: 2-rank sharded update equals the single-process Muon update on
 # the SAME weights and grads.
 # --------------------------------------------------------------------------- #

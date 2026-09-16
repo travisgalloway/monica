@@ -383,19 +383,15 @@ see `docs/infrastructure.md`'s "Multi-GPU training pod" checklist, which this re
   by wrapping each layer plus the top-level leaves (`embedding`, and `lm_head` when untied)
   individually rather than a final root `fully_shard(model, ...)` call — same practical
   parameter coverage, no root wrap.
-- **`fully_shard`'s auto-unshard hooks never fire — a second, deeper finding.** FSDP2 unshards a
-  wrapped module's params via a forward pre-hook on `nn.Module.__call__`. This codebase's block
-  API (`forward_seq`/`step`/`forward_prefill`, the whole train/infer-parity design — see "The
-  SSM" in `CLAUDE.md`) is invoked by DIRECT method call, never through `layer(...)`, specifically
-  so `forward` and `step` share identical compute without an `nn.Module` dispatch layer between
-  them. That design choice means FSDP2's hook never fires, and a sharded `DTensor` param hits an
-  op against a plain activation tensor (`mixed torch.Tensor and DTensor`). Fixed with an explicit
-  `CUDAMambaModel._fsdp_unshard(layer)` call before every direct block invocation — see its
-  docstring for the tradeoff this forces: no paired `reshard()` call (so the actual per-layer
-  memory-reclaim timing is UNVERIFIED — a CUDA-host follow-up), and **`grad_checkpoint` does not
-  yet compose with this workaround at all** (the checkpointed recompute in backward calls
-  `layer.forward_seq` directly, bypassing `_layer_forward`'s unshard entirely) — `grad_checkpoint`
-  must stay `false` under FSDP2 until that gap is closed.
+- **`fully_shard` auto-unshard/reshard composition under `grad_checkpoint` (#288).** #271 initially
+  worked around direct block dispatch with manual `_fsdp_unshard(layer)` calls, which could not
+  pair with `reshard()` without breaking recompute in backward under `grad_checkpoint`. #288 resolved
+  this by refactoring the blocks (`MambaBlock`, `AttentionBlock`, `MoEBlock`) to implement the standard
+  `forward()` protocol with `forward_seq = forward` alias. `_layer_forward` invokes `layer(...)` through
+  `__call__` (both eager and wrapped in `_checkpoint`), allowing FSDP2 pre-forward and post-forward
+  hooks to automatically unshard and reshard per block across forward and backward recomputation.
+  Verified with 2-rank Gloo tests (`tests/test_cuda_distributed.py` V6b) with loss parity to fp32
+  tolerance and confirmed DTensor parameter resharding between layers.
 - **Muon under FSDP2: one explicit gather, not ~10 implicit ones.** `Muon.step` orthogonalizes a
   `DTensor` momentum buffer by gathering it to a full tensor ONCE (`buf.full_tensor()`),
   Newton-Schulz in fp32 on the full matrix (bit-identical math to the single-process path), then
