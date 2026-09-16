@@ -233,3 +233,68 @@ def test_prefill_false_still_rejects_an_empty_prompt():
     store = _store()
     with pytest.raises(ValueError, match="prompt_ids must be non-empty"):
         generate(store, "s", [], sampler=_greedy, prefill=False)
+
+
+# --- sampler hooks (#200) -----------------------------------------------------------
+
+from src.serve.generate import custom_generate
+
+
+def test_sampler_hook_modifies_logits():
+    """A mutating sampler hook modifies logits before the sampler runs."""
+    store = _store()
+
+    def force_token_9(logits):
+        mod = np.array(logits, copy=True)
+        mod[9] = 100.0
+        return mod
+
+    out = generate(store, "s", [0], sampler=_greedy, max_new_tokens=3,
+                   sampler_hook=force_token_9)
+    # CounterModel naturally counts 1, 2, 3, but the hook forces token 9 every step.
+    assert out == [9, 9, 9]
+
+
+def test_sampler_hook_observes_logits_and_context():
+    """An observational sampler hook returns None, leaving logits untouched, and observes context."""
+    store = _store()
+    observed_contexts = []
+    observed_max_logits = []
+
+    def observer_hook(logits, previous_tokens=None):
+        observed_contexts.append(list(previous_tokens) if previous_tokens is not None else None)
+        observed_max_logits.append(int(np.argmax(logits)))
+        return None  # None -> do not alter logits
+
+    out = generate(store, "s", [0], sampler=_greedy, max_new_tokens=3,
+                   sampler_hook=observer_hook, pass_context=True)
+    assert out == [1, 2, 3]
+    assert observed_contexts == [[0], [0, 1], [0, 1, 2]]
+    assert observed_max_logits == [1, 2, 3]
+
+
+def test_sampler_hooks_sequence_chained():
+    """Multiple sampler hooks execute in sequence, chaining logit modifications."""
+    store = _store()
+
+    def bias_token_5(logits):
+        mod = np.array(logits, copy=True)
+        mod[5] = 50.0
+        return mod
+
+    def override_token_8(logits):
+        mod = np.array(logits, copy=True)
+        mod[8] = 100.0
+        return mod
+
+    out = generate(store, "s", [0], sampler=_greedy, max_new_tokens=2,
+                   sampler_hooks=[bias_token_5, override_token_8])
+    assert out == [8, 8]
+
+
+def test_custom_generate_alias():
+    """custom_generate is an alias for generate, providing the custom generate loop entrypoint."""
+    assert custom_generate is generate
+    store = _store()
+    out = custom_generate(store, "s", [0], sampler=_greedy, max_new_tokens=3)
+    assert out == [1, 2, 3]

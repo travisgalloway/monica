@@ -1,0 +1,53 @@
+# Sparse-upcycle SOURCE config + AR baseline (#200):
+# A degenerate n_experts=1 MoE block, which IS a plain dense SwiGLU FFN (softmax over
+# one logit is exactly 1.0, MoEBlock._moe takes the k==E branch — see
+# MambaConfig.validate()'s n_experts==1 carve-out).
+#
+# This single dense checkpoint seeds both downstream MoE runs:
+#   - #222 (small MoE rung, ~700M total, single GPU)
+#   - #223 (Large A, ~3.88B total / 710M active, FSDP)
+# Resolved by #272 (2026-08-09): both rungs share d_model 768 and moe_d_ff = d_inner (1536),
+# avoiding a second dense pretrain at 1536.
+#
+# check_upcycle_compatible (src/train/upcycle.py) requires 15 fields (_MUST_MATCH) to agree
+# between this source and target configs:
+#   (d_model, n_layers, d_state, expand, d_conv, head_dim, dt_rank_resolved, d_inner,
+#    n_heads, vocab_size, tie_embeddings, attn_every, n_attn_heads_resolved,
+#    moe_every, moe_d_ff_resolved)
+# plus identical MoE layer indices.
+#
+# FIM constraint (docs/design/13-code-model-moe.md):
+#   n_layers % attn_every == 0 (56 % 8 == 0) so the final block is attention.
+
+d_model: 768           # d_inner = expand * d_model = 1536
+n_layers: 56           # 56 % 8 == 0 (7 attention layers, final block is attention)
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 1536
+d_conv: 4
+head_dim: 64           # Mamba-2/SSD: 1536/64 = 24 heads (scalar A per head)
+dt_rank: auto
+
+# Hybrid attention: every 8th layer is full attention (7 attention layers, 12.5%)
+attn_every: 8
+n_attn_heads: null     # d_model // 64 = 12 attention heads
+
+# Sparse MoE backbone interleave: every 3rd layer is MoE (16 MoE layers, 33 Mamba survive)
+moe_every: 3
+n_experts: 1           # degenerate: ONE expert == a plain dense SwiGLU FFN (#200/#214)
+top_k: 1               # validate() REQUIRES top_k==1 whenever n_experts==1
+moe_d_ff: 1536         # full width = d_inner (resolved by #272/PR #275)
+moe_balance_rate: null # validate() REQUIRES null at E=1 (sign(0) == 0 forever)
+
+# Native cross-platform Swift tokenizer (#191/#245/#251, uint16 packing)
+vocab_size: 49152
+seq_len: 2048
+tie_embeddings: true   # MANDATORY: saves ~37.7M parameters at this vocab size
+
+precision: fp32        # fp32 default for clean verification/exact upcycle; runs use bf16/fp16
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: true  # 56 layers; recompute saves activation memory
+
+# dt-projection bias init (load-bearing — identical across the config family)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001
