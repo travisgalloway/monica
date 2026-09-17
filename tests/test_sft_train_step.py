@@ -15,7 +15,7 @@ from mlx.utils import tree_flatten
 
 from src.model.blocks import load_config
 from src.model.mlx_backend import MLXMambaModel
-from src.model.mlx_train_step import make_sft_train_step
+from src.model.mlx_train_step import make_sft_train_step, make_contrastive_sft_train_step
 from src.eval.val_loss import masked_cross_entropy
 from src.train.loss_scale import DynamicLossScaler
 
@@ -96,3 +96,36 @@ def test_all_zero_mask_is_safe():
     # All padding -> zero loss and zero gradient (the denom guard avoids a div-by-zero).
     assert out["loss"] == 0.0
     assert out["grad_norm"] == 0.0
+
+
+def test_contrastive_null_arm_matches_sft_loss():
+    cfg = load_config(TOY_CFG)
+    inp, tgt, mask = _rand_sft_batch(cfg)
+
+    mx.random.seed(0)
+    m1 = MLXMambaModel(cfg)
+    sft_out = make_sft_train_step(m1, optim.AdamW(learning_rate=0.0), grad_clip=0.0)(
+        m1, [(inp, tgt, mask)], 0.0)
+
+    mx.random.seed(0)
+    m2 = MLXMambaModel(cfg)
+    # aux_weight=0.0 (the M4 null arm)
+    null_out = make_contrastive_sft_train_step(
+        m2, optim.AdamW(learning_rate=0.0), aux_weight=0.0, grad_clip=0.0)(
+        m2, [(inp, tgt, mask)], 0.0)
+
+    assert abs(sft_out["loss"] - null_out["loss"]) < 1e-6
+
+
+def test_contrastive_step_6tuple_with_aux_weight():
+    cfg = load_config(TOY_CFG)
+    pos_in, pos_tgt, pos_mask = _rand_sft_batch(cfg, seed=1)
+    neg_in, neg_tgt, neg_mask = _rand_sft_batch(cfg, seed=2)
+
+    mx.random.seed(0)
+    model = MLXMambaModel(cfg)
+    step = make_contrastive_sft_train_step(
+        model, optim.AdamW(learning_rate=0.0), margin=1.0, aux_weight=0.5, grad_clip=0.0)
+    out = step(model, [(pos_in, pos_tgt, pos_mask, neg_in, neg_tgt, neg_mask)], 0.0)
+    assert out["loss"] > 0.0
+    assert "grad_norm" in out

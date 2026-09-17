@@ -205,6 +205,51 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> torch.Tensor:
     return (chosen * m).sum(dim=-1)                          # (B,)
 
 
+def make_contrastive_sft_train_step(model, optimizer, *, margin: float = 1.0,
+                                    aux_weight: float = 0.5, grad_clip: float = 1.0,
+                                    scaler=None, balancer=None,
+                                    load_reduce=None) -> Callable:
+    """Build an SFT `train_step(model, micro_batches, lr) -> dict` with contrastive margin loss.
+
+    Torch mirror of `mlx_train_step.make_contrastive_sft_train_step`.
+    """
+    params = list(model.parameters())
+
+    def _loss(mb) -> torch.Tensor:
+        if len(mb) == 3:
+            inputs, targets, mask = mb
+            logits = model.forward(inputs)
+            V = logits.shape[-1]
+            device = logits.device
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device).reshape(-1)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")
+            m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device).reshape(-1)
+            return (ce * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+        pos_in, pos_tgt, pos_mask, neg_in, neg_tgt, neg_mask = mb
+        logits = model.forward(pos_in)
+        V = logits.shape[-1]
+        device = logits.device
+        t = torch.as_tensor(np.asarray(pos_tgt), dtype=torch.long, device=device).reshape(-1)
+        ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")
+        m = torch.as_tensor(np.asarray(pos_mask), dtype=torch.float32, device=device).reshape(-1)
+        sft_loss = (ce * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+        if aux_weight > 0.0:
+            lp_pos = _masked_seq_logprob(model, pos_in, pos_tgt, pos_mask)
+            lp_neg = _masked_seq_logprob(model, neg_in, neg_tgt, neg_mask)
+            diff = lp_pos - lp_neg
+            m_loss = torch.clamp(margin - diff, min=0.0).mean()
+            return sft_loss + aux_weight * m_loss
+        return sft_loss
+
+    def train_step(model, micro_batches, lr: float) -> dict:
+        return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
+                                    grad_clip, scaler, balancer, load_reduce)
+
+    return train_step
+
+
 def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1,
                         grad_clip: float = 1.0, scaler=None, balancer=None,
                         load_reduce=None) -> Callable:

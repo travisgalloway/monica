@@ -183,6 +183,62 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> mx.array:
     return (chosen * m).sum(axis=-1)                         # (B,)
 
 
+def make_contrastive_sft_train_step(model, optimizer, *, margin: float = 1.0,
+                                    aux_weight: float = 0.5, grad_clip: float = 1.0,
+                                    scaler=None, balancer=None) -> Callable:
+    """Build an SFT `train_step(model, micro_batches, lr) -> dict` with auxiliary contrastive margin loss.
+
+    `micro_batches` is a list of 6-tuples `(pos_in, pos_tgt, pos_mask, neg_in, neg_tgt, neg_mask)`
+    or 3-tuples `(inputs, targets, mask)`.
+    The positive loss is response-token masked cross-entropy.
+    The auxiliary loss is max(0, margin - (lp_pos - lp_neg)).mean() using `_masked_seq_logprob`.
+    Total loss = sft_loss + aux_weight * margin_loss.
+    When `aux_weight == 0.0`, the margin loss contributes zero gradient (M4 null arm).
+    """
+    def loss_fn(model, *mb):
+        if len(mb) == 3:
+            inputs, targets, mask = mb
+            logits = model.forward(inputs)
+            V = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                         t, reduction="none")
+            m = mx.array(mask).reshape(-1).astype(mx.float32)
+            loss = (ce * m).sum() / mx.maximum(m.sum(), 1.0)
+            return loss * scaler.scale if scaler else loss
+
+        pos_in, pos_tgt, pos_mask, neg_in, neg_tgt, neg_mask = mb
+        logits = model.forward(pos_in)
+        V = logits.shape[-1]
+        t = mx.array(pos_tgt).reshape(-1).astype(mx.int32)
+        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                     t, reduction="none")
+        m = mx.array(pos_mask).reshape(-1).astype(mx.float32)
+        sft_loss = (ce * m).sum() / mx.maximum(m.sum(), 1.0)
+
+        if aux_weight > 0.0:
+            lp_pos = _masked_seq_logprob(model, pos_in, pos_tgt, pos_mask)
+            lp_neg = _masked_seq_logprob(model, neg_in, neg_tgt, neg_mask)
+            diff = lp_pos - lp_neg
+            m_loss = mx.mean(mx.maximum(0.0, margin - diff))
+            total_loss = sft_loss + aux_weight * m_loss
+        else:
+            total_loss = sft_loss
+
+        return total_loss * scaler.scale if scaler else total_loss
+
+    value_and_grad = nn.value_and_grad(model, loss_fn)
+
+    def loss_and_grad(model, mb):
+        return value_and_grad(model, *mb)
+
+    def train_step(model, micro_batches, lr: float) -> dict:
+        return _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches,
+                                    lr, grad_clip, scaler, balancer)
+
+    return train_step
+
+
 def _log_sigmoid(x: mx.array) -> mx.array:
     """Stable log(sigmoid(x)) = -softplus(-x)."""
     return -mx.logaddexp(mx.zeros_like(x), -x)

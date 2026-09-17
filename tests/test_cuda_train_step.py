@@ -15,7 +15,7 @@ torch = pytest.importorskip("torch")
 
 from src.model.blocks import MambaConfig, load_config
 from src.model.cuda_backend import CUDAMambaModel
-from src.model.cuda_train_step import (make_train_step, make_sft_train_step,
+from src.model.cuda_train_step import (make_train_step, make_sft_train_step, make_contrastive_sft_train_step,
                                        make_dpo_train_step, make_grpo_train_step,
                                        save_optimizer, load_optimizer)
 from src.train.loss_scale import DynamicLossScaler
@@ -325,3 +325,38 @@ def test_grad_accum_two_microbatches_accumulates_moe_load_counts():
     assert sum(sum(l) for l in single) > 0     # sanity: routing actually happened
     for s_layer, d_layer in zip(single, double):
         assert d_layer == [2 * c for c in s_layer]
+
+
+def test_cuda_contrastive_sft_step_null_arm_matches_sft():
+    cfg = load_config(TOY_CFG)
+    inp, tgt = _rand_batch(cfg)
+    mask = np.ones_like(inp, dtype=np.float32)
+
+    torch.manual_seed(0)
+    m1 = CUDAMambaModel(cfg)
+    sft_out = make_sft_train_step(m1, _adam(m1, 0.0), grad_clip=0.0)(
+        m1, [(inp, tgt, mask)], 0.0)
+
+    torch.manual_seed(0)
+    m2 = CUDAMambaModel(cfg)
+    null_out = make_contrastive_sft_train_step(
+        m2, _adam(m2, 0.0), aux_weight=0.0, grad_clip=0.0)(
+        m2, [(inp, tgt, mask)], 0.0)
+
+    assert abs(sft_out["loss"] - null_out["loss"]) < 1e-5
+
+
+def test_cuda_contrastive_sft_step_6tuple_with_margin():
+    cfg = load_config(TOY_CFG)
+    pos_in, pos_tgt = _rand_batch(cfg, seed=1)
+    pos_mask = np.ones_like(pos_in, dtype=np.float32)
+    neg_in, neg_tgt = _rand_batch(cfg, seed=2)
+    neg_mask = np.ones_like(neg_in, dtype=np.float32)
+
+    torch.manual_seed(0)
+    model = CUDAMambaModel(cfg)
+    step = make_contrastive_sft_train_step(
+        model, _adam(model, 0.0), margin=1.0, aux_weight=0.5, grad_clip=0.0)
+    out = step(model, [(pos_in, pos_tgt, pos_mask, neg_in, neg_tgt, neg_mask)], 0.0)
+    assert out["loss"] > 0.0
+    assert "grad_norm" in out

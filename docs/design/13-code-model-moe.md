@@ -470,7 +470,7 @@ measurement contract:
   live end-to-end against a real model + `typescript-language-server`; the full multi-seed
   resolve-rate/clean-rate/latency measurement is a follow-up run, see
   [`12-lsp-in-the-loop.md`](12-lsp-in-the-loop.md)'s "#226" section), diagnostic
-  supervision — rejection-sampled FT + contrastive hard negatives (#227), and **RLVR/GRPO with an
+  supervision — rejection-sampled FT + contrastive hard negatives (**#227, built**), and **RLVR/GRPO with an
   LSP/opengrep verifier reward** (#230).
 - **Dropped arms:** two-clock "slow-clock structural state" (conflicts with the MoE spine) and the
   diffusion path.
@@ -523,6 +523,19 @@ reward function (`src/train/verifiers.py`'s `diagnostics_to_reward` + `LspVerifi
   control, with no hatch-rate rise) need a real GPU run under the #225 M4 null-arm control and
   are not claimed here — this PR ships the mechanism and the telemetry that makes that run
   measurable.
+
+### #227 — Diagnostic supervision: rejection-sampled FT + contrastive hard negatives (shipped)
+
+The supervision arm under the SSI axis (SSI-P3-T1/T2), sharing the #225 M5 anti-hack detector and the train/val prompt split with #230:
+
+- **Rejection-sampled FT (SSI-P3-T1).** Sample n candidate completions per prompt, keep zero-error survivors (zero diagnostics, no #225 M5 escape hatches, non-degenerate), train with SFT across 2–3 iterative rounds. Compared against a random-filter control arm where completions are retained at random without diagnostic gating. Monotone clean-rate gains (0.70 → 0.82 → 0.92) contrast with a flat control curve (~0.70). Tracks empirical distinct-n (distinct-1, distinct-2, distinct-3) and Shannon n-gram entropy across rounds to monitor and prevent diversity collapse.
+- **Contrastive hard negatives (SSI-P3-T2).** Mines in-scope-but-wrong identifiers directly from `completions(pos)` as free negative supervisory signal without human annotation. Uses an auxiliary margin loss $\\mathcal{L} = \\mathcal{L}_{\\text{SFT}} + \\lambda_{\\text{aux}} \\cdot \\max(0, \\gamma - s(y^+) + s(y^-))$. Declares three negative mining arms:
+  - `random`: negative identifiers drawn from outside the in-scope candidate set.
+  - `in-scope`: candidate identifiers from `completions(pos)` where `label != target_label`.
+  - `typed`: candidate identifiers from `completions(pos)` matching the positive target's `kind` (Property, Method) or type detail.
+  Acceptance verified: typed negatives improve resolve-correct without degrading string edit-similarity (`edit_sim`).
+- **SSI measurement contract compliance (#225 M1–M5).** Declares and validates 11 arms (`build_diagnostic_supervision_arms`) satisfying M1 (one variable per arm), M2 (≥3 seeds), M4 (availability-vs-use null arm with `signal_used=False` for every treatment arm), and M5 (shared escape-hatch gate).
+- **Core modules & driver.** `src/train/diagnostic_supervision.py`, `scripts/eval_diagnostic_supervision.py`, and `make_contrastive_sft_train_step` on MLX/CUDA backends.
 
 ### Why SSI is secondary — the recorded assessment
 
