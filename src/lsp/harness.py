@@ -334,7 +334,9 @@ def generate_slow_loop(
     diagnose: DiagnoseFn,
     prompt: str,
     *,
-    repair: str = "hard",
+    repair: Optional[str] = "hard",
+    masker: Optional[object] = None,
+    strategy: Optional[str] = None,
     budget: str = "stmt",
     block_size: int = _DEFAULT_BLOCK_SIZE,
     max_gen_tokens: int = _DEFAULT_MAX_GEN_TOKENS,
@@ -361,7 +363,7 @@ def generate_slow_loop(
     final check, so that last check sees compilable TS instead of a flood of
     "expected X" syntax noise from the unfinished tail.
     """
-    if repair not in ("hard", "soft", "both"):
+    if repair not in ("hard", "soft", "both", "none", None):
         raise ValueError(f"unknown repair strategy {repair!r}")
     if budget not in ("stmt", "block"):
         raise ValueError(f"unknown budget {budget!r}")
@@ -369,7 +371,18 @@ def generate_slow_loop(
     t0 = time.monotonic()
     n_fwd0, n_fwd_nc0 = lm.n_forward_tokens, lm.n_forward_tokens_nocache
 
-    result = GenResult(strategy=f"slow-{repair}", prompt=prompt, completion="", context=prompt)
+    if strategy is None:
+        if masker is not None and repair not in ("none", None):
+            strat_name = f"both-{repair}"
+        elif masker is not None:
+            strat_name = "fast"
+        elif repair not in ("none", None):
+            strat_name = f"slow-{repair}"
+        else:
+            strat_name = "baseline"
+    else:
+        strat_name = strategy
+    result = GenResult(strategy=strat_name, prompt=prompt, completion="", context=prompt)
     strip = strip_suggestion if strip_suggestions else (lambda d: d)
 
     def _diag(source: str) -> List[Diagnostic]:
@@ -412,8 +425,22 @@ def generate_slow_loop(
                 if banned:
                     step_logits = step_logits.copy()
                     step_logits[list(banned)] = -np.inf
-                tok = sample(step_logits, temperature=temperature, rng=rng,
-                             previous_tokens=gen_ids)
+                allowed = None
+                if masker is not None:
+                    allowed = masker.mask_for(
+                        context + lm.decode(gen_ids),
+                        vocab_size=int(np.asarray(step_logits).size),
+                    )
+                    if allowed is not None and eos_ids:
+                        allowed = sorted(set(allowed) | eos_ids)
+                tok = sample(
+                    step_logits,
+                    temperature=temperature,
+                    rng=rng,
+                    previous_tokens=gen_ids,
+                    allowed_ids=allowed,
+                    banned_ids=list(banned) if banned else None,
+                )
                 if tok in eos_ids:
                     return True, True, False
                 logits = lm.step(tok)
@@ -428,7 +455,7 @@ def generate_slow_loop(
         segment_is_final_partial = hit_budget and not hit_boundary  # budget ran out mid-statement
 
         n_retry_rounds = 0
-        while True:
+        while repair not in ("none", None):
             gen_text = lm.decode(gen_ids)
             check_text = close_open_delimiters(gen_text) if segment_is_final_partial else gen_text
             source = context + check_text
@@ -618,6 +645,11 @@ def generate_slow_loop(
     result.n_forward_tokens = lm.n_forward_tokens - n_fwd0
     result.n_forward_tokens_nocache = lm.n_forward_tokens_nocache - n_fwd_nc0
     result.wall_s = time.monotonic() - t0
+    if masker is not None:
+        result.n_mask_steps = getattr(masker, "n_mask_steps", 0)
+        result.n_mask_bypass = getattr(masker, "n_mask_bypass", 0)
+        result.n_completion_calls = getattr(masker, "n_completion_calls", 0)
+        result.mask_wall_s = getattr(masker, "mask_wall_s", 0.0)
     return result
 
 

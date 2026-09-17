@@ -123,3 +123,63 @@ def generate(
 
 
 custom_generate = generate
+
+
+def create_repair_sampler(
+    ban_table: Optional[dict] = None,
+    *,
+    base_sampler: Optional[Callable[..., int]] = None,
+    masker: Optional[object] = None,
+    decode_fn: Optional[Callable[[Sequence[int]], str]] = None,
+    prompt_text: str = "",
+    temperature: float = 0.0,
+    rng: Optional[np.random.Generator] = None,
+    eos_ids: Optional[set[int]] = None,
+) -> Callable[..., int]:
+    """Wrap a sampler for validate-and-rollback and constrained decode (#201).
+
+    Attaches to `generate(..., pass_context=True)`. When called with
+    `(logits, previous_tokens=prompt + generated)`, it queries `ban_table`
+    for tokens banned at this history (setting banned logits to -inf via
+    `src/serve/sampling.py::sample(..., banned_ids=...)`) and applies
+    `masker.mask_for(...)` when fast-loop completion masking is active.
+    """
+    from .sampling import sample
+
+    _ban_table = ban_table if ban_table is not None else {}
+
+    def repair_sampler(logits: np.ndarray, previous_tokens: Optional[Sequence[int]] = None) -> int:
+        banned = None
+        if previous_tokens is not None and _ban_table:
+            key = tuple(previous_tokens)
+            banned = _ban_table.get(key)
+            if not banned:
+                for prefix_len in range(len(previous_tokens) + 1):
+                    sub_key = tuple(previous_tokens[prefix_len:])
+                    if sub_key in _ban_table:
+                        banned = _ban_table[sub_key]
+                        break
+
+        allowed = None
+        if masker is not None and decode_fn is not None and previous_tokens is not None:
+            text = prompt_text + decode_fn(previous_tokens)
+            allowed = masker.mask_for(text, vocab_size=int(np.asarray(logits).size))
+            if allowed is not None and eos_ids:
+                allowed = sorted(set(allowed) | eos_ids)
+
+        if base_sampler is not None and banned is None and allowed is None:
+            try:
+                return base_sampler(logits, previous_tokens=previous_tokens)
+            except TypeError:
+                return base_sampler(logits)
+
+        return sample(
+            logits,
+            temperature=temperature,
+            rng=rng,
+            previous_tokens=previous_tokens,
+            allowed_ids=allowed,
+            banned_ids=list(banned) if banned else None,
+        )
+
+    return repair_sampler
