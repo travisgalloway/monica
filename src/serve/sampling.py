@@ -43,6 +43,7 @@ def sample(
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: Optional[int] = None,
     allowed_ids: Optional[Sequence[int]] = None,
+    banned_ids: Optional[Sequence[int]] = None,
 ) -> int:
     """Return one token id sampled from a 1-D logits vector.
 
@@ -100,6 +101,14 @@ def sample(
         mask[ids] = 0.0
         logits = logits + mask  # mask BEFORE repetition control / temperature / top-k / top-p
 
+    b_ids = np.empty(0, dtype=np.int64)
+    if banned_ids is not None and len(banned_ids):
+        raw_b = np.asarray(list(banned_ids), dtype=np.int64)
+        b_ids = raw_b[(raw_b >= 0) & (raw_b < logits.size)]
+        if b_ids.size:
+            logits = logits.copy() if allowed_ids is None else logits
+            logits[b_ids] = -np.inf
+
     if previous_tokens is not None and len(previous_tokens) and (
             repetition_penalty != 1.0 or no_repeat_ngram_size):
         logits = logits.copy()  # own the buffer before in-place penalty edits
@@ -133,7 +142,15 @@ def sample(
             # Drawing from the full vocab instead would silently return a token
             # outside the caller's constraint set, breaking constrained decode's
             # guarantee that sampling never escapes allowed_ids.
-            return int(rng.choice(ids))
+            survivors = ids[~np.isin(ids, b_ids)] if b_ids.size else ids
+            if survivors.size == 0:
+                survivors = ids
+            return int(rng.choice(survivors))
+        if b_ids.size:
+            all_ids = np.arange(logits.size)
+            unbanned = all_ids[~np.isin(all_ids, b_ids)]
+            if unbanned.size:
+                return int(rng.choice(unbanned))
         return int(rng.integers(logits.size))
 
     if temperature == 0:

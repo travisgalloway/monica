@@ -336,3 +336,173 @@ class SessionHistory:
         budget in the first place.
         """
         return self.max_depth * self.per_node_bytes()
+
+
+# --- SessionStoreLMAdapter (#201) ----------------------------------------------------
+
+class SessionStoreLMAdapter:
+    """Implements `LMAdapter` and `SnapshotCapable` on `SessionStore` (#201).
+
+    Bridges Monica's native recurrent serving stack to the LSP harness, supporting:
+    - `reset(context)`: prefill prompt via `store.prefill`
+    - `step(token_id)`: advance via `store.step`
+    - `rollback(n_tokens)`: roll back state via `RewindTree` state snapshot restoration
+      when available, or full re-prefill of `context + kept_tokens`
+    - `checkpoint()` / `restore()`: snapshot/restore recurrent state directly
+    """
+
+    def __init__(
+        self,
+        store: SessionStore,
+        *,
+        tokenizer: Optional[object] = None,
+        encode: Optional[Callable[[str], list[int]]] = None,
+        decode: Optional[Callable[[Sequence[int]], str]] = None,
+        session_id: str = "harness_session",
+        rollback_strategy: str = "auto",
+        use_rewind_tree: bool = True,
+        max_depth: int = 64,
+    ) -> None:
+        self.store = store
+        self.session_id = session_id
+        self._rollback_strategy = rollback_strategy
+        self.use_rewind_tree = use_rewind_tree
+        self.history: Optional[SessionHistory] = None
+        self.max_depth = max_depth
+
+        if encode is not None:
+            self._encode = encode
+        elif hasattr(tokenizer, "encode"):
+            self._encode = tokenizer.encode
+        else:
+            self._encode = lambda text: [ord(c) for c in text]
+
+        if decode is not None:
+            self._decode = decode
+        elif hasattr(tokenizer, "decode"):
+            self._decode = tokenizer.decode
+        else:
+            self._decode = lambda ids: "".join(chr(i) for i in ids)
+
+        self._context_ids: list[int] = []
+        self._gen_ids: list[int] = []
+        self._last_logits: Optional[np.ndarray] = None
+        self._step_snapshots: list[int] = []
+
+        self.n_forward_tokens = 0
+        self.n_forward_tokens_nocache = 0
+        self.n_trim_rollbacks = 0
+        self.n_reprefill_rollbacks = 0
+        self.n_snapshot_rollbacks = 0
+        self.n_reprefill_tokens = 0
+
+    @property
+    def rollback_strategy(self) -> str:
+        return self._rollback_strategy
+
+    def encode(self, text: str) -> list[int]:
+        return list(self._encode(text))
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return self._decode(list(token_ids))
+
+    def reset(self, context: str) -> np.ndarray:
+        if self.session_id in self.store:
+            self.store.remove(self.session_id)
+        self.store.create(self.session_id)
+        if self.use_rewind_tree:
+            self.history = SessionHistory(self.store, self.session_id, max_depth=self.max_depth)
+            self._step_snapshots = []
+        else:
+            self.history = None
+
+        self._context_ids = self.encode(context)
+        self._gen_ids = []
+        if len(self._context_ids) == 0:
+            raise ValueError("context must not tokenize to empty")
+
+        logits = self.store.prefill(self.session_id, self._context_ids)
+        self._last_logits = np.asarray(logits, dtype=np.float64)[0]
+        self.n_forward_tokens += len(self._context_ids)
+        self.n_forward_tokens_nocache += len(self._context_ids)
+
+        if self.history is not None:
+            node = self.history.commit_turn()
+            self._step_snapshots = [node]
+
+        return self._last_logits.copy()
+
+    def step(self, token_id: int) -> np.ndarray:
+        logits = self.store.step(self.session_id, token_id)
+        self._last_logits = np.asarray(logits, dtype=np.float64)[0]
+        self._gen_ids.append(token_id)
+        self.n_forward_tokens += 1
+        self.n_forward_tokens_nocache += 1
+
+        if self.history is not None:
+            node = self.history.commit_turn()
+            self._step_snapshots.append(node)
+
+        return self._last_logits.copy()
+
+    def rollback(self, n_tokens: int) -> None:
+        if n_tokens <= 0:
+            return
+        keep = len(self._gen_ids) - n_tokens
+        if keep < 0:
+            raise ValueError(
+                f"cannot roll back {n_tokens} tokens; only {len(self._gen_ids)} generated since reset()"
+            )
+
+        self.n_forward_tokens_nocache += len(self._context_ids) + keep
+
+        use_tree = (
+            self.history is not None
+            and self._rollback_strategy != "reprefill"
+            and keep < len(self._step_snapshots)
+            and self._step_snapshots[keep] in self.history.tree
+        )
+
+        if use_tree:
+            target_node = self._step_snapshots[keep]
+            self.history.rewind_to(target_node)
+            self._gen_ids = self._gen_ids[:keep]
+            self._step_snapshots = self._step_snapshots[: keep + 1]
+            self.n_snapshot_rollbacks += 1
+        else:
+            kept_gen = self._gen_ids[:keep]
+            if self.session_id in self.store:
+                self.store.remove(self.session_id)
+            self.store.create(self.session_id)
+            all_ids = self._context_ids + kept_gen
+            logits = self.store.prefill(self.session_id, all_ids)
+            self._last_logits = np.asarray(logits, dtype=np.float64)[0]
+            self._gen_ids = kept_gen
+            self.n_reprefill_rollbacks += 1
+            self.n_reprefill_tokens += len(all_ids)
+            if self.use_rewind_tree:
+                self.history = SessionHistory(self.store, self.session_id, max_depth=self.max_depth)
+                node = self.history.commit_turn()
+                self._step_snapshots = [node]
+
+    def checkpoint(self) -> object:
+        state = self.store.get_state(self.session_id)
+        return {
+            "state": state,
+            "context_ids": list(self._context_ids),
+            "gen_ids": list(self._gen_ids),
+            "last_logits": None if self._last_logits is None else self._last_logits.copy(),
+        }
+
+    def restore(self, handle: object) -> np.ndarray:
+        if not isinstance(handle, dict) or "state" not in handle:
+            raise ValueError("invalid checkpoint handle")
+        self.store.set_state(self.session_id, handle["state"])
+        self._context_ids = list(handle["context_ids"])
+        self._gen_ids = list(handle["gen_ids"])
+        self._last_logits = None if handle["last_logits"] is None else handle["last_logits"].copy()
+        self.n_snapshot_rollbacks += 1
+        return self._last_logits
+
+    def snapshot_bytes(self) -> int:
+        return self.store.model.state_size() if hasattr(self.store.model, "state_size") else 0

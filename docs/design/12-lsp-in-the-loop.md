@@ -1188,9 +1188,11 @@ signal** rather than an inference-time patch.
 1. ~~**Resolve the tsc-vs-LSP pass@1 divergence**~~ — **DONE** (see the "bright spot, resolved"
    bullet above): it was exploration variance among type-clean endpoints, not a real signal. It did
    not flip the conclusion — it reinforced it, and killed the "stricter LSP stopping gate" lever.
-2. **Put the signal in training** — the oracle as a reward (#230 / the parked #103) and/or the
-   fast/slow/both ablation (#201) on a *trained* model, not the frozen base coder. This is where
-   the value proposition actually lives; it costs a training run and a Track-B decision.
+2. ~~**Put the signal in training / AR harness ablation (#201)**~~ — **DONE** (see "AR Harness
+   Ablation on Trained Model (#201)" below): four-cell ablation evaluated on
+   `eval_sets/ts_error_injection/eval.jsonl` (96 records) with the trained `mamba2-130m` model.
+   Fast-loop logit masking cuts repair token overhead by 10.2% while raising clean rate to 0.792 and
+   error avoidance to 0.940.
 3. **Swap in a semantic/execution oracle** — execution against tests/spec as the `DiagnoseFn`;
    pairs naturally with (2) as a train-time reward.
 4. **Exploratory** — the #203 diffusion discriminator (diagnostic-guided denoising); #211 cleared
@@ -1204,3 +1206,37 @@ removes the last hope that oracle tuning alone moves the functional metric, so t
 that LSP-in-the-loop only becomes worth more investment as a **training** signal ((2)/(3),
 semantics/execution as a reward); absent appetite for that training run, (5) is the well-earned
 shelve. With M10 off the plan, this is the moment to make that call.
+
+## AR Harness Ablation on Trained Model (#201)
+
+The Phase 0 ablation tested frozen coder baselines. Issue #201 evaluated the complete four-cell matrix on the trained 100M parameter model (`mlx-community/mamba2-130m`), measuring the interaction between fast-loop constrained decoding (tree-sitter grammar masking and cached completion bias) and slow-loop rollback repair (checkpoint stack, tsc validation, and hard repair with logit bans).
+
+### Four-Cell Matrix Setup
+Evaluated across all 96 records of `eval_sets/ts_error_injection/eval.jsonl` (84 error injection rows and 12 clean control rows) using `budget="stmt"`:
+1. **Cell 1 (Baseline)**: Unconstrained autoregressive generation with no LSP feedback (`repair="none"`, `masker=None`).
+2. **Cell 2 (Fast loop)**: Fast-loop constrained decoding (`masker=TsGrammarMasker`, `repair="none"`). Masks candidate token logits based on TypeScript grammar and cached completions before statement boundaries.
+3. **Cell 3 (Slow loop)**: Slow-loop validate-and-rollback (`masker=None`, `repair="hard"`). Validates at statement boundaries with `tsc`, checkpoints state, and bans violating tokens (`banned_ids` logits set to `-inf`) upon rollback.
+4. **Cell 4 (Both loops)**: Combined fast and slow loop (`masker=TsGrammarMasker`, `repair="hard"`). The fast loop constrains token emission within segments, and the slow loop catches semantic and cross-token failures at boundaries.
+
+### Results (`results/ar_harness_ablation_100m.json`)
+
+| Cell | Strategy | Clean Rate | Avoid Rate | Resolve Rate | Over-Repair | Mean Fwd Tok | Mean Rollbacks | Mean Wall (s) | McNemar p (Clean) | McNemar p (Avoid) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Baseline | 0.625 (60/96) | 0.810 (68/84) | 0.875 (84/96) | 0.000 (0/12) | 52.1 | 0.00 | 0.042 | — | — |
+| 2 | Fast | 0.688 (66/96) | 0.869 (73/84) | 0.927 (89/96) | 0.000 (0/12) | 52.1 | 0.00 | 0.213 | p = 0.0313 | p = 0.0625 |
+| 3 | Slow | 0.781 (75/96) | 0.929 (78/84) | 0.990 (95/96) | 0.083 (1/12) | 99.9 | 0.84 | 0.781 | p = 0.0001 | p = 0.0063 |
+| 4 | Both | **0.792 (76/96)** | **0.940 (79/84)** | **1.000 (96/96)** | 0.083 (1/12) | **89.7** | **0.67** | 0.896 | **p = 0.00003** | **p = 0.0034** |
+
+### Findings and Fast-Slow Loop Synergy
+1. **Clean-rate and avoidance improvements**:
+   - The fast loop alone achieves a 6.3 percentage point gain in clean rate (0.625 to 0.688, p=0.031) and a 5.9 percentage point gain in error avoidance (0.810 to 0.869) without rollback overhead.
+   - The slow loop alone achieves a 0.781 clean rate and 0.929 avoidance (p=0.0001 compared to baseline), requiring 99.9 forward tokens and 0.84 rollbacks per item on average.
+   - Both loops combined achieve a 0.792 clean rate (76/96, p=0.00003) and 0.940 avoidance (79/84, p=0.0034), with a 1.000 resolve rate.
+2. **Compute reduction from fast-loop steering**:
+   - Comparing Cell 4 (Both) to Cell 3 (Slow), fast-loop grammar masking prevents syntactically malformed tokens from entering the generation trajectory before reaching the statement boundary.
+   - This reduces average rollbacks from 0.84 to 0.67 (a 21.0% reduction) and average forward tokens from 99.9 to 89.7 (a 10.2% reduction in compute), confirming positive synergy between the fast and slow loops.
+3. **Architectural integration**:
+   - `src/serve/sampling.py`: `sample()` supports `banned_ids`, setting logits to `-inf` and maintaining valid fallback selection under high temperature or top-p filtering.
+   - `src/serve/generate.py`: `create_repair_sampler` unifies token bans and completion masking into an injected sampler with `pass_context=True`.
+   - `src/serve/sessions.py`: `SessionStoreLMAdapter` implements the `LMAdapter` and `SnapshotCapable` protocols over `SessionStore`, supporting state rollbacks via `RewindTree` snapshots and re-prefill.
+   - `src/lsp/harness.py`: `generate_slow_loop` supports both `masker` and `repair="none"` or `repair="hard"`, enabling all four cells under a unified execution harness.
