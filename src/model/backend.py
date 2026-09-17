@@ -15,7 +15,7 @@ on any host and stays in `tests/test_import_guard.py`'s portable set.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 @dataclass
@@ -38,8 +38,9 @@ class Backend:
     # Post-training (M9/#110) step factories, mirroring `make_train_step`. Implemented on
     # both the MLX and CUDA backends (the CUDA factories are torch mirrors, parity-tested).
     make_sft_train_step: Callable[..., Callable]
-    make_dpo_train_step: Callable[..., Callable]
-    make_grpo_train_step: Callable[..., Callable]
+    make_contrastive_sft_train_step: Optional[Callable[..., Callable]] = None
+    make_dpo_train_step: Optional[Callable[..., Callable]] = None
+    make_grpo_train_step: Optional[Callable[..., Callable]] = None
 
 
 def get_backend(name: str = "auto") -> Backend:
@@ -85,6 +86,10 @@ def _mlx_backend() -> Backend:
                                  save_optimizer, load_optimizer)
 
     # Lazy so constructing the backend never requires the DPO/GRPO step to exist yet.
+    def _make_contrastive_sft_train_step(*args, **kwargs):
+        from .mlx_train_step import make_contrastive_sft_train_step
+        return make_contrastive_sft_train_step(*args, **kwargs)
+
     def _make_dpo_train_step(*args, **kwargs):
         from .mlx_train_step import make_dpo_train_step
         return make_dpo_train_step(*args, **kwargs)
@@ -122,6 +127,7 @@ def _mlx_backend() -> Backend:
         seed=lambda value: mx.random.seed(value),
         to_numpy=lambda a: np.array(a),
         make_sft_train_step=make_sft_train_step,
+        make_contrastive_sft_train_step=_make_contrastive_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
     )
@@ -162,6 +168,10 @@ def _cuda_backend() -> Backend:
     def _make_sft_train_step(*args, **kwargs):
         from .cuda_train_step import make_sft_train_step
         return make_sft_train_step(*args, **kwargs)
+
+    def _make_contrastive_sft_train_step(*args, **kwargs):
+        from .cuda_train_step import make_contrastive_sft_train_step
+        return make_contrastive_sft_train_step(*args, **kwargs)
 
     def _make_dpo_train_step(*args, **kwargs):
         from .cuda_train_step import make_dpo_train_step
@@ -251,6 +261,7 @@ def _cuda_backend() -> Backend:
         seed=lambda value: torch.manual_seed(value),
         to_numpy=lambda a: a.detach().to("cpu").numpy(),
         make_sft_train_step=_make_sft_train_step,
+        make_contrastive_sft_train_step=_make_contrastive_sft_train_step,
         make_dpo_train_step=_make_dpo_train_step,
         make_grpo_train_step=_make_grpo_train_step,
     )
