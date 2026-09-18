@@ -1,0 +1,369 @@
+{
+  "config": {
+    "batch_size": 4,
+    "blocklist": "/Users/travisgalloway/github/monica/eval_sets/decontam/blocklist.txt",
+    "blocklist_sha256": "01223d5cd5a1d207f9be2a78d4e9be3b5618f6a530870af4384e1b4d5ea2f52c",
+    "domains_json": null,
+    "fixture_repo": "/Users/travisgalloway/github/monica/eval_sets/code_recall/fixture_repo.jsonl",
+    "haystack": "/Users/travisgalloway/github/monica/eval_sets/code_needle/haystack.jsonl",
+    "limit": 5,
+    "max_batches": null,
+    "model": {
+      "checkpoint": "runs/tier1-poc/weights.safetensors",
+      "config": "config/code-small-dense.yaml",
+      "kind": "mlx",
+      "vocab_size": 49152
+    },
+    "seed": 0,
+    "seq_len": 256,
+    "shard_dir": null,
+    "suites": [
+      "recall",
+      "needle",
+      "fim",
+      "external"
+    ],
+    "temperature": 0.0,
+    "tokenizer": {
+      "kind": "byte",
+      "vocab_size": 256
+    }
+  },
+  "n_records": 40,
+  "sources": {
+    "external": {
+      "sets": {
+        "crosscodeeval": {
+          "config": null,
+          "data_files": "crosscodeeval_data/typescript/line_completion_rg1_bm25.jsonl",
+          "fixture": "eval_sets/external/crosscodeeval/fixture.jsonl",
+          "hf_repo": "Vincentvmt/CrossCodeEval",
+          "kind": "cross_file",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20. REPO CORRECTED #304: Salesforce/CrossCodeEval is HTTP 401 and no official HF dataset exists. third-party mirror: CrossCodeEval has no official HF dataset (upstream amazon-science/cceval ships via GitHub/Drive) and Salesforce/CrossCodeEval is 401. Mirror checked 2026-08-20 by (a) file-tree match against the official crosscodeeval_data/ release layout (LICENSES/, README, {python,java,csharp,typescript}/line_completion*.jsonl) and (b) row count of the pinned TypeScript file = 3356, the published CCEval TypeScript instance count. The repo declares no configs, so the TypeScript file is named explicitly via data_files and lands in the default `train` split. The RG-1/BM25 variant is pinned rather than plain line_completion.jsonl because only it carries the retrieved `crossfile_context` this suite exists to measure; both files hold the same 3356 instances.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "41f916e35cc48bcca5dc369664f931afd9ffa22f",
+          "split": "train"
+        },
+        "mceval": {
+          "config": "generation",
+          "data_files": null,
+          "fixture": "eval_sets/external/mceval/fixture.jsonl",
+          "hf_repo": "Multilingual-Multimodal-NLP/McEval",
+          "kind": "completion",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20. CONFIG CORRECTED #304: was None, which is invalid \u2014 McEval declares generation/explanation/completion with no default. `generation` is the completion-from-docstring config; `completion` is a separate FIM-style config with a different schema. Adapter rewritten: there is no `language` column, so it is derived from task_id.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "c4767fec950de7decd487a40a4dab2795df4a094",
+          "split": "test"
+        },
+        "multipl-e-humaneval-ts": {
+          "config": "humaneval-ts",
+          "data_files": null,
+          "fixture": "eval_sets/external/multipl-e-humaneval-ts/fixture.jsonl",
+          "hf_repo": "nuprl/MultiPL-E",
+          "kind": "completion",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20; also already built into eval_sets/humaneval_ts/ by scripts/build_humaneval_ts_set.py. Identifier unchanged since #221.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "28441b6024e71d4a1c1c0f6bf171c935cd5a43f2",
+          "split": "test"
+        },
+        "multipl-e-mbpp-ts": {
+          "config": "mbpp-ts",
+          "data_files": null,
+          "fixture": "eval_sets/external/multipl-e-mbpp-ts/fixture.jsonl",
+          "hf_repo": "nuprl/MultiPL-E",
+          "kind": "completion",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20; same repo/commit as multipl-e-humaneval-ts, different config. Identifier unchanged since #221.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "28441b6024e71d4a1c1c0f6bf171c935cd5a43f2",
+          "split": "test"
+        },
+        "real-fim-eval": {
+          "config": "add",
+          "data_files": null,
+          "fixture": "eval_sets/external/real-fim-eval/fixture.jsonl",
+          "hf_repo": "gonglinyuan/real_fim_eval",
+          "kind": "infill",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20. REPO CORRECTED #304: JetBrains-Research/real-fim-eval is HTTP 401 (does not exist); the dataset that exists is gonglinyuan/real_fim_eval. Config `add` (pure insertion) chosen over `edit`, whose `to_remove` column makes it a replacement task that does not map onto (prefix, suffix, middle).",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "a36062544c7ed6c4e5ffb8dad8536fc7777e1f36",
+          "split": "test"
+        },
+        "repobench": {
+          "config": "default",
+          "data_files": null,
+          "fixture": "eval_sets/external/repobench/fixture.jsonl",
+          "hf_repo": "tianyang/repobench_python_v1.1",
+          "kind": "cross_file",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20. REPO+SPLIT CORRECTED #304: tianyang/repobench-c exists but is a loading-script dataset, and datasets>=4 removed script execution, so it cannot be loaded at all. This is the maintained parquet re-release; it has no `test` split (cross_file_first/cross_file_random/in_file). CAVEAT: RepoBench v1.1 is Python/Java only \u2014 no TypeScript \u2014 so this row measures cross-file recall in Python, not in M12's target language.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "8a7cf0c8942cc1aa066bf261839650ac55a2ff79",
+          "split": "cross_file_first"
+        },
+        "safim": {
+          "config": "block",
+          "data_files": null,
+          "fixture": "eval_sets/external/safim/fixture.jsonl",
+          "hf_repo": "gonglinyuan/safim",
+          "kind": "infill",
+          "n_fixture_rows": 6,
+          "note": "confirmed live on huggingface.co/api/datasets (unauthenticated) 2026-08-20. CONFIG CORRECTED #304: was None, which is invalid \u2014 SAFIM declares block/control/api/block_v2/control_fixed with no default, so a live pull would have failed. `block` is the headline block-completion config. Adapter rewritten: there is no `suffix` column.",
+          "pinned": true,
+          "repo_verified": true,
+          "revision": "be132cc15372e90b6f03a608e77f2d940e384edb",
+          "split": "test"
+        }
+      }
+    },
+    "fim": {
+      "fixture_repo": "/Users/travisgalloway/github/monica/eval_sets/code_recall/fixture_repo.jsonl",
+      "n_examples": 5,
+      "n_per_doc": 2,
+      "note": "no --shard-dir; FIM examples built from the fixture repo"
+    },
+    "needle": {
+      "context_lens": [
+        512,
+        1024
+      ],
+      "depths": [
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "haystack": "/Users/travisgalloway/github/monica/eval_sets/code_needle/haystack.jsonl",
+      "n_instances": 5,
+      "variants": [
+        "single",
+        "multikey"
+      ]
+    },
+    "recall": {
+      "fixture_repo": "/Users/travisgalloway/github/monica/eval_sets/code_recall/fixture_repo.jsonl",
+      "n_files": 14,
+      "n_instances": 5
+    }
+  },
+  "suites_skipped": {},
+  "summaries": {
+    "external": {
+      "by_bucket": {
+        "long": null,
+        "medium": {
+          "ce": 22.45690017468546,
+          "exact_match_rate": 0.0,
+          "mrr": null,
+          "n_instances": 5,
+          "n_tokens": 81,
+          "perplexity": 5661191247.007512,
+          "rank_top1_rate": null,
+          "token_accuracy": 0.012345679012345678
+        },
+        "short": {
+          "ce": 19.868783993793517,
+          "exact_match_rate": 0.0,
+          "mrr": null,
+          "n_instances": 20,
+          "n_tokens": 728,
+          "perplexity": 425503611.5809562,
+          "rank_top1_rate": null,
+          "token_accuracy": 0.10302197802197802
+        }
+      },
+      "by_set": {
+        "crosscodeeval": {
+          "n_rows": 5,
+          "n_scored": 5
+        },
+        "mceval": {
+          "n_rows": 5,
+          "n_scored": 5
+        },
+        "multipl-e-humaneval-ts": {
+          "n_rows": 5,
+          "n_scored": 0,
+          "reason": "no gold `answer` field \u2014 loaded and adapted, unscored"
+        },
+        "multipl-e-mbpp-ts": {
+          "n_rows": 5,
+          "n_scored": 0,
+          "reason": "no gold `answer` field \u2014 loaded and adapted, unscored"
+        },
+        "real-fim-eval": {
+          "n_rows": 5,
+          "n_scored": 5
+        },
+        "repobench": {
+          "n_rows": 5,
+          "n_scored": 5
+        },
+        "safim": {
+          "n_rows": 5,
+          "n_scored": 5
+        }
+      },
+      "overall": {
+        "ce": 20.127915527356247,
+        "exact_match_rate": 0.0,
+        "mrr": null,
+        "n_instances": 25,
+        "n_tokens": 809,
+        "perplexity": 551369382.0504785,
+        "rank_top1_rate": null,
+        "token_accuracy": 0.09394313967861558
+      }
+    },
+    "fim": {
+      "advisory": null,
+      "by_key": {
+        "prefix_len": {
+          "long": null,
+          "medium": null,
+          "short": {
+            "ce": 19.916873396776705,
+            "exact_match_rate": 0.0,
+            "n_examples": 5,
+            "n_tokens": 232,
+            "perplexity": 446465816.5969921,
+            "token_accuracy": 0.09051724137931035
+          }
+        },
+        "recall_distance": {
+          "long": null,
+          "medium": null,
+          "short": {
+            "ce": 19.916873396776705,
+            "exact_match_rate": 0.0,
+            "n_examples": 5,
+            "n_tokens": 232,
+            "perplexity": 446465816.5969921,
+            "token_accuracy": 0.09051724137931035
+          }
+        }
+      },
+      "overall": {
+        "ce": 19.916873396776705,
+        "exact_match_rate": 0.0,
+        "n_examples": 5,
+        "n_tokens": 232,
+        "perplexity": 446465816.5969921,
+        "token_accuracy": 0.09051724137931035
+      }
+    },
+    "needle": {
+      "by_bucket": {
+        "ctx1024_d0.00": null,
+        "ctx1024_d0.25": null,
+        "ctx1024_d0.50": null,
+        "ctx1024_d0.75": null,
+        "ctx1024_d1.00": null,
+        "ctx512_d0.00": {
+          "ce": 17.871879122197615,
+          "exact_match_rate": 0.0,
+          "mrr": null,
+          "n_instances": 2,
+          "n_tokens": 24,
+          "perplexity": 57764162.8929203,
+          "rank_top1_rate": null,
+          "token_accuracy": 0.041666666666666664
+        },
+        "ctx512_d0.25": {
+          "ce": 18.346593115598647,
+          "exact_match_rate": 0.0,
+          "mrr": null,
+          "n_instances": 2,
+          "n_tokens": 24,
+          "perplexity": 92859031.9435016,
+          "rank_top1_rate": null,
+          "token_accuracy": 0.0
+        },
+        "ctx512_d0.50": {
+          "ce": 20.955554985050508,
+          "exact_match_rate": 0.0,
+          "mrr": null,
+          "n_instances": 1,
+          "n_tokens": 12,
+          "perplexity": 1261484431.9310238,
+          "rank_top1_rate": null,
+          "token_accuracy": 0.0
+        },
+        "ctx512_d0.75": null,
+        "ctx512_d1.00": null
+      },
+      "overall": {
+        "ce": 18.678499892128606,
+        "exact_match_rate": 0.0,
+        "mrr": null,
+        "n_instances": 5,
+        "n_tokens": 60,
+        "perplexity": 129410475.62542681,
+        "rank_top1_rate": null,
+        "token_accuracy": 0.016666666666666666
+      }
+    },
+    "recall": {
+      "by_bucket": {
+        "long": {
+          "ce": 22.8590718140471,
+          "exact_match_rate": 0.0,
+          "mrr": 0.41666666666666663,
+          "n_instances": 2,
+          "n_tokens": 24,
+          "perplexity": 8463865440.268489,
+          "rank_top1_rate": 0.0,
+          "token_accuracy": 0.0
+        },
+        "medium": {
+          "ce": 22.85404666343918,
+          "exact_match_rate": 0.0,
+          "mrr": 0.41666666666666663,
+          "n_instances": 2,
+          "n_tokens": 24,
+          "perplexity": 8421439928.277554,
+          "rank_top1_rate": 0.0,
+          "token_accuracy": 0.0
+        },
+        "short": {
+          "ce": 22.85991983274917,
+          "exact_match_rate": 0.0,
+          "mrr": 0.3333333333333333,
+          "n_instances": 1,
+          "n_tokens": 12,
+          "perplexity": 8471046000.64809,
+          "rank_top1_rate": 0.0,
+          "token_accuracy": 0.0
+        }
+      },
+      "overall": {
+        "ce": 22.857231357544347,
+        "exact_match_rate": 0.0,
+        "mrr": 0.4,
+        "n_instances": 5,
+        "n_tokens": 60,
+        "perplexity": 8448302390.032071,
+        "rank_top1_rate": 0.0,
+        "token_accuracy": 0.0
+      }
+    }
+  },
+  "timing": {
+    "external": 4.048944332986139,
+    "fim": 0.8320150409126654,
+    "needle": 4.085911375004798,
+    "recall": 22.70497441594489,
+    "total_s": 31.67553691705689
+  }
+}

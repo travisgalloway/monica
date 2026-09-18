@@ -80,20 +80,43 @@ tasks:
     cmds:
       - '{{.PYTHON}} scripts/eval_cross_path.py'
 
+  eval-code:
+    desc: 'Run held-out code evaluation suite (recall, needle, FIM) on POC weights'
+    cmds:
+      - '{{.PYTHON}} scripts/eval_code_suite.py --config {{.POC_CONFIG}} --checkpoint {{.POC_OUT}}/weights.safetensors --backend mlx --byte-tokenizer --suites recall,needle,fim,external --limit {{.LIMIT}} --output results/poc_code_suite.json --transcript results/poc_code_suite.jsonl'
+
+  bench-lsp:
+    desc: 'Benchmark native Swift LSP service completions and diagnostics throughput'
+    cmds:
+      - 'swift/.build/release/monica-lsp --bench --eval-set-dir eval_sets/ts_error_injection'
+
   eval:
-    desc: 'Run the complete evaluation suite (diagnostic, cross-path, and AR ablation)'
+    desc: 'Run the complete evaluation suite (diagnostic, cross-path, AR ablation, and code suite)'
     cmds:
       - task: eval-diagnostic
       - task: eval-cross-path
       - task: eval-ar
+      - task: eval-code
 
   e2e:
-    desc: 'Run end-to-end flow: smoke test -> train model -> generate tokens -> run evals'
+    desc: 'Run end-to-end demo flow: smoke test -> train model -> generate tokens -> run evals'
     cmds:
       - task: smoke
       - task: train
       - task: generate
       - task: eval-diagnostic
+      - task: eval-cross-path
+
+  e2e-poc:
+    desc: 'Run full end-to-end Tier 1 Mac POC flow: smoke -> train POC -> quantize -> generate -> run evals'
+    cmds:
+      - task: smoke
+      - task: train-poc
+      - task: quantize-poc
+      - task: generate-poc
+      - task: generate-q4
+      - task: eval-code
+      - task: eval-ar
       - task: eval-cross-path
 
   test-ssi:

@@ -17,7 +17,7 @@ POC_STEPS ?= 50
 POC_BATCH_SIZE ?= 2
 POC_BASE_LR ?= 3e-4
 
-.PHONY: help smoke train train-poc quantize-poc generate generate-poc generate-q4 build-swift eval-ar eval-diagnostic eval-cross-path eval e2e test-ssi clean
+.PHONY: help smoke train train-poc quantize-poc generate generate-poc generate-q4 build-swift bench-lsp eval-ar eval-diagnostic eval-cross-path eval-code eval e2e e2e-poc test-ssi clean
 
 help:
 	@echo "Available commands:"
@@ -29,11 +29,14 @@ help:
 	@echo "  make generate-poc     Generate text from Tier 1 POC native weights"
 	@echo "  make generate-q4      Generate text from Tier 1 POC quantized weights"
 	@echo "  make build-swift      Build native Swift tokenizer and engine tools"
+	@echo "  make bench-lsp        Benchmark native Swift LSP service"
 	@echo "  make eval-ar          Run AR harness ablation across 4 cells (Issue #201)"
 	@echo "  make eval-diagnostic  Run diagnostic supervision evaluation (Issue #227)"
 	@echo "  make eval-cross-path  Run cross-path efficiency comparison (Issue #204)"
+	@echo "  make eval-code        Run code evaluation suite (recall, needle, FIM)"
 	@echo "  make eval             Run all evaluation pipelines"
-	@echo "  make e2e              Run full flow: smoke -> train -> generate -> eval"
+	@echo "  make e2e              Run demo flow: smoke -> train -> generate -> eval"
+	@echo "  make e2e-poc          Run full Tier 1 Mac POC flow: smoke -> train -> quantize -> gen -> evals"
 	@echo "  make test-ssi         Run SSI test suite"
 	@echo "  make clean            Clean up output run directories"
 
@@ -70,9 +73,17 @@ eval-diagnostic:
 eval-cross-path:
 	$(PYTHON) scripts/eval_cross_path.py
 
-eval: eval-diagnostic eval-cross-path eval-ar
+eval-code:
+	$(PYTHON) scripts/eval_code_suite.py --config $(POC_CONFIG) --checkpoint $(POC_OUT)/weights.safetensors --backend mlx --byte-tokenizer --suites recall,needle,fim,external --limit $(LIMIT) --output results/poc_code_suite.json --transcript results/poc_code_suite.jsonl
+
+bench-lsp:
+	swift/.build/release/monica-lsp --bench --eval-set-dir eval_sets/ts_error_injection
+
+eval: eval-diagnostic eval-cross-path eval-ar eval-code
 
 e2e: smoke train generate eval-diagnostic eval-cross-path
+
+e2e-poc: smoke train-poc quantize-poc generate-poc generate-q4 eval-code eval-ar eval-cross-path
 
 test-ssi:
 	$(PYTEST) tests/test_ar_ablation.py tests/test_diagnostic_supervision.py tests/test_cross_path.py
