@@ -388,7 +388,9 @@ class SelectiveSSM(nn.Module):
         X = _f32(x).reshape(B_, L, H, P)             # whole scan runs in fp32
 
         pad = (-L) % Q
-        if pad:
+        if isinstance(L, torch.SymInt) and (int(L) % Q) == 0:
+            pad = 0
+        elif pad:
             zc = lambda t, shp: torch.cat([t, t.new_zeros(shp)], dim=1)
             X, delta = zc(X, (B_, pad, H, P)), zc(delta, (B_, pad, H))
             Bm, Cm = zc(Bm, (B_, pad, N)), zc(Cm, (B_, pad, N))
