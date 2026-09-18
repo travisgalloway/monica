@@ -120,6 +120,7 @@ def main() -> None:
             volume_in_gb=args.volume_gb,
             container_disk_in_gb=args.disk_gb,
             start_ssh=True,
+            ports="22/tcp",
             env=pod_env,
         )
         pod_id = pod.get("id")
@@ -131,7 +132,7 @@ def main() -> None:
                 time.sleep(5)
                 info = runpod.get_pod(pod_id)
                 status = info.get("desiredStatus")
-                runtime = info.get("runtime", {})
+                runtime = info.get("runtime") or {}
                 ports = runtime.get("ports", [])
                 if runtime and ports:
                     ssh_port = None
