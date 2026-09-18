@@ -13,6 +13,7 @@ vars:
   LIMIT: '5'
   PROMPT: 'function add(a: number, b: number): number {'
   MAX_TOKENS: '20'
+  BACKEND: 'auto'
   POC_CONFIG: 'config/code-small-dense.yaml'
   POC_OUT: 'runs/tier1-poc'
   POC_STEPS: '50'
@@ -28,17 +29,28 @@ tasks:
   smoke:
     desc: 'Run exact resume gate and val-perplexity smoke test'
     cmds:
-      - '{{.PYTHON}} scripts/smoke_test.py --config {{.CONFIG}} --data {{.DATA}} --steps 10 --batch-size 2 --out runs/smoke_test'
+      - '{{.PYTHON}} scripts/smoke_test.py --backend {{.BACKEND}} --config {{.CONFIG}} --data {{.DATA}} --steps 10 --batch-size 2 --out runs/smoke_test'
+
+  smoke-cuda:
+    desc: 'Run exact resume gate on CUDA backend with torch.compile'
+    cmds:
+      - '{{.PYTHON}} scripts/smoke_test.py --backend cuda --config {{.CONFIG}} --data {{.DATA}} --steps 10 --batch-size 2 --out runs/smoke_test --compile'
 
   train:
-    desc: 'Train a model on Apple Silicon / MLX and save complete safetensors weights'
+    desc: 'Train a model and save complete safetensors weights'
     cmds:
-      - '{{.PYTHON}} scripts/train.py --config {{.CONFIG}} --data {{.DATA}} --out {{.OUT}} --total-steps {{.STEPS}} --batch-size {{.BATCH_SIZE}} --log-every 5 --eval-every 10 --ckpt-every 10'
+      - '{{.PYTHON}} scripts/train.py --backend {{.BACKEND}} --config {{.CONFIG}} --data {{.DATA}} --out {{.OUT}} --total-steps {{.STEPS}} --batch-size {{.BATCH_SIZE}} --log-every 5 --eval-every 10 --ckpt-every 10'
 
   train-poc:
-    desc: 'Train Tier 1 Mac POC model (code-small-dense.yaml)'
+    desc: 'Train Tier 1 POC model (code-small-dense.yaml)'
     cmds:
-      - '{{.PYTHON}} scripts/train.py --config {{.POC_CONFIG}} --data {{.DATA}} --out {{.POC_OUT}} --total-steps {{.POC_STEPS}} --batch-size {{.POC_BATCH_SIZE}} --base-lr {{.POC_BASE_LR}} --log-every 5 --eval-every 10 --ckpt-every 10'
+      - '{{.PYTHON}} scripts/train.py --backend {{.BACKEND}} --config {{.POC_CONFIG}} --data {{.DATA}} --out {{.POC_OUT}} --total-steps {{.POC_STEPS}} --batch-size {{.POC_BATCH_SIZE}} --base-lr {{.POC_BASE_LR}} --log-every 5 --eval-every 10 --ckpt-every 10'
+
+  train-cuda:
+    desc: 'Train Tier 1 POC model on CUDA backend'
+    cmds:
+      - task: train-poc
+        vars: { BACKEND: 'cuda' }
 
   quantize-poc:
     desc: 'Quantize Tier 1 POC weights to Mixed W4+Head8'
@@ -46,19 +58,19 @@ tasks:
       - '{{.PYTHON}} scripts/quantize_checkpoint.py --weights {{.POC_OUT}}/weights.safetensors --out {{.POC_OUT}}/weights.q4.safetensors --bits 4 --head-bits 8'
 
   generate:
-    desc: 'Generate text from the trained checkpoint using MLX'
+    desc: 'Generate text from the trained checkpoint'
     cmds:
-      - '{{.PYTHON}} scripts/generate.py --config {{.CONFIG}} --weights {{.OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+      - '{{.PYTHON}} scripts/generate.py --backend {{.BACKEND}} --config {{.CONFIG}} --weights {{.OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
 
   generate-poc:
     desc: 'Generate text from Tier 1 POC native weights'
     cmds:
-      - '{{.PYTHON}} scripts/generate.py --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+      - '{{.PYTHON}} scripts/generate.py --backend {{.BACKEND}} --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
 
   generate-q4:
     desc: 'Generate text from Tier 1 POC quantized weights'
     cmds:
-      - '{{.PYTHON}} scripts/generate.py --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.q4.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+      - '{{.PYTHON}} scripts/generate.py --backend {{.BACKEND}} --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.q4.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
 
   build-swift:
     desc: 'Build native Swift tokenizer and engine tools'
@@ -83,7 +95,13 @@ tasks:
   eval-code:
     desc: 'Run held-out code evaluation suite (recall, needle, FIM) on POC weights'
     cmds:
-      - '{{.PYTHON}} scripts/eval_code_suite.py --config {{.POC_CONFIG}} --checkpoint {{.POC_OUT}}/weights.safetensors --backend mlx --byte-tokenizer --suites recall,needle,fim,external --limit {{.LIMIT}} --output results/poc_code_suite.json --transcript results/poc_code_suite.jsonl'
+      - '{{.PYTHON}} scripts/eval_code_suite.py --config {{.POC_CONFIG}} --checkpoint {{.POC_OUT}}/weights.safetensors --backend {{.BACKEND}} --byte-tokenizer --suites recall,needle,fim,external --limit {{.LIMIT}} --output results/poc_code_suite.json --transcript results/poc_code_suite.jsonl'
+
+  eval-code-cuda:
+    desc: 'Run held-out code evaluation suite on CUDA backend'
+    cmds:
+      - task: eval-code
+        vars: { BACKEND: 'cuda' }
 
   bench-lsp:
     desc: 'Benchmark native Swift LSP service completions and diagnostics throughput'
@@ -94,9 +112,13 @@ tasks:
     desc: 'Run the complete evaluation suite (diagnostic, cross-path, AR ablation, and code suite)'
     cmds:
       - task: eval-diagnostic
+        vars: { BACKEND: '{{.BACKEND}}' }
       - task: eval-cross-path
+        vars: { BACKEND: '{{.BACKEND}}' }
       - task: eval-ar
+        vars: { BACKEND: '{{.BACKEND}}' }
       - task: eval-code
+        vars: { BACKEND: '{{.BACKEND}}' }
 
   e2e:
     desc: 'Run end-to-end demo flow: smoke test -> train model -> generate tokens -> run evals'
@@ -108,7 +130,7 @@ tasks:
       - task: eval-cross-path
 
   e2e-poc:
-    desc: 'Run full end-to-end Tier 1 Mac POC flow: smoke -> train POC -> quantize -> generate -> run evals'
+    desc: 'Run full end-to-end Tier 1 POC flow: smoke -> train POC -> quantize -> generate -> run evals'
     cmds:
       - task: smoke
       - task: train-poc
@@ -117,6 +139,20 @@ tasks:
       - task: generate-q4
       - task: eval-code
       - task: eval-ar
+      - task: eval-cross-path
+
+  e2e-cuda:
+    desc: 'Run full end-to-end POC flow on CUDA backend'
+    cmds:
+      - task: smoke-cuda
+      - task: train-cuda
+      - task: quantize-poc
+      - task: generate-poc
+        vars: { BACKEND: 'cuda' }
+      - task: generate-q4
+        vars: { BACKEND: 'cuda' }
+      - task: eval-code-cuda
+      - task: eval-diagnostic
       - task: eval-cross-path
 
   test-ssi:

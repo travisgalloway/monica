@@ -267,6 +267,8 @@ def main() -> None:
                          "student config/student-1b.yaml, olmo for config/poc.yaml)")
     ap.add_argument("--byte-fallback", action="store_true",
                     help="offline ByteTokenizer (toy config only; not OLMo/Qwen-compatible)")
+    ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
+                    help="hardware backend (auto: try mlx, fall back to cuda/torch)")
     args = ap.parse_args()
     if args.chat and args.interactive:
         ap.error("--chat and --interactive are different REPLs; pick one")
@@ -274,26 +276,19 @@ def main() -> None:
         ap.error("provide --prompt for completion mode, --chat for the instruction "
                  "REPL, or --interactive for the stateful continuation REPL")
 
-    try:
-        import mlx.core as mx  # noqa: F401  (seeded below; import proves availability)
-    except ModuleNotFoundError as e:
-        if e.name != "mlx":
-            raise
-        raise SystemExit(
-            "mlx not found — run with the project venv on Apple Silicon:\n"
-            "    .venv/bin/python scripts/generate.py ...")
     from src.data.tokenize import (
         ByteTokenizer,
         load_olmo_tokenizer,
         load_qwen25_tokenizer,
         load_qwen3_tokenizer,
     )
+    from src.model.backend import get_backend
     from src.model.blocks import load_config
-    from src.model.mlx_backend import MLXMambaModel
 
+    backend = get_backend(args.backend)
     cfg = load_config(str(args.config))
-    mx.random.seed(args.seed)
-    model = MLXMambaModel(cfg)
+    backend.seed(args.seed)
+    model = backend.model_cls(cfg)
     if args.weights:
         model.load(str(args.weights))
         print(f"loaded weights: {args.weights}", file=sys.stderr)
@@ -320,7 +315,7 @@ def main() -> None:
                       repetition_penalty=args.repetition_penalty,
                       no_repeat_ngram_size=args.no_repeat_ngram_size)
     store = SessionStore(model, max_concurrent=1)
-    to_numpy = lambda a: np.array(a)
+    to_numpy = backend.to_numpy
 
     def run(text: str, *, stop_marker: str | None) -> str:
         """Encode `text`, emit the continuation to stdout, on one fresh session.
