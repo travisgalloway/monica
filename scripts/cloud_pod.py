@@ -53,7 +53,7 @@ def main() -> None:
     p_launch.add_argument("--gpu", default="NVIDIA GeForce RTX 4090", help="GPU type ID")
     p_launch.add_argument("--image", default="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
                           help="Docker image")
-    p_launch.add_argument("--volume-gb", type=int, default=50, help="volume size in GB")
+    p_launch.add_argument("--volume-gb", type=int, default=0, help="volume size in GB (0 = none)")
     p_launch.add_argument("--disk-gb", type=int, default=50, help="container disk in GB")
     p_launch.add_argument("--cloud-type", choices=("ALL", "COMMUNITY", "SECURE"), default="ALL")
     p_launch.add_argument("--wait", action="store_true", default=True,
