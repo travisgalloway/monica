@@ -7,8 +7,10 @@ serve/chat → eval**. For *why* the project is built this way, see
 
 > **Status note (2026-07-19).** The **live program is M12** — a from-scratch TypeScript-first
 > Mamba-2 hybrid **MoE** code model ([issue #198](https://github.com/travisgalloway/monica/issues/198),
-> design: [`design/13-code-model-moe.md`](design/13-code-model-moe.md)). The M10 distillation
-> program (issue #65) was **dropped 2026-07-19**; its design record moved to
+> design: [`design/13-code-model-moe.md`](design/13-code-model-moe.md)). For the active M12
+> operational runbook across POC (~100M Mac, ~1B CUDA) and MVP (~4B CUDA) runs with Native FP16/BF16
+> and Mixed Precision W4 + KV8, see [`runbooks/e2e-training-eval-serving.md`](runbooks/e2e-training-eval-serving.md).
+> The M10 distillation program (issue #65) was **dropped 2026-07-19**; its design record moved to
 > [`reserve/10-distillation.md`](reserve/10-distillation.md). M12's own commands (own-BPE
 > tokenizer #191, Essential-Web + Stack-v2 corpus #193, MoE training) land as that work is built
 > out. The two paths below remain accurate for what they cover; the distillation path is now

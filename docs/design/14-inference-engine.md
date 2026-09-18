@@ -205,6 +205,22 @@ trained model — see `swift/engine/Fixtures/README.md`).
 checkpoint, not a toy fixture — `scripts/quantize_checkpoint.py` reports the packed/original
 byte ratio as the footprint evidence, and throughput is left to a future bench issue.
 
+### Deployment Precision Regimes: Native FP16/BF16 vs. Mixed Precision W4 + KV8
+
+Inference and serving standardize on two deployment precision profiles across the target matrix (see [16-target-configuration-matrix.md](16-target-configuration-matrix.md)):
+
+1. **Native Precision (FP16 / BF16)**:
+   - Full-precision baseline: uncompressed 16-bit weights and KV cache.
+   - Preserves exact ground-truth attention sharpness and numerical parity.
+   - Memory footprint scales to 7.4 GB at 128k context and 18.5 GB at 256k max context (`code-large-a`).
+
+2. **Mixed Precision (W4 + KV8)**:
+   - **Hidden Weights**: 4-bit group-wise affine (`--bits 4 --group-size 64`).
+   - **Tied Head**: 8-bit embedding override (`--head-bits 8`) to eliminate code syntax and token logit degradation.
+   - **Attention KV Cache**: 8-bit quantized (`KV8`), providing 256 discrete bins to preserve sharp attention dot-products across 64k, 128k, and 256k context lengths.
+   - **SSM Recurrent State**: Kept in native FP32 (under 7 MB total across all 49 Mamba layers).
+   - **Memory Advantage**: Delivers 75% memory bandwidth reduction and 2x–3x decode speedup, dropping 256k context memory from 18.5 GB down to 7.52 GB (W4 + KV8).
+
 ## Training on the Swift engine (#195/#196/#197)
 
 Half of M13's scope, and the half with the most unknowns.

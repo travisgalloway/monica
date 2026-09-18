@@ -1,0 +1,77 @@
+version: '3'
+
+vars:
+  PYTHON: '.venv/bin/python'
+  PYTEST: '.venv/bin/pytest'
+  TSC_PATH: 'eval_sets/ts_error_injection/node_modules/.bin'
+  CONFIG: 'config/toy.yaml'
+  DATA: 'data/split'
+  OUT: 'runs/demo_run'
+  STEPS: '20'
+  BATCH_SIZE: '2'
+  MODEL: 'mlx-community/mamba2-130m'
+  LIMIT: '5'
+  PROMPT: 'function add(a: number, b: number): number {'
+  MAX_TOKENS: '20'
+
+tasks:
+  default:
+    desc: 'List available tasks'
+    cmds:
+      - task --list
+
+  smoke:
+    desc: 'Run exact resume gate and val-perplexity smoke test'
+    cmds:
+      - '{{.PYTHON}} scripts/smoke_test.py --config {{.CONFIG}} --data {{.DATA}} --steps 10 --batch-size 2 --out runs/smoke_test'
+
+  train:
+    desc: 'Train a model on Apple Silicon / MLX and save complete safetensors weights'
+    cmds:
+      - '{{.PYTHON}} scripts/train.py --config {{.CONFIG}} --data {{.DATA}} --out {{.OUT}} --total-steps {{.STEPS}} --batch-size {{.BATCH_SIZE}} --log-every 5 --eval-every 10 --ckpt-every 10'
+
+  generate:
+    desc: 'Generate text from the trained checkpoint using MLX'
+    cmds:
+      - '{{.PYTHON}} scripts/generate.py --config {{.CONFIG}} --weights {{.OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+
+  eval-ar:
+    desc: 'Run AR harness ablation across 4 cells on TypeScript error injection eval set'
+    cmds:
+      - 'PATH="{{.TSC_PATH}}:$PATH" {{.PYTHON}} scripts/eval_ar_ablation.py --model {{.MODEL}} --limit {{.LIMIT}}'
+
+  eval-diagnostic:
+    desc: 'Run diagnostic supervision evaluation (rejection FT + contrastive hard negatives)'
+    cmds:
+      - 'PATH="{{.TSC_PATH}}:$PATH" {{.PYTHON}} scripts/eval_diagnostic_supervision.py --limit {{.LIMIT}}'
+
+  eval-cross-path:
+    desc: 'Run cross-path comparison and tool-call efficiency baseline'
+    cmds:
+      - '{{.PYTHON}} scripts/eval_cross_path.py'
+
+  eval:
+    desc: 'Run the complete evaluation suite (diagnostic, cross-path, and AR ablation)'
+    cmds:
+      - task: eval-diagnostic
+      - task: eval-cross-path
+      - task: eval-ar
+
+  e2e:
+    desc: 'Run end-to-end flow: smoke test -> train model -> generate tokens -> run evals'
+    cmds:
+      - task: smoke
+      - task: train
+      - task: generate
+      - task: eval-diagnostic
+      - task: eval-cross-path
+
+  test-ssi:
+    desc: 'Run unit and contract tests for SSI evaluation and supervision'
+    cmds:
+      - '{{.PYTEST}} tests/test_ar_ablation.py tests/test_diagnostic_supervision.py tests/test_cross_path.py'
+
+  clean:
+    desc: 'Clean run outputs and temporary files'
+    cmds:
+      - rm -rf runs/demo_run runs/smoke_test /tmp/smoke_out
