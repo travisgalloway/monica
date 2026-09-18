@@ -32,7 +32,7 @@ source .venv/bin/activate
 pip install -e ".[dev,data,mlx]"
 
 # Build native Swift tokenizer and engine tools
-swift build -c release
+(cd swift && swift build -c release --build-system native)
 
 # Install Task runner (optional, or use make)
 # brew install go-task
@@ -111,13 +111,13 @@ task smoke
 # Full local training run
 python scripts/train.py \
   --config config/code-small-dense.yaml \
-  --data data/packed/train_shard_000.bin \
-  --out checkpoints/tier1-poc \
-  --steps 50000 \
-  --lr 3e-4 \
+  --data data/split \
+  --out runs/tier1-poc \
+  --total-steps 50000 \
+  --base-lr 3e-4 \
   --batch-size 4 \
   --grad-accum 8 \
-  --save-every 1000 \
+  --ckpt-every 1000 \
   --eval-every 500
 ```
 
@@ -126,9 +126,9 @@ To resume from an existing checkpoint:
 ```bash
 python scripts/train.py \
   --config config/code-small-dense.yaml \
-  --data data/packed/train_shard_000.bin \
-  --resume checkpoints/tier1-poc/step-10000.safetensors \
-  --out checkpoints/tier1-poc
+  --data data/split \
+  --resume runs/tier1-poc/resume \
+  --out runs/tier1-poc
 ```
 
 ### 3.2 Tier 2: CUDA-Trained POC (~1B Active, 128k Window)
@@ -240,10 +240,11 @@ Runs recall, FIM completion, and external benchmarks (MultiPL-E, CrossCodeEval):
 
 ```bash
 python scripts/eval_code_suite.py \
-  --checkpoint checkpoints/tier1-poc/final.safetensors \
-  --decontam-manifest eval_sets/decontam/blocklist.manifest.json \
-  --suites fim,recall,cross_file \
-  --out results/code_suite.json
+  --config config/code-small-dense.yaml \
+  --checkpoint runs/tier1-poc/weights.safetensors \
+  --suites recall,needle,fim,external \
+  --output results/code_suite.json \
+  --transcript results/code_suite.jsonl
 ```
 
 ---
@@ -255,21 +256,21 @@ To deploy with 75% memory bandwidth reduction while preserving exact code syntax
 ```bash
 # Quantize checkpoint
 python scripts/quantize_checkpoint.py \
-  --input checkpoints/tier1-poc/final.safetensors \
-  --output checkpoints/tier1-poc/model_w4_kv8.safetensors \
+  --weights runs/tier1-poc/weights.safetensors \
+  --out runs/tier1-poc/weights.q4.safetensors \
   --bits 4 \
   --group-size 64 \
   --head-bits 8
 
 # Inspect resulting configuration sidecar
-cat checkpoints/tier1-poc/model_w4_kv8.safetensors.config.json
+cat runs/tier1-poc/weights.q4.safetensors.config.json
 ```
 
 The output JSON sidecar records:
-- `quantization.bits`: 4
-- `quantization.group_size`: 64
-- `quantization.head_bits`: 8
-- `kv_quantization.mode`: "int8"
+- `quant.mode`: "affine"
+- `quant.group_size`: 64
+- `quant.targets.embedding`: 8
+- `quant.targets.layers.*`: 4
 - `state_quantization.mode`: "fp32" (unquantized continuous SSM states)
 
 ---
@@ -283,17 +284,18 @@ Run interactive generation or batch completions:
 ```bash
 # Native FP16 serving (Mac POC)
 python scripts/generate.py \
-  --checkpoint checkpoints/tier1-poc/final.safetensors \
+  --config config/code-small-dense.yaml \
+  --weights runs/tier1-poc/weights.safetensors \
   --prompt "function mergeSort(arr: number[]): number[] {" \
-  --max-tokens 256 \
-  --temp 0.2
+  --max-new-tokens 256 \
+  --temperature 0.2
 
 # Mixed Precision W4 + KV8 serving
 python scripts/generate.py \
-  --checkpoint checkpoints/tier1-poc/model_w4_kv8.safetensors \
+  --config config/code-small-dense.yaml \
+  --weights runs/tier1-poc/weights.q4.safetensors \
   --prompt "interface DistributedCache<K, V> {" \
-  --max-tokens 512 \
-  --kv-bits 8
+  --max-new-tokens 512
 ```
 
 ### 6.2 High-Throughput Native Swift Engine

@@ -13,6 +13,11 @@ vars:
   LIMIT: '5'
   PROMPT: 'function add(a: number, b: number): number {'
   MAX_TOKENS: '20'
+  POC_CONFIG: 'config/code-small-dense.yaml'
+  POC_OUT: 'runs/tier1-poc'
+  POC_STEPS: '50'
+  POC_BATCH_SIZE: '2'
+  POC_BASE_LR: '3e-4'
 
 tasks:
   default:
@@ -30,10 +35,35 @@ tasks:
     cmds:
       - '{{.PYTHON}} scripts/train.py --config {{.CONFIG}} --data {{.DATA}} --out {{.OUT}} --total-steps {{.STEPS}} --batch-size {{.BATCH_SIZE}} --log-every 5 --eval-every 10 --ckpt-every 10'
 
+  train-poc:
+    desc: 'Train Tier 1 Mac POC model (code-small-dense.yaml)'
+    cmds:
+      - '{{.PYTHON}} scripts/train.py --config {{.POC_CONFIG}} --data {{.DATA}} --out {{.POC_OUT}} --total-steps {{.POC_STEPS}} --batch-size {{.POC_BATCH_SIZE}} --base-lr {{.POC_BASE_LR}} --log-every 5 --eval-every 10 --ckpt-every 10'
+
+  quantize-poc:
+    desc: 'Quantize Tier 1 POC weights to Mixed W4+Head8'
+    cmds:
+      - '{{.PYTHON}} scripts/quantize_checkpoint.py --weights {{.POC_OUT}}/weights.safetensors --out {{.POC_OUT}}/weights.q4.safetensors --bits 4 --head-bits 8'
+
   generate:
     desc: 'Generate text from the trained checkpoint using MLX'
     cmds:
       - '{{.PYTHON}} scripts/generate.py --config {{.CONFIG}} --weights {{.OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+
+  generate-poc:
+    desc: 'Generate text from Tier 1 POC native weights'
+    cmds:
+      - '{{.PYTHON}} scripts/generate.py --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+
+  generate-q4:
+    desc: 'Generate text from Tier 1 POC quantized weights'
+    cmds:
+      - '{{.PYTHON}} scripts/generate.py --config {{.POC_CONFIG}} --weights {{.POC_OUT}}/weights.q4.safetensors --prompt "{{.PROMPT}}" --byte-fallback --max-new-tokens {{.MAX_TOKENS}}'
+
+  build-swift:
+    desc: 'Build native Swift tokenizer and engine tools'
+    cmds:
+      - 'cd swift && swift build -c release --build-system native'
 
   eval-ar:
     desc: 'Run AR harness ablation across 4 cells on TypeScript error injection eval set'

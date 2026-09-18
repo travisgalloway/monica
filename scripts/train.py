@@ -269,6 +269,11 @@ def main() -> None:
     start_step = 0
     start_data_state = None
     if resuming:
+        slot = store.latest_slot()
+        slot_dir = store.root / slot
+        check_weight_keys(load_weights_dict(str(slot_dir / "weights.safetensors")),
+                          model._portable_state_dict(),
+                          where=f"resume checkpoint ({slot_dir})")
         meta = store.load(weights_deserializer=lambda p: model.load(p),
                           optimizer_deserializer=lambda p: backend.load_optimizer(opt, p))
         start_step = int(meta["step"])
