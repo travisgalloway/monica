@@ -1170,6 +1170,8 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self._state = None
         self.to(self._device)
+        if self._device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
         _report_fast_path_once(self._device)
         if config.fp8_experts and config.n_moe_layers:
             _report_fp8_status_once(self._device)
