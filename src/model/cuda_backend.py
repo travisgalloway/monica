@@ -387,10 +387,9 @@ class SelectiveSSM(nn.Module):
         # --- pure-PyTorch fallback ------------------------------------------------
         X = _f32(x).reshape(B_, L, H, P)             # whole scan runs in fp32
 
-        pad = (-L) % Q
-        if isinstance(L, torch.SymInt) and (int(L) % Q) == 0:
-            pad = 0
-        elif pad:
+        rem = L % Q
+        pad = (Q - rem) % Q
+        if pad != 0:
             zc = lambda t, shp: torch.cat([t, t.new_zeros(shp)], dim=1)
             X, delta = zc(X, (B_, pad, H, P)), zc(delta, (B_, pad, H))
             Bm, Cm = zc(Bm, (B_, pad, N)), zc(Cm, (B_, pad, N))
