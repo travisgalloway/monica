@@ -59,6 +59,7 @@ PORTABLE_MODULES = [
     "src.data.tool_sources",
     "src.data.tool_sft",
     "src.agent",
+    "src.agent.fetcher",
     "src.agent.search",
     "src.data.sft_data",
     "src.data.sft_loader",
