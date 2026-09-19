@@ -29,15 +29,15 @@ below is importable, and testable, without a backend.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Callable, Optional
 
 import numpy as np
 
@@ -78,7 +78,7 @@ def _nonnegative_int(text: str) -> int:
 
 def _parse_rewind_arg(arg: str) -> tuple[int, bool]:
     """`"2" -> (2, False)`, `"#7" -> (7, True)`. Raises ValueError on anything else."""
-    body = arg[1:] if arg.startswith("#") else arg
+    body = arg.removeprefix("#")
     try:
         return int(body), arg.startswith("#")
     except ValueError:
@@ -91,7 +91,7 @@ def _path_to_root(nodes, node_id: int) -> list[int]:
     """Root-first ancestry of `node_id`, from a `SessionHistory.nodes()` listing."""
     parent_of = {nid: parent for nid, parent, _ in nodes}
     path: list[int] = []
-    cursor: Optional[int] = node_id
+    cursor: int | None = node_id
     while cursor is not None and cursor in parent_of:
         path.append(cursor)
         cursor = parent_of[cursor]
@@ -101,10 +101,10 @@ def _path_to_root(nodes, node_id: int) -> list[int]:
 def interactive_repl(
     store,
     session_id: str,
-    history: Optional[SessionHistory],
+    history: SessionHistory | None,
     *,
     run_turn: Callable[..., str],
-    read_line: Callable[[], Optional[str]],
+    read_line: Callable[[], str | None],
     emit: Callable[[str], None],
     rewind_enabled: bool = True,
 ) -> None:
@@ -132,7 +132,7 @@ def interactive_repl(
         for stale in [node_id for node_id in transcript if node_id not in retained]:
             del transcript[stale]
 
-    root: Optional[int] = None                # this session's own turn-0 node id (#318)
+    root: int | None = None                # this session's own turn-0 node id (#318)
     if rewind_enabled:
         if history is None:
             raise ValueError("rewind_enabled=True requires a SessionHistory")
@@ -282,6 +282,14 @@ def main() -> None:
                     help="offline ByteTokenizer (toy config only; not OLMo/Qwen-compatible)")
     ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                     help="hardware backend (auto: try mlx, fall back to cuda/torch)")
+    ap.add_argument("--critic-filter", action="store_true", default=False,
+                    help="filter candidate completions with surrogate critic head (M12 #388)")
+    ap.add_argument("--critic-threshold", type=float, default=0.70,
+                    help="P(clean) threshold for surrogate critic filtering (default: 0.70)")
+    ap.add_argument("--best-of-n", "--n-candidates", type=int, default=1, dest="best_of_n",
+                    help="number of candidate completions to generate and verify (default: 1)")
+    ap.add_argument("--critic-weights", type=Path, default=None,
+                    help="optional path to trained critic head weights .npz")
     args = ap.parse_args()
     if args.chat and args.interactive:
         ap.error("--chat and --interactive are different REPLs; pick one")
@@ -292,8 +300,8 @@ def main() -> None:
     from src.data.tokenize import (
         ByteTokenizer,
         load_olmo_tokenizer,
-        load_qwen25_tokenizer,
         load_qwen3_tokenizer,
+        load_qwen25_tokenizer,
     )
     from src.model.backend import get_backend
     from src.model.blocks import load_config
@@ -330,7 +338,7 @@ def main() -> None:
     store = SessionStore(model, max_concurrent=1)
     to_numpy = backend.to_numpy
 
-    def _resolve_special(text: str) -> Optional[int]:
+    def _resolve_special(text: str) -> int | None:
         try:
             ids = tok.encode(text, add_special_tokens=False)
             if len(ids) == 1:
@@ -463,14 +471,82 @@ def main() -> None:
             reply = run(prompt, stop_marker=INSTRUCTION_MARKER)
             messages.append({"role": "assistant", "content": reply.strip()})
     else:
-        if args.fim_prefix is not None:
-            prompt = f"<|fim_prefix|>{args.fim_prefix}<|fim_suffix|>{args.fim_suffix or ''}<|fim_middle|>"
-            run(prompt, stop_marker=None)
-        elif args.prompt and "<|fim_prefix|>" in args.prompt:
-            run(args.prompt, stop_marker=None)
+        critic_head = None
+        if args.critic_filter:
+            if hasattr(model, "critic_heads") and "noul" in model.critic_heads:
+                critic_head = model.critic_heads["noul"]
+            elif args.critic_weights and args.critic_weights.exists():
+                from src.model.critic import CriticConfig, DecisionCriticHead
+                critic_head = DecisionCriticHead(CriticConfig(d_model=cfg.d_model, primitive="noul"))
+                try:
+                    cdata = np.load(args.critic_weights)
+                    critic_head.w1 = cdata["w1"]
+                    critic_head.b1 = cdata["b1"]
+                    critic_head.w2 = cdata["w2"]
+                    critic_head.b2 = cdata["b2"]
+                    critic_head.temperature = float(cdata.get("temperature", 1.0))
+                except Exception as e:
+                    print(f"[critic] warning: failed loading critic weights ({e})", file=sys.stderr)
+
+        if args.best_of_n > 1 or args.critic_filter:
+            prompt_str = args.prompt or (
+                f"<|fim_prefix|>{args.fim_prefix}<|fim_suffix|>{args.fim_suffix or ''}<|fim_middle|>"
+                if args.fim_prefix is not None
+                else ""
+            )
+            try:
+                ids = tok.encode(prompt_str, add_special_tokens=False)
+            except TypeError:
+                ids = tok.encode(prompt_str)
+            if not ids:
+                return
+            from src.serve.generate import generate_best_of_n
+
+            n_cands = max(args.best_of_n, 1)
+            res = generate_best_of_n(
+                store,
+                "best_of_n",
+                ids,
+                n_candidates=n_cands,
+                sampler=sampler,
+                critic_filter=args.critic_filter,
+                critic_threshold=args.critic_threshold,
+                critic_head=critic_head,
+                decode_fn=tok.decode,
+                to_numpy=to_numpy,
+                max_new_tokens=args.max_new_tokens,
+                eos_id=eos_id,
+                pass_context=True,
+                reasoning_mode=reasoning_mode,
+                fim_prefix_id=fim_prefix_id,
+                think_token_id=think_token_id,
+                think_close_id=think_close_id,
+                max_reasoning_tokens=args.max_reasoning_tokens,
+            )
+            if args.prompt and "<|fim_prefix|>" not in args.prompt and args.fim_prefix is None:
+                sys.stdout.write(args.prompt)
+            sys.stdout.write(res.best_text)
+            sys.stdout.flush()
+            print()
+            if args.critic_filter:
+                print(
+                    f"[critic-filter] Telemetry: "
+                    f"critic_latency_ms={res.telemetry.critic_latency_ms:.3f}ms  "
+                    f"oracle_calls_saved={res.telemetry.oracle_calls_saved}/{res.telemetry.total_candidates} "
+                    f"({res.telemetry.prune_rate*100:.1f}%)  "
+                    f"debounce_time_saved_s={res.telemetry.debounce_time_saved_s:.3f}s  "
+                    f"downstream_clean_rate={res.telemetry.downstream_clean_rate*100:.1f}%",
+                    file=sys.stderr,
+                )
         else:
-            sys.stdout.write(args.prompt)
-            run(args.prompt, stop_marker=None)
+            if args.fim_prefix is not None:
+                prompt = f"<|fim_prefix|>{args.fim_prefix}<|fim_suffix|>{args.fim_suffix or ''}<|fim_middle|>"
+                run(prompt, stop_marker=None)
+            elif args.prompt and "<|fim_prefix|>" in args.prompt:
+                run(args.prompt, stop_marker=None)
+            else:
+                sys.stdout.write(args.prompt)
+                run(args.prompt, stop_marker=None)
 
 
 if __name__ == "__main__":
