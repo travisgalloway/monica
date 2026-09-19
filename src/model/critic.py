@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Literal
 
 import numpy as np
-
 
 PrimitiveType = Literal["noul", "score", "choice"]
 
@@ -34,12 +34,12 @@ PrimitiveType = Literal["noul", "score", "choice"]
 class CriticConfig:
     """Configuration for an auxiliary critic head."""
     d_model: int = 768
-    hidden_dim: Optional[int] = None      # Defaults to d_model // 4 if None
+    hidden_dim: int | None = None      # Defaults to d_model // 4 if None
     primitive: PrimitiveType = "noul"
     n_classes: int = 1                    # 1 for noul, K for score/choice
     temperature: float = 1.0
-    rubric_names: Optional[List[str]] = None
-    choice_names: Optional[List[str]] = None
+    rubric_names: list[str] | None = None
+    choice_names: list[str] | None = None
 
     def __post_init__(self):
         if self.hidden_dim is None:
@@ -79,7 +79,7 @@ class DecisionCriticHead:
         -> Raw Logits
     """
 
-    def __init__(self, config: CriticConfig, *, rng: Optional[np.random.Generator] = None):
+    def __init__(self, config: CriticConfig, *, rng: np.random.Generator | None = None):
         self.config = config
         if rng is None:
             rng = np.random.default_rng(42)
@@ -114,7 +114,7 @@ class DecisionCriticHead:
         logits = np.matmul(hidden, self.w2) + self.b2
         return logits
 
-    def predict_noul(self, hidden_states: np.ndarray) -> Dict[str, Any]:
+    def predict_noul(self, hidden_states: np.ndarray) -> dict[str, Any]:
         """Evaluate a boolean condition ('noul' primitive).
 
         Returns:
@@ -124,7 +124,10 @@ class DecisionCriticHead:
         """
         if self.config.primitive != "noul":
             raise ValueError(f"Head configured for {self.config.primitive}, not 'noul'")
-        logits = self.forward_logits(hidden_states)
+        h = np.asarray(hidden_states)
+        if h.ndim == 3:
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
         scaled_logit = logits[..., 0] / max(self.temperature, 1e-6)
         prob = float(np.squeeze(_sigmoid(scaled_logit)))
         decision = bool(prob >= 0.5)
@@ -136,7 +139,7 @@ class DecisionCriticHead:
         }
 
     def predict_score(self, hidden_states: np.ndarray,
-                      rubric_values: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+                      rubric_values: Sequence[float] | None = None) -> dict[str, Any]:
         """Evaluate an ordinal rubric ('score' primitive).
 
         Returns:
@@ -167,7 +170,7 @@ class DecisionCriticHead:
             "confidence": confidence,
         }
 
-    def predict_choice(self, hidden_states: np.ndarray) -> Dict[str, Any]:
+    def predict_choice(self, hidden_states: np.ndarray) -> dict[str, Any]:
         """Evaluate a categorical choice ('choice' primitive).
 
         Returns:
@@ -193,6 +196,16 @@ class DecisionCriticHead:
             "probs": probs.tolist() if isinstance(probs, np.ndarray) else [probs],
             "confidence": confidence,
         }
+
+    def predict(self, hidden_states: np.ndarray, **kwargs) -> dict[str, Any]:
+        """Dispatch prediction based on configured primitive."""
+        if self.config.primitive == "noul":
+            return self.predict_noul(hidden_states)
+        elif self.config.primitive == "score":
+            return self.predict_score(hidden_states, **kwargs)
+        elif self.config.primitive == "choice":
+            return self.predict_choice(hidden_states)
+        raise ValueError(f"Unknown primitive: {self.config.primitive}")
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +299,7 @@ class CriticGateResult:
     brier_score: float
     baseline_brier_score: float
     brier_improvement_pct: float
-    gate_details: Dict[str, bool] = field(default_factory=dict)
+    gate_details: dict[str, bool] = field(default_factory=dict)
     summary: str = ""
 
 

@@ -42,6 +42,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--critic-filter", action="store_true", default=False,
+                    help="abort flawed draft trajectories early using surrogate critic head (#388)")
+    ap.add_argument("--critic-threshold", type=float, default=0.70,
+                    help="P(clean) threshold to accept draft tokens (default: 0.70)")
+    ap.add_argument("--critic-weights", type=Path, default=None,
+                    help="optional path to trained critic head weights .npz")
     args = ap.parse_args()
     if args.weights is None and args.train_steps < 1:
         ap.error("pass --weights <safetensors>, or --train-steps N to build a toy checkpoint")
@@ -51,11 +57,12 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _train_toy_checkpoint(cfg, data_dir, steps, batch_size, lr, seed, mx):
+    import mlx.optimizers as optim
+
+    from src.data.loader import PackedLoader
     from src.model.mlx_backend import MLXMambaModel
     from src.model.mlx_train_step import make_train_step
     from src.train.loss_scale import scaler_for_precision
-    from src.data.loader import PackedLoader
-    import mlx.optimizers as optim
 
     mx.random.seed(seed)
     model = MLXMambaModel(cfg)
@@ -101,13 +108,16 @@ def plain_decode(model, prompt, max_new, mx):
     return generated, time.perf_counter() - t0
 
 
-def spec_decode(model, prompt, max_new, gamma, max_n, mx):
-    """Greedy self-speculative decoding. Identical output to `plain_decode`."""
-    from src.serve.spec_decode import first_mismatch, propose
+def spec_decode(model, prompt, max_new, gamma, max_n, mx, *,
+                critic_filter: bool = False, critic_threshold: float = 0.70, critic: object = None):
+    """Greedy self-speculative decoding with optional surrogate critic early rejection (#388)."""
+    from src.serve.spec_decode import first_mismatch, propose, prune_draft_trajectory
 
     logits, state = _prefill(model, prompt, mx)
     context = [int(t) for t in prompt]
     generated, drafted, accepted, rounds = [], 0, 0, 0
+    critic_latency_ms = 0.0
+    draft_tokens_aborted = 0
 
     t0 = time.perf_counter()
     while len(generated) < max_new:
@@ -121,6 +131,20 @@ def spec_decode(model, prompt, max_new, gamma, max_n, mx):
             generated.append(x)
             context.append(x)
             continue
+
+        if critic_filter:
+            draft, crit_telemetry = prune_draft_trajectory(
+                context, draft, critic, threshold=critic_threshold, model=model
+            )
+            critic_latency_ms += crit_telemetry["critic_latency_ms"]
+            draft_tokens_aborted += crit_telemetry["tokens_aborted"]
+            if not draft:
+                x = _argmax(logits, mx)
+                logits, state = model.step(mx.array([x]), state)
+                mx.eval(logits)
+                generated.append(x)
+                context.append(x)
+                continue
 
         block_logits, block_states = model.verify_block(draft, state)   # one eval
         # All greedy verifier predictions for draft positions 0..len(draft) in ONE host
@@ -153,10 +177,14 @@ def spec_decode(model, prompt, max_new, gamma, max_n, mx):
         context.extend(emit)
 
     elapsed = time.perf_counter() - t0
+    tok_per_sec = (len(generated) / elapsed) if elapsed else 0.0
     stats = {
         "rounds": rounds, "drafted": drafted, "accepted": accepted,
         "accept_rate": (accepted / drafted) if drafted else 0.0,
         "tokens_per_round": (len(generated) / rounds) if rounds else 0.0,
+        "tokens_per_second": tok_per_sec,
+        "critic_latency_ms": critic_latency_ms,
+        "draft_tokens_aborted": draft_tokens_aborted,
     }
     return generated[:max_new], elapsed, stats
 
@@ -172,9 +200,9 @@ def main() -> None:
             "mlx not found — run with the project venv on Apple Silicon:\n"
             "    .venv/bin/python scripts/spec_decode.py ...")
 
+    from src.data.loader import PackedLoader
     from src.model.blocks import load_config
     from src.model.mlx_backend import MLXMambaModel
-    from src.data.loader import PackedLoader
 
     cfg = load_config(str(args.config))
     print(f"[spec] config={args.config}  d_model={cfg.d_model}  n_layers={cfg.n_layers}  "
@@ -196,8 +224,30 @@ def main() -> None:
     inputs, _ = next(iter(loader.epoch()))
     prompt = [int(t) for t in inputs[0]]
 
+    critic = None
+    if args.critic_filter:
+        if hasattr(model, "critic_heads") and "noul" in model.critic_heads:
+            critic = model.critic_heads["noul"]
+        elif args.critic_weights and args.critic_weights.exists():
+            from src.model.critic import CriticConfig, DecisionCriticHead
+            critic = DecisionCriticHead(CriticConfig(d_model=cfg.d_model, primitive="noul"))
+            # Load weights if available
+            try:
+                data = np.load(args.critic_weights)
+                critic.w1 = data["w1"]
+                critic.b1 = data["b1"]
+                critic.w2 = data["w2"]
+                critic.b2 = data["b2"]
+                critic.temperature = float(data.get("temperature", 1.0))
+            except Exception as e:
+                print(f"[critic] failed loading critic weights ({e})", file=sys.stderr)
+
     plain, t_plain = plain_decode(model, prompt, args.max_new, mx)
-    spec, t_spec, stats = spec_decode(model, prompt, args.max_new, args.gamma, args.max_n, mx)
+    spec, t_spec, stats = spec_decode(
+        model, prompt, args.max_new, args.gamma, args.max_n, mx,
+        critic_filter=args.critic_filter, critic_threshold=args.critic_threshold,
+        critic=critic,
+    )
 
     identical = plain == spec
     print(f"\n[correctness] speculative == plain greedy: {identical}")
@@ -210,7 +260,10 @@ def main() -> None:
           f"({stats['accept_rate']*100:.1f}%); {stats['tokens_per_round']:.2f} tokens/round "
           f"over {stats['rounds']} rounds")
     print(f"[plain]    {len(plain)/t_plain:>8.1f} tokens/s   ({t_plain:.3f}s)")
-    print(f"[spec]     {len(spec)/t_spec:>8.1f} tokens/s   ({t_spec:.3f}s)")
+    print(f"[spec]     {len(spec)/t_spec:>8.1f} tokens/s   ({t_spec:.3f}s)  [throughput={stats['tokens_per_second']:.1f} tok/s]")
+    if args.critic_filter:
+        print(f"[critic]   latency={stats.get('critic_latency_ms', 0.0):.3f}ms  "
+              f"tokens_aborted={stats.get('draft_tokens_aborted', 0)}")
     print(f"[result]   speculative is {t_plain/t_spec:.2f}x plain decode wall-clock "
           f"(identical output)")
 
