@@ -200,6 +200,22 @@ WEB_SEARCH_TOOL: dict = {
     },
 }
 
+# Native page extraction tool schema (#367)
+FETCH_WEB_PAGE_TOOL: dict = {
+    "name": "fetch_web_page",
+    "description": "Fetch and extract readable markdown content from a web page URL",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The web page URL to fetch and extract content from",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
 _DISTRACTOR_POOL: List[dict] = [
     {"name": "send_email", "description": "Send an email to a recipient",
      "parameters": {"type": "object",
