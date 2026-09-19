@@ -1316,6 +1316,31 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
 
+    def eval_batch_ce(self, inputs: Array, targets: Array) -> float:
+        """Fast on-device cross-entropy evaluation: avoids transferring full (B, L, V) logits to host."""
+        with torch.no_grad():
+            logits = self.forward(inputs)
+            V = logits.shape[-1]
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=logits.device).reshape(-1)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="mean")
+            return float(ce.item())
+
+    def eval_masked_batch_ce(self, inputs: Array, targets: Array, mask: Array) -> Tuple[float, float]:
+        """Fast on-device masked cross-entropy evaluation: returns (total_weighted_ce, total_mask_weight)."""
+        with torch.no_grad():
+            logits = self.forward(inputs)
+            V = logits.shape[-1]
+            device = logits.device
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device).reshape(-1)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")
+            m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device).reshape(-1)
+            wsum = float(m.sum().item())
+            if wsum == 0.0:
+                return 0.0, 0.0
+            tot = float((ce * m).sum().item())
+            return tot, wsum
+
+
     # --- distillation matching accessors (#100) ------------------------------
     def hidden_states(self, token_batch: Array) -> Tuple[Array, ...]:
         """Per-layer hidden states for the `hidden-align` stage: the embedding output followed

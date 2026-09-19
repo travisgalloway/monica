@@ -50,7 +50,8 @@ def _accumulate_and_step(model, optimizer, loss_and_grad, micro_batches, lr,
         loss, grads = loss_and_grad(model, mb)
         acc_grads = grads if acc_grads is None else _add(acc_grads, grads)
         acc_loss = acc_loss + loss
-        mx.eval(acc_grads, acc_loss)
+        if n > 1:
+            mx.eval(acc_grads, acc_loss)
     grads = _unscale(acc_grads, 1.0 / n)
     loss = acc_loss / n
 
@@ -176,9 +177,10 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> mx.array:
     `cuda_train_step._masked_seq_logprob` to keep the two backends in parity.
     """
     logits = model.forward(inputs).astype(mx.float32)        # (B, L, V)
-    logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     t = mx.array(targets).astype(mx.int32)
-    chosen = mx.take_along_axis(logp, t[..., None], axis=-1)[..., 0]   # (B, L)
+    chosen_logits = mx.take_along_axis(logits, t[..., None], axis=-1)[..., 0]   # (B, L)
+    lse = mx.logsumexp(logits, axis=-1)                                         # (B, L)
+    chosen = chosen_logits - lse                                                # (B, L)
     m = mx.array(mask).astype(mx.float32)
     return (chosen * m).sum(axis=-1)                         # (B,)
 

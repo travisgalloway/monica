@@ -115,6 +115,7 @@ def main() -> None:
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.checkpoint import check_weight_keys, load_weights_dict
+    import mlx.core as mx
 
     backend = get_backend()
     cfg = load_config(str(args.config))
@@ -181,19 +182,37 @@ def main() -> None:
             prompt_ids = list(tok.encode(prob["prompt"])) or [eos or 0]
             step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"])
                               if verifier is not None else reward_fn)
-            rollouts, rewards = [], []
-            for k in range(args.group_size):
-                sid = f"s{step}-{k}"
-                store.create(sid)
-                sampler = partial(sample, temperature=args.temperature, top_k=args.top_k,
-                                  rng=np.random.default_rng(int(rng.integers(1 << 30))))
-                try:
-                    gen = generate(store, sid, prompt_ids, sampler=sampler, to_numpy=np_to,
-                                   max_new_tokens=args.max_new_tokens, eos_id=eos)
-                finally:
-                    store.remove(sid)   # never leak the session if generate/sampling raises
-                rollouts.append((prompt_ids, gen or [eos or 0]))
-                rewards.append(step_reward_fn(tok.decode(gen), str(prob.get("answer", ""))))
+            # Batched rollout generation: parallel prefill + concurrent decode across group_size
+            p_batch = mx.repeat(mx.array([int(t) for t in prompt_ids])[None], args.group_size, axis=0)
+            logits, state = model.prefill(p_batch, last_only=True)
+            batched_gens = [[] for _ in range(args.group_size)]
+            finished = [False] * args.group_size
+            rngs = [np.random.default_rng(int(rng.integers(1 << 30))) for _ in range(args.group_size)]
+
+            logits_np = np_to(logits)
+            for _ in range(args.max_new_tokens):
+                next_tokens = []
+                all_done = True
+                for k in range(args.group_size):
+                    if finished[k]:
+                        next_tokens.append(eos or 0)
+                        continue
+                    tk = sample(logits_np[k], temperature=args.temperature, top_k=args.top_k, rng=rngs[k])
+                    batched_gens[k].append(tk)
+                    if eos is not None and tk == eos:
+                        finished[k] = True
+                        next_tokens.append(eos)
+                    else:
+                        all_done = False
+                        next_tokens.append(tk)
+                if all_done:
+                    break
+                logits, state = model.step(mx.array(next_tokens), state)
+                logits_np = np_to(logits)
+
+            rollouts = [(prompt_ids, g or [eos or 0]) for g in batched_gens]
+            ans_str = str(prob.get("answer", ""))
+            rewards = [step_reward_fn(tok.decode(g), ans_str) for g in batched_gens]
 
             adv = group_advantages([rewards])[0]            # (K,)
             metrics = grpo_step(model, [collate_rollouts(rollouts, adv)], args.lr)

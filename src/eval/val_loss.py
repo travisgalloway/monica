@@ -108,12 +108,16 @@ def evaluate(model: ModelInterface, loader: PackedLoader,
     # Weight each batch's mean CE by its token count so a smaller final batch
     # (drop_last=False) does not bias the result.
     total_ce, total_tokens = 0.0, 0
+    fast_eval = getattr(model, "eval_batch_ce", None)
     for i, (inputs, targets) in enumerate(loader.epoch()):
         if max_batches is not None and i >= max_batches:
             break
-        logits = to_numpy(model.forward(inputs))
         n_tokens = int(np.asarray(targets).size)
-        total_ce += cross_entropy(logits, targets) * n_tokens
+        if fast_eval is not None:
+            total_ce += fast_eval(inputs, targets) * n_tokens
+        else:
+            logits = to_numpy(model.forward(inputs))
+            total_ce += cross_entropy(logits, targets) * n_tokens
         total_tokens += n_tokens
     if total_tokens == 0:
         # Otherwise mean_ce=0 -> perplexity=1.0, a false "perfect model" that silently
@@ -141,15 +145,22 @@ def evaluate_masked(model: ModelInterface, loader,
     common case (omitted); kept for the day a byte-aware loader is passed.
     """
     total_ce, total_tokens = 0.0, 0.0
+    fast_eval_masked = getattr(model, "eval_masked_batch_ce", None)
     for i, (inputs, targets, mask) in enumerate(loader.epoch()):
         if max_batches is not None and i >= max_batches:
             break
         n_tokens = float(np.asarray(mask).sum())
         if n_tokens == 0:
             continue
-        logits = to_numpy(model.forward(inputs))
-        total_ce += masked_cross_entropy(logits, targets, mask) * n_tokens
-        total_tokens += n_tokens
+        if fast_eval_masked is not None:
+            tot, w = fast_eval_masked(inputs, targets, mask)
+            total_ce += tot
+            total_tokens += w
+        else:
+            logits = to_numpy(model.forward(inputs))
+            total_ce += masked_cross_entropy(logits, targets, mask) * n_tokens
+            total_tokens += n_tokens
+
     if total_tokens == 0:
         # No response tokens at all -> a false perplexity=1.0; fail loudly instead.
         raise ValueError("evaluate_masked(): no response tokens evaluated — "
