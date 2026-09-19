@@ -140,12 +140,12 @@ torchrun --nproc_per_node=8 scripts/train.py \
   --config config/1b.yaml \
   --data "data/packed/train_shard_*.bin" \
   --out /mnt/checkpoints/tier2-poc-1b \
-  --steps 100000 \
-  --lr 2e-4 \
+  --total-steps 100000 \
+  --base-lr 2e-4 \
   --global-batch-size 256 \
   --seq-len 4096 \
   --curriculum-length-schedule "1024:10000,4096:50000,16384:100000" \
-  --save-every 2500 \
+  --ckpt-every 2500 \
   --backend cuda
 ```
 
@@ -174,13 +174,13 @@ torchrun \
     --init-weights /mnt/checkpoints/tier3-mvp-init.safetensors \
     --data "/mnt/data/packed/shard_*.bin" \
     --out /mnt/checkpoints/tier3-mvp-4b \
-    --steps 250000 \
-    --lr 1.5e-4 \
+    --total-steps 250000 \
+    --base-lr 1.5e-4 \
     --global-batch-size 1024 \
     --seq-len 8192 \
     --curriculum-length-schedule "2048:25000,8192:150000,32768:250000" \
     --loss-free-balancing \
-    --save-every 5000
+    --ckpt-every 5000
 ```
 
 ---
@@ -241,7 +241,7 @@ Runs recall, FIM completion, and external benchmarks (MultiPL-E, CrossCodeEval):
 ```bash
 python scripts/eval_code_suite.py \
   --config config/code-small-dense.yaml \
-  --checkpoint runs/tier1-poc/weights.safetensors \
+  --weights runs/tier1-poc/weights.safetensors \
   --suites recall,needle,fim,external \
   --output results/code_suite.json \
   --transcript results/code_suite.jsonl

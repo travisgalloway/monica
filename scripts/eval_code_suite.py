@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=None, help="model config YAML")
-    ap.add_argument("--checkpoint", type=Path, default=None,
+    ap.add_argument("--checkpoint", "--weights", dest="checkpoint", type=Path, default=None,
                     help="portable weights (safetensors) to load into the model")
     ap.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto")
     ap.add_argument("--stub-model", action="store_true",

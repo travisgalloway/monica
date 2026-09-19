@@ -123,3 +123,15 @@ def test_loader_contiguous_windows(tmp_path):
     # first window is the very start of the stream
     assert np.array_equal(inputs[0], ids[0:9])
     assert np.array_equal(targets[0], ids[1:10])
+
+
+def test_packed_loader_undersized_shard_diagnostic(tmp_path):
+    import pytest
+    packed = tmp_path / "short.bin"
+    pack_ids(np.arange(10, dtype=np.uint16), packed)
+    with pytest.raises(ValueError) as excinfo:
+        PackedLoader(packed, seq_len=64, batch_size=2)
+    err = str(excinfo.value)
+    assert "too small for one chunk: 10 tokens < stride 65" in err
+    assert "(seq_len=64 + 1)" in err
+

@@ -67,3 +67,22 @@ def test_r2_endpoint_reads_env(monkeypatch):
     assert r2_endpoint() == "https://acc.r2.cloudflarestorage.com"
 
 
+def test_r2_region_defaults_to_auto(monkeypatch):
+    import fsspec.core
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://acc.r2.cloudflarestorage.com")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    captured_kwargs = {}
+    orig_url_to_fs = fsspec.core.url_to_fs
+
+    def mock_url_to_fs(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return orig_url_to_fs("memory://dummy")
+
+    monkeypatch.setattr(fsspec.core, "url_to_fs", mock_url_to_fs)
+    from src.data.r2_sync import _fs_for
+    _fs_for("s3://bucket/dir")
+    assert captured_kwargs.get("client_kwargs", {}).get("region_name") == "auto"
+
+
+
