@@ -69,6 +69,16 @@ class ModelInterface(ABC):
             f"{type(self).__name__} does not implement forward_with_critics"
         )
 
+    def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
+        """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387).
+
+        Computes the representation stream h through all layers, applied with final RMSNorm,
+        before the vocabulary LM head or auxiliary critic heads.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_hidden"
+        )
+
     # --- inference path ---
     @abstractmethod
     def step(self, token: Array, state: State) -> Tuple[Array, State]:
