@@ -13,7 +13,7 @@ treats it as an opaque, fixed-size blob that it can snapshot and restore.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .blocks import MambaConfig
 
@@ -45,6 +45,29 @@ class ModelInterface(ABC):
         set; `src/conformance/doc_boundary_parity.py` verifies a packed multi-doc forward
         equals the per-document forwards.
         """
+
+    def forward_with_critics(
+        self,
+        token_batch: Array = None,
+        critic_names: Optional[Sequence[str]] = None,
+        seg_ids: Array = None,
+        **kwargs,
+    ) -> Tuple[Array, Dict[str, Any]]:
+        """Full-sequence forward pass returning (logits, critic_outputs) (#386).
+
+        Args:
+            token_batch: (batch, seq_len) token IDs (also accepted as `input_ids`).
+            critic_names: Optional sequence of critic head names to evaluate.
+                If None, evaluates all configured heads in `config.critic_heads`.
+            seg_ids: Optional document segmentation IDs.
+
+        Returns:
+            logits: LM vocabulary logits (batch, seq_len, vocab_size).
+            critic_outputs: Dict mapping critic head name to calibrated output dict.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_with_critics"
+        )
 
     # --- inference path ---
     @abstractmethod

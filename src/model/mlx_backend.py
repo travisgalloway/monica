@@ -21,7 +21,7 @@ and allowed: it lives below the seam and nothing portable imports it.
 from __future__ import annotations
 
 import math
-from typing import List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,6 +30,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 import numpy as np
 
 from .blocks import MambaConfig
+from .critic import CriticConfig
 from .interface import ModelInterface, State, Array
 from .metal_kernels import (
     is_metal_fast_available,
@@ -885,6 +886,200 @@ class MoEBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Auxiliary Decision Critic Head (#386)
+# --------------------------------------------------------------------------- #
+class DecisionCriticHead(nn.Module):
+    """Auxiliary Decision Critic Head in MLX.
+
+    Architecture:
+      h (..., d_model)
+        -> RMSNorm (unweighted, eps=1e-6)
+        -> Linear(d_model, hidden_dim) + Bias
+        -> GELU (approximate)
+        -> Linear(hidden_dim, n_classes) + Bias
+        -> Raw Logits
+    """
+
+    def __init__(self, config: CriticConfig):
+        super().__init__()
+        self.config = config
+        self.eps = 1e-6
+        self.l1 = nn.Linear(config.d_model, config.hidden_dim)
+        self.l2 = nn.Linear(config.hidden_dim, config.n_classes)
+        self.temperature = float(config.temperature)
+
+        bound1 = 1.0 / math.sqrt(config.d_model)
+        bound2 = 1.0 / math.sqrt(config.hidden_dim)
+        self.l1.weight = mx.random.uniform(-bound1, bound1, shape=(config.hidden_dim, config.d_model))
+        self.l1.bias = mx.zeros((config.hidden_dim,))
+        self.l2.weight = mx.random.uniform(-bound2, bound2, shape=(config.n_classes, config.hidden_dim))
+        self.l2.bias = mx.zeros((config.n_classes,))
+
+    @property
+    def param_count(self) -> int:
+        return (
+            self.config.d_model * self.config.hidden_dim
+            + self.config.hidden_dim
+            + self.config.hidden_dim * self.config.n_classes
+            + self.config.n_classes
+            + 1  # temperature
+        )
+
+    def _rmsnorm(self, x: Array) -> Array:
+        rms = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return x * rms
+
+    def __call__(self, h: Array) -> Array:
+        return self.forward_logits(h)
+
+    def forward_logits(self, h: Array) -> Array:
+        if not isinstance(h, mx.array):
+            h = mx.array(h)
+        normed = self._rmsnorm(h)
+        hidden = nn.gelu_approx(self.l1(normed))
+        return self.l2(hidden)
+
+    def copy_from_reference(self, ref: Any) -> None:
+        """Copy weights from a portable critic.DecisionCriticHead instance."""
+        self.l1.weight = mx.array(ref.w1.T)
+        self.l1.bias = mx.array(ref.b1)
+        self.l2.weight = mx.array(ref.w2.T)
+        self.l2.bias = mx.array(ref.b2)
+        self.temperature = float(ref.temperature)
+
+    def predict_noul(self, h: Array) -> Dict[str, Any]:
+        if self.config.primitive != "noul":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'noul'")
+        if not isinstance(h, mx.array):
+            h = mx.array(h)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits[..., 0] / max(self.temperature, 1e-6)
+        sig = mx.sigmoid(scaled)
+        prob_arr = np.array(sig)
+        prob_sq = np.squeeze(prob_arr)
+        if prob_sq.ndim == 0:
+            prob = float(prob_sq)
+            decision = bool(prob >= 0.5)
+            confidence = prob if decision else (1.0 - prob)
+        else:
+            prob = prob_sq.tolist()
+            decision = (prob_sq >= 0.5).tolist()
+            conf_arr = np.where(prob_sq >= 0.5, prob_sq, 1.0 - prob_sq)
+            confidence = conf_arr.tolist()
+        out = {
+            "prob": prob,
+            "decision": decision,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict_score(self, h: Array, rubric_values: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+        if self.config.primitive != "score":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'score'")
+        if not isinstance(h, mx.array):
+            h = mx.array(h)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits / max(self.temperature, 1e-6)
+        probs_mx = mx.softmax(scaled, axis=-1)
+        probs_np = np.squeeze(np.array(probs_mx))
+
+        K = self.config.n_classes
+        if rubric_values is None:
+            values = np.arange(K, dtype=np.float32)
+        else:
+            values = np.asarray(rubric_values, dtype=np.float32)
+
+        if probs_np.ndim == 1:
+            expected_score = float(np.sum(probs_np * values))
+            best_level = int(np.argmax(probs_np))
+            confidence = float(probs_np[best_level])
+            probs_out = probs_np.tolist()
+        else:
+            expected_score = np.sum(probs_np * values, axis=-1).tolist()
+            best_level = np.argmax(probs_np, axis=-1).tolist()
+            confidence = np.max(probs_np, axis=-1).tolist()
+            probs_out = probs_np.tolist()
+
+        out = {
+            "score": expected_score,
+            "best_level": best_level,
+            "probs": probs_out,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict_choice(self, h: Array) -> Dict[str, Any]:
+        if self.config.primitive != "choice":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'choice'")
+        if not isinstance(h, mx.array):
+            h = mx.array(h)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits / max(self.temperature, 1e-6)
+        probs_mx = mx.softmax(scaled, axis=-1)
+        probs_np = np.squeeze(np.array(probs_mx))
+
+        if probs_np.ndim == 1:
+            best_idx = int(np.argmax(probs_np))
+            confidence = float(probs_np[best_idx])
+            choice_name = (
+                self.config.choice_names[best_idx]
+                if self.config.choice_names and best_idx < len(self.config.choice_names)
+                else best_idx
+            )
+            probs_out = probs_np.tolist()
+        else:
+            best_idx = np.argmax(probs_np, axis=-1).tolist()
+            confidence = np.max(probs_np, axis=-1).tolist()
+            if self.config.choice_names:
+                choice_name = [
+                    self.config.choice_names[i] if i < len(self.config.choice_names) else i
+                    for i in best_idx
+                ]
+            else:
+                choice_name = best_idx
+            probs_out = probs_np.tolist()
+
+        out = {
+            "choice": choice_name,
+            "choice_idx": best_idx,
+            "probs": probs_out,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict(self, h: Array, **kwargs) -> Dict[str, Any]:
+        if self.config.primitive == "noul":
+            return self.predict_noul(h)
+        elif self.config.primitive == "score":
+            return self.predict_score(h, **kwargs)
+        elif self.config.primitive == "choice":
+            return self.predict_choice(h)
+        else:
+            raise ValueError(f"Unknown primitive: {self.config.primitive}")
+
+
+# --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class MLXMambaModel(ModelInterface, nn.Module):
@@ -902,6 +1097,10 @@ class MLXMambaModel(ModelInterface, nn.Module):
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.critic_heads = {}
+        if config.critic_heads:
+            for name, head_cfg in config.critic_heads.items():
+                self.critic_heads[name] = DecisionCriticHead(head_cfg)
         self._state = None
         # Gradient checkpointing: recompute each layer's forward in the backward pass
         # instead of retaining its activations. Essential at poc scale — without it the
@@ -938,6 +1137,36 @@ class MLXMambaModel(ModelInterface, nn.Module):
             for layer_fn in self._layer_fns:
                 h = layer_fn(h, seg)                                  # boundary-aware (#68)
         return self._head(self.norm_f(h))
+
+    def forward_with_critics(
+        self,
+        token_batch: Array = None,
+        critic_names: Optional[Sequence[str]] = None,
+        seg_ids: Array = None,
+        **kwargs,
+    ) -> Tuple[Array, Dict[str, Any]]:
+        if token_batch is None and "input_ids" in kwargs:
+            token_batch = kwargs.pop("input_ids")
+        h = _cast(self.embedding(mx.array(token_batch)), self._cd)
+        if seg_ids is None:
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h)
+        else:
+            seg = mx.array(seg_ids)
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h, seg)
+        h_post_norm = self.norm_f(h)
+        logits = self._head(h_post_norm)
+
+        critic_outputs = {}
+        if self.critic_heads:
+            names = critic_names if critic_names is not None else list(self.critic_heads.keys())
+            for name in names:
+                if name not in self.critic_heads:
+                    raise KeyError(f"Critic head {name!r} not found in model critic_heads")
+                head = self.critic_heads[name]
+                critic_outputs[name] = head.predict(h_post_norm)
+        return logits, critic_outputs
 
     def prefill(self, token_batch: Array, seg_ids: Array = None, *,
                 last_only: bool = False) -> Tuple[Array, State]:

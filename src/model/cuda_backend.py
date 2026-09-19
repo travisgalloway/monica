@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from .blocks import MambaConfig
+from .critic import CriticConfig
 from .interface import ModelInterface, State, Array
 
 
@@ -1138,6 +1139,202 @@ def _torch_ge_21() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Auxiliary Decision Critic Head (#386)
+# --------------------------------------------------------------------------- #
+class DecisionCriticHead(nn.Module):
+    """Auxiliary Decision Critic Head in CUDA / PyTorch.
+
+    Architecture:
+      h (..., d_model)
+        -> RMSNorm (unweighted, eps=1e-6)
+        -> Linear(d_model, hidden_dim) + Bias
+        -> GELU (tanh approximation)
+        -> Linear(hidden_dim, n_classes) + Bias
+        -> Raw Logits
+    """
+
+    def __init__(self, config: CriticConfig):
+        super().__init__()
+        self.config = config
+        self.eps = 1e-6
+        self.l1 = nn.Linear(config.d_model, config.hidden_dim)
+        self.l2 = nn.Linear(config.hidden_dim, config.n_classes)
+        self.temperature = float(config.temperature)
+
+        bound1 = 1.0 / math.sqrt(config.d_model)
+        bound2 = 1.0 / math.sqrt(config.hidden_dim)
+        with torch.no_grad():
+            nn.init.uniform_(self.l1.weight, -bound1, bound1)
+            nn.init.zeros_(self.l1.bias)
+            nn.init.uniform_(self.l2.weight, -bound2, bound2)
+            nn.init.zeros_(self.l2.bias)
+
+    @property
+    def param_count(self) -> int:
+        return (
+            self.config.d_model * self.config.hidden_dim
+            + self.config.hidden_dim
+            + self.config.hidden_dim * self.config.n_classes
+            + self.config.n_classes
+            + 1  # temperature
+        )
+
+    def _rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        return x * rms
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.forward_logits(h)
+
+    def forward_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if not isinstance(h, torch.Tensor):
+            h = torch.as_tensor(h, dtype=torch.float32, device=self.l1.weight.device)
+        normed = self._rmsnorm(h)
+        hidden = F.gelu(self.l1(normed), approximate="tanh")
+        return self.l2(hidden)
+
+    def copy_from_reference(self, ref: Any) -> None:
+        """Copy weights from a portable critic.DecisionCriticHead instance."""
+        with torch.no_grad():
+            self.l1.weight.copy_(torch.as_tensor(ref.w1.T, dtype=self.l1.weight.dtype, device=self.l1.weight.device))
+            self.l1.bias.copy_(torch.as_tensor(ref.b1, dtype=self.l1.bias.dtype, device=self.l1.bias.device))
+            self.l2.weight.copy_(torch.as_tensor(ref.w2.T, dtype=self.l2.weight.dtype, device=self.l2.weight.device))
+            self.l2.bias.copy_(torch.as_tensor(ref.b2, dtype=self.l2.bias.dtype, device=self.l2.bias.device))
+        self.temperature = float(ref.temperature)
+
+    def predict_noul(self, h: torch.Tensor) -> Dict[str, Any]:
+        if self.config.primitive != "noul":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'noul'")
+        if not isinstance(h, torch.Tensor):
+            h = torch.as_tensor(h, dtype=torch.float32, device=self.l1.weight.device)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits[..., 0] / max(self.temperature, 1e-6)
+        sig = torch.sigmoid(scaled)
+        prob_arr = sig.detach().cpu().numpy()
+        prob_sq = np.squeeze(prob_arr)
+        if prob_sq.ndim == 0:
+            prob = float(prob_sq)
+            decision = bool(prob >= 0.5)
+            confidence = prob if decision else (1.0 - prob)
+        else:
+            prob = prob_sq.tolist()
+            decision = (prob_sq >= 0.5).tolist()
+            conf_arr = np.where(prob_sq >= 0.5, prob_sq, 1.0 - prob_sq)
+            confidence = conf_arr.tolist()
+        out = {
+            "prob": prob,
+            "decision": decision,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict_score(self, h: torch.Tensor, rubric_values: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+        if self.config.primitive != "score":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'score'")
+        if not isinstance(h, torch.Tensor):
+            h = torch.as_tensor(h, dtype=torch.float32, device=self.l1.weight.device)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits / max(self.temperature, 1e-6)
+        probs_th = F.softmax(scaled, dim=-1)
+        probs_np = np.squeeze(probs_th.detach().cpu().numpy())
+
+        K = self.config.n_classes
+        if rubric_values is None:
+            values = np.arange(K, dtype=np.float32)
+        else:
+            values = np.asarray(rubric_values, dtype=np.float32)
+
+        if probs_np.ndim == 1:
+            expected_score = float(np.sum(probs_np * values))
+            best_level = int(np.argmax(probs_np))
+            confidence = float(probs_np[best_level])
+            probs_out = probs_np.tolist()
+        else:
+            expected_score = np.sum(probs_np * values, axis=-1).tolist()
+            best_level = np.argmax(probs_np, axis=-1).tolist()
+            confidence = np.max(probs_np, axis=-1).tolist()
+            probs_out = probs_np.tolist()
+
+        out = {
+            "score": expected_score,
+            "best_level": best_level,
+            "probs": probs_out,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict_choice(self, h: torch.Tensor) -> Dict[str, Any]:
+        if self.config.primitive != "choice":
+            raise ValueError(f"Head configured for {self.config.primitive}, not 'choice'")
+        if not isinstance(h, torch.Tensor):
+            h = torch.as_tensor(h, dtype=torch.float32, device=self.l1.weight.device)
+        seq_logits = None
+        if h.ndim == 3:
+            seq_logits = self.forward_logits(h)
+            h = h[:, -1, :]
+        logits = self.forward_logits(h)
+        scaled = logits / max(self.temperature, 1e-6)
+        probs_th = F.softmax(scaled, dim=-1)
+        probs_np = np.squeeze(probs_th.detach().cpu().numpy())
+
+        if probs_np.ndim == 1:
+            best_idx = int(np.argmax(probs_np))
+            confidence = float(probs_np[best_idx])
+            choice_name = (
+                self.config.choice_names[best_idx]
+                if self.config.choice_names and best_idx < len(self.config.choice_names)
+                else best_idx
+            )
+            probs_out = probs_np.tolist()
+        else:
+            best_idx = np.argmax(probs_np, axis=-1).tolist()
+            confidence = np.max(probs_np, axis=-1).tolist()
+            if self.config.choice_names:
+                choice_name = [
+                    self.config.choice_names[i] if i < len(self.config.choice_names) else i
+                    for i in best_idx
+                ]
+            else:
+                choice_name = best_idx
+            probs_out = probs_np.tolist()
+
+        out = {
+            "choice": choice_name,
+            "choice_idx": best_idx,
+            "probs": probs_out,
+            "confidence": confidence,
+            "logits": logits,
+        }
+        if seq_logits is not None:
+            out["sequence_logits"] = seq_logits
+        return out
+
+    def predict(self, h: torch.Tensor, **kwargs) -> Dict[str, Any]:
+        if self.config.primitive == "noul":
+            return self.predict_noul(h)
+        elif self.config.primitive == "score":
+            return self.predict_score(h, **kwargs)
+        elif self.config.primitive == "choice":
+            return self.predict_choice(h)
+        else:
+            raise ValueError(f"Unknown primitive: {self.config.primitive}")
+
+
+# --------------------------------------------------------------------------- #
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class CUDAMambaModel(ModelInterface, nn.Module):
@@ -1168,6 +1365,10 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self._tie_embeddings = config.tie_embeddings
         if not config.tie_embeddings:
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.critic_heads = nn.ModuleDict()
+        if config.critic_heads:
+            for name, head_cfg in config.critic_heads.items():
+                self.critic_heads[name] = DecisionCriticHead(head_cfg)
         self._state = None
         self.to(self._device)
         if self._device.type == "cuda":
@@ -1280,6 +1481,35 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         if seg_ids is not None:                      # (B, L) document ids -> boundary-aware (#68)
             seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
         return self._forward_compute(h, seg)
+
+    def forward_with_critics(
+        self,
+        token_batch: Array = None,
+        critic_names: Optional[Sequence[str]] = None,
+        seg_ids: Array = None,
+        **kwargs,
+    ) -> Tuple[Array, Dict[str, Any]]:
+        if token_batch is None and "input_ids" in kwargs:
+            token_batch = kwargs.pop("input_ids")
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        h = _cast(self.embedding(ids), self._cd)
+        seg = None
+        if seg_ids is not None:
+            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+        for layer in self.layers:
+            h = self._layer_forward(layer, h, seg)
+        h_post_norm = self.norm_f(h)
+        logits = self._head(h_post_norm)
+
+        critic_outputs = {}
+        if len(self.critic_heads) > 0:
+            names = critic_names if critic_names is not None else list(self.critic_heads.keys())
+            for name in names:
+                if name not in self.critic_heads:
+                    raise KeyError(f"Critic head {name!r} not found in model critic_heads")
+                head = self.critic_heads[name]
+                critic_outputs[name] = head.predict(h_post_norm)
+        return logits, critic_outputs
 
     def prefill(self, token_batch: Array, seg_ids: Array = None, *,
                 last_only: bool = False) -> Tuple[Array, State]:
