@@ -835,8 +835,8 @@ class MoEBlock(nn.Module):
                 sel = logits + self._route_bias
             else:
                 sel = probs
-            order = mx.argsort(-sel, axis=-1)
-            ranks = mx.argsort(order, axis=-1)
+            order = mx.stop_gradient(mx.argsort(-sel, axis=-1))
+            ranks = mx.stop_gradient(mx.argsort(order, axis=-1))
             mask = ranks < k
             if self._count_loads:
                 # Per-expert load bookkeeping for the balancer: how many tokens (summed
@@ -849,7 +849,7 @@ class MoEBlock(nn.Module):
                 self._load_counts = self._load_counts + mx.stop_gradient(
                     mx.sum(mask.astype(mx.float32), axis=axes))
             if self._use_gather:
-                topk_ids = mx.sort(order[..., :k], axis=-1)
+                topk_ids = mx.stop_gradient(mx.sort(order[..., :k], axis=-1))
                 flat_probs = probs.reshape(-1, E)
                 flat_ids = topk_ids.reshape(-1, k)
                 flat_gate = mx.take_along_axis(flat_probs, flat_ids, axis=-1)
