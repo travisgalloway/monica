@@ -58,6 +58,8 @@ PORTABLE_MODULES = [
     "src.data.reasoning_sft",
     "src.data.tool_sources",
     "src.data.tool_sft",
+    "src.agent",
+    "src.agent.search",
     "src.data.sft_data",
     "src.data.sft_loader",
     "src.data.sft_corpus",

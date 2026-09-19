@@ -178,6 +178,28 @@ CODING_AGENT_TOOLS: List[dict] = [
     },
 ]
 
+# Native web search tool schema (#366)
+WEB_SEARCH_TOOL: dict = {
+    "name": "web_search",
+    "description": "Search the web for technical documentation, API references, and error signatures",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query keywords or error signature",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of search results to return (default: 5, max: 10)",
+                "default": 5,
+                "maximum": 10,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 _DISTRACTOR_POOL: List[dict] = [
     {"name": "send_email", "description": "Send an email to a recipient",
      "parameters": {"type": "object",

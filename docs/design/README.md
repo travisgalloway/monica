@@ -68,6 +68,9 @@ Every claim here is sourced from a docstring or config comment in the code, with
     & context roadmap: Mac-trained POC (~100M, 64k window), CUDA-trained POC (~1B active, 128k
     window), and CUDA-trained MVP (~4B active, 128k–256k window) across Native FP16/BF16 and
     Mixed Precision W4 + KV8. Operational procedures: [`../runbooks/e2e-training-eval-serving.md`](../runbooks/e2e-training-eval-serving.md).
+17. [Agent harness: native search & discovery](17-agent-harness.md) — the M12 agent harness
+    architecture (#349, #366): two-stage web search (discovery via Brave Search, extraction via
+    fetch_web_page), token distillation (< 400 tokens), in-turn caching, and timeout resilience.
 
 > **The live program is topic 13** (M12, [#198](https://github.com/travisgalloway/monica/issues/198)):
 > a from-scratch Mamba-2 hybrid **MoE code model** with the structural-signal (SSI) fold as a
