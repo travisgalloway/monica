@@ -153,6 +153,18 @@ CODING_AGENT_TOOLS: List[dict] = [
         },
     },
     {
+        "name": "write_file",
+        "description": "Write or overwrite content to a file in the workspace",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
         "name": "grep_search",
         "description": "Search for a pattern across files in the codebase",
         "parameters": {

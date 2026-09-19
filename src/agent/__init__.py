@@ -1,4 +1,4 @@
-"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #366, #367)."""
+"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #351, #366, #367)."""
 
 from .compaction import (
     CompactionConfig,
@@ -22,6 +22,13 @@ from .runtime import (
     WorkspaceToolExecutor,
     run_agent_loop,
 )
+from .safety import (
+    FileReadRecord,
+    FileReadRegistry,
+    format_diagnostic_summary,
+    resolve_safe_workspace_path,
+    run_file_diagnostics,
+)
 from .search import BraveSearchClient, SearchResult, web_search
 
 __all__ = [
@@ -36,6 +43,8 @@ __all__ = [
     "CompactionResult",
     "ContextCompactor",
     "FetchResult",
+    "FileReadRecord",
+    "FileReadRegistry",
     "InMemoryTrajectoryLogger",
     "JsonlTrajectoryLogger",
     "PageFetcherClient",
@@ -45,7 +54,10 @@ __all__ = [
     "WorkspaceToolExecutor",
     "estimate_tokens",
     "fetch_web_page",
+    "format_diagnostic_summary",
     "partition_conversation",
+    "resolve_safe_workspace_path",
     "run_agent_loop",
+    "run_file_diagnostics",
     "web_search",
 ]
