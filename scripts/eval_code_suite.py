@@ -46,8 +46,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+import sys
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc")
+ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall")
 DEFAULT_SUITES = "recall,needle,fim"
 
 
@@ -123,6 +126,11 @@ def _build_model(args):
 
     if args.stub_model:
         vocab = 256 if args.byte_tokenizer else 256
+        if "repo_recall" in args.suites:
+            from src.eval.code_suite import InContextRecallModel
+            return (InContextRecallModel(vocab_size=vocab, seed=args.seed), None,
+                    {"kind": "in_context_recall_stub", "vocab_size": vocab, "seed": args.seed,
+                     "warning": "InContextRecallModel simulates KV cache associative retrieval"})
         return (StubCausalModel(vocab_size=vocab, seed=args.seed), None,
                 {"kind": "stub", "vocab_size": vocab, "seed": args.seed,
                  "warning": "StubCausalModel is a deterministic fake — its scores are NOT "
@@ -331,6 +339,18 @@ def _run_domain_bpb(args, model, to_numpy):
     return result, {"domains_json": str(args.domains_json), "n_domains": len(domains)}
 
 
+
+def _run_repo_recall(args, model, to_numpy, encode, rng):
+    from src.eval.code_suite import evaluate_repo_recall, load_code_files
+
+    files = load_code_files(args.fixture_repo)
+    result = evaluate_repo_recall(model, files, encode, rng=rng, batch_size=args.batch_size,
+                                  to_numpy=to_numpy)
+    return result, {"fixture_repo": str(args.fixture_repo), "n_files": len(files),
+                    "n_instances": result["n_instances"],
+                    "topo_top1_accuracy": result["topo_top1_accuracy"],
+                    "random_top1_accuracy": result["random_top1_accuracy"]}
+
 def _run_tsc(args):
     """Type-aware completion — surfaced, NOT rebuilt.
 
@@ -420,6 +440,8 @@ def main() -> int:
                 result, src = _run_domain_bpb(args, model, to_numpy)
             elif suite == "tsc":
                 result, src = _run_tsc(args)
+            elif suite == "repo_recall":
+                result, src = _run_repo_recall(args, model, to_numpy, encode, rng)
             else:                                        # unreachable: validated in _parse_args
                 raise RuntimeError(f"unhandled suite {suite!r}")
         except RuntimeError as e:

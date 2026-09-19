@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -447,3 +448,230 @@ def load_code_files(path) -> List[dict]:
         if "path" not in r or "text" not in r:
             raise ValueError(f"{path}: every row needs 'path' and 'text', got {sorted(r)}")
     return sorted(rows, key=lambda r: r["path"])
+
+# --------------------------------------------------------------------------------------- #
+# In-context associative recall model (#359)
+# --------------------------------------------------------------------------------------- #
+
+class InContextRecallModel:
+    """A causal model with variable-order in-context associative recall (induction heads).
+
+    Simulates the attention layer's capacity to retrieve previously defined symbols
+    from the KV cache.
+    Logits at position `t` depend causally on `inputs[b, :t+1]`:
+    1. Base token-transition table (like `StubCausalModel`).
+    2. Associative induction retrieval: prefix contexts that appeared in the past
+       `inputs[b, :t+1]` boost predictions for their observed next tokens.
+    """
+
+    def __init__(self, vocab_size: int = 256, boost: float = 15.0, seed: int = 0,
+                 max_order: int = 3, n_layers: int = 4, attn_every: int = 2):
+        self.vocab_size = int(vocab_size)
+        self.boost = float(boost)
+        self.max_order = int(max_order)
+
+        class _Cfg:
+            pass
+
+        self.config = _Cfg()
+        self.config.n_layers = n_layers
+        self.config.attn_every = attn_every
+        self._table = (np.random.default_rng(seed)
+                       .standard_normal((self.vocab_size, self.vocab_size))
+                       .astype(np.float32))
+
+    def forward(self, inputs):
+        inputs = np.asarray(inputs, dtype=np.int64)
+        B, L = inputs.shape
+        base = self._table[inputs % self.vocab_size]
+        out = base.copy()
+        for b in range(B):
+            row = (inputs[b] % self.vocab_size).tolist()
+            ngram_next: Dict[Tuple[int, ...], Dict[int, int]] = {}
+            for t in range(L):
+                for order in range(1, min(t + 2, self.max_order + 1)):
+                    ctx = tuple(row[t - order + 1 : t + 1])
+                    if ctx in ngram_next:
+                        for nxt, cnt in ngram_next[ctx].items():
+                            out[b, t, nxt] += self.boost * order * min(cnt, 2)
+                if t > 0:
+                    curr = row[t]
+                    for order in range(1, min(t + 1, self.max_order + 1)):
+                        ctx = tuple(row[t - order : t])
+                        if ctx not in ngram_next:
+                            ngram_next[ctx] = {}
+                        ngram_next[ctx][curr] = ngram_next[ctx].get(curr, 0) + 1
+        return out
+
+
+# --------------------------------------------------------------------------------------- #
+# Repository recall probe (topological vs random ordering) (#359)
+# --------------------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class RepoRecallInstance:
+    """One cross-file repository recall query instance."""
+
+    id: str
+    definer: str
+    consumer: str
+    symbol: str
+    consumer_prefix: str
+    candidates: Tuple[str, ...]
+    candidate_tokens: Tuple[np.ndarray, ...]
+    answer_index: int
+
+
+def build_repo_recall_instances(files: Sequence[dict], encode: Callable[[str], Sequence[int]],
+                                rng: Optional[np.random.Generator] = None,
+                                n_candidates: int = 4) -> List[RepoRecallInstance]:
+    """Extract symbol retrieval instances across dependencies in a multi-file repo."""
+    if n_candidates < 2:
+        raise ValueError(f"n_candidates must be >= 2, got {n_candidates}")
+    from ..data.repo_graph import build_repo_graph
+
+    graph = build_repo_graph(files)
+    by_path = {f["path"]: f["text"] for f in files}
+    all_exports = sorted({s for syms in graph.exports.values() for s in syms})
+    instances: List[RepoRecallInstance] = []
+
+    for consumer in graph.files:
+        consumer_text = by_path[consumer]
+        for definer in sorted(graph.dependencies.get(consumer, set())):
+            exported_in_definer = graph.exports.get(definer, set())
+            for sym in sorted(exported_in_definer):
+                ts_match = re.search(r"import\s*\{[^}]*\b" + re.escape(sym) + r"\b[^}]*\}\s*from", consumer_text)
+                py_match = re.search(r"from\s+[\.\w]+\s+import\s+[^#\n]*\b" + re.escape(sym) + r"\b", consumer_text)
+                match = ts_match or py_match
+                if not match:
+                    continue
+                start = match.start()
+                inside = consumer_text[start : match.end()]
+                sym_pos = inside.find(sym)
+                if sym_pos < 0:
+                    continue
+                query_prefix = consumer_text[:start + sym_pos]
+
+                distractors = [f"{sym}Helper", f"{sym}Impl", f"{sym}Alt", f"get{sym.capitalize()}"][:n_candidates - 1]
+                candidates = tuple(sorted(set(distractors) | {sym}))
+                answer_index = candidates.index(sym)
+                candidate_tokens = tuple(
+                    np.asarray(list(encode(c)), dtype=np.int64).reshape(-1) for c in candidates
+                )
+                if any(ct.size < 1 for ct in candidate_tokens):
+                    continue
+
+                instances.append(RepoRecallInstance(
+                    id=f"{consumer}::{sym}",
+                    definer=definer,
+                    consumer=consumer,
+                    symbol=sym,
+                    consumer_prefix=query_prefix,
+                    candidates=candidates,
+                    candidate_tokens=candidate_tokens,
+                    answer_index=answer_index,
+                ))
+    return instances
+
+
+def evaluate_repo_recall(model, files: Sequence[dict], encode: Callable[[str], Sequence[int]],
+                         rng: Optional[np.random.Generator] = None, *,
+                         n_candidates: int = 4, n_random_orders: int = 10,
+                         batch_size: int = 8, to_numpy=np.asarray,
+                         file_sep: str = "\n<|file_sep|>\n",
+                         rank_metric: str = "ce_nats") -> dict:
+    """Compare symbol resolution accuracy across topologically sorted sequences vs random file sequences (#359).
+
+    Emits records with suite='repo_recall', bucket='topological' vs bucket='random'.
+    Returns summary dict containing `topo_top1_accuracy` and `random_top1_accuracy`.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    from ..data.repo_graph import build_repo_graph
+
+    graph = build_repo_graph(files)
+    topo_order = graph.topological_sort()
+    by_path = {f["path"]: f["text"] for f in files}
+    instances = build_repo_recall_instances(files, encode, rng, n_candidates=n_candidates)
+    if not instances:
+        raise ValueError("evaluate_repo_recall(): no cross-file recall instances found in repository")
+
+    all_paths = list(graph.files)
+    random_orders: List[List[str]] = []
+    for _ in range(n_random_orders):
+        p = list(rng.permutation(all_paths))
+        if p != topo_order:
+            random_orders.append(p)
+        else:
+            p.reverse()
+            random_orders.append(p)
+
+    def make_prefix(order: Sequence[str], consumer: str, consumer_prefix: str) -> str:
+        c_idx = order.index(consumer)
+        preceding = order[:c_idx]
+        if preceding:
+            return file_sep.join(by_path[p] for p in preceding) + file_sep + consumer_prefix
+        return consumer_prefix
+
+    records: List[dict] = []
+
+    # 1. Score topological order
+    for inst in instances:
+        prefix_str = make_prefix(topo_order, inst.consumer, inst.consumer_prefix)
+        prefix_toks = np.asarray(list(encode(prefix_str)), dtype=np.int64).reshape(-1)
+        rows = [
+            ScoreRow(tokens=np.concatenate([prefix_toks, ct]), span_start=int(prefix_toks.size), span_len=int(ct.size))
+            for ct in inst.candidate_tokens
+        ]
+        scored = score_rows(model, rows, batch_size=batch_size, to_numpy=to_numpy)
+        ordering = sorted(range(len(inst.candidates)), key=lambda j: (scored[j][rank_metric], inst.candidates[j]))
+        rank = ordering.index(inst.answer_index) + 1
+        ans = scored[inst.answer_index]
+        records.append(make_record(
+            suite="repo_recall", id=f"{inst.id}::topo", bucket="topological", distance=int(prefix_toks.size),
+            n_scored_tokens=ans["n_scored_tokens"], ce_nats=ans["ce_nats"], token_accuracy=ans["token_accuracy"],
+            exact_match=ans["exact_match"], rank_top1=(rank == 1), mrr=1.0 / rank,
+            meta={"ordering": "topological", "definer": inst.definer, "consumer": inst.consumer, "symbol": inst.symbol, "rank": rank}
+        ))
+
+    # 2. Score random orders
+    for r_idx, rand_order in enumerate(random_orders):
+        for inst in instances:
+            prefix_str = make_prefix(rand_order, inst.consumer, inst.consumer_prefix)
+            prefix_toks = np.asarray(list(encode(prefix_str)), dtype=np.int64).reshape(-1)
+            rows = [
+                ScoreRow(tokens=np.concatenate([prefix_toks, ct]), span_start=int(prefix_toks.size), span_len=int(ct.size))
+                for ct in inst.candidate_tokens
+            ]
+            scored = score_rows(model, rows, batch_size=batch_size, to_numpy=to_numpy)
+            ordering = sorted(range(len(inst.candidates)), key=lambda j: (scored[j][rank_metric], inst.candidates[j]))
+            rank = ordering.index(inst.answer_index) + 1
+            ans = scored[inst.answer_index]
+            records.append(make_record(
+                suite="repo_recall", id=f"{inst.id}::rand_{r_idx}", bucket="random", distance=int(prefix_toks.size),
+                n_scored_tokens=ans["n_scored_tokens"], ce_nats=ans["ce_nats"], token_accuracy=ans["token_accuracy"],
+                exact_match=ans["exact_match"], rank_top1=(rank == 1), mrr=1.0 / rank,
+                meta={"ordering": "random", "definer": inst.definer, "consumer": inst.consumer, "symbol": inst.symbol, "rank": rank, "perm_idx": r_idx}
+            ))
+
+    topo_records = [r for r in records if r["bucket"] == "topological"]
+    rand_records = [r for r in records if r["bucket"] == "random"]
+
+    topo_top1 = float(np.mean([r["rank_top1"] for r in topo_records]))
+    rand_top1 = float(np.mean([r["rank_top1"] for r in rand_records]))
+    topo_mrr = float(np.mean([r["mrr"] for r in topo_records]))
+    rand_mrr = float(np.mean([r["mrr"] for r in rand_records]))
+
+    summary = summarize_bucketed(records, ["topological", "random"])
+    return {
+        "records": records,
+        "topo_top1_accuracy": topo_top1,
+        "random_top1_accuracy": rand_top1,
+        "topo_mrr": topo_mrr,
+        "random_mrr": rand_mrr,
+        "topological_order": topo_order,
+        "n_instances": len(instances),
+        "n_random_orders": len(random_orders),
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }

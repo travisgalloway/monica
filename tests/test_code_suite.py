@@ -243,3 +243,81 @@ def test_load_code_files_sorts_and_validates(tmp_path):
     write_jsonl([{"path": "a.ts"}], bad)
     with pytest.raises(ValueError, match="needs 'path' and 'text'"):
         load_code_files(bad)
+
+
+# --------------------------------------------------------------------------------------- #
+# Repository recall probe (#359)
+# --------------------------------------------------------------------------------------- #
+
+def test_in_context_recall_model_is_causal_and_seed_reproducible():
+    from src.eval.code_suite import InContextRecallModel
+
+    a = InContextRecallModel(vocab_size=VOCAB, seed=4)
+    b = InContextRecallModel(vocab_size=VOCAB, seed=4)
+    x = np.array([[1, 2, 3, 4]])
+    np.testing.assert_array_equal(a.forward(x), b.forward(x))
+
+    # Causality: modifying a later token must not move earlier positions' logits
+    y = np.array([[1, 2, 3, 9]])
+    np.testing.assert_array_equal(a.forward(x)[0, :3], a.forward(y)[0, :3])
+
+
+def test_in_context_recall_model_padding_invariance():
+    from src.eval.code_suite import InContextRecallModel
+
+    model = InContextRecallModel(vocab_size=VOCAB, seed=5)
+    short = ScoreRow(tokens=np.arange(1, 13) % VOCAB, span_start=4, span_len=3)
+    long = ScoreRow(tokens=np.arange(1, 100) % VOCAB, span_start=50, span_len=10)
+
+    batched = score_rows(model, [short, long], batch_size=2)
+    alone = score_rows(model, [short], batch_size=1)
+    plus = score_rows(model, [long], batch_size=1)
+    assert batched[0]["ce_nats"] == pytest.approx(alone[0]["ce_nats"], rel=1e-6)
+    assert batched[1]["ce_nats"] == pytest.approx(plus[0]["ce_nats"], rel=1e-6)
+
+
+def test_topological_sort_shows_higher_symbol_retrieval_than_random():
+    from src.eval.code_suite import InContextRecallModel, evaluate_repo_recall
+
+    files = [
+        {"path": "src/units.ts",
+         "text": "export function metersToFeet(m: number): number {\n  return m * 3.28084;\n}\n"
+                 "export function feetToMeters(f: number): number {\n  return f / 3.28084;\n}\n"},
+        {"path": "src/calc.ts",
+         "text": "import { metersToFeet } from \"./units\";\n"
+                 "export function computeElevation(elevMeters: number): number {\n"
+                 "  return metersToFeet(elevMeters);\n}\n"},
+        {"path": "src/app.ts",
+         "text": "import { computeElevation } from \"./calc\";\n"
+                 "export function main(): void {\n"
+                 "  const res = computeElevation(100);\n}\n"}
+    ]
+    model = InContextRecallModel(vocab_size=256, seed=0)
+    encode = make_byte_encoder()
+    rng = np.random.default_rng(42)
+
+    res = evaluate_repo_recall(model, files, encode, rng=rng, n_random_orders=10)
+
+    # Acceptance Criterion 4: Topologically sorted sequences show higher top-1
+    # symbol retrieval accuracy compared to randomized file ordering.
+    assert res["topo_top1_accuracy"] > res["random_top1_accuracy"]
+    assert res["topo_mrr"] > res["random_mrr"]
+    assert res["topo_top1_accuracy"] == pytest.approx(1.0)
+    assert res["random_top1_accuracy"] < 1.0
+
+
+def test_repo_recall_records_conform_to_shared_schema_and_buckets():
+    from src.eval.code_suite import InContextRecallModel, evaluate_repo_recall
+
+    files = load_code_files("eval_sets/code_recall/fixture_repo.jsonl")
+    model = InContextRecallModel(vocab_size=256, seed=0)
+    res = evaluate_repo_recall(model, files, make_byte_encoder(), rng=np.random.default_rng(0), n_random_orders=3)
+
+    assert res["records"]
+    for rec in res["records"]:
+        assert tuple(sorted(rec)) == tuple(sorted(RECORD_FIELDS))
+        assert rec["suite"] == "repo_recall"
+        assert rec["bucket"] in ("topological", "random")
+        assert rec["n_scored_tokens"] > 0
+    assert set(res["by_bucket"]) == {"topological", "random"}
+    assert res["topo_top1_accuracy"] > res["random_top1_accuracy"]

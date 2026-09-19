@@ -20,7 +20,8 @@ import MonicaTokenizer
 // SPECIAL_TOKENS so the model's vocab layout is unchanged: EOS first, then FIM, then <mask>.
 let SPECIAL_TOKENS = [
     "<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>",
-    "<|fim_suffix|>", "<|fim_pad|>", "<mask>",
+    "<|fim_suffix|>", "<|fim_pad|>", "<mask|>",
+    Tokenizer.repoNameToken, Tokenizer.fileSepToken,
 ]
 // Ratified 2026-08-04 by the #251 sweep (see docs/design/13-code-model-moe.md). 16384 was sized
 // when #193 was scoped TypeScript-only; on the #198 multilingual corpus it costs 7.6% of overall
@@ -226,10 +227,77 @@ func cmdDecode(_ flags: [String: String]) {
     print(tok.decode(ids), terminator: "")
 }
 
+func tryLoadRepoManifest(_ path: String, flags: [String: String]) -> [Packing.RepoProject]? {
+    let url = URL(fileURLWithPath: path)
+    let dec = JSONDecoder()
+
+    if let repoName = flags["repo"], !repoName.isEmpty {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
+            let exts: Set<String> = ["ts", "tsx", "js", "jsx", "py", "txt", "md", "swift"]
+            var files: [Packing.RepoFileEntry] = []
+            if let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {
+                for case let f as URL in en where exts.contains(f.pathExtension) {
+                    if let c = try? String(contentsOf: f, encoding: .utf8) {
+                        let rel = f.path.replacingOccurrences(of: url.path + "/", with: "")
+                        files.append(Packing.RepoFileEntry(path: rel, content: c))
+                    }
+                }
+            }
+            files.sort { $0.path < $1.path }
+            if !files.isEmpty { return [Packing.RepoProject(repo: repoName, files: files)] }
+        }
+    }
+
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    if let single = try? dec.decode(Packing.RepoProject.self, from: data) {
+        return [single]
+    }
+    if let list = try? dec.decode([Packing.RepoProject].self, from: data) {
+        return list
+    }
+    if path.hasSuffix(".jsonl") || path.hasSuffix(".json") {
+        if let text = try? String(contentsOf: url, encoding: .utf8) {
+            var repos: [Packing.RepoProject] = []
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                if let lineData = line.data(using: .utf8),
+                   let project = try? dec.decode(Packing.RepoProject.self, from: lineData) {
+                    repos.append(project)
+                }
+            }
+            if !repos.isEmpty { return repos }
+        }
+    }
+    return nil
+}
+
 func cmdPack(_ flags: [String: String]) async {
     let tok = loadTokenizer(flags)
-    guard let inPath = flags["in"] else { fail("pack: --in <jsonl|txt> is required") }
+    let manifestFlag = flags["repo-manifest"]
+    let inPath = flags["in"] ?? manifestFlag
+    guard let inPath = inPath else { fail("pack: --in <jsonl|txt> or --repo-manifest <path> is required") }
     guard let outPath = flags["out"] else { fail("pack: --out <dir> is required") }
+
+    // Check if packing multi-file repository projects (#359)
+    let repoProjects: [Packing.RepoProject]? = manifestFlag != nil ? tryLoadRepoManifest(manifestFlag!, flags: flags) : tryLoadRepoManifest(inPath, flags: flags)
+
+    if let repos = repoProjects, !repos.isEmpty {
+        let seqLen = intFlag(flags, "seq-len", default: 32768)
+        let shardMB = intFlag(flags, "shard-size-mb", default: 512)
+        let chunkAlign: Int? = flags["chunk-align"].flatMap(Int.init)
+        do {
+            let m = try Packing.packRepos(repos: repos, tokenizer: tok,
+                                         outDir: URL(fileURLWithPath: outPath),
+                                         seqLen: seqLen, shardSizeMB: shardMB,
+                                         chunkAlign: chunkAlign)
+            let totalFiles = repos.reduce(0) { $0 + $1.files.count }
+            print("packed repository DAG: \(repos.count) repo(s), \(totalFiles) file(s), \(m.n_sequences) seq x \(seqLen) (\(m.n_tokens) tokens, \(m.shards.count) shard(s)) -> \(outPath)")
+            return
+        } catch {
+            fail("pack repos: \(error)")
+        }
+    }
+
     let seqLen = intFlag(flags, "seq-len", default: 8192)
     let shardMB = intFlag(flags, "shard-size-mb", default: 512)
     let chunkAlign: Int?

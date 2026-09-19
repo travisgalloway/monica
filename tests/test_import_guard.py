@@ -44,6 +44,7 @@ PORTABLE_MODULES = [
     "src.data.dedup",
     "src.data.shard",
     "src.data.pack",
+    "src.data.repo_graph",
     "src.data.stack_v2",
     "src.data.vocab_sample",
     "src.data.ts_clean",
