@@ -22,15 +22,60 @@ The run targets one of two model configurations depending on instance provisioni
 | **Deployment Target** | Mixed W4 + KV8 (Head 8-bit) | Mixed W4 + KV8 (Head 8-bit) |
 | **Hardware Fit** | 1× RTX 4090 (24 GB) or 1× A100 (40/80 GB) | 1× A100/H100 (80 GB) or 2–4× A100 (FSDP2) |
 
-### 1.2 Recommended Cloud Host & Pricing Discipline
+### 1.2 Hardware Templates & Recommended Cloud Hosts
 
-Per `docs/infrastructure.md`:
-- **Provider**: RunPod Secure Cloud or Community Cloud.
-- **Image**: `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` (requires `-devel` for Triton / CUDA kernel headers).
-- **Instance Tiers**:
-  - *Single-GPU POC*: 1× RTX 4090 (24 GB VRAM, ~$0.44/hr) or 1× A100 PCIe (80 GB VRAM, ~$1.89/hr).
-  - *Distributed Multi-GPU (#271 FSDP2)*: 2× or 4× A100 SXM4 (80 GB, ~$3.80–$7.60/hr).
-- **Billing Hygiene**: Stop ≠ Terminate. Sync all checkpoints and evaluation logs to Cloudflare R2 (`s3://monica-training/`), then **terminate** the pod.
+Hardware configurations are formalized as templates in `scripts/cloud_pod.py`:
+
+| Template | GPU Tier | VRAM | Container Disk | Network Volume | Cloud Type | Approx. Cost | Target Workload |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `rtx4090` | NVIDIA GeForce RTX 4090 | 24 GB | 50 GB | 0 GB | `ALL` | ~$0.44/hr | Fast local iteration and toy smoke tests |
+| `a40` | NVIDIA A40 | 48 GB | 50 GB | 0 GB | `COMMUNITY` | ~$0.40/hr | Scaled Tier 1 POC (code-small-dense, 232M) |
+| `a100-pcie` | NVIDIA A100 PCIe | 80 GB | 100 GB | 0 GB | `SECURE` | ~$1.89/hr | Tier 2 POC full scale (1B dense Mamba-2) |
+| `a100-sxm4` | NVIDIA A100 SXM4 | 80 GB | 100 GB | 0 GB | `SECURE` | ~$2.49/hr | Distributed FSDP2 + Expert Parallelism (#271) |
+| `h100-sxm` | NVIDIA H100 SXM5 | 80 GB | 100 GB | 0 GB | `SECURE` | ~$3.89/hr | FP8 expert GEMM verification on Hopper (#240) |
+
+All templates use image `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` with CUDA 12.4.1 and Triton support. Standalone instances default to zero volume disk allocation, because RunPod rejects non-zero container volume sizes when no network volume is attached.
+
+### 1.3 Automated Lifecycle Management & Budget Caps (`scripts/cloud_pod.py`)
+
+`scripts/cloud_pod.py` provides automated lifecycle tracking to prevent accidental cloud spend:
+
+1. **Standard CLI Commands**:
+   - `python scripts/cloud_pod.py templates`: List formalized templates and hardware specifications.
+   - `python scripts/cloud_pod.py launch --template <name> [options]`: Provision a pod using template presets.
+   - `python scripts/cloud_pod.py watch <pod_id> [options]`: Monitor instance limits and trigger automated shutdown on threshold breach.
+   - `python scripts/cloud_pod.py heartbeat <pod_id>`: Record activity heartbeat from training processes.
+   - `python scripts/cloud_pod.py status <pod_id>`: Display live runtime, estimated spend, and remaining limit headroom.
+   - `python scripts/cloud_pod.py list`: Display all active pods with tracked expenditure.
+   - `python scripts/cloud_pod.py stop <pod_id>`: Halt compute billing while retaining container disk.
+   - `python scripts/cloud_pod.py terminate <pod_id>`: Permanently destroy instance and storage, ceasing all billing.
+
+2. **Environment Variable Configuration**:
+   The utility resolves configuration with the following precedence: explicit CLI flags override environment variables, which override template presets.
+   - `RUNPOD_API_KEY`: API authentication key.
+   - `RUNPOD_TEMPLATE`: Default template preset (`rtx4090`, `a40`, `a100-pcie`, `a100-sxm4`, `h100-sxm`).
+   - `RUNPOD_MAX_BUDGET_USD`: Maximum dollar spend before enforcing automated shutdown.
+   - `RUNPOD_MAX_RUNTIME_HOURS`: Maximum runtime in hours before enforcing automated shutdown.
+   - `RUNPOD_IDLE_TIMEOUT_MINUTES`: Inactivity period before idle teardown triggers (default: 30 minutes).
+   - `RUNPOD_AUTO_ACTION`: Action executed upon limit breach (`terminate` or `stop`, default: `terminate`).
+   - `RUNPOD_TRACKER_FILE`: Custom file path for persistent lifecycle tracking state (default: `runs/cloud_pod_tracker.json`).
+
+3. **Lifecycle Guard & Idle Teardown Daemon**:
+   To enforce limits during long-running tasks, detach the lifecycle watcher in the background:
+   ```bash
+   nohup python scripts/cloud_pod.py watch <pod_id> \
+       --max-budget 15.0 \
+       --max-runtime-hours 6.0 \
+       --idle-timeout 30.0 \
+       --auto-action terminate \
+       > runs/cloud_guard.log 2>&1 & disown
+   ```
+
+4. **Periodic Activity Heartbeat**:
+   Training loops or background sync tasks emit heartbeats to indicate forward progress:
+   ```bash
+   python scripts/cloud_pod.py heartbeat <pod_id>
+   ```
 
 ---
 
@@ -376,8 +421,9 @@ swift/.build/release/monica-engine bench-prefill \
 python -m src.data.r2_sync up runs/cuda-poc s3://monica-training/runs/cuda-poc
 python -m src.data.r2_sync up results s3://monica-training/results
 
-# Verify R2 sync completion before terminating instance
-echo "Sync complete. Terminate RunPod instance via Web Console / CLI to cease billing."
+# Verify tracker status and terminate instance to cease all billing
+python scripts/cloud_pod.py status <pod_id>
+python scripts/cloud_pod.py terminate <pod_id>
 ```
 
 ---
