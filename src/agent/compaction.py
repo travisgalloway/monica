@@ -203,32 +203,46 @@ def partition_conversation(
 def elide_observation_content(
     content: str,
     elision_char_threshold: int = DEFAULT_ELISION_CHAR_THRESHOLD,
+    tool_name: str | None = None,
+    tool_names: list[str] | None = None,
 ) -> tuple[str, int, int]:
-    """Elide bulky tool observation outputs within content.
+    """Elide bulky tool observation outputs within content (#350, #368).
 
-    Replaces bulky outputs with `[Output elided: N chars]` where N is the
-    character count of the elided observation body. Zero compute/API cost.
+    Replaces bulky outputs with `[Output elided: N chars]` or `[Web page content elided: N chars]`
+    for fetch_web_page outputs where N is the character count of the elided observation body.
+    Zero compute/API cost.
 
     Returns:
         (elided_content, elided_blocks_count, elided_chars_count)
     """
-    if "[Output elided:" in content:
+    if "[Output elided:" in content or "[Web page content elided:" in content:
         # Already elided; avoid nested or repetitive elisions
         return content, 0, 0
 
     elided_blocks = 0
     elided_chars = 0
 
+    names_list = list(tool_names) if tool_names is not None else ([tool_name] if tool_name else [])
+
     if TOOL_RESPONSE_OPEN in content:
+        block_idx = 0
+
         def _replace_block(match: re.Match[str]) -> str:
-            nonlocal elided_blocks, elided_chars
+            nonlocal elided_blocks, elided_chars, block_idx
             prefix, body, suffix = match.group(1), match.group(2), match.group(3)
             stripped_body = body.strip()
+            curr_tool = names_list[block_idx] if block_idx < len(names_list) else (tool_name or "")
+            block_idx += 1
+
             if len(stripped_body) > elision_char_threshold:
                 n_chars = len(stripped_body)
                 elided_blocks += 1
                 elided_chars += n_chars
-                return f"{prefix}\n[Output elided: {n_chars} chars]\n{suffix}"
+                if curr_tool == "fetch_web_page":
+                    elision_marker = f"[Web page content elided: {n_chars} chars]"
+                else:
+                    elision_marker = f"[Output elided: {n_chars} chars]"
+                return f"{prefix}\n{elision_marker}\n{suffix}"
             return match.group(0)
 
         new_content = _TOOL_RESPONSE_REGEX.sub(_replace_block, content)
@@ -240,7 +254,12 @@ def elide_observation_content(
         n_chars = len(stripped)
         elided_blocks += 1
         elided_chars += n_chars
-        return f"[Output elided: {n_chars} chars]", elided_blocks, elided_chars
+        curr_tool = names_list[0] if names_list else (tool_name or "")
+        if curr_tool == "fetch_web_page":
+            elision_marker = f"[Web page content elided: {n_chars} chars]"
+        else:
+            elision_marker = f"[Output elided: {n_chars} chars]"
+        return elision_marker, elided_blocks, elided_chars
 
     return content, 0, 0
 
@@ -269,7 +288,7 @@ def _format_turns_for_summary(turns: list[list[dict[str, Any]]]) -> str:
                 else:
                     lines.append(f"  Response: {content[:150]}")
             elif role in ("user", "tool"):
-                if "[Output elided:" in content:
+                if "[Output elided:" in content or "[Web page content elided:" in content:
                     lines.append(f"  Observation: {content[:120]}")
                 elif TOOL_RESPONSE_OPEN in content:
                     matches = _TOOL_RESPONSE_REGEX.findall(content)
@@ -301,11 +320,15 @@ def _deterministic_narrative_summary(turns: list[list[dict[str, Any]]]) -> str:
                     elif name == "execute_bash" and "command" in args:
                         cmd = str(args["command"]).strip()
                         actions.append(f"ran `{cmd[:30]}`")
+                    elif name == "web_search" and "query" in args:
+                        actions.append(f"searched `{args['query']}`")
+                    elif name == "fetch_web_page" and "url" in args:
+                        actions.append(f"fetched {args['url']}")
                     elif name:
                         actions.append(f"called {name}")
             elif role in ("user", "tool"):
-                if "[Output elided:" in content:
-                    m = re.search(r"\[Output elided: (\d+) chars\]", content)
+                if "[Output elided:" in content or "[Web page content elided:" in content:
+                    m = re.search(r"\[(?:Output|Web page content) elided: (\d+) chars\]", content)
                     if m:
                         observations.append(f"observed {m.group(1)} chars elided output")
                 elif "error" in content.lower():
@@ -438,13 +461,21 @@ class ContextCompactor:
 
         elided_middle_turns: list[list[dict[str, Any]]] = []
         for turn in middle_turns:
+            turn_tool_names: list[str] = []
+            for msg in turn:
+                if msg.get("role") == "assistant":
+                    calls = parse_tool_calls(msg.get("content", ""))
+                    turn_tool_names.extend(c.get("name", "") for c in calls if "name" in c)
+
             new_turn: list[dict[str, Any]] = []
             for msg in turn:
                 role = msg.get("role")
                 content = str(msg.get("content", ""))
                 if role in ("user", "tool"):
                     new_content, n_obs, n_chars = elide_observation_content(
-                        content, elision_char_threshold=self.elision_char_threshold
+                        content,
+                        elision_char_threshold=self.elision_char_threshold,
+                        tool_names=turn_tool_names,
                     )
                     if n_obs > 0:
                         elision_applied = True

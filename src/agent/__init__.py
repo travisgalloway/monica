@@ -26,6 +26,7 @@ from .runtime import (
     JsonlTrajectoryLogger,
     ToolCall,
     ToolObservation,
+    TrajectoryTelemetry,
     WorkspaceToolExecutor,
     run_agent_loop,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "SearchResult",
     "ToolCall",
     "ToolObservation",
+    "TrajectoryTelemetry",
     "WorkspaceToolExecutor",
     "estimate_tokens",
     "fetch_web_page",

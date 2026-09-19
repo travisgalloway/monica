@@ -1,6 +1,6 @@
-# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, Native Web Tools, Safety Gates, and Planning Scaffolding (#349, #350, #351, #352, #366, #367)
+# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, Native Web Tools, Safety Gates, Planning Scaffolding, and Tool SFT Integration (#349, #350, #351, #352, #366, #367, #368)
 
-This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367), deterministic safety gates (`src/agent/safety.py`, #351), and capability-adaptive planning scaffolding with out-of-history plan injection (`src/agent/planning.py`, #352) above the hardware seam.
+This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367), deterministic safety gates (`src/agent/safety.py`, #351), capability-adaptive planning scaffolding with out-of-history plan injection (`src/agent/planning.py`, #352), and web tool runtime dispatch with SFT distractor integration (#368) above the hardware seam.
 
 ## 1. Autonomous Multi-Turn Execution Loop (`src/agent/runtime.py`)
 
@@ -63,11 +63,12 @@ Escalation proceeds in two stages:
   `[CIRCUIT BREAKER REDIRECTION] Detected 5 consecutive identical tool calls for '<tool>'. Stop repeating identical calls. Adjust arguments, use a different tool, or provide your final answer.`
 - **Early Termination (8 repeats)**: When either counter reaches 8 consecutive repeats, execution terminates immediately. The run status is set to `circuit_breaker_tripped`, and a dedicated failure reason is recorded (e.g. `anti_spin_circuit_breaker: 8 consecutive identical failures for tool '<tool>'`). The agent halts without exhausting the remaining turn budget.
 
-## 3. Trajectory Telemetry and Logging
+## 3. Trajectory Telemetry and Logging (`TrajectoryTelemetry`, #349, #368)
 
-The runtime records structured telemetry for every turn:
-- **Turn Telemetry**: Prompt token counts, completion token counts, model generation wall time, cumulative tool execution time, total turn duration, and phase transitions (`thought`, `action`, `observation`, `completion`).
-- **Telemetry Events**: Explicit records for `run_start`, `turn_start`, `thought_generated`, `tool_call`, `tool_executed`, `circuit_breaker_redirection`, `circuit_breaker_terminated`, and `run_complete`.
+The runtime records comprehensive structured telemetry across each turn and for the complete execution trajectory:
+- **Turn Telemetry**: Prompt token counts, completion token counts, model generation wall time, cumulative tool execution time, observation token counts, total turn duration, and phase transitions (`thought`, `action`, `observation`, `completion`).
+- **Telemetry Events**: Explicit structured records for `run_start`, `turn_start`, `thought_generated`, `tool_call`, `tool_executed`, `network_event`, `circuit_breaker_redirection`, `circuit_breaker_terminated`, and `run_complete`.
+- **`TrajectoryTelemetry` Structure**: Aggregate trajectory metrics captured on `AgentRunResult.telemetry`, tracking total wall time, total tool wall time, prompt and completion token counts, `web_search_count`, `web_fetch_count`, and all `network_events` with request targets, durations, token counts, and error statuses.
 - **Pluggable Loggers**: Sinks implement the `TrajectoryLogger` protocol. `InMemoryTrajectoryLogger` retains turns and results in memory for evaluation. `JsonlTrajectoryLogger` streams turn and trajectory records to disk.
 
 ## 4. Two-Stage Web Access (`web_search` and `fetch_web_page`)
@@ -181,6 +182,20 @@ The agent harness operates in automated ReAct loops where network interruptions 
 2. **In-Turn Deduplication**: Both clients maintain in-memory session caches to serve repeated identical requests instantly without repeating network traffic.
 3. **Structured Error Reporting**: Network errors, HTTP status errors, and timeouts return structured result objects with explanatory error messages rather than unhandled exceptions.
 
+### Runtime Dispatch Integration and Default Tool Registry (#368)
+
+`WorkspaceToolExecutor` maintains an explicit default tool registry mapping tool names to execution handlers:
+- `web_search` and `fetch_web_page` handlers are registered in the default tool registry upon initialization.
+- Custom tools can be dynamically registered via `executor.register_tool(name, handler)` or inspected via the `executor.registry` mapping.
+- Handlers verify `enable_web_tools` and gracefully return informative errors if web capabilities are disabled.
+- Execution timings (`duration_s`), observation token counts (`token_count`), and structured network events (`network_event`) flow automatically into turn events and `AgentRunResult.telemetry`.
+
+### Tool SFT & Evaluation Distractors (#368)
+
+`web_search` and `fetch_web_page` are registered in `CODING_AGENT_TOOLS` in `src/data/tool_sources.py`:
+- They are available by default in multi-turn coding agent runs without manual tool concatenation.
+- For tasks where external web access is unnecessary (e.g. local syntax fixes or repository refactoring), they serve as negative distractor candidates in tool-use SFT and abstention evaluation pipelines.
+
 
 ## 5. Staged Context Compaction (T4: Soft Elision and Hard Summarization, #350)
 
@@ -208,8 +223,11 @@ Empirical findings from arXiv:2609.20804 show that staged two-tier context compa
 
 ### Two-Tier Compaction Stages
 
-1. **Soft Threshold Elision (M1, ~0.60 Usable Context)**:
-   When conversation token usage exceeds the configured soft threshold (default 0.60 of `max_context_tokens`), the compactor inspects observation messages in the middle region. Bulky observation bodies, such as compiler build logs, test outputs, and large file reads exceeding `elision_char_threshold` (default 200 characters), are replaced with `[Output elided: N chars]`, where N records the original character count. This operation incurs zero compute or API cost.
+1. **Soft Threshold Elision (M1, ~0.60 Usable Context, #350, #368)**:
+   When conversation token usage exceeds the configured soft threshold (default 0.60 of `max_context_tokens`), the compactor inspects observation messages in the middle region:
+   - **Repository & Tool Outputs**: Bulky observation bodies, such as compiler build logs, test outputs, and large file reads exceeding `elision_char_threshold` (default 200 characters), are replaced with `[Output elided: N chars]`.
+   - **Web Page Extractions (#368)**: Bulky `fetch_web_page` observation outputs exceeding `elision_char_threshold` are recognized from preceding assistant tool calls and replaced with `[Web page content elided: N chars]`.
+   - This operation incurs zero compute or API cost while pruning thousands of tokens of external documentation that has already been synthesized by the model.
 
 2. **Hard Threshold Summarization (M3, ~0.85 Usable Context)**:
    If conversation token count continues to exceed the hard threshold (default 0.85 of `max_context_tokens`) after soft elision, the compactor invokes language-model summarization. It extracts actions, tool invocations, and key findings from the oldest middle turns and compresses them into a concise narrative summary message (`[Context Summary: <narrative>]`). If no external language model is supplied, the compactor generates a deterministic extractive narrative summary.

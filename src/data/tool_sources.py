@@ -75,11 +75,19 @@ def format_tool_call(calls: List[dict]) -> str:
 
 
 def format_tool_response(results: Sequence) -> str:
-    """User content for one or more tool results: stacked `<tool_response>\\n{json}\\n</tool_response>`.
+    """User content for one or more tool results: stacked `<tool_response>\n{json}\n</tool_response>`.
     A result that is not already a str is JSON-serialized."""
     blocks = []
     for r in results:
-        payload = r if isinstance(r, str) else json.dumps(r)
+        if isinstance(r, str):
+            payload = r
+        elif hasattr(r, "to_json") and callable(r.to_json):
+            payload = r.to_json()
+        else:
+            try:
+                payload = json.dumps(r)
+            except (TypeError, ValueError):
+                payload = str(r)
         blocks.append(f"{TOOL_RESPONSE_OPEN}\n{payload}\n{TOOL_RESPONSE_CLOSE}")
     return "\n".join(blocks)
 
@@ -115,7 +123,45 @@ def validate_call_against_tools(call: dict, tools: List[dict]) -> bool:
 # Distractor pool + deterministic sampler
 # --------------------------------------------------------------------------- #
 
-# Standard developer / coding agent tools (#306)
+# Native web search tool schema (#366)
+WEB_SEARCH_TOOL: dict = {
+    "name": "web_search",
+    "description": "Search the web for technical documentation, API references, and error signatures",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query keywords or error signature",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of search results to return (default: 5, max: 10)",
+                "default": 5,
+                "maximum": 10,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+# Native page extraction tool schema (#367)
+FETCH_WEB_PAGE_TOOL: dict = {
+    "name": "fetch_web_page",
+    "description": "Fetch and extract readable markdown content from a web page URL",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The web page URL to fetch and extract content from",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
+# Standard developer / coding agent tools (#306, #368)
 CODING_AGENT_TOOLS: List[dict] = [
     {
         "name": "execute_bash",
@@ -188,45 +234,9 @@ CODING_AGENT_TOOLS: List[dict] = [
             "required": ["pattern"],
         },
     },
+    WEB_SEARCH_TOOL,
+    FETCH_WEB_PAGE_TOOL,
 ]
-
-# Native web search tool schema (#366)
-WEB_SEARCH_TOOL: dict = {
-    "name": "web_search",
-    "description": "Search the web for technical documentation, API references, and error signatures",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query keywords or error signature",
-            },
-            "count": {
-                "type": "integer",
-                "description": "Number of search results to return (default: 5, max: 10)",
-                "default": 5,
-                "maximum": 10,
-            },
-        },
-        "required": ["query"],
-    },
-}
-
-# Native page extraction tool schema (#367)
-FETCH_WEB_PAGE_TOOL: dict = {
-    "name": "fetch_web_page",
-    "description": "Fetch and extract readable markdown content from a web page URL",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "The web page URL to fetch and extract content from",
-            },
-        },
-        "required": ["url"],
-    },
-}
 
 # Native plan state mutation tool schema (#352)
 UPDATE_PLAN_TOOL: dict = {

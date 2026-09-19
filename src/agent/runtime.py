@@ -36,15 +36,14 @@ import numpy as np
 from ..data.chat_template import CHAT_EOS, IM_END, render
 from ..data.tool_sources import (
     CODING_AGENT_TOOLS,
-    FETCH_WEB_PAGE_TOOL,
     TOOL_CALL_OPEN,
     UPDATE_PLAN_TOOL,
-    WEB_SEARCH_TOOL,
     format_tool_response,
     render_tool_system,
 )
 from ..eval.bfcl_adapter import parse_tool_calls
 from ..serve.sampling import sample
+from .compaction import estimate_tokens
 from .fetcher import fetch_web_page
 from .planning import PlanManager, PlanningPolicy
 from .safety import (
@@ -154,6 +153,7 @@ class ToolObservation:
     wall_s: float = 0.0
     call_id: str | None = None
     redirection_warning: str | None = None
+    token_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         out_repr = self.output
@@ -170,6 +170,7 @@ class ToolObservation:
             "output": out_repr,
             "is_error": self.is_error,
             "wall_s": self.wall_s,
+            "token_count": self.token_count,
         }
         if self.call_id is not None:
             res["call_id"] = self.call_id
@@ -218,6 +219,36 @@ class AgentTurn:
 
 
 @dataclass
+class TrajectoryTelemetry:
+    """Telemetry metrics, execution timings, and network events collected across a trajectory (#349, #368)."""
+
+    total_turns: int = 0
+    total_wall_s: float = 0.0
+    total_tool_wall_s: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    web_search_count: int = 0
+    web_fetch_count: int = 0
+    events: list[dict[str, Any]] = field(default_factory=list)
+    network_events: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_turns": self.total_turns,
+            "total_wall_s": self.total_wall_s,
+            "total_tool_wall_s": self.total_tool_wall_s,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_tokens,
+            "web_search_count": self.web_search_count,
+            "web_fetch_count": self.web_fetch_count,
+            "events": list(self.events),
+            "network_events": list(self.network_events),
+        }
+
+
+@dataclass
 class AgentRunResult:
     """Full trajectory result returned by an agent run."""
 
@@ -237,6 +268,7 @@ class AgentRunResult:
     total_completion_tokens: int = 0
     total_tokens: int = 0
     events: list[dict[str, Any]] = field(default_factory=list)
+    telemetry: TrajectoryTelemetry = field(default_factory=TrajectoryTelemetry)
 
     @property
     def total_turns(self) -> int:
@@ -261,6 +293,7 @@ class AgentRunResult:
             "turns": [t.to_dict() for t in self.turns],
             "messages": self.messages,
             "events": list(self.events),
+            "telemetry": self.telemetry.to_dict(),
         }
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -461,6 +494,47 @@ class WorkspaceToolExecutor:
         self.diagnostic_provider = diagnostic_provider
         self.ts_lsp_service = ts_lsp_service
         self.plan_manager = plan_manager
+        self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "execute_bash": lambda a: self.execute_bash(str(a.get("command", ""))),
+            "view_file": lambda a: self.view_file(
+                path=str(a.get("path", "")),
+                start_line=a.get("start_line"),
+                end_line=a.get("end_line"),
+            ),
+            "edit_file": lambda a: self.edit_file(
+                path=str(a.get("path", "")),
+                old_str=str(a.get("old_str", "")),
+                new_str=str(a.get("new_str", "")),
+            ),
+            "write_file": lambda a: self.write_file(
+                path=str(a.get("path", "")),
+                content=str(a.get("content", "")),
+            ),
+            "grep_search": lambda a: self.grep_search(
+                query=str(a.get("query", "")),
+                path=a.get("path"),
+            ),
+            "find_files": lambda a: self.find_files(
+                pattern=str(a.get("pattern", "*")),
+                dir=a.get("dir"),
+            ),
+            "web_search": lambda a: self.web_search(
+                query=str(a.get("query", "")),
+                count=int(a.get("count", 5)),
+            ),
+            "fetch_web_page": lambda a: self.fetch_web_page(
+                url=str(a.get("url", "")),
+            ),
+        }
+
+    @property
+    def registry(self) -> dict[str, Callable[[dict[str, Any]], Any]]:
+        """Registry mapping tool names to execution handlers (#368)."""
+        return dict(self._handlers)
+
+    def register_tool(self, name: str, handler: Callable[[dict[str, Any]], Any]) -> None:
+        """Register or update a tool handler in the default tool registry (#368)."""
+        self._handlers[name] = handler
 
     def reset(self) -> None:
         """Reset session-level safety state (read registry and content hashes)."""
@@ -739,42 +813,29 @@ class WorkspaceToolExecutor:
         except OSError as e:
             return {"error": f"find_files failed: {e}", "is_error": True}
 
+    def web_search(self, query: str, count: int = 5) -> str:
+        """Execute web search discovery query (#366, #368)."""
+        if not self.enable_web_tools:
+            return "Error: Web tools are disabled in this executor."
+        return web_search(query=query, count=count)
+
+    def fetch_web_page(self, url: str) -> str:
+        """Fetch and extract readable markdown from URL (#367, #368)."""
+        if not self.enable_web_tools:
+            return "Error: Web tools are disabled in this executor."
+        return fetch_web_page(url=url)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> Any:
-        """Dispatch tool execution by name."""
+        """Dispatch tool execution by name using default tool registry (#349, #368)."""
         args = arguments or {}
-        if name == "execute_bash":
-            return self.execute_bash(str(args.get("command", "")))
-        elif name == "view_file":
-            return self.view_file(
-                path=str(args.get("path", "")),
-                start_line=args.get("start_line"),
-                end_line=args.get("end_line"),
-            )
-        elif name == "edit_file":
-            return self.edit_file(
-                path=str(args.get("path", "")),
-                old_str=str(args.get("old_str", "")),
-                new_str=str(args.get("new_str", "")),
-            )
-        elif name == "write_file":
-            return self.write_file(
-                path=str(args.get("path", "")),
-                content=str(args.get("content", "")),
-            )
-        elif name == "grep_search":
-            return self.grep_search(query=str(args.get("query", "")), path=args.get("path"))
-        elif name == "find_files":
-            return self.find_files(pattern=str(args.get("pattern", "*")), dir=args.get("dir"))
-        elif name == "web_search" and self.enable_web_tools:
-            return web_search(query=str(args.get("query", "")), count=int(args.get("count", 5)))
-        elif name == "fetch_web_page" and self.enable_web_tools:
-            return fetch_web_page(url=str(args.get("url", "")))
-        elif name == "update_plan":
+        if name == "update_plan":
             if self.plan_manager is not None:
                 return self.plan_manager.execute_update_plan(args)
             return {"error": "No PlanManager configured for update_plan", "is_error": True}
-        else:
-            return {"error": f"Unknown or unsupported tool: {name}", "is_error": True}
+        handler = self._handlers.get(name)
+        if handler is not None:
+            return handler(args)
+        return {"error": f"Unknown or unsupported tool: {name}", "is_error": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -940,7 +1001,17 @@ class AgentRuntime:
         planning_policy: str | PlanningPolicy | None = None,
     ) -> None:
         self.lm = lm
-        self.tools = list(tools) if tools is not None else list(CODING_AGENT_TOOLS) + [WEB_SEARCH_TOOL, FETCH_WEB_PAGE_TOOL]
+        raw_tools = list(tools) if tools is not None else list(CODING_AGENT_TOOLS)
+        seen_tool_names = set()
+        deduped_tools = []
+        for t in raw_tools:
+            t_name = t.get("name")
+            if t_name and t_name not in seen_tool_names:
+                seen_tool_names.add(t_name)
+                deduped_tools.append(t)
+            elif not t_name:
+                deduped_tools.append(t)
+        self.tools = deduped_tools
         self.workspace_dir = workspace_dir
         if tool_executor is not None:
             self.tool_executor = tool_executor
@@ -1109,6 +1180,9 @@ class AgentRuntime:
         total_prompt_tokens = 0
         total_completion_tokens = 0
         total_tool_wall_s = 0.0
+        web_search_count = 0
+        web_fetch_count = 0
+        network_events: list[dict[str, Any]] = []
 
         for turn_idx in range(1, turn_budget + 1):
             t_turn_start = time.monotonic()
@@ -1256,6 +1330,41 @@ class AgentRuntime:
                 turn_tool_wall_s += dur_s
                 total_tool_wall_s += dur_s
 
+                # Compute token count of tool observation
+                obs_tokens = estimate_tokens(str(result))
+
+                # Handle search and fetch telemetry & network events (#368)
+                if call.name == "web_search":
+                    web_search_count += 1
+                    net_event = {
+                        "event": "network_event",
+                        "tool": "web_search",
+                        "action": "search",
+                        "query": str(call.arguments.get("query", "")),
+                        "count": int(call.arguments.get("count", 5)),
+                        "duration_s": dur_s,
+                        "token_count": obs_tokens,
+                        "is_error": is_err,
+                        "timestamp": time.time(),
+                    }
+                    turn_events.append(net_event)
+                    network_events.append(net_event)
+                elif call.name == "fetch_web_page":
+                    web_fetch_count += 1
+                    net_event = {
+                        "event": "network_event",
+                        "tool": "fetch_web_page",
+                        "action": "fetch",
+                        "url": str(call.arguments.get("url", "")),
+                        "duration_s": dur_s,
+                        "token_count": obs_tokens,
+                        "char_count": len(str(result)),
+                        "is_error": is_err,
+                        "timestamp": time.time(),
+                    }
+                    turn_events.append(net_event)
+                    network_events.append(net_event)
+
                 # Check circuit breaker after execution outcome
                 cb_res_status = self.circuit_breaker.record_result(call.name, call.arguments, is_error=is_err)
 
@@ -1290,6 +1399,7 @@ class AgentRuntime:
                         is_error=is_err,
                         wall_s=dur_s,
                         redirection_warning=redir_warn,
+                        token_count=obs_tokens,
                     )
                 )
 
@@ -1298,6 +1408,7 @@ class AgentRuntime:
                     "name": call.name,
                     "is_error": is_err,
                     "duration_s": dur_s,
+                    "token_count": obs_tokens,
                 })
 
                 if call.name == "update_plan":
@@ -1385,6 +1496,19 @@ class AgentRuntime:
             "total_wall_s": total_wall_s,
         })
 
+        telemetry = TrajectoryTelemetry(
+            total_turns=len(turns),
+            total_wall_s=total_wall_s,
+            total_tool_wall_s=total_tool_wall_s,
+            total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
+            web_search_count=web_search_count,
+            web_fetch_count=web_fetch_count,
+            events=list(all_events),
+            network_events=list(network_events),
+        )
+
         run_result = AgentRunResult(
             task=task,
             turns=turns,
@@ -1402,6 +1526,7 @@ class AgentRuntime:
             total_completion_tokens=total_completion_tokens,
             total_tokens=total_prompt_tokens + total_completion_tokens,
             events=all_events,
+            telemetry=telemetry,
         )
 
         if self.trajectory_logger:
