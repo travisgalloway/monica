@@ -1,6 +1,6 @@
-# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, Native Web Tools, and Safety Gates (#349, #350, #351, #366, #367)
+# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, Native Web Tools, Safety Gates, and Planning Scaffolding (#349, #350, #351, #352, #366, #367)
 
-This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367), and deterministic safety gates (`src/agent/safety.py`, #351) above the hardware seam.
+This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367), deterministic safety gates (`src/agent/safety.py`, #351), and capability-adaptive planning scaffolding with out-of-history plan injection (`src/agent/planning.py`, #352) above the hardware seam.
 
 ## 1. Autonomous Multi-Turn Execution Loop (`src/agent/runtime.py`)
 
@@ -287,4 +287,46 @@ All path-accepting tools (`view_file`, `edit_file`, `write_file`, `find_files`, 
 - Rejects non-existent files targeted through symlinked external parent directories.
 - Rejects empty strings and paths containing null bytes (`\x00`).
 - Rejections return structured error objects with `"safety_violation": "path_jailbreak"`.
+
+## 7. Capability-Adaptive Planning Scaffolding (`src/agent/planning.py`, #352)
+
+Empirical findings in arXiv:2609.20804 demonstrate an inverse relationship between model scale and planning utility. Planning functions as an accuracy scaffold for sub-frontier models (<100B), but operates as a cost-cutting termination gate for frontier models.
+
+```
++-----------------------------------------------------------------------------+
+|               Capability-Adaptive Planning Scaffolding                      |
+|                                                                             |
+|  1. Out-of-History Plan State:                                              |
+|     - Harness maintains active checklist in external PlanManager state.     |
+|     - Injects clean {PLAN} block into turn prompt conditioning.             |
+|     - Prevents conversational turn growth and context contamination.        |
+|                                                                             |
+|  2. Policy Selection (PlanningPolicy):                                      |
+|     - Sub-frontier (<100B): Enforce mandatory turn 1 plan generation;       |
+|       prevent premature task aborts when checklist items remain pending.    |
+|     - Frontier (>=100B): Configure plan as completion exit gate;            |
+|       terminate execution immediately upon checklist verification.          |
+|                                                                             |
+|  3. Plan State Mutation:                                                    |
+|     - Agents invoke update_plan tool to update checklist items ([ ] -> [x]) |
+|       or initialize structured plans.                                       |
++-----------------------------------------------------------------------------+
+```
+
+### Out-of-History Plan Injection
+To prevent conversational history bloat, `PlanManager` maintains the active plan outside the dialogue message list. For each turn, the runtime generates conditioned messages by injecting the active `{PLAN}` block into the prompt template or system message. The persistent conversation history retains only tool executions and observations, avoiding duplicated planning dialogue turns.
+
+### Capability-Adaptive Scaffolding Policies
+`PlanManager` supports two operational policies:
+1. **Sub-Frontier Scaffolding (`PlanningPolicy.SUB_FRONTIER`)**: Sub-frontier models (<100B parameters) tend to abandon complex code localization tasks early. This policy enforces plan generation on turn 1. When a model attempts completion before all checklist items are marked complete, the runtime rejects the early abort and injects a scaffolding redirection reminder.
+2. **Frontier Exit Gate (`PlanningPolicy.FRONTIER`)**: Frontier models frequently engage in repetitive post-edit verification loops. This policy instructs the model to exit once verification items are completed. When all checklist items are marked complete via `update_plan`, the runtime triggers an immediate clean completion, reducing API token costs.
+3. **Adaptive Auto-Resolution (`PlanningPolicy.ADAPTIVE`)**: Selects `SUB_FRONTIER` for models under 100B parameters, and `FRONTIER` for frontier models based on model parameter count or model identifiers.
+
+### Plan Mutation Tool (`update_plan`)
+The `update_plan` tool allows models to mutate checklist states:
+- `step`: 1-based index of the target step.
+- `completed`: Boolean status (`True` for `[x]`, `False` for `[ ]`).
+- `plan`: Markdown checklist string for initializing or replacing the active plan.
+- `steps`: Array of string step descriptions.
+- `updates`: Batch update list specifying step indices and completion statuses.
 

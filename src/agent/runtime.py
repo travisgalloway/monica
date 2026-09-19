@@ -38,6 +38,7 @@ from ..data.tool_sources import (
     CODING_AGENT_TOOLS,
     FETCH_WEB_PAGE_TOOL,
     TOOL_CALL_OPEN,
+    UPDATE_PLAN_TOOL,
     WEB_SEARCH_TOOL,
     format_tool_response,
     render_tool_system,
@@ -45,6 +46,7 @@ from ..data.tool_sources import (
 from ..eval.bfcl_adapter import parse_tool_calls
 from ..serve.sampling import sample
 from .fetcher import fetch_web_page
+from .planning import PlanManager, PlanningPolicy
 from .safety import (
     FileReadRegistry,
     format_diagnostic_summary,
@@ -227,6 +229,8 @@ class AgentRunResult:
     success: bool = True
     failure_reason: str | None = None
     circuit_breaker_triggered: bool = False
+    exit_gate_triggered: bool = False
+    plan_state: dict[str, Any] | None = None
     total_wall_s: float = 0.0
     total_tool_wall_s: float = 0.0
     total_prompt_tokens: int = 0
@@ -245,6 +249,8 @@ class AgentRunResult:
             "success": self.success,
             "failure_reason": self.failure_reason,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
+            "exit_gate_triggered": self.exit_gate_triggered,
+            "plan_state": self.plan_state,
             "total_turns": self.total_turns,
             "total_wall_s": self.total_wall_s,
             "total_tool_wall_s": self.total_tool_wall_s,
@@ -444,6 +450,7 @@ class WorkspaceToolExecutor:
         read_registry: FileReadRegistry | None = None,
         diagnostic_provider: Any | None = None,
         ts_lsp_service: Any | None = None,
+        plan_manager: PlanManager | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_dir or os.getcwd()).resolve()
         self.timeout_s = float(timeout_s)
@@ -453,10 +460,13 @@ class WorkspaceToolExecutor:
         self.read_registry = read_registry if read_registry is not None else FileReadRegistry()
         self.diagnostic_provider = diagnostic_provider
         self.ts_lsp_service = ts_lsp_service
+        self.plan_manager = plan_manager
 
     def reset(self) -> None:
         """Reset session-level safety state (read registry and content hashes)."""
         self.read_registry.clear()
+        if self.plan_manager is not None:
+            self.plan_manager.reset()
 
     def _resolve_safe_path(self, path_str: str) -> tuple[Path | None, str | None]:
         """Resolve a workspace path, preventing directory traversal and symlink jailbreaks outside root."""
@@ -759,6 +769,10 @@ class WorkspaceToolExecutor:
             return web_search(query=str(args.get("query", "")), count=int(args.get("count", 5)))
         elif name == "fetch_web_page" and self.enable_web_tools:
             return fetch_web_page(url=str(args.get("url", "")))
+        elif name == "update_plan":
+            if self.plan_manager is not None:
+                return self.plan_manager.execute_update_plan(args)
+            return {"error": "No PlanManager configured for update_plan", "is_error": True}
         else:
             return {"error": f"Unknown or unsupported tool: {name}", "is_error": True}
 
@@ -922,6 +936,8 @@ class AgentRuntime:
         termination_threshold: int = DEFAULT_TERMINATION_THRESHOLD,
         trajectory_logger: TrajectoryLogger | Callable[[AgentRunResult], None] | str | Path | None = None,
         compactor: Any | None = None,
+        plan_manager: PlanManager | None = None,
+        planning_policy: str | PlanningPolicy | None = None,
     ) -> None:
         self.lm = lm
         self.tools = list(tools) if tools is not None else list(CODING_AGENT_TOOLS) + [WEB_SEARCH_TOOL, FETCH_WEB_PAGE_TOOL]
@@ -953,11 +969,26 @@ class AgentRuntime:
 
         self.compactor = compactor
 
+        if plan_manager is not None:
+            self.plan_manager = plan_manager
+        elif planning_policy is not None:
+            self.plan_manager = PlanManager(policy=planning_policy)
+        else:
+            self.plan_manager = None
+
+        if self.plan_manager is not None:
+            if not any(t.get("name") == "update_plan" for t in self.tools):
+                self.tools.append(UPDATE_PLAN_TOOL)
+            if hasattr(self.tool_executor, "plan_manager") and self.tool_executor.plan_manager is None:
+                self.tool_executor.plan_manager = self.plan_manager
+
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> tuple[Any, bool, float]:
         """Execute a tool call using configured executor, handling exceptions safely."""
         t0 = time.monotonic()
         try:
-            if hasattr(self.tool_executor, "execute") and callable(self.tool_executor.execute):
+            if name == "update_plan" and self.plan_manager is not None:
+                res = self.plan_manager.execute_update_plan(arguments)
+            elif hasattr(self.tool_executor, "execute") and callable(self.tool_executor.execute):
                 res = self.tool_executor.execute(name, arguments)
             elif callable(self.tool_executor):
                 res = self.tool_executor(name, arguments)
@@ -1053,6 +1084,8 @@ class AgentRuntime:
             self.tool_executor.reset()
         elif hasattr(self.tool_executor, "read_registry") and hasattr(self.tool_executor.read_registry, "clear"):
             self.tool_executor.read_registry.clear()
+        if self.plan_manager is not None:
+            self.plan_manager.reset()
 
         # Build initial messages
         system_content = render_tool_system(self.tools, preamble=self.system_prompt)
@@ -1071,6 +1104,7 @@ class AgentRuntime:
         success = True
         failure_reason: str | None = None
         circuit_breaker_triggered = False
+        exit_gate_triggered = False
 
         total_prompt_tokens = 0
         total_completion_tokens = 0
@@ -1103,9 +1137,15 @@ class AgentRuntime:
                 elif callable(self.compactor):
                     messages = self.compactor(messages)
 
+            # Out-of-history plan injection into prompt conditioning (#352)
+            if self.plan_manager is not None:
+                conditioned_messages = self.plan_manager.inject_plan(messages)
+            else:
+                conditioned_messages = messages
+
             # Generate model turn
             try:
-                response_text, p_tokens, c_tokens, gen_wall_s = self._generate_turn(messages, rng=rng)
+                response_text, p_tokens, c_tokens, gen_wall_s = self._generate_turn(conditioned_messages, rng=rng)
             except Exception as e:  # noqa: BLE001
                 status = "failed"
                 success = False
@@ -1123,6 +1163,41 @@ class AgentRuntime:
 
             # Case A: Agent finishes without further tool calls
             if not tool_calls:
+                # Capability-adaptive scaffolding: detect and prevent premature task abort (#352)
+                premature_abort = False
+                abort_reason = None
+                if self.plan_manager is not None:
+                    premature_abort, abort_reason = self.plan_manager.check_premature_abort(turn_idx)
+
+                if premature_abort and abort_reason:
+                    phase_transitions.append("scaffolding_redirection")
+                    turn_events.append({
+                        "event": "premature_abort_prevented",
+                        "turn": turn_idx,
+                        "reason": abort_reason,
+                    })
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append({"role": "user", "content": abort_reason})
+                    turn = AgentTurn(
+                        turn_index=turn_idx,
+                        thought=thought,
+                        action=None,
+                        tool_calls=[],
+                        tool_observations=[],
+                        prompt_tokens=p_tokens,
+                        completion_tokens=c_tokens,
+                        generation_wall_s=gen_wall_s,
+                        tool_wall_s=0.0,
+                        turn_wall_s=time.monotonic() - t_turn_start,
+                        phase_transitions=phase_transitions,
+                        events=turn_events,
+                    )
+                    turns.append(turn)
+                    all_events.extend(turn_events)
+                    if self.trajectory_logger and hasattr(self.trajectory_logger, "log_turn"):
+                        self.trajectory_logger.log_turn(turn)
+                    continue
+
                 final_answer = answer or response_text
                 messages.append({"role": "assistant", "content": response_text})
                 phase_transitions.append("completion")
@@ -1225,6 +1300,31 @@ class AgentRuntime:
                     "duration_s": dur_s,
                 })
 
+                if call.name == "update_plan":
+                    turn_events.append({
+                        "event": "plan_updated",
+                        "completed_items": self.plan_manager.completed_count if self.plan_manager else 0,
+                        "total_items": self.plan_manager.total_count if self.plan_manager else 0,
+                        "is_complete": self.plan_manager.is_complete if self.plan_manager else False,
+                    })
+
+                # Check completion exit-gate policy (#352)
+                if self.plan_manager is not None and self.plan_manager.should_exit_gate_terminate():
+                    exit_gate_triggered = True
+                    status = "completed"
+                    success = True
+                    final_answer = (
+                        answer or f"Task completed: all {self.plan_manager.total_count} plan checklist items verified."
+                    )
+                    phase_transitions.append("exit_gate")
+                    turn_events.append({
+                        "event": "exit_gate_terminated",
+                        "turn": turn_idx,
+                        "completed_items": self.plan_manager.completed_count,
+                        "total_items": self.plan_manager.total_count,
+                    })
+                    break
+
                 if trip_breaker_this_turn:
                     break
 
@@ -1236,6 +1336,12 @@ class AgentRuntime:
             if redirection_reminders:
                 reminder_block = "\n\n" + "\n".join(redirection_reminders)
                 tool_resp_str += reminder_block
+
+            if turn_idx == 1 and not exit_gate_triggered and self.plan_manager is not None:
+                plan_reminder = self.plan_manager.get_turn1_reminder()
+                if plan_reminder:
+                    tool_resp_str += f"\n\n{plan_reminder}"
+                    turn_events.append({"event": "plan_scaffolding_reminder", "message": plan_reminder})
 
             messages.append({"role": "user", "content": tool_resp_str})
 
@@ -1259,8 +1365,9 @@ class AgentRuntime:
             if self.trajectory_logger and hasattr(self.trajectory_logger, "log_turn"):
                 self.trajectory_logger.log_turn(turn)
 
-            if trip_breaker_this_turn:
-                success = False
+            if trip_breaker_this_turn or exit_gate_triggered:
+                if trip_breaker_this_turn:
+                    success = False
                 break
         else:
             # Reached max turns without natural termination or breaker trip
@@ -1287,6 +1394,8 @@ class AgentRuntime:
             success=success,
             failure_reason=failure_reason,
             circuit_breaker_triggered=circuit_breaker_triggered,
+            exit_gate_triggered=exit_gate_triggered,
+            plan_state=self.plan_manager.to_dict() if self.plan_manager is not None else None,
             total_wall_s=total_wall_s,
             total_tool_wall_s=total_tool_wall_s,
             total_prompt_tokens=total_prompt_tokens,
@@ -1319,6 +1428,8 @@ def run_agent_loop(
     trajectory_logger: TrajectoryLogger | Callable[[AgentRunResult], None] | str | Path | None = None,
     system_prompt: str | None = None,
     compactor: Any | None = None,
+    plan_manager: PlanManager | None = None,
+    planning_policy: str | PlanningPolicy | None = None,
 ) -> AgentRunResult:
     """Convenience functional wrapper around AgentRuntime."""
     runtime = AgentRuntime(
@@ -1334,5 +1445,7 @@ def run_agent_loop(
         termination_threshold=termination_threshold,
         trajectory_logger=trajectory_logger,
         compactor=compactor,
+        plan_manager=plan_manager,
+        planning_policy=planning_policy,
     )
     return runtime.run(task)
