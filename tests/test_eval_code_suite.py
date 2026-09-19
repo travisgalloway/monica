@@ -239,3 +239,12 @@ def test_composite_oracle_has_no_diagnose_method():
     from src.lsp.oracle import CompositeOracle
 
     assert not hasattr(CompositeOracle, "diagnose")
+
+
+def test_repo_recall_suite_runs_and_topological_beats_random(tmp_path):
+    res, out, transcript = _run(tmp_path, "repo_recall", "--suites", "repo_recall")
+    assert res.returncode == 0, res.stderr
+    results = json.loads(out.read_text())
+    assert "repo_recall" in results["summaries"]
+    summary = results["summaries"]["repo_recall"]
+    assert summary["topo_top1_accuracy"] > summary["random_top1_accuracy"]

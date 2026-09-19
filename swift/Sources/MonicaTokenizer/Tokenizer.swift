@@ -9,6 +9,37 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
     public let bpe: BPE
     public let digitGroup: Int
     public let eosTokenId: Int
+
+    /// Repository metadata special tokens (#359)
+    public static let repoNameToken = "<|repo_name|>"
+    public static let fileSepToken = "<|file_sep|>"
+
+    public var repoNameTokenId: Int? { specials.first(where: { $0.text == Self.repoNameToken })?.id }
+    public var fileSepTokenId: Int? { specials.first(where: { $0.text == Self.fileSepToken })?.id }
+
+    /// Encode repository header with <|repo_name|> delimiter.
+    public func encodeRepoHeader(repo: String) -> [Int] {
+        var ids: [Int] = []
+        if let id = repoNameTokenId {
+            ids.append(id)
+        } else {
+            ids.append(contentsOf: encode(Self.repoNameToken))
+        }
+        ids.append(contentsOf: encode(" " + repo + "\n"))
+        return ids
+    }
+
+    /// Encode file separator with <|file_sep|> delimiter.
+    public func encodeFileSeparator(path: String) -> [Int] {
+        var ids: [Int] = []
+        if let id = fileSepTokenId {
+            ids.append(id)
+        } else {
+            ids.append(contentsOf: encode(Self.fileSepToken))
+        }
+        ids.append(contentsOf: encode(" " + path + "\n"))
+        return ids
+    }
     /// (special string, id), longest-first for greedy longest-match splitting.
     let specials: [(text: String, id: Int)]
 

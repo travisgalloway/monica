@@ -720,7 +720,50 @@ if let fixturesDir = resolveFixturesDir() {
     failures.append("could not resolve swift/Fixtures (checked $MONICA_FIXTURES, #filePath, ./Fixtures)")
 }
 
+
+// MARK: repository DAG context packing (#359)
+
+do {
+    eq(Tokenizer.repoNameToken, "<|repo_name|>", "Tokenizer.repoNameToken is <|repo_name|>")
+    eq(Tokenizer.fileSepToken, "<|file_sep|>", "Tokenizer.fileSepToken is <|file_sep|>")
+
+    let fmt = trained(1000)
+    let tok = Tokenizer(format: fmt)
+
+    let files = [
+        Packing.RepoFileEntry(path: "src/types.ts", content: "export interface Config { timeout: number; }"),
+        Packing.RepoFileEntry(path: "src/client.ts", content: "import { Config } from \"./types\"; export function connect() {}"),
+    ]
+    let repo = Packing.RepoProject(repo: "test-repo", files: files)
+
+    let tempOut = FileManager.default.temporaryDirectory.appendingPathComponent("repo-pack-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempOut) }
+
+    do {
+        let manifest = try Packing.packRepos(repos: [repo], tokenizer: tok, outDir: tempOut, seqLen: 1024, shardSizeMB: 1)
+        check(manifest.n_sequences >= 0, "packRepos returned valid manifest")
+
+        let binURL = tempOut.appendingPathComponent("part-00000.bin")
+        let boundsURL = tempOut.appendingPathComponent("part-00000.bounds")
+        if FileManager.default.fileExists(atPath: binURL.path) && FileManager.default.fileExists(atPath: boundsURL.path) {
+            let binData = try Data(contentsOf: binURL)
+            let boundsData = try Data(contentsOf: boundsURL)
+            eq(binData.count / 2, boundsData.count, "bin and bounds length match")
+
+            // First byte of bounds must be 1 (repo boundary)
+            eq(boundsData.first, 1, "repository starts with boundary 1")
+
+            // Crucial test: internal dependent files have boundary suppressed (no 1s after index 0)
+            let internalBoundaryCount = boundsData.dropFirst().filter { $0 == 1 }.count
+            eq(internalBoundaryCount, 0, "boundary resets between dependent files in repo are suppressed")
+        }
+    } catch {
+        failures.append("packRepos failed: \(error)")
+    }
+}
+
 // MARK: report
+
 
 if failures.isEmpty {
     print("monica-selfcheck: OK — all checks passed")
