@@ -38,6 +38,32 @@ public enum Trainer {
             (bytes.map { specialCount + Int($0) }, count)
         }
 
+        let targetMerges = max(0, vocabSize - baseOffset)
+
+        // Seed initial Swift BPE vocabulary with dedicated space tokens for 2, 4, 8, 12,
+        // and 16 horizontal spaces (single tabs are byte 0x09, already in the base 256 bytes).
+        let spaceId = specialCount + 32
+        let initialCandidateMerges = [
+            [spaceId, spaceId],                      // 2 spaces  (id: baseOffset + 0)
+            [baseOffset + 0, baseOffset + 0],        // 4 spaces  (id: baseOffset + 1)
+            [baseOffset + 1, baseOffset + 1],        // 8 spaces  (id: baseOffset + 2)
+            [baseOffset + 2, baseOffset + 1],        // 12 spaces (id: baseOffset + 3)
+            [baseOffset + 2, baseOffset + 2],        // 16 spaces (id: baseOffset + 4)
+        ]
+        let initialMerges = Array(initialCandidateMerges.prefix(targetMerges))
+        var merges: [[Int]] = []
+        for pair in initialMerges {
+            let a = pair[0]
+            let b = pair[1]
+            let newId = baseOffset + merges.count
+            merges.append([a, b])
+            for wi in 0..<words.count {
+                if words[wi].syms.count >= 2 {
+                    words[wi].syms = applyMerge(words[wi].syms, a: a, b: b, newId: newId)
+                }
+            }
+        }
+
         // 3. Precompute pair counts and inverted word index.
         var pairCounts: [UInt64: Int] = [:]
         var pairToWords: [UInt64: [Int]] = [:]
@@ -50,10 +76,7 @@ public enum Trainer {
         }
 
         // 4. Greedily merge the most frequent adjacent pair until the vocab is full.
-        var merges: [[Int]] = []
-        let targetMerges = max(0, vocabSize - baseOffset)
-
-        for _ in 0..<targetMerges {
+        while merges.count < targetMerges {
             // Deterministic pick: max count, tie → smaller packed key.
             var bestKey: UInt64 = .max
             var bestCount = 0
