@@ -53,7 +53,10 @@ def _fs_for(uri):
     if str(uri).startswith("s3://"):
         endpoint = r2_endpoint()
         if endpoint:
-            opts["client_kwargs"] = {"endpoint_url": endpoint}
+            opts["client_kwargs"] = {
+                "endpoint_url": endpoint,
+                "region_name": os.environ.get("AWS_DEFAULT_REGION", "auto"),
+            }
     return fsspec.core.url_to_fs(str(uri), **opts)
 
 

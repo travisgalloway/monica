@@ -729,7 +729,9 @@ def build_fixture(config_path: str, out_dir: str, *, batch: int, seq: int,
         # exactly the keys its own LayerState case implies, fails loudly on a missing key if the
         # two sides ever disagree about layer structure, instead of silently skipping a check.
         pre_logits, pre_state = ref_model.prefill(tokens)
+        mx.eval(pre_logits)
         pre_last, _ = ref_model.prefill(tokens, last_only=True)
+        mx.eval(pre_last)
         prefill_out = {
             "prefill_logits": _np_f32(pre_logits),
             "prefill_last_logits": _np_f32(pre_last),

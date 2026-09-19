@@ -387,8 +387,9 @@ class SelectiveSSM(nn.Module):
         # --- pure-PyTorch fallback ------------------------------------------------
         X = _f32(x).reshape(B_, L, H, P)             # whole scan runs in fp32
 
-        pad = (-L) % Q
-        if pad:
+        rem = L % Q
+        pad = (Q - rem) % Q
+        if pad != 0:
             zc = lambda t, shp: torch.cat([t, t.new_zeros(shp)], dim=1)
             X, delta = zc(X, (B_, pad, H, P)), zc(delta, (B_, pad, H))
             Bm, Cm = zc(Bm, (B_, pad, N)), zc(Cm, (B_, pad, N))
@@ -1169,6 +1170,8 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self._state = None
         self.to(self._device)
+        if self._device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
         _report_fast_path_once(self._device)
         if config.fp8_experts and config.n_moe_layers:
             _report_fp8_status_once(self._device)

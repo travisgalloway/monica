@@ -42,9 +42,18 @@ A from-scratch, **TypeScript-first Mamba-2 hybrid Mixture-of-Experts (MoE) code 
 backbone is mostly Mamba-2/SSD state-space layers with a **minority (~12.5%) of full-attention
 layers** for the cross-file symbol recall that pure SSMs are weak at, and **MoE on the MLP layers**
 (Jamba-style: fine-grained experts, top-k routing, one shared expert, aux-loss-free load
-balancing). It targets two sizes — a **small** rung (~120M active / ~700M total) and a **large**
-rung ("Large A", ~700M active / ~3.5B total, the default), the large one **sparse-upcycled** from
-the small dense checkpoint. **Both rungs share `d_model 768`** (resolved 2026-08-09, #272 — see
+balancing).
+
+The program targets an authoritative three-tier configuration matrix (see [16-target-configuration-matrix.md](16-target-configuration-matrix.md)):
+1. **Mac-Trained POC (~100M params, ~64k context window)**: Local Apple Silicon development on MLX, validating the MHM architecture and SSI feedback loops.
+2. **CUDA-Trained POC (~1B active params, 128k context window)**: Cloud-scale proof-of-concept on PyTorch FSDP2 + Muon/AdamW.
+3. **CUDA-Trained MVP (~4B active params, 128k – 256k context window)**: Flagship production code model for multi-file repository understanding.
+
+All tiers standardize on two runtime precision regimes:
+- **Native FP16 / BF16**: Reference unquantized weights and KV cache.
+- **Mixed Precision W4 + KV8**: 4-bit affine weights with 8-bit tied embedding head, 8-bit attention KV cache, and constant FP32 SSM state, delivering 75% memory bandwidth reduction and 2x–3x decode speedup.
+
+Both small and large rungs share `d_model 768` (resolved 2026-08-09, #272 — see
 the resolved note under MHM-P5), which is what lets a single dense run (#200) seed both. It trains on a general multilingual **Essential-Web + Stack-v2**
 mixture with its **own byte-level BPE** (a native cross-platform Swift tokenizer, #191/#245 — see
 MHM-P1b) and **fill-in-the-middle (FIM)**. Success stays the POC

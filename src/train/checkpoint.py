@@ -129,6 +129,10 @@ def load_weights_dict(path: str) -> Dict[str, np.ndarray]:
 def load_weights(model: Any, path: str) -> None:
     """Load portable weights into a backend model via its `_load_portable` hook."""
     weights = load_weights_dict(path)
+    quant_block = load_quant_sidecar(path)
+    if quant_block is not None:
+        from ..eval.quantize import dequantize_portable_state_dict
+        weights = dequantize_portable_state_dict(weights, quant_block)
     if not hasattr(model, "_load_portable"):
         raise NotImplementedError(
             "Backend must implement `_load_portable(dict)` to map portable weights."

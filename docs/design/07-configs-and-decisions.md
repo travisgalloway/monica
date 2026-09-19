@@ -23,11 +23,14 @@ scale run" runbook appendix is deliberately not duplicated here — read it in
 | `toy-moe-muon.yaml` | `toy-moe.yaml` + `optimizer: muon` — covers expert gate/up/down (Muon) and the router (AdamW) in one real model (#214) | live |
 | `toy-moe-8bit.yaml` | `toy-moe.yaml` + `optimizer_8bit: true` — config-surface fixture ONLY, not runnable without `bitsandbytes`/a CUDA host (#214) | live (surface-only) |
 | `toy-muon.yaml` | toy.yaml's shape with `optimizer: muon` (#237) — exercises the hybrid optimizer | live |
+| `code-small-dense.yaml` | 232M dense upcycle source / Tier 1 Mac-trained POC (~64k context) | **live** (#200) |
+| `code-small-moe.yaml` | 685M total / 345M active intermediate MoE dev rung | **live** |
+| `code-large-a.yaml` | 3.86B total / 686M–4B active MVP flagship MoE (128k–256k context) | **live** (#272) |
 | `small.yaml` | ~2.6M params, byte vocab — fast local iteration | live |
 | `poc.yaml` | ~127M OLMo-vocab from-scratch scale run | reserve (validated foundation, #75) |
 | `poc-small.yaml` | ~97M, real-but-slow local POC (the "≤100M trained locally" target) | reserve |
 | `poc-qwen.yaml` | poc.yaml retargeted to Qwen2.5 — the **completed** ~205M run (val-ppl 75.7) | reserve (done) |
-| `1b.yaml` | ~1B from-scratch, OLMo vocab | reserve (#75) |
+| `1b.yaml` | ~1B from-scratch, OLMo vocab (Tier 2 CUDA POC seed, 128k context) | reserve (#75) |
 | `student-1b.yaml` | ~1B hybrid distillation-student sweep seed | **history** (M10 dropped 2026-07-19) but still **live as a fixture**: `tests/test_packing_dtype.py` uses it as the uint32 case, and [09-hybrid-architectures.md](09-hybrid-architectures.md) cites it as the hybrid sizing example |
 
 > The `student-1b-attn-lo.yaml` / `-attn-hi.yaml` sweep siblings were **deleted** (2026-07-25).
@@ -37,9 +40,15 @@ scale run" runbook appendix is deliberately not duplicated here — read it in
 > attention-fraction reasoning they encoded survives as prose in
 > [09-hybrid-architectures.md](09-hybrid-architectures.md); the files themselves are in git history.
 
-The M12 code model's own configs (small ~120M-active/700M-total, "Large A"
-~700M-active/3.5B-total) do **not** exist yet — they arrive with #200/#219. See
-[13-code-model-moe.md](13-code-model-moe.md).
+### Target Configuration Matrix (POC to MVP)
+
+The program standardizes on three target tiers across **Native FP16/BF16** and **Mixed Precision W4 + KV8** (see [16-target-configuration-matrix.md](16-target-configuration-matrix.md)):
+
+| Tier | Active Params | Target Context Window | Hardware | Key Config |
+| :--- | :--- | :--- | :--- | :--- |
+| **Tier 1: Mac-Trained POC** | ~100M | **~64k tokens** | Apple Silicon (MLX) | `code-small-dense.yaml` |
+| **Tier 2: CUDA-Trained POC** | ~1B active | **128k tokens** | Single-Node CUDA | `1b.yaml` |
+| **Tier 3: CUDA-Trained MVP** | ~4B active | **128k – 256k tokens** | Multi-Node H100 Cluster | `code-large-a.yaml` |
 
 **Note (#200) — the sparse-upcycle source is a specific shape, not just a matching width.**
 Three things must hold, and only the first is about `d_model`:

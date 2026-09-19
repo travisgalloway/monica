@@ -64,6 +64,10 @@ Every claim here is sourced from a docstring or config comment in the code, with
     rules every SSI arm (#226/#227/#230) must satisfy — one variable per arm, ≥3 seeds + paired
     McNemar/sign-test/Wilcoxon, repo-level contamination split with a logged manifest,
     availability-vs-use null arms, and the ten-hatch shared escape-hatch lint gate.
+16. [Target Configuration Matrix: POC to MVP](16-target-configuration-matrix.md) — the deployment
+    & context roadmap: Mac-trained POC (~100M, 64k window), CUDA-trained POC (~1B active, 128k
+    window), and CUDA-trained MVP (~4B active, 128k–256k window) across Native FP16/BF16 and
+    Mixed Precision W4 + KV8. Operational procedures: [`../runbooks/e2e-training-eval-serving.md`](../runbooks/e2e-training-eval-serving.md).
 
 > **The live program is topic 13** (M12, [#198](https://github.com/travisgalloway/monica/issues/198)):
 > a from-scratch Mamba-2 hybrid **MoE code model** with the structural-signal (SSI) fold as a

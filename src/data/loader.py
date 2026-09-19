@@ -37,7 +37,10 @@ class PackedLoader:
         self.stride = seq_len + 1
         self.n_chunks = (self.data.shape[0]) // self.stride
         if self.n_chunks == 0:
-            raise ValueError("packed file too small for one chunk")
+            raise ValueError(
+                f"packed file {self.path} too small for one chunk: {self.data.shape[0]} tokens "
+                f"< stride {self.stride} (seq_len={self.seq_len} + 1)"
+            )
 
     def _chunk(self, idx: int) -> np.ndarray:
         start = idx * self.stride
