@@ -159,3 +159,68 @@ def test_python_reads_the_psm_frame_the_swift_packer_wrote(monica_tokenize, toke
             if SUFFIX_ID in doc and MIDDLE_ID in doc:
                 assert doc.index(SUFFIX_ID) < doc.index(MIDDLE_ID)
     assert fim_docs > 0, "no FIM-framed document reached the Python shard reader"
+
+
+def test_python_reads_the_spm_frame_the_swift_packer_wrote(monica_tokenize, tokenizer, tmp_path):
+    """End-to-end SPM: the trainer's own shard reader must see `<|fim_suffix|>` at document start,
+    with `<|fim_prefix|>` appearing before `<|fim_middle|>` (#358)."""
+    out = tmp_path / "fim-spm"
+    _pack(monica_tokenize, tokenizer, out, "--fim-rate", "0.5", "--fim-seed", "1234", "--fim-mode", "spm")
+
+    manifest = read_manifest(out)
+    fim_docs = 0
+    for shard in manifest["shards"]:
+        toks, bnds = open_shard(out, shard["name"])
+        starts = doc_start_offsets(bnds)
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(toks)
+            doc = [int(t) for t in toks[start:end]]
+            if not doc or doc[0] != SUFFIX_ID:
+                continue
+            fim_docs += 1
+            assert doc.count(SUFFIX_ID) == 1
+            # In SPM order, prefix must precede middle
+            if PREFIX_ID in doc and MIDDLE_ID in doc:
+                assert doc.index(PREFIX_ID) < doc.index(MIDDLE_ID)
+    assert fim_docs > 0, "no SPM-framed document reached the Python shard reader"
+
+
+def test_joint_mode_emits_both_psm_and_spm(monica_tokenize, tokenizer, tmp_path):
+    """Joint mode produces both PSM (starts with prefix sentinel) and SPM (starts with suffix sentinel) (#358)."""
+    out = tmp_path / "fim-joint"
+    _pack(monica_tokenize, tokenizer, out, "--fim-rate", "0.9", "--fim-seed", "42", "--fim-mode", "joint")
+
+    manifest = read_manifest(out)
+    psm_count = 0
+    spm_count = 0
+    for shard in manifest["shards"]:
+        toks, bnds = open_shard(out, shard["name"])
+        starts = doc_start_offsets(bnds)
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(toks)
+            doc = [int(t) for t in toks[start:end]]
+            if not doc:
+                continue
+            if doc[0] == PREFIX_ID:
+                psm_count += 1
+            elif doc[0] == SUFFIX_ID:
+                spm_count += 1
+    assert psm_count > 0, f"joint mode emitted no PSM docs: psm={psm_count}, spm={spm_count}"
+    assert spm_count > 0, f"joint mode emitted no SPM docs: psm={psm_count}, spm={spm_count}"
+
+
+@pytest.mark.parametrize("mode", ["spm", "joint"])
+def test_same_seed_packs_are_byte_identical_for_modes(monica_tokenize, tokenizer, tmp_path, mode):
+    a, b = tmp_path / f"a-{mode}", tmp_path / f"b-{mode}"
+    for out in (a, b):
+        _pack(monica_tokenize, tokenizer, out, "--fim-rate", "0.5", "--fim-seed", "1234", "--fim-mode", mode)
+    assert _dir_bytes(a) == _dir_bytes(b)
+
+
+@pytest.mark.parametrize("bad_mode", ["foo", "prefix", "suffix", "123"])
+def test_invalid_fim_mode_fails_fast(monica_tokenize, tokenizer, tmp_path, bad_mode):
+    r = _run(monica_tokenize, "pack", "--tokenizer", str(tokenizer), "--in", str(FIXTURE),
+             "--out", str(tmp_path / f"out-{bad_mode}"), "--seq-len", "64",
+             "--fim-rate", "0.5", "--fim-mode", bad_mode)
+    assert r.returncode != 0
+    assert "fim-mode" in r.stderr

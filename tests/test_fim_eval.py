@@ -21,7 +21,10 @@ from src.eval.fim_eval import (
     evaluate_fim_multi_key,
     format_fim_multi_table,
     format_fim_table,
+    format_fim_modes_table,
     make_fim_example,
+    evaluate_fim_modes,
+    evaluate_fim_by_mode,
 )
 
 VOCAB = 32
@@ -440,3 +443,87 @@ def test_fim_example_is_frozen():
     assert isinstance(ex, FIMExample)
     with pytest.raises(Exception):
         ex.middle_start = 0
+
+
+# --------------------------------------------------------------------------------------- #
+# SPM layout and multi-mode evaluation (#358)
+# --------------------------------------------------------------------------------------- #
+
+def test_spm_layout_and_reassembly():
+    s = FIMSentinels()
+    doc = _doc(10)
+    ex = make_fim_example(doc, 3, 7, s, doc_index=4, mode="spm")
+
+    assert ex.mode == "spm"
+    assert ex.tokens[0] == s.suffix
+    assert ex.tokens[1 + 3] == s.prefix
+    assert ex.middle_start == 1 + 3 + 1 + 3
+    assert ex.tokens[ex.middle_start] == s.middle
+    assert (ex.prefix_len, ex.middle_len, ex.suffix_len) == (3, 4, 3)
+    assert ex.doc_index == 4
+    assert ex.recall_distance == ex.middle_start
+
+    suffix = ex.tokens[1:1 + ex.suffix_len]
+    prefix = ex.tokens[2 + ex.suffix_len:2 + ex.suffix_len + ex.prefix_len]
+    middle = ex.tokens[ex.middle_start + 1:]
+    np.testing.assert_array_equal(np.concatenate([prefix, middle, suffix]), doc)
+
+    for sentinel in s.all_sentinels:
+        assert int((ex.tokens == sentinel).sum()) == 1
+
+
+@pytest.mark.parametrize("a,b", [(0, 0), (0, 10), (10, 10), (4, 4)])
+def test_degenerate_spm_cuts_still_reassemble(a, b):
+    doc = _doc(10)
+    ex = make_fim_example(doc, a, b, mode="spm")
+    suffix = ex.tokens[1:1 + ex.suffix_len]
+    prefix = ex.tokens[2 + ex.suffix_len:2 + ex.suffix_len + ex.prefix_len]
+    middle = ex.tokens[ex.middle_start + 1:]
+    np.testing.assert_array_equal(np.concatenate([prefix, middle, suffix]), doc)
+
+
+def test_invalid_mode_raises():
+    with pytest.raises(ValueError, match="unknown FIM mode"):
+        make_fim_example(_doc(10), 2, 6, mode="invalid")
+    with pytest.raises(ValueError, match="unknown FIM mode"):
+        build_fim_examples([_doc(10)], np.random.default_rng(0), mode="invalid")
+
+
+def test_spm_oracle_middle_scoring():
+    doc = _doc(24)
+    ex = make_fim_example(doc, 5, 15, mode="spm")
+    oracle = _OracleModel(bridge={FIMSentinels().middle: int(doc[5])})
+    res = evaluate_fim(oracle, [ex], batch_size=1)
+    rec = res["records"][0]
+    assert rec["mode"] == "spm"
+    assert rec["n_middle_tokens"] == ex.middle_len
+    assert rec["ce_nats"] < 1e-6
+    assert rec["token_accuracy"] == 1.0
+    assert rec["exact_match"] == 1.0
+
+
+def test_evaluate_fim_modes_reports_both_suites():
+    docs = [_doc(30), _doc(24, start=8)]
+    rng = np.random.default_rng(42)
+    model = _FakeModel()
+    results = evaluate_fim_modes(model, docs, rng, modes=("psm", "spm"), n_per_doc=2, min_middle=2)
+    assert "psm" in results and "spm" in results
+    assert "token_accuracy" in results["psm"]["overall"]
+    assert "token_accuracy" in results["spm"]["overall"]
+    assert 0.0 <= results["psm"]["overall"]["token_accuracy"] <= 1.0
+    assert 0.0 <= results["spm"]["overall"]["token_accuracy"] <= 1.0
+
+    table = format_fim_modes_table(results)
+    assert "FIM PSM loss" in table
+    assert "FIM SPM loss" in table
+
+
+def test_evaluate_fim_by_mode():
+    doc = _doc(20)
+    psm_ex = make_fim_example(doc, 4, 10, mode="psm")
+    spm_ex = make_fim_example(doc, 4, 10, mode="spm")
+    model = _FakeModel()
+    res = evaluate_fim_by_mode(model, [psm_ex, spm_ex], batch_size=2)
+    assert set(res.keys()) == {"psm", "spm"}
+    assert res["psm"]["overall"]["n_examples"] == 1
+    assert res["spm"]["overall"]["n_examples"] == 1

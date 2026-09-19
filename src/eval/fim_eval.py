@@ -80,8 +80,8 @@ class FIMSentinels:
 
 @dataclass(frozen=True)
 class FIMExample:
-    """One teacher-forcing example: the full PSM stream plus the spans needed to score and
-    bucket it. `middle_start` is the index of the `fim_middle` sentinel — which is also the
+    """One teacher-forcing example: the full PSM or SPM stream plus the spans needed to score and
+    bucket it (#358). `middle_start` is the index of the `fim_middle` sentinel — which is also the
     input position whose prediction is the first middle token."""
 
     tokens: np.ndarray
@@ -90,6 +90,7 @@ class FIMExample:
     middle_len: int
     suffix_len: int
     doc_index: int
+    mode: str = "psm"
 
     @property
     def recall_distance(self) -> int:
@@ -101,8 +102,12 @@ class FIMExample:
 
 def make_fim_example(doc_ids: Sequence[int], cut_a: int, cut_b: int,
                      sentinels: FIMSentinels = FIMSentinels(),
-                     doc_index: int = 0) -> FIMExample:
-    """Build a PSM stream from an already-tokenized document and two cut points `0 <= a <= b <= n`.
+                     doc_index: int = 0,
+                     mode: str = "psm") -> FIMExample:
+    """Build a PSM or SPM stream from an already-tokenized document and two cut points `0 <= a <= b <= n` (#358).
+
+    In PSM mode: [fim_prefix] + prefix + [fim_suffix] + suffix + [fim_middle] + middle.
+    In SPM mode: [fim_suffix] + suffix + [fim_prefix] + prefix + [fim_middle] + middle.
 
     Cuts are on **token** indices here, whereas the Swift pack-time transform cuts on UTF-8 byte
     offsets so that middles can begin mid-token. That difference is deliberate and harmless for
@@ -110,27 +115,42 @@ def make_fim_example(doc_ids: Sequence[int], cut_a: int, cut_b: int,
     distribution is the packed corpus's, not this constructor's. Use `documents_from_shards` when
     you want to score the real, Swift-inserted streams instead.
     """
+    mode = mode.lower()
+    if mode not in ("psm", "spm"):
+        raise ValueError(f"unknown FIM mode {mode!r}, expected 'psm' or 'spm'")
+
     ids = np.asarray(doc_ids, dtype=np.int64).reshape(-1)
     n = int(ids.size)
     if not (0 <= cut_a <= cut_b <= n):
         raise ValueError(f"cut points must satisfy 0 <= a <= b <= {n}, got a={cut_a}, b={cut_b}")
 
     prefix, middle, suffix = ids[:cut_a], ids[cut_a:cut_b], ids[cut_b:]
-    stream = np.concatenate([
-        np.array([sentinels.prefix], dtype=np.int64), prefix,
-        np.array([sentinels.suffix], dtype=np.int64), suffix,
-        np.array([sentinels.middle], dtype=np.int64), middle,
-    ])
-    middle_start = 1 + int(prefix.size) + 1 + int(suffix.size)
+    if mode == "spm":
+        stream = np.concatenate([
+            np.array([sentinels.suffix], dtype=np.int64), suffix,
+            np.array([sentinels.prefix], dtype=np.int64), prefix,
+            np.array([sentinels.middle], dtype=np.int64), middle,
+        ])
+        middle_start = 1 + int(suffix.size) + 1 + int(prefix.size)
+    else:
+        stream = np.concatenate([
+            np.array([sentinels.prefix], dtype=np.int64), prefix,
+            np.array([sentinels.suffix], dtype=np.int64), suffix,
+            np.array([sentinels.middle], dtype=np.int64), middle,
+        ])
+        middle_start = 1 + int(prefix.size) + 1 + int(suffix.size)
+
     return FIMExample(tokens=stream, middle_start=middle_start,
                       prefix_len=int(prefix.size), middle_len=int(middle.size),
-                      suffix_len=int(suffix.size), doc_index=doc_index)
+                      suffix_len=int(suffix.size), doc_index=doc_index,
+                      mode=mode)
 
 
 def build_fim_examples(docs: Iterable[Sequence[int]], rng: np.random.Generator, *,
                        sentinels: FIMSentinels = FIMSentinels(),
-                       n_per_doc: int = 1, min_middle: int = 1) -> List[FIMExample]:
-    """Sample `n_per_doc` PSM examples per document with uniform two-point cuts.
+                       n_per_doc: int = 1, min_middle: int = 1,
+                       mode: str = "psm") -> List[FIMExample]:
+    """Sample `n_per_doc` FIM examples per document in `mode` ('psm' or 'spm') (#358).
 
     `rng` is an explicit `np.random.Generator` — there is no module-level RNG, so a given seed
     reproduces a given eval set exactly. Documents shorter than `min_middle` are skipped (they
@@ -139,6 +159,10 @@ def build_fim_examples(docs: Iterable[Sequence[int]], rng: np.random.Generator, 
     """
     if min_middle < 1:
         raise ValueError(f"min_middle must be >= 1, got {min_middle}")
+    mode = mode.lower()
+    if mode not in ("psm", "spm"):
+        raise ValueError(f"unknown FIM mode {mode!r}, expected 'psm' or 'spm'")
+
     examples: List[FIMExample] = []
     for doc_index, doc in enumerate(docs):
         ids = np.asarray(doc, dtype=np.int64).reshape(-1)
@@ -148,7 +172,7 @@ def build_fim_examples(docs: Iterable[Sequence[int]], rng: np.random.Generator, 
         for _ in range(n_per_doc):
             cut_a = int(rng.integers(0, n - min_middle + 1))
             cut_b = int(rng.integers(cut_a + min_middle, n + 1))
-            examples.append(make_fim_example(ids, cut_a, cut_b, sentinels, doc_index))
+            examples.append(make_fim_example(ids, cut_a, cut_b, sentinels, doc_index, mode=mode))
     return examples
 
 
@@ -277,6 +301,7 @@ def evaluate_fim(model, examples: Sequence[FIMExample], *, batch_size: int = 8,
         for ex, scored in zip(batch, _score_batch(model, batch, sentinels, to_numpy)):
             records.append({
                 "doc_index": ex.doc_index,
+                "mode": ex.mode,
                 "bucket": bucket_of(int(key(ex)), buckets),
                 "prefix_len": ex.prefix_len,
                 "middle_len": ex.middle_len,
@@ -369,6 +394,7 @@ def evaluate_fim_multi_key(model, examples: Sequence[FIMExample], *, batch_size:
         for ex, scored in zip(batch, _score_batch(model, batch, sentinels, to_numpy)):
             records.append({
                 "doc_index": ex.doc_index,
+                "mode": ex.mode,
                 "prefix_len": ex.prefix_len,
                 "middle_len": ex.middle_len,
                 "suffix_len": ex.suffix_len,
@@ -446,3 +472,57 @@ def format_fim_multi_table(results: dict) -> str:
     if results.get("advisory"):
         blocks.append(f"  advisory: {results['advisory']}")
     return "\n".join(blocks)
+
+
+def evaluate_fim_modes(model, docs: Iterable[Sequence[int]], rng: np.random.Generator, *,
+                       modes: Sequence[str] = ("psm", "spm"),
+                       batch_size: int = 8,
+                       n_per_doc: int = 1, min_middle: int = 1,
+                       buckets: Sequence[Tuple[str, int, Optional[int]]] = DEFAULT_BUCKETS,
+                       key: Callable[[FIMExample], int] = lambda ex: ex.prefix_len,
+                       sentinels: FIMSentinels = FIMSentinels(),
+                       to_numpy=np.asarray) -> dict[str, dict]:
+    """Evaluate PSM and SPM test suites independently on the same document cuts (#358).
+
+    Returns `{mode: evaluate_fim(...)}` reporting completion accuracy (`token_accuracy`,
+    `exact_match_rate`, `ce`, `perplexity`) for each specified mode.
+    """
+    docs_list = list(docs)
+    results: dict[str, dict] = {}
+    import copy
+    for mode in modes:
+        mode_rng = copy.deepcopy(rng)
+        examples = build_fim_examples(docs_list, mode_rng, sentinels=sentinels,
+                                      n_per_doc=n_per_doc, min_middle=min_middle, mode=mode)
+        results[mode] = evaluate_fim(model, examples, batch_size=batch_size,
+                                     buckets=buckets, key=key, sentinels=sentinels,
+                                     to_numpy=to_numpy)
+    return results
+
+
+def evaluate_fim_by_mode(model, examples: Sequence[FIMExample], *,
+                         batch_size: int = 8,
+                         buckets: Sequence[Tuple[str, int, Optional[int]]] = DEFAULT_BUCKETS,
+                         key: Callable[[FIMExample], int] = lambda ex: ex.prefix_len,
+                         sentinels: FIMSentinels = FIMSentinels(),
+                         to_numpy=np.asarray) -> dict[str, dict]:
+    """Evaluate examples grouped by prompt mode ('psm' vs 'spm') (#358)."""
+    by_mode: dict[str, List[FIMExample]] = {}
+    for ex in examples:
+        by_mode.setdefault(ex.mode, []).append(ex)
+    return {
+        mode: evaluate_fim(model, mode_examples, batch_size=batch_size,
+                           buckets=buckets, key=key, sentinels=sentinels,
+                           to_numpy=to_numpy)
+        for mode, mode_examples in by_mode.items()
+    }
+
+
+def format_fim_modes_table(results_by_mode: dict[str, dict]) -> str:
+    """Format completion accuracy table for each FIM mode (#358)."""
+    blocks = []
+    for mode, res in results_by_mode.items():
+        title = f"FIM {mode.upper()} loss by distance bucket:"
+        table = format_fim_table(res).replace("FIM loss by distance bucket:", title, 1)
+        blocks.append(table)
+    return "\n\n".join(blocks)

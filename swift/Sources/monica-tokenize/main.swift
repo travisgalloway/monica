@@ -5,7 +5,7 @@
 //   monica-tokenize decode --tokenizer <tokenizer.json> [--in <file>]
 //   monica-tokenize pack   --tokenizer <tokenizer.json> --in <parquet|jsonl|txt|dir> --out <dir>
 //                          [--seq-len 8192] [--shard-size-mb 512] [--chunk-align N]
-//                          [--fim-rate 0.0] [--fim-seed 0]
+//                          [--fim-rate 0.0] [--fim-seed 0] [--fim-mode psm|spm|joint]
 //   monica-tokenize stats  --tokenizer <tokenizer.json> --in <jsonl> [--json]
 //
 // `--in` reads stdin when omitted (encode/decode). `train`/`pack` corpus = a `.parquet` file or
@@ -244,8 +244,13 @@ func cmdPack(_ flags: [String: String]) async {
     // still exist as whole objects — `src/data/split.py` drops the `.bounds` sidecars, so the
     // Python trainer never sees doc structure. Trade-off, accepted and recorded in FIM.swift:
     // changing the rate means re-packing the corpus, not editing a config.
+    let fimModeRaw = flags["fim-mode"] ?? "psm"
+    guard let fimMode = FIMMode(rawValue: fimModeRaw) else {
+        fail("--fim-mode must be one of 'psm', 'spm', 'joint', got '\(fimModeRaw)'")
+    }
     let fimOptions = FIMOptions(rateBasisPoints: rateBasisPoints(flags, "fim-rate"),
-                                seed: uint64Flag(flags, "fim-seed", default: 0))
+                                seed: uint64Flag(flags, "fim-seed", default: 0),
+                                mode: fimMode)
     var fimStats = FIMStats()
 
     let docs = readDocs(inPath)
@@ -291,7 +296,7 @@ func cmdPack(_ flags: [String: String]) async {
         if fimOptions.isEnabled {
             let rate = String(format: "%.4f", Double(fimOptions.rateBasisPoints) / 10000.0)
             print("fim: \(fimStats.transformed)/\(docs.count) docs transformed "
-                  + "(rate \(rate), seed \(fimOptions.seed); \(fimStats.eligible) eligible, "
+                  + "(rate \(rate), seed \(fimOptions.seed), mode \(fimOptions.mode.rawValue); \(fimStats.eligible) eligible, "
                   + "skipped \(fimStats.skippedShort) short, "
                   + "\(fimStats.skippedSentinel) sentinel-bearing)")
         }
