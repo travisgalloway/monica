@@ -234,6 +234,15 @@ func psmSpans(_ ids: [Int], _ o: FIMOptions) -> (p: [Int], s: [Int], m: [Int])? 
     return (Array(ids[1..<si]), Array(ids[(si + 1)..<mi]), Array(ids[(mi + 1)...]))
 }
 
+/// Split an SPM stream into its (prefix, suffix, middle) id runs (#358).
+func spmSpans(_ ids: [Int], _ o: FIMOptions) -> (p: [Int], s: [Int], m: [Int])? {
+    guard let si = ids.firstIndex(of: o.suffixId),
+          let pi = ids.firstIndex(of: o.prefixId),
+          let mi = ids.firstIndex(of: o.middleId),
+          si == 0, si < pi, pi < mi else { return nil }
+    return (Array(ids[(pi + 1)..<mi]), Array(ids[1..<pi]), Array(ids[(mi + 1)...]))
+}
+
 do {
     // --- 1. RNG determinism and a known-answer vector -----------------------------------------
     // The known answers are the *published* SplitMix64 outputs for seed 0, not values harvested
@@ -432,6 +441,161 @@ do {
             }
             eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), unicodeDoc,
                "unicode doc reassembles at seed \(seed)")
+        }
+    }
+
+    // --- 7. SPM mode (#358) -------------------------------------------------------------------
+    do {
+        let forceAllSPM = FIMOptions(rateBasisPoints: 10000, seed: 1234, mode: .spm)
+        var stats = FIMStats()
+        for (i, doc) in fimDocs.enumerated() {
+            let ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                    options: forceAllSPM, stats: &stats)
+            eq(ids.first, forceAllSPM.suffixId, "SPM stream starts with <|fim_suffix|> (doc \(i))")
+            for sentinel in FIM.sentinels(forceAllSPM) {
+                eq(ids.filter { $0 == sentinel }.count, 1,
+                   "sentinel \(sentinel) appears exactly once in SPM (doc \(i))")
+            }
+            guard let spans = spmSpans(ids, forceAllSPM) else {
+                failures.append("malformed SPM frame for doc \(i)")
+                continue
+            }
+            eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), doc,
+               "SPM prefix+middle+suffix reassembles original doc (doc \(i))")
+            let specialsInSpans = (spans.p + spans.m + spans.s).filter { $0 < SPECIALS.count }
+            eq(specialsInSpans, [], "no sentinel id leaks inside SPM span (doc \(i))")
+        }
+
+        // SPM unicode round trip
+        let unicodeDoc = "π≈3.14 数字 🚀 πππ 数数数 🚀🚀🚀 tail"
+        for seed in UInt64(0)..<64 {
+            var s = FIMStats()
+            let out = FIM.transform(document: unicodeDoc, index: 0, tokenizer: tok,
+                                    options: FIMOptions(rateBasisPoints: 10000, seed: seed, mode: .spm),
+                                    stats: &s)
+            guard let spans = spmSpans(out, forceAllSPM) else {
+                failures.append("unicode doc produced a malformed SPM frame at seed \(seed)")
+                continue
+            }
+            eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), unicodeDoc,
+               "unicode doc SPM reassembles at seed \(seed)")
+        }
+    }
+
+    // --- 8. Joint mode 50/50 sampling (#358) --------------------------------------------------
+    do {
+        let jointOpt = FIMOptions(rateBasisPoints: 10000, seed: 42, mode: .joint)
+        var psmCount = 0
+        var spmCount = 0
+        let nDocs = 200
+        for i in 0..<nDocs {
+            let doc = "function computeItem\(i)(x: number): number { const y = x * 2; return y + \(i); }"
+            var s = FIMStats()
+            let ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                    options: jointOpt, stats: &s)
+            let isPSM = (ids.first == jointOpt.prefixId)
+            let isSPM = (ids.first == jointOpt.suffixId)
+            check(isPSM || isSPM, "joint doc \(i) starts with either prefixId or suffixId")
+            if isPSM {
+                psmCount += 1
+                guard let spans = psmSpans(ids, jointOpt) else {
+                    failures.append("joint doc \(i) had malformed PSM frame")
+                    continue
+                }
+                eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), doc,
+                   "joint PSM doc \(i) reassembles")
+            } else if isSPM {
+                spmCount += 1
+                guard let spans = spmSpans(ids, jointOpt) else {
+                    failures.append("joint doc \(i) had malformed SPM frame")
+                    continue
+                }
+                eq(tok.decode(spans.p) + tok.decode(spans.m) + tok.decode(spans.s), doc,
+                   "joint SPM doc \(i) reassembles")
+            }
+        }
+        check(psmCount >= 70 && psmCount <= 130,
+              "joint mode samples roughly 50% PSM (\(psmCount)/\(nDocs))")
+        check(spmCount >= 70 && spmCount <= 130,
+              "joint mode samples roughly 50% SPM (\(spmCount)/\(nDocs))")
+    }
+
+    // --- 9. Prefix cut point distribution (Beta 70%-90%) and 10% empty-suffix mode (#358) ----
+    do {
+        let opt = FIMOptions(rateBasisPoints: 10000, seed: 9999, mode: .psm)
+        let nDocs = 300
+        var totalPrefixRatio: Double = 0.0
+        var emptySuffixCount = 0
+        for i in 0..<nDocs {
+            let doc = String(repeating: "0123456789abcdefghij", count: 10) // 200 bytes
+            var s = FIMStats()
+            let ids = FIM.transform(document: doc, index: i, tokenizer: tok, options: opt, stats: &s)
+            guard let spans = psmSpans(ids, opt) else {
+                failures.append("distribution test doc \(i) malformed frame")
+                continue
+            }
+            let pText = tok.decode(spans.p)
+            let sText = tok.decode(spans.s)
+            let ratio = Double(pText.utf8.count) / Double(doc.utf8.count)
+            totalPrefixRatio += ratio
+            if sText.isEmpty {
+                emptySuffixCount += 1
+            }
+        }
+        let meanPrefixRatio = totalPrefixRatio / Double(nDocs)
+        check(meanPrefixRatio >= 0.70 && meanPrefixRatio <= 0.90,
+              "mean prefix length ratio is within 70%-90% (got \(meanPrefixRatio))")
+        check(emptySuffixCount >= 10 && emptySuffixCount <= 60,
+              "empty-suffix mode occurs roughly 10% of the time (\(emptySuffixCount)/\(nDocs))")
+    }
+
+    // --- 10. Pack determinism for SPM and Joint modes (#358) -----------------------------------
+    do {
+        func packModeWith(_ options: FIMOptions, into dir: URL) -> Bool {
+            var stats = FIMStats()
+            var tokenized: [[Int]] = []
+            for (i, doc) in SAMPLE.enumerated() {
+                var ids = FIM.transform(document: doc, index: i, tokenizer: tok,
+                                        options: options, stats: &stats)
+                ids.append(tok.eosTokenId)
+                tokenized.append(ids)
+            }
+            guard (try? Packing.pack(docs: tokenized, outDir: dir, seqLen: 16, shardSizeMB: 1)) != nil else {
+                failures.append("FIM pack failed for mode \(options.mode) seed \(options.seed)")
+                return false
+            }
+            return true
+        }
+
+        func artifacts(_ dir: URL) -> [String: Data] {
+            var out: [String: Data] = [:]
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+            for name in names.sorted() {
+                out[name] = (try? Data(contentsOf: dir.appendingPathComponent(name))) ?? Data()
+            }
+            return out
+        }
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("monica-fim-modes-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for mode in [FIMMode.spm, FIMMode.joint] {
+            let dirA = root.appendingPathComponent("\(mode)-a")
+            let dirB = root.appendingPathComponent("\(mode)-b")
+            let dirC = root.appendingPathComponent("\(mode)-c")
+            let opt1 = FIMOptions(rateBasisPoints: 5000, seed: 1234, mode: mode)
+            let opt2 = FIMOptions(rateBasisPoints: 5000, seed: 4321, mode: mode)
+            if packModeWith(opt1, into: dirA), packModeWith(opt1, into: dirB), packModeWith(opt2, into: dirC) {
+                let a = artifacts(dirA), b = artifacts(dirB), c = artifacts(dirC)
+                check(!a.isEmpty, "FIM pack for \(mode) produced artifacts")
+                eq(a.keys.sorted(), b.keys.sorted(), "same-seed packs write the same file set (\(mode))")
+                for name in a.keys.sorted() {
+                    eq(a[name], b[name], "same-seed pack is byte-identical: \(name) (\(mode))")
+                }
+                check(a["part-00000.bin"] != c["part-00000.bin"],
+                      "different seed produces different tokens (\(mode))")
+            }
         }
     }
 }

@@ -36,8 +36,10 @@
 // `batchEncode`-style bounded concurrency. This is the property that lets the design survive a
 // future parallelization without breaking the cross-platform `cmp`.
 //
-// PSM only. SPM (suffix-prefix-middle) mode is deliberately out of scope for #215 — its absence
-// is a scoping decision, not an oversight.
+// PSM, SPM, and joint modes (#215, #358). Suffix-Prefix-Middle (SPM) preserves 1D convolution
+// state continuity across the insertion point for Mamba-2 architectures. Joint mode samples
+// PSM or SPM with equal 50% probability. Prefix cut points use a Beta(8, 2) distribution skewed
+// toward realistic 70% to 90% completion contexts, plus a 10% empty-suffix mode.
 
 /// SplitMix64 (Steele/Lea/Flood) — a fixed, fully specified integer PRNG. Every operation is an
 /// explicitly wrapping 64-bit integer op, so the stream is identical on every platform and Swift
@@ -68,20 +70,33 @@ public struct SplitMix64 {
     }
 }
 
+/// The formatting mode for FIM document streams (#358).
+/// In PSM: `[fim_prefix] prefix [fim_suffix] suffix [fim_middle] middle`.
+/// In SPM: `[fim_suffix] suffix [fim_prefix] prefix [fim_middle] middle`.
+/// In joint: sampled 50/50 PSM or SPM deterministically per document.
+public enum FIMMode: String, Sendable, CaseIterable {
+    case psm
+    case spm
+    case joint
+}
+
 /// How `FIM.transform` behaves. `rateBasisPoints` is integer parts-per-10000 (4500 = 0.45);
 /// `0` disables the transform entirely, which is the default and keeps `pack` output
 /// byte-identical to the pre-#215 pipeline.
-public struct FIMOptions {
+public struct FIMOptions: Sendable {
     public var rateBasisPoints: Int
     public var seed: UInt64
+    public var mode: FIMMode
     public var prefixId: Int
     public var suffixId: Int
     public var middleId: Int
 
     public init(rateBasisPoints: Int = 0, seed: UInt64 = 0,
+                mode: FIMMode = .psm,
                 prefixId: Int = 1, suffixId: Int = 3, middleId: Int = 2) {
         self.rateBasisPoints = rateBasisPoints
         self.seed = seed
+        self.mode = mode
         self.prefixId = prefixId
         self.suffixId = suffixId
         self.middleId = middleId
@@ -111,8 +126,18 @@ public struct FIMStats: Sendable {
 
 public enum FIM {
 
-    /// The three reserved sentinel ids in *stream* order for PSM: prefix, suffix, middle.
-    public static func sentinels(_ o: FIMOptions) -> [Int] { [o.prefixId, o.suffixId, o.middleId] }
+    /// The three reserved sentinel ids in *stream* order (#358).
+    /// For PSM: prefix, suffix, middle.
+    /// For SPM: suffix, prefix, middle.
+    /// For joint: prefix, suffix, middle by default.
+    public static func sentinels(_ o: FIMOptions) -> [Int] {
+        switch o.mode {
+        case .spm:
+            return [o.suffixId, o.prefixId, o.middleId]
+        case .psm, .joint:
+            return [o.prefixId, o.suffixId, o.middleId]
+        }
+    }
 
     /// Derive this document's RNG seed from the global seed and the document's index. One
     /// SplitMix64 step over a Weyl-shifted index, so neighbouring indices land far apart in the
@@ -173,15 +198,35 @@ public enum FIM {
         }
         stats.transformed += 1
 
-        // Uniform two-point sampling over byte offsets (Bavarian et al.). An empty prefix, middle,
-        // or suffix is a legitimate draw and is KEPT — the model must learn both "complete from
-        // nothing" and "nothing left to complete". Resampling would distort the distribution.
+        // Prefix cut point: Beta(8, 2) distribution over byte offsets, skewed toward realistic
+        // completion contexts (70% to 90% prefix length). Sampled via the 8th order statistic of
+        // 9 uniform draws in [0, n). Pure 64-bit integer ops — zero floating point (#358).
         let n = UInt64(bytes.count + 1)
-        var a = Int(rng.next(upperBound: n))
-        var b = Int(rng.next(upperBound: n))
-        if a > b { let t = a; a = b; b = t }
+        var draws: [UInt64] = [
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+            rng.next(upperBound: n),
+        ]
+        draws.sort()
+        var a = Int(draws[7])
         a = snapToScalarBoundary(bytes, a)
-        b = snapToScalarBoundary(bytes, b)   // snapping is monotonic, so a <= b still holds
+
+        // 10% empty-suffix mode to represent standard left-to-right completions in FIM format.
+        let emptySuffix = rng.next(upperBound: 100) < 10
+        var b: Int
+        if emptySuffix {
+            b = bytes.count
+        } else {
+            let rem = UInt64(bytes.count - a)
+            b = a + Int(rng.next(upperBound: rem + 1))
+            b = snapToScalarBoundary(bytes, b)
+        }
 
         // Split the document TEXT, not the token ids. Slicing ids instead would make every middle
         // begin exactly on a token boundary, teaching the model it never has to complete a partial
@@ -190,14 +235,36 @@ public enum FIM {
         let middle = String(decoding: bytes[a..<b], as: UTF8.self)
         let suffix = String(decoding: bytes[b...], as: UTF8.self)
 
+        // Select prompt layout: PSM vs SPM. In joint mode, sample PSM or SPM with equal 50% probability.
+        let isSPM: Bool
+        switch options.mode {
+        case .spm:
+            isSPM = true
+        case .psm:
+            isSPM = false
+        case .joint:
+            isSPM = (rng.next(upperBound: 2) == 1)
+        }
+
         var ids: [Int] = []
         ids.reserveCapacity(bytes.count / 2 + 3)
-        ids.append(options.prefixId)
-        tokenizer.encode(prefix, into: &ids)
-        ids.append(options.suffixId)
-        tokenizer.encode(suffix, into: &ids)
-        ids.append(options.middleId)
-        tokenizer.encode(middle, into: &ids)
+        if isSPM {
+            // SPM: [fim_suffix] + encode(suffix) + [fim_prefix] + encode(prefix) + [fim_middle] + encode(middle)
+            ids.append(options.suffixId)
+            tokenizer.encode(suffix, into: &ids)
+            ids.append(options.prefixId)
+            tokenizer.encode(prefix, into: &ids)
+            ids.append(options.middleId)
+            tokenizer.encode(middle, into: &ids)
+        } else {
+            // PSM: [fim_prefix] + encode(prefix) + [fim_suffix] + encode(suffix) + [fim_middle] + encode(middle)
+            ids.append(options.prefixId)
+            tokenizer.encode(prefix, into: &ids)
+            ids.append(options.suffixId)
+            tokenizer.encode(suffix, into: &ids)
+            ids.append(options.middleId)
+            tokenizer.encode(middle, into: &ids)
+        }
         return ids
     }
 
