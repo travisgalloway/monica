@@ -97,3 +97,16 @@ def test_ultrachat_row_to_messages_skips_malformed():
     assert ultrachat_row_to_messages(
         {"messages": [{"role": "user", "content": ""},
                       {"role": "assistant", "content": "ok"}]}) is None
+
+
+def test_architecture_records_are_clean_and_cover_system_design():
+    from src.data.sft_sources import architecture_records, ARCHITECTURE_RECORDS
+    recs = list(architecture_records())
+    assert len(recs) == len(ARCHITECTURE_RECORDS)
+    for r in recs:
+        assert r["source"] == "architecture" and r["license"] == "cc0"
+        assert len(r["messages"]) == 2
+        assert r["messages"][0]["role"] == "user"
+        assert r["messages"][1]["role"] == "assistant"
+        assert len(r["messages"][1]["content"]) > 100
+

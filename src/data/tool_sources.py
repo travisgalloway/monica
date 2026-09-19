@@ -43,6 +43,7 @@ SOURCE_LICENSES = {
     "toolace": "apache-2.0",
     "when2call": "cc-by-4.0",
     "handauthored": "cc0",
+    "coding_agent": "cc0",
 }
 
 
@@ -114,6 +115,69 @@ def validate_call_against_tools(call: dict, tools: List[dict]) -> bool:
 # Distractor pool + deterministic sampler
 # --------------------------------------------------------------------------- #
 
+# Standard developer / coding agent tools (#306)
+CODING_AGENT_TOOLS: List[dict] = [
+    {
+        "name": "execute_bash",
+        "description": "Execute a shell command in the repository workspace",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "view_file",
+        "description": "View lines of a file in the workspace",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace a unique target chunk with replacement content in a file",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_str": {"type": "string"},
+                "new_str": {"type": "string"},
+            },
+            "required": ["path", "old_str", "new_str"],
+        },
+    },
+    {
+        "name": "grep_search",
+        "description": "Search for a pattern across files in the codebase",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "find_files",
+        "description": "Find files matching a glob pattern",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "dir": {"type": "string"},
+            },
+            "required": ["pattern"],
+        },
+    },
+]
+
 _DISTRACTOR_POOL: List[dict] = [
     {"name": "send_email", "description": "Send an email to a recipient",
      "parameters": {"type": "object",
@@ -129,6 +193,12 @@ _DISTRACTOR_POOL: List[dict] = [
     {"name": "set_timer", "description": "Set a countdown timer",
      "parameters": {"type": "object",
                     "properties": {"seconds": {"type": "integer"}}, "required": ["seconds"]}},
+    {"name": "git_blame", "description": "Show commit revision and author for each line of a file",
+     "parameters": {"type": "object",
+                    "properties": {"file": {"type": "string"}}, "required": ["file"]}},
+    {"name": "npm_audit", "description": "Run dependency vulnerability security audit",
+     "parameters": {"type": "object",
+                    "properties": {"fix": {"type": "boolean"}}, "required": []}},
 ]
 
 
@@ -482,12 +552,55 @@ def handauthored_tool_records() -> Iterator[dict]:
         source="handauthored")
 
 
+def coding_agent_tool_records(max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Curated coding agent trajectories with developer tools and error recovery (CC0) (#306).
+    Covers:
+    (1) Terminal/bash execution and test verification
+    (2) Tool error handling and self-correction
+    (3) File inspection and line range viewing"""
+    rng = random.Random(42)
+    recs = [
+        # (1) Test execution
+        build_tool_messages(
+            CODING_AGENT_TOOLS + sample_distractors({t["name"] for t in CODING_AGENT_TOOLS}, 1, rng=rng),
+            "Run the test suite in the workspace.",
+            [{"name": "execute_bash", "arguments": {"command": "npm test"}}],
+            results=[{"exit_code": 0, "stdout": "PASS tests/tokenizer.test.ts (5 tests passed)"}],
+            final="All 5 tests in tests/tokenizer.test.ts passed.",
+            source="coding_agent"
+        ),
+        # (2) Error recovery & self-correction
+        build_tool_messages(
+            CODING_AGENT_TOOLS + sample_distractors({t["name"] for t in CODING_AGENT_TOOLS}, 1, rng=rng),
+            "Inspect the BPE implementation file.",
+            [{"name": "view_file", "arguments": {"path": "src/bpe.ts"}}],
+            results=[{"error": "FileNotFoundError: src/bpe.ts does not exist"}],
+            final="The file src/bpe.ts was not found. Let me search for BPE files across the repository.",
+            source="coding_agent"
+        ),
+        # (3) Targeted file slice viewing
+        build_tool_messages(
+            CODING_AGENT_TOOLS + sample_distractors({t["name"] for t in CODING_AGENT_TOOLS}, 1, rng=rng),
+            "Check lines 10 to 25 of src/data/loader.py",
+            [{"name": "view_file", "arguments": {"path": "src/data/loader.py", "start_line": 10, "end_line": 25}}],
+            results=[{"lines": "10: from typing import Iterator\n11: import numpy as np\n..."}],
+            final="Lines 10-25 show the PackedLoader imports and initialization logic.",
+            source="coding_agent"
+        ),
+    ]
+    for i, r in enumerate(recs):
+        if max_examples is not None and i >= max_examples:
+            break
+        yield r
+
+
 # --------------------------------------------------------------------------- #
 # Aggregator
 # --------------------------------------------------------------------------- #
 
 _LOADERS = {
     "handauthored": lambda n: handauthored_tool_records(),
+    "coding_agent": lambda n: coding_agent_tool_records(max_examples=n),
     "glaive": lambda n: load_glaive(max_examples=n),
     "xlam": lambda n: load_xlam(max_examples=n),
     "toolace": lambda n: load_toolace(max_examples=n),
