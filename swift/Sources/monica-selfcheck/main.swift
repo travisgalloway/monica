@@ -24,11 +24,11 @@ let SPECIALS = ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>",
                 "<|fim_suffix|>", "<|fim_pad|>", "<mask>"]
 
 func trained(_ vocab: Int = 2000) -> TokenizerFormat {
-    Trainer.train(corpus: SAMPLE, vocabSize: vocab, specialTokens: SPECIALS, digitGroup: 3)
+    Trainer.train(corpus: SAMPLE, vocabSize: vocab, specialTokens: SPECIALS, digitGroup: 1)
 }
 
 func pretok(_ s: String) -> [String] {
-    Pretokenizer.pretokenize(s, digitGroup: 3).map { String(decoding: $0, as: UTF8.self) }
+    Pretokenizer.pretokenize(s, digitGroup: 1).map { String(decoding: $0, as: UTF8.self) }
 }
 
 // MARK: training
@@ -136,10 +136,36 @@ do {
 
 // MARK: pretokenizer scheme
 
-eq(pretok("1234567"), ["123", "456", "7"], "digit runs split at 3")
-eq(pretok("    end"), ["   ", " end"], "indentation run grouped")
+eq(Pretokenizer.pretokenize("  \n    const x = 1;").map { String(decoding: $0, as: UTF8.self) },
+   ["  ", "\n", "    ", "const", " x", " =", " 1", ";"],
+   "pretokenizer indentation and newline separation")
+eq(pretok("1234567"), ["1", "2", "3", "4", "5", "6", "7"], "digit runs split at 1")
+eq(pretok("    end"), ["    ", "end"], "indentation run isolated from following word")
 eq(pretok("hello world"), ["hello", " world"], "leading space attaches to word")
 eq(pretok("it's"), ["it", "'s"], "contraction split")
+
+// MARK: indentation token vocabulary (#357)
+
+do {
+    let tok = Tokenizer(format: trained())
+    eq(tok.encode("  ").count, 1, "2 spaces encode to 1 token")
+    eq(tok.encode("    ").count, 1, "4 spaces encode to 1 token")
+    eq(tok.encode("        ").count, 1, "8 spaces encode to 1 token")
+    eq(tok.encode("            ").count, 1, "12 spaces encode to 1 token")
+    eq(tok.encode("                ").count, 1, "16 spaces encode to 1 token")
+    eq(tok.encode("\t").count, 1, "single tab encodes to 1 token")
+
+    // Verify that no composite \n tokens exist in the trained vocabulary
+    for id in 0..<tok.vocabSize {
+        let dec = tok.decode([id])
+        if dec.contains("\n") {
+            eq(dec, "\n", "no composite \n token in vocab: id \(id) decoded as \(dec.debugDescription)")
+        }
+        if dec.contains("\r") {
+            eq(dec, "\r", "no composite \r token in vocab: id \(id) decoded as \(dec.debugDescription)")
+        }
+    }
+}
 
 // MARK: batch encode
 

@@ -4,10 +4,11 @@
 // Scheme (o200k-style, code-oriented; see docs/plan). At each position, first match wins:
 //   1. contraction:            '  + (s|t|re|ve|m|ll|d)   (case-insensitive)
 //   2. optional leading space + letter run:   ` ?\p{L}+`
-//   3. optional leading space + digit run, capped at `digitGroup` (≤3): ` ?\p{N}{1,3}`
+//   3. optional leading space + digit run, capped at `digitGroup` (default 1): ` ?\p{N}{1,digitGroup}`
 //   4. optional leading space + other run:    ` ?[^\s\p{L}\p{N}]+`
-//   5. whitespace run: consumed whole at end-of-string, else all-but-last (the last ws
-//      char is left so a following word can attach one leading space via rule 2/3/4).
+//   5. newline or horizontal whitespace run: newlines (\n, \r) are isolated as single-character
+//      tokens; horizontal whitespace runs (spaces, tabs) are consumed whole as dedicated
+//      indentation runs.
 //
 // \p{L}/\p{N}/whitespace come from stdlib `Unicode.Scalar.Properties.generalCategory`
 // (exact, platform-invariant), with an ASCII fast path for the common (code) case.
@@ -15,8 +16,8 @@
 public enum Pretokenizer {
 
     /// Split `text` into pre-tokens, each returned as its raw UTF-8 bytes (BPE operates
-    /// on bytes). `digitGroup` caps a digit pre-token's length (3 = o200k-style).
-    public static func pretokenize(_ text: String, digitGroup: Int) -> [[UInt8]] {
+    /// on bytes). `digitGroup` caps a digit pre-token's length (default 1 = StarCoder2/Llama 3 style).
+    public static func pretokenize(_ text: String, digitGroup: Int = 1) -> [[UInt8]] {
         // A non-positive cap would make the digit branch consume zero scalars and never
         // advance `i` on digit-leading input (infinite loop). Trained/validated formats
         // always carry a positive `digit_group`; this guards the direct-API path too.
@@ -55,10 +56,13 @@ public enum Pretokenizer {
                 out.append(bytesOf(sc, start, i)); continue
             }
 
-            // 5. whitespace run (sc[i] is whitespace here)
-            var k = i
-            while k < n && isWhitespace(sc[k]) { k += 1 }
-            i = (k == n) ? k : max(i + 1, k - 1)                // leave last ws char if a word follows
+            // 5. newline or horizontal whitespace run
+            if isNewline(sc[i]) {
+                i += 1
+                out.append(bytesOf(sc, start, i))
+                continue
+            }
+            while i < n && isHorizontalWhitespace(sc[i]) { i += 1 }
             out.append(bytesOf(sc, start, i))
         }
         return out
@@ -92,12 +96,22 @@ public enum Pretokenizer {
     }
 
     @inline(__always)
+    static func isNewline(_ s: Unicode.Scalar) -> Bool {
+        s.value == 0x0A || s.value == 0x0D
+    }
+
+    @inline(__always)
     static func isWhitespace(_ s: Unicode.Scalar) -> Bool {
         let v = s.value
         if v < 128 {
             return v == 0x20 || v == 0x09 || v == 0x0A || v == 0x0D || v == 0x0B || v == 0x0C
         }
         return s.properties.isWhitespace
+    }
+
+    @inline(__always)
+    static func isHorizontalWhitespace(_ s: Unicode.Scalar) -> Bool {
+        isWhitespace(s) && !isNewline(s)
     }
 
     @inline(__always)

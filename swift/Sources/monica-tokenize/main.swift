@@ -26,7 +26,7 @@ let SPECIAL_TOKENS = [
 // when #193 was scoped TypeScript-only; on the #198 multilingual corpus it costs 7.6% of overall
 // compression and 11.4% on Markdown against 49152. Still under the 65536 uint16 packing cap.
 let DEFAULT_VOCAB_SIZE = 49152
-let DEFAULT_DIGIT_GROUP = 3
+let DEFAULT_DIGIT_GROUP = 1
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data("error: \(msg)\n".utf8))
