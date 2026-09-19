@@ -150,3 +150,31 @@ def test_quant_sidecar_round_trips(tmp_path, capsys):
     assert cfg is not None
     captured = capsys.readouterr()
     assert "dropping fields unknown" not in captured.out
+
+
+def test_load_weights_transparently_dequantizes(tmp_path):
+    from src.train.checkpoint import load_weights
+    sd = _toy_moe_state_dict()
+    targets = quant_targets(sd, group_size=64, bits=8)
+    qsd, quant_block = quantize_portable_state_dict(sd, targets, group_size=64)
+
+    path = tmp_path / "weights.safetensors"
+    save_weights(qsd, str(path), config=_FakeConfig(), quant=quant_block)
+
+    class DummyModel:
+        def __init__(self):
+            self.loaded = None
+
+        def _load_portable(self, weights):
+            self.loaded = weights
+
+    model = DummyModel()
+    load_weights(model, str(path))
+
+    assert model.loaded is not None
+    assert set(model.loaded) == set(sd)
+    for name in targets:
+        key = f"{name}.weight"
+        assert model.loaded[key].dtype == np.float32
+        assert model.loaded[key].shape == sd[key].shape
+

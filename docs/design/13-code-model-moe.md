@@ -131,8 +131,16 @@ Namespaced **MHM-P#** to avoid colliding with backlog priority tiers (P0/P1/P2):
   > **BPB is unaffected by this choice.** BPB is byte-normalized, so a larger vocab does not
   > "cheat" it the way it deflates raw perplexity — the table measures genuine compression, and
   > BPB remains a fair primary metric across vocab sizes.
-- **MHM-P1 — Corpus** (#193): general multilingual Essential-Web + Stack-v2 mixture, repo-context
-  packing, decontamination blocklist. (Rescopes the earlier FineWeb-Edu + Stack-v1 corpus.)
+- **MHM-P1 — Corpus** (#193, #306): balanced 5-component mixture supporting coding, agentic tool
+  use, software architecture, and logic/math reasoning:
+  1. **Code Spine (45%)**: Stack-v2 (TypeScript anchor, Python, Go, Rust, Java, C++, SQL, Bash) + FIM (0.45 PSM).
+  2. **Repo Context & Commits (10%)**: Topologically sorted multi-file repositories + CommitPackFT diffs.
+  3. **Math & Logic (15%)**: OpenWebMath + Proof-Pile-2 + competitive programming invariants (TACO).
+  4. **Architecture & Technical Prose (15%)**: RFCs/PEPs/ADRs, system design documentation, engineering blogs.
+  5. **Curated Web Spine (15%)**: Essential-Web / FineWeb-Edu quality-filtered prose.
+  Post-training SFT adds standard developer tool definitions (`src/data/tool_sources.py`: `execute_bash`,
+  `view_file`, `edit_file`, `grep_search`, `find_files`), system design and architecture patterns
+  (`src/data/sft_sources.py`), and thinking-before-coding reasoning traces (`src/data/reasoning_traces.py`).
 - **MHM-P1b — Tokenizer** (#191, **done** — PR #245): own byte-level BPE, shipped as a **native
   Swift package** (`swift/Sources/MonicaTokenizer` + the `monica-tokenize` CLI) rather than a Python build.
   Its own **tiktoken-style JSON format**, **raw-byte** BPE (no GPT-2 `bytes_to_unicode` remap), and

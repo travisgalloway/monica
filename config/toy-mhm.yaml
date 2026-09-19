@@ -1,0 +1,22 @@
+# Toy config for the MHM 49,152 vocab smoke test (#251).
+# Tiny + fp32 so fixed-seed resume is exactly reproducible.
+d_model: 64
+n_layers: 2
+d_state: 16            # SSM state width N (per head)
+expand: 2              # d_inner = 128
+d_conv: 4
+head_dim: 16           # Mamba-2/SSD: 128/16 = 8 heads (scalar A per head)
+dt_rank: auto
+
+vocab_size: 49152      # Ratified MHM tokenizer vocabulary (#251)
+seq_len: 1024
+tie_embeddings: true
+
+precision: fp32        # correctness first; trivial exact resume
+chunk_size: null       # SSD chunk length Q (null -> backend default 64)
+grad_checkpoint: false # tiny model -> not needed; keep smoke exact-resume cheap
+
+# dt-projection bias init (load-bearing)
+dt_min: 0.001
+dt_max: 0.1
+dt_init_floor: 0.0001

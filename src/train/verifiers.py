@@ -26,7 +26,9 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from src.lsp.diagnostics import Diagnostic
@@ -246,7 +248,7 @@ class LspVerifier:
 
     def __init__(self, *, kind: str = "ts", timeout_s: float = 10.0,
                 ignore_module_resolution: bool = True, hatches: str = "superset",
-                oracle=None, on_error: str = "raise", **reward_kwargs):
+                oracle=None, on_error: str = "raise", fail_fast: bool = False, **reward_kwargs):
         if hatches not in _HATCH_MODES:
             raise ValueError(f"unknown hatches mode {hatches!r} (want one of {_HATCH_MODES})")
         if on_error not in ("raise", "skip"):
@@ -256,10 +258,12 @@ class LspVerifier:
         self.ignore_module_resolution = ignore_module_resolution
         self.hatches = hatches
         self.on_error = on_error
+        self.fail_fast = fail_fast
         self.reward_kwargs = reward_kwargs
 
         self._oracle = oracle
         self._closed = False
+        self._lock = threading.Lock()
 
         self._n_samples = 0
         self._n_clean = 0
@@ -304,19 +308,23 @@ class LspVerifier:
         if hacked:
             self._n_hacked += 1
 
-        oracle = self._ensure_oracle()
-        diagnose = oracle.diagnostics
-        if self.ignore_module_resolution:
-            diagnose = drop_codes(diagnose, MODULE_RESOLUTION_CODES)
+        if self.fail_fast and (hacked or degenerate):
+            diags = []
+        else:
+            with self._lock:
+                oracle = self._ensure_oracle()
+                diagnose = oracle.diagnostics
+                if self.ignore_module_resolution:
+                    diagnose = drop_codes(diagnose, MODULE_RESOLUTION_CODES)
 
-        artifact = f"{prompt}{completion}"
-        try:
-            diags = diagnose(artifact)
-        except Exception:
-            self._n_oracle_errors += 1
-            if self.on_error == "skip":
-                return None
-            raise
+                artifact = f"{prompt}{completion}"
+                try:
+                    diags = diagnose(artifact)
+                except Exception:
+                    self._n_oracle_errors += 1
+                    if self.on_error == "skip":
+                        return None
+                    raise
 
         self._diag_total += len(diags)
         if not diags and not hacked and not degenerate:
@@ -366,3 +374,119 @@ class LspVerifier:
 
     def __exit__(self, *exc_info) -> None:
         self.close()
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency & Memoization (#341-#344 perf improvements)
+# --------------------------------------------------------------------------- #
+
+class MemoizedVerifier:
+    """Thread-safe memoization cache wrapping any verifier reward function or callable.
+
+    Caches `(prompt, completion, reference) -> reward` in an in-memory dictionary.
+    Eliminates redundant oracle, parser, or compiler invocations on identical completions
+    (common in multi-sample GRPO rollouts).
+    """
+
+    def __init__(self, target: Any, max_size: int = 65536):
+        self.target = target
+        self.max_size = max_size
+        self._cache: Dict[Tuple[str, str, Optional[str]], Optional[float]] = {}
+        self._inflight: Dict[Tuple[str, str, Optional[str]], threading.Event] = {}
+        self._hits = 0
+        self._misses = 0
+        self._lock = threading.Lock()
+
+    def reward(self, completion: str, reference: Optional[str] = None, *,
+               prompt: str = "") -> Optional[float]:
+        key = (prompt, str(completion), None if reference is None else str(reference))
+        while True:
+            with self._lock:
+                if key in self._cache:
+                    self._hits += 1
+                    return self._cache[key]
+                if key in self._inflight:
+                    ev = self._inflight[key]
+                else:
+                    ev = threading.Event()
+                    self._inflight[key] = ev
+                    break
+            ev.wait()
+
+        r: Optional[float] = None
+        try:
+            if hasattr(self.target, "reward") and callable(self.target.reward):
+                r = self.target.reward(completion, reference, prompt=prompt)
+            elif callable(self.target):
+                try:
+                    r = self.target(completion, reference, prompt=prompt)
+                except TypeError:
+                    r = self.target(completion, reference)
+            else:
+                raise TypeError(f"cannot score with target {type(self.target).__name__}")
+        finally:
+            with self._lock:
+                self._misses += 1
+                if r is not None and len(self._cache) < self.max_size:
+                    self._cache[key] = r
+                self._inflight.pop(key, None)
+                ev.set()
+        return r
+
+    def telemetry(self) -> dict:
+        base = {}
+        if hasattr(self.target, "telemetry") and callable(self.target.telemetry):
+            base = self.target.telemetry()
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total) if total > 0 else 0.0
+        return {
+            **base,
+            "cache_hits": self._hits,
+            "cache_misses": self._misses,
+            "cache_hit_rate": hit_rate,
+            "cache_size": len(self._cache),
+        }
+
+    def close(self) -> None:
+        if hasattr(self.target, "close") and callable(self.target.close):
+            self.target.close()
+
+    def __enter__(self) -> "MemoizedVerifier":
+        if hasattr(self.target, "__enter__"):
+            self.target.__enter__()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        if hasattr(self.target, "__exit__"):
+            self.target.__exit__(*exc_info)
+        else:
+            self.close()
+
+
+def score_rollouts(
+    reward_fn: Callable[..., Optional[float]],
+    completions: Sequence[str],
+    reference: Optional[str] = None,
+    *,
+    max_workers: int = 0,
+    executor: Optional[ThreadPoolExecutor] = None,
+) -> List[Optional[float]]:
+    """Score a sequence of completions either sequentially or concurrently.
+
+    Preserves exact input order. If `executor` is given or `max_workers > 1`, scoring
+    runs concurrently across threads, releasing the GIL during subprocess and I/O wait.
+    """
+    if not completions:
+        return []
+
+    if max_workers <= 1 and executor is None:
+        return [reward_fn(c, reference) for c in completions]
+
+    if executor is not None:
+        futures = [executor.submit(reward_fn, c, reference) for c in completions]
+        return [f.result() for f in futures]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(reward_fn, c, reference) for c in completions]
+        return [f.result() for f in futures]
+

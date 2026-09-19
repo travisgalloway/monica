@@ -362,3 +362,16 @@ def test_tool_sft_does_not_raise_with_extended_vocab(tmp_path):
         tokenizer="qwen25", byte_fallback=True, seq_len=8192,
     )
     assert manifest["n_records"] >= 1, "expected at least one tokenized record"
+
+
+def test_coding_agent_tool_records_cover_developer_tools():
+    from src.data.tool_sources import coding_agent_tool_records, CODING_AGENT_TOOLS
+    recs = list(coding_agent_tool_records())
+    assert len(recs) == 3
+    tool_names = {t["name"] for t in CODING_AGENT_TOOLS}
+    assert "execute_bash" in tool_names and "view_file" in tool_names and "edit_file" in tool_names
+    for r in recs:
+        assert r["source"] == "coding_agent" and r["license"] == "cc0"
+        assert any(m["role"] == "system" and "execute_bash" in m["content"] for m in r["messages"])
+        assert any(m["role"] == "assistant" and "<tool_call>" in m["content"] for m in r["messages"])
+

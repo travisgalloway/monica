@@ -81,11 +81,9 @@ def _argmax(mx_logits, mx) -> int:
 
 
 def _prefill(model, prompt, mx):
-    """Feed the prompt through `step`; return (next-token logits, state)."""
-    state = model.init_state(1)
-    logits = None
-    for tok in prompt:
-        logits, state = model.step(mx.array([int(tok)]), state)
+    """Feed the prompt through single-scan parallel prefill; return (next-token logits, state)."""
+    p_arr = mx.array([int(tok) for tok in prompt])[None]
+    logits, state = model.prefill(p_arr, last_only=True)
     mx.eval(logits)
     return logits, state
 

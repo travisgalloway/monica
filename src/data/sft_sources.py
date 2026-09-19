@@ -23,7 +23,8 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 # Source -> license, for the clean-license accounting (CC-BY-SA flagged share-alike).
 SOURCE_LICENSES = {"oasst1": "apache-2.0", "flan": "apache-2.0",
-                   "dolly": "cc-by-sa-3.0", "handauthored": "cc0", "ultrachat": "mit"}
+                   "dolly": "cc-by-sa-3.0", "handauthored": "cc0", "ultrachat": "mit",
+                   "architecture": "cc0"}
 
 
 def _tag(messages: List[dict], source: str) -> dict:
@@ -192,6 +193,62 @@ def handauthored_records() -> Iterator[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Hand-authored architecture & system design set (checked in, CC0) (#306)
+# --------------------------------------------------------------------------- #
+ARCHITECTURE_RECORDS: List[List[dict]] = [
+    [
+        {"role": "user", "content": "Compare Cache-Aside vs Write-Through caching patterns in distributed systems."},
+        {"role": "assistant", "content": (
+            "Cache-Aside (Lazy Loading) and Write-Through are two foundational caching strategies with distinct consistency and latency trade-offs:\n\n"
+            "1. Cache-Aside (Lazy Loading):\n"
+            "- Read path: The application queries the cache first. On a cache miss, it reads from the primary database, populates the cache with the retrieved data, and returns.\n"
+            "- Write path: The application writes directly to the primary database and invalidates (evicts) the corresponding cache key.\n"
+            "- Trade-offs: Memory-efficient (only requested data is cached) and resilient to cache failures (fallback to DB). However, initial reads incur penalty latency, and concurrent writes risk temporary stale reads unless managed with TTLs or Change Data Capture (CDC).\n\n"
+            "2. Write-Through:\n"
+            "- Write path: The application writes to the cache, which synchronously updates the primary database within the same write operation before confirming success.\n"
+            "- Read path: Data is always read directly from the cache.\n"
+            "- Trade-offs: Guarantees strong read consistency and eliminates cold-read penalties. However, write latency is strictly higher because both storage tiers must acknowledge the write, and infrequently read data occupies valuable cache memory.\n\n"
+            "Selection Guideline: Use Cache-Aside for read-heavy workloads with tolerance for eventual consistency; use Write-Through or Write-Behind for high-frequency read/write data requiring strict freshness."
+        )}
+    ],
+    [
+        {"role": "user", "content": "Explain the leftmost prefix rule in composite B-tree indexes."},
+        {"role": "assistant", "content": (
+            "The leftmost prefix rule states that a composite index on columns (A, B, C) can only accelerate queries that filter on a contiguous prefix of the indexed columns starting from the first column (A).\n\n"
+            "Why this holds (B-tree ordering):\n"
+            "A composite B-tree sorts entries lexicographically: first by column A, then by column B within identical values of A, and finally by C within identical pairs of (A, B).\n\n"
+            "Query evaluation scenarios:\n"
+            "- WHERE A = 1 AND B = 2: Fully uses the index (matches prefix A, B).\n"
+            "- WHERE A = 1: Uses the index on column A.\n"
+            "- WHERE B = 2 AND C = 3: Cannot use the index efficiently because without an equality constraint on A, values of B are scattered across the entire index tree (requires index scan).\n"
+            "- WHERE A = 1 AND B > 10 AND C = 'active': Column A and the range on B use index seeks; column C acts merely as an index filter because range conditions terminate the seek prefix.\n\n"
+            "Design rule: Place high-cardinality equality filter columns first, followed by low-cardinality or range predicate columns."
+        )}
+    ],
+    [
+        {"role": "user", "content": "What is the core principle of Clean Architecture regarding dependency flow?"},
+        {"role": "assistant", "content": (
+            "The foundational rule of Clean Architecture (and Hexagonal / Ports & Adapters) is the Dependency Inversion Rule: source code dependencies must point only inward, toward higher-level business policies.\n\n"
+            "Layer hierarchy (inward flow):\n"
+            "Frameworks & Drivers (DB, Web, UI) -> Interface Adapters (Controllers, Gateways) -> Application Use Cases -> Domain Entities (Core)\n\n"
+            "Key architectural consequences:\n"
+            "1. Domain independence: Business logic has no knowledge of SQL, ORMs, HTTP routers, or UI frameworks. Domain models never import database libraries.\n"
+            "2. Inversion via Ports: When a use case must persist data, it defines a Port (interface, e.g. `UserRepository`). The concrete Adapter (e.g. `PostgresUserRepository`) implements this port in an outer layer.\n"
+            "3. Testability: Core logic can be unit-tested in pure memory without mocking external database connections or spinning up HTTP servers."
+        )}
+    ],
+]
+
+
+def architecture_records(max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Checked-in software architecture and system design examples (always offline, CC0)."""
+    for i, messages in enumerate(ARCHITECTURE_RECORDS):
+        if max_examples is not None and i >= max_examples:
+            break
+        yield _tag([dict(m) for m in messages], "architecture")
+
+
+# --------------------------------------------------------------------------- #
 # Aggregator + CLI
 # --------------------------------------------------------------------------- #
 _LOADERS = {
@@ -200,6 +257,7 @@ _LOADERS = {
     "dolly": lambda n: load_dolly(max_examples=n),
     "handauthored": lambda n: handauthored_records(),
     "ultrachat": lambda n: load_ultrachat(max_examples=n),
+    "architecture": lambda n: architecture_records(max_examples=n),
 }
 
 

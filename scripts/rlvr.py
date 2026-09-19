@@ -25,6 +25,7 @@ import argparse
 import contextlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 import sys
@@ -34,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.train.grpo import group_advantages, reward_stats
-from src.train.verifiers import LspVerifier, exact_match_reward, math_reward
+from src.train.verifiers import (LspVerifier, MemoizedVerifier, exact_match_reward,
+                                 math_reward, score_rollouts)
 
 
 def collate_rollouts(rollouts, advantages, *, pad_id: int = 0):
@@ -86,6 +88,12 @@ def main() -> None:
                          "so a long run that crashes does not lose all progress")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--group-size", type=int, default=8, help="K completions per problem")
+    ap.add_argument("--verifier-workers", type=int, default=4,
+                    help="concurrent worker threads for rollout scoring (0 or 1 = sequential)")
+    ap.add_argument("--verifier-cache", action=argparse.BooleanOptionalAction, default=True,
+                    help="memoize verifier rewards across identical completions (default on)")
+    ap.add_argument("--fail-fast", action=argparse.BooleanOptionalAction, default=True,
+                    help="skip oracle/compiler when output is degenerate or hacked (default on)")
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=50)
@@ -115,6 +123,7 @@ def main() -> None:
     from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.checkpoint import check_weight_keys, load_weights_dict
+    import mlx.core as mx
 
     backend = get_backend()
     cfg = load_config(str(args.config))
@@ -152,28 +161,39 @@ def main() -> None:
     telemetry_path = out / "telemetry.json"
 
     with contextlib.ExitStack() as stack:
+        raw_verifier = None
         if args.reward == "math":
-            reward_fn, verifier = math_reward, None
+            raw_verifier, reward_fn = math_reward, None
         elif args.reward == "exact":
-            reward_fn, verifier = exact_match_reward, None
+            raw_verifier, reward_fn = exact_match_reward, None
         else:
-            # Constructed ONCE, outside the step loop — it owns a persistent
-            # language-server subprocess, so per-step construction would dominate
-            # the wall clock. `stack` guarantees `.close()` on any exit path
-            # (normal completion, SystemExit, or an unhandled exception).
-            verifier = LspVerifier(kind=args.oracle, timeout_s=args.lsp_timeout_s,
-                                   ignore_module_resolution=args.lsp_ignore_module_resolution,
-                                   hatches=args.lsp_hatches)
+            raw_verifier = LspVerifier(kind=args.oracle, timeout_s=args.lsp_timeout_s,
+                                       ignore_module_resolution=args.lsp_ignore_module_resolution,
+                                       hatches=args.lsp_hatches, fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+
+        if args.verifier_cache and raw_verifier is not None:
+            verifier = MemoizedVerifier(raw_verifier)
             stack.enter_context(verifier)
-            reward_fn = None  # bound per-step below with the current prompt
+        else:
+            verifier = raw_verifier if hasattr(raw_verifier, "reward") else None
+            if verifier is None:
+                reward_fn = raw_verifier
+
+        executor = None
+        if args.verifier_workers > 1:
+            executor = ThreadPoolExecutor(max_workers=args.verifier_workers)
+            stack.callback(executor.shutdown, wait=True)
 
         run_start = time.monotonic()
 
         def write_telemetry() -> None:
             elapsed = time.monotonic() - run_start
-            t = verifier.telemetry()
+            t = verifier.telemetry() if verifier is not None else {}
             t["elapsed_wall_s"] = elapsed
-            t["oracle_wall_frac"] = (t["wall_s"] / elapsed) if elapsed > 0 else 0.0
+            if "wall_s" in t:
+                t["oracle_wall_frac"] = (t["wall_s"] / elapsed) if elapsed > 0 else 0.0
             telemetry_path.write_text(json.dumps(t, indent=2), encoding="utf-8")
 
         for step in range(args.steps):
@@ -181,19 +201,38 @@ def main() -> None:
             prompt_ids = list(tok.encode(prob["prompt"])) or [eos or 0]
             step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"])
                               if verifier is not None else reward_fn)
-            rollouts, rewards = [], []
-            for k in range(args.group_size):
-                sid = f"s{step}-{k}"
-                store.create(sid)
-                sampler = partial(sample, temperature=args.temperature, top_k=args.top_k,
-                                  rng=np.random.default_rng(int(rng.integers(1 << 30))))
-                try:
-                    gen = generate(store, sid, prompt_ids, sampler=sampler, to_numpy=np_to,
-                                   max_new_tokens=args.max_new_tokens, eos_id=eos)
-                finally:
-                    store.remove(sid)   # never leak the session if generate/sampling raises
-                rollouts.append((prompt_ids, gen or [eos or 0]))
-                rewards.append(step_reward_fn(tok.decode(gen), str(prob.get("answer", ""))))
+            # Batched rollout generation: parallel prefill + concurrent decode across group_size
+            p_batch = mx.repeat(mx.array([int(t) for t in prompt_ids])[None], args.group_size, axis=0)
+            logits, state = model.prefill(p_batch, last_only=True)
+            batched_gens = [[] for _ in range(args.group_size)]
+            finished = [False] * args.group_size
+            rngs = [np.random.default_rng(int(rng.integers(1 << 30))) for _ in range(args.group_size)]
+
+            logits_np = np_to(logits)
+            for _ in range(args.max_new_tokens):
+                next_tokens = []
+                all_done = True
+                for k in range(args.group_size):
+                    if finished[k]:
+                        next_tokens.append(eos or 0)
+                        continue
+                    tk = sample(logits_np[k], temperature=args.temperature, top_k=args.top_k, rng=rngs[k])
+                    batched_gens[k].append(tk)
+                    if eos is not None and tk == eos:
+                        finished[k] = True
+                        next_tokens.append(eos)
+                    else:
+                        all_done = False
+                        next_tokens.append(tk)
+                if all_done:
+                    break
+                logits, state = model.step(mx.array(next_tokens), state)
+                logits_np = np_to(logits)
+
+            rollouts = [(prompt_ids, g or [eos or 0]) for g in batched_gens]
+            ans_str = str(prob.get("answer", ""))
+            decoded_completions = [tok.decode(g) for g in batched_gens]
+            rewards = score_rollouts(step_reward_fn, decoded_completions, ans_str, executor=executor)
 
             adv = group_advantages([rewards])[0]            # (K,)
             metrics = grpo_step(model, [collate_rollouts(rollouts, adv)], args.lr)
@@ -204,11 +243,14 @@ def main() -> None:
                 if verifier is not None:
                     t = verifier.telemetry()
                     elapsed = time.monotonic() - run_start
-                    n = max(t["n_samples"], 1)
-                    line += (f"  oracle_calls {t['n_calls']}  oracle_wall_s {t['wall_s']:.1f}  "
-                            f"frac_hacked {t['n_hacked'] / n:.3f}  "
-                            f"frac_degenerate {t['n_degenerate'] / n:.3f}  "
-                            f"oracle_wall_frac {(t['wall_s'] / elapsed) if elapsed > 0 else 0.0:.3f}")
+                    if "n_samples" in t:
+                        n = max(t.get("n_samples", 0), 1)
+                        line += (f"  oracle_calls {t.get('n_calls', 0)}  oracle_wall_s {t.get('wall_s', 0.0):.1f}  "
+                                f"frac_hacked {t.get('n_hacked', 0) / n:.3f}  "
+                                f"frac_degenerate {t.get('n_degenerate', 0) / n:.3f}  "
+                                f"oracle_wall_frac {(t.get('wall_s', 0.0) / elapsed) if elapsed > 0 else 0.0:.3f}")
+                    if "cache_hit_rate" in t and (t.get("cache_hits", 0) + t.get("cache_misses", 0)) > 0:
+                        line += f"  cache_hit {t['cache_hit_rate']:.2f}"
                 print(line)
             if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
                 model.save(weights_path)

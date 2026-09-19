@@ -309,20 +309,57 @@ def score_rows(model, rows: Sequence[ScoreRow], *, pad_id: int = 0, batch_size: 
         for i, r in enumerate(batch):
             mask[i, r.span_start - 1:r.span_start - 1 + r.span_len] = 1.0
 
-        logits = np.asarray(to_numpy(model.forward(inputs)))
-        for i, r in enumerate(batch):
-            sel = mask[i] > 0
-            n = int(sel.sum())
-            ce = masked_cross_entropy(logits[i:i + 1], targets[i:i + 1], mask[i:i + 1])
-            pred = np.argmax(logits[i][sel], axis=-1)
-            correct = pred == targets[i][sel]
-            out.append({
-                "total_ce_nats": float(ce) * n,
-                "ce_nats": float(ce),
-                "n_scored_tokens": n,
-                "token_accuracy": float(correct.mean()),
-                "exact_match": float(bool(correct.all())),
-            })
+        raw_out = model.forward(inputs)
+        mod_name = type(raw_out).__module__
+        if hasattr(raw_out, "argmax") and mod_name.startswith(("mlx", "torch")):
+            B, L = inputs.shape
+            V = raw_out.shape[-1]
+            if mod_name.startswith("mlx"):
+                import mlx.core as mx
+                import mlx.nn as nn
+                pred_np = np.asarray(raw_out.argmax(axis=-1))
+                t_arr = mx.array(targets).reshape(-1).astype(mx.int32)
+                ce_arr = nn.losses.cross_entropy(raw_out.reshape(-1, V).astype(mx.float32),
+                                                 t_arr, reduction="none").reshape(B, L)
+                ce_np = np.asarray(ce_arr)
+            else:
+                import torch
+                import torch.nn.functional as F
+                with torch.no_grad():
+                    pred_np = raw_out.argmax(dim=-1).cpu().numpy()
+                    t_arr = torch.as_tensor(targets, dtype=torch.long, device=raw_out.device).reshape(-1)
+                    ce_arr = F.cross_entropy(raw_out.reshape(-1, V).float(),
+                                             t_arr, reduction="none").reshape(B, L)
+                    ce_np = ce_arr.cpu().numpy()
+
+            for i, r in enumerate(batch):
+                sel = mask[i] > 0
+                n = int(sel.sum())
+                ce = float(ce_np[i][sel].mean()) if n > 0 else 0.0
+                pred = pred_np[i][sel]
+                correct = pred == targets[i][sel]
+                out.append({
+                    "total_ce_nats": float(ce_np[i][sel].sum()),
+                    "ce_nats": float(ce),
+                    "n_scored_tokens": n,
+                    "token_accuracy": float(correct.mean()) if n > 0 else 0.0,
+                    "exact_match": float(bool(correct.all())) if n > 0 else 0.0,
+                })
+        else:
+            logits = np.asarray(to_numpy(raw_out))
+            for i, r in enumerate(batch):
+                sel = mask[i] > 0
+                n = int(sel.sum())
+                ce = masked_cross_entropy(logits[i:i + 1], targets[i:i + 1], mask[i:i + 1])
+                pred = np.argmax(logits[i][sel], axis=-1)
+                correct = pred == targets[i][sel]
+                out.append({
+                    "total_ce_nats": float(ce) * n,
+                    "ce_nats": float(ce),
+                    "n_scored_tokens": n,
+                    "token_accuracy": float(correct.mean()),
+                    "exact_match": float(bool(correct.all())),
+                })
     return out
 
 

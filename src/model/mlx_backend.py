@@ -969,6 +969,28 @@ class MLXMambaModel(ModelInterface, nn.Module):
             new_state.append(st2)
         return self._head(self.norm_f(h)), new_state
 
+    def eval_batch_ce(self, inputs: Array, targets: Array) -> float:
+        """Fast on-device cross-entropy evaluation: avoids transferring full (B, L, V) logits to host."""
+        logits = self.forward(inputs)
+        V = logits.shape[-1]
+        t = mx.array(targets).reshape(-1).astype(mx.int32)
+        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32), t, reduction="mean")
+        return float(ce.item())
+
+    def eval_masked_batch_ce(self, inputs: Array, targets: Array, mask: Array) -> Tuple[float, float]:
+        """Fast on-device masked cross-entropy evaluation: returns (total_weighted_ce, total_mask_weight)."""
+        logits = self.forward(inputs)
+        V = logits.shape[-1]
+        t = mx.array(targets).reshape(-1).astype(mx.int32)
+        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32), t, reduction="none")
+        m = mx.array(mask).reshape(-1).astype(mx.float32)
+        wsum = float(m.sum().item())
+        if wsum == 0.0:
+            return 0.0, 0.0
+        tot = float((ce * m).sum().item())
+        return tot, wsum
+
+
     def verify_block(self, tokens: Sequence[int], state: State):
         """Speculative-decoding verify pass (#52): consume `tokens` (a HOST-side sequence
         of int ids) through the `step` recurrence from `state`, returning the per-token

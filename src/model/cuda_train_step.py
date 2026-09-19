@@ -198,9 +198,10 @@ def _masked_seq_logprob(model, inputs, targets, mask) -> torch.Tensor:
     if you switch one to a mean (`/ m.sum(-1).clamp_min(1.0)`), switch both."""
     logits = model.forward(inputs).float()                   # (B, L, V)
     device = logits.device
-    logp = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
     t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device)
-    chosen = torch.gather(logp, -1, t.unsqueeze(-1)).squeeze(-1)   # (B, L)
+    chosen_logits = torch.gather(logits, -1, t.unsqueeze(-1)).squeeze(-1)       # (B, L)
+    lse = torch.logsumexp(logits, dim=-1)                                       # (B, L)
+    chosen = chosen_logits - lse                                                # (B, L)
     m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device)
     return (chosen * m).sum(dim=-1)                          # (B,)
 

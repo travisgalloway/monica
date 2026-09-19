@@ -14,8 +14,8 @@ Columns match what this repository actually runs:
 `n/a` means the tier cannot exist for that capability; `none` means it could and does not. The
 two are never interchangeable. An empty Gaps cell is a claim, so it is only written when true.
 
-Last audited 2026-09-15 (`/closure-audit`, whole repo: 81 capabilities × 139 test surfaces —
-136 `tests/test_*.py` + `conftest.py` + 2 Swift native runners).
+Last audited 2026-09-19 (`/closure-audit`, whole repo: 84 capabilities × 146 test surfaces,
+including 143 `tests/test_*.py` + `conftest.py` + 2 Swift native runners).
 
 ## Data pipeline
 
@@ -56,6 +56,8 @@ Last audited 2026-09-15 (`/closure-audit`, whole repo: 81 capabilities × 139 te
 | MODEL-6 | `test_upcycle.py` (mlx-gated) | none | none | `_MUST_MATCH` 15-field guard | `scripts/upcycle.py` untested end to end |
 | MODEL-7 | `test_sizing.py`, `test_sizing_mlx.py`, `test_train_time.py` | `test_bench_config_export.py`, `test_bench_context.py` | none (informational) | tied-embedding accounting | none |
 | MODEL-8 | `test_quantize.py`, `test_quantize_mlx_format.py` | `test_quant_checkpoint.py`, `test_quant_parity.py` | CI `swift-engine` int8 `monica-bench` step | int8 group size, scale/zero-point | none |
+| MODEL-9 | `test_bench_config_export.py`, `test_sizing.py`, `test_sizing_mlx.py`, `test_train_time.py` | `test_backend_parity.py`, `test_ci_backend_matrix.py` | `scripts/smoke_test.py`, `docs/runbooks/e2e-training-eval-serving.md` | parameter sizing, head divisibility, expert routing across tiers | scale pretraining tiers 2 and 3 gated on CUDA hardware (#222, #223) |
+| MODEL-10 | `test_quantize.py`, `test_quantize_mlx_format.py` | `test_quant_checkpoint.py`, `test_quant_parity.py` | CI `swift-engine` int8 `monica-bench` step, `scripts/generate.py` | W4 group-wise affine quantization, KV8 cache quantization, `--head-bits 8` syntax preservation | native Metal fused kernel for W4 decode is planned (#171) |
 
 ## Training
 
@@ -77,7 +79,7 @@ Last audited 2026-09-15 (`/closure-audit`, whole repo: 81 capabilities × 139 te
 |----|------|-------------|-----|--------------------|------|
 | POST-1 | `test_sft_train_step.py`, `test_masked_ce.py` | `test_sft_train_step.py`, `test_cuda_post_training.py` | `test_sft_driver_e2e.py` | response masking in the loss | `scripts/sft.py` tested end to end on MLX (`test_sft_driver_e2e.py`); no CUDA-backend equivalent |
 | POST-2 | `test_dpo_math.py` | `test_dpo_train_step.py`, `test_cuda_post_training.py` | none | reference-model logratio, beta | `scripts/dpo.py` untested end to end |
-| POST-3 | `test_grpo.py`, `test_build_rlvr_prompts.py`, `test_lsp_verifier.py` | `test_grpo_train_step.py`, `test_verifiers.py`, `test_cuda_post_training.py` | none | group advantage, KL penalty | `test_verifiers.py:39` gates real code execution behind `RUN_CODE_VERIFIER`, which **no CI job sets** — the execution path never runs in the standard matrix |
+| POST-3 | `test_grpo.py`, `test_build_rlvr_prompts.py`, `test_lsp_verifier.py`, `test_rlvr_concurrency.py`, `test_verifiers.py` | `test_grpo_train_step.py`, `test_verifiers.py`, `test_cuda_post_training.py` | none | group advantage, KL penalty, concurrent scoring, singleflight verifier memoization, fail-fast guards | `test_verifiers.py:39` gates real code execution behind `RUN_CODE_VERIFIER`, which **no CI job sets**, so the execution path never runs in the standard matrix |
 | POST-4 | none | `test_dpo_sources.py` (source label only, never invokes generation) | none | none | `scripts/gen_onpolicy_prefs.py` has zero test references anywhere |
 
 ## Serving
@@ -154,3 +156,4 @@ Last audited 2026-09-15 (`/closure-audit`, whole repo: 81 capabilities × 139 te
 | OPS-1 | n/a | n/a | `scripts/smoke_test.py`, CI `smoke-linux` + `parity-macos` | resume exactness + eval | does not cover `train.py`'s stream-resume (see TRAIN-2) |
 | OPS-2 | `test_workflow_triggers.py`, `test_import_guard.py` | n/a | `ci.yml` (9 jobs, PR/push + monthly schedule) + `scheduled-parity.yml` (5 jobs, dispatch/weekly schedule, incl. `mlx-buffer-reuse-probe` — #298's macOS buffer-reuse measurement, `--report-only`) | portable/seam guard, both backends, Swift parity; the trigger×job matrix itself; `ci.yml`'s cron literal `"43 9 3 * *"` and its event-scoped `concurrency.group` (#312) | 5 of 14 jobs are in a workflow with no PR/push trigger (see ENGINE-6); the probe job is a *measurement*, not a gate — a BLIND runner is recorded with a `::warning::` and does not redden the run; the monthly cadence bounds drift-detection latency to ~1 month, and nothing alerts on a red scheduled run beyond GitHub's default notification |
 | OPS-3 | `test_bench_config_export.py`, `test_bench_context.py` | none | `monica-bench` CI steps (informational) | provenance tagging | nothing checks `docs/benchmarks.md` stays in sync with CI bench output |
+| OPS-4 | none | `scripts/cloud_pod.py` lifecycle commands | `docs/runbooks/cuda-vm-e2e-plan.md` | pod start/stop/terminate, volume mounting, SSH port forwarding | idle heartbeat and spend limit automated tests ticketed in #354 |

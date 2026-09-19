@@ -41,27 +41,42 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
 
     public func decode(_ ids: [Int]) -> String { bpe.decode(ids) }
 
-    /// Append `text`'s ids to `ids`. Public (it was `private`) so `FIM.transform` (#215) can
-    /// assemble a PSM stream â€” sentinel, piece, sentinel, piece â€” without three throwaway arrays,
-    /// and so it goes through exactly this encoder rather than a second copy of it.
+    /// Append `text`'s ids to `ids`. Public so `FIM.transform` can assemble a stream.
     public func encode(_ text: String, into ids: inout [Int]) {
-        if specials.isEmpty { encodeSegment(text, into: &ids); return }
+        var scratch: [Int] = []
+        scratch.reserveCapacity(64)
+        encode(text, scratch: &scratch, into: &ids)
+    }
+
+    /// Append `text`'s ids to `ids`, using a caller-provided scratch buffer for BPE symbols.
+    public func encode(_ text: String, scratch: inout [Int], into ids: inout [Int]) {
+        if specials.isEmpty { encodeSegment(text, scratch: &scratch, into: &ids); return }
+
+        // Fast path: if all specials start with '<' and text contains no '<', none can match.
+        if !text.utf8.contains(UInt8(ascii: "<")) {
+            encodeSegment(text, scratch: &scratch, into: &ids)
+            return
+        }
+
         var idx = text.startIndex
         var segStart = idx
         let end = text.endIndex
         while idx < end {
-            var hit: (text: String, id: Int)? = nil
-            for sp in specials where text[idx...].hasPrefix(sp.text) { hit = sp; break }
-            if let m = hit {
-                if segStart < idx { encodeSegment(String(text[segStart..<idx]), into: &ids) }
-                ids.append(m.id)
-                idx = text.index(idx, offsetBy: m.text.count)
-                segStart = idx
-            } else {
-                idx = text.index(after: idx)
+            // Only inspect prefixes if the leading character matches a special token's start ('<')
+            if text[idx] == "<" {
+                var hit: (text: String, id: Int)? = nil
+                for sp in specials where text[idx...].hasPrefix(sp.text) { hit = sp; break }
+                if let m = hit {
+                    if segStart < idx { encodeSegment(String(text[segStart..<idx]), scratch: &scratch, into: &ids) }
+                    ids.append(m.id)
+                    idx = text.index(idx, offsetBy: m.text.count)
+                    segStart = idx
+                    continue
+                }
             }
+            idx = text.index(after: idx)
         }
-        if segStart < end { encodeSegment(String(text[segStart..<end]), into: &ids) }
+        if segStart < end { encodeSegment(String(text[segStart..<end]), scratch: &scratch, into: &ids) }
     }
 
     /// Encode many documents concurrently (data-parallel across docs; identical on Mac/Linux).
@@ -75,12 +90,30 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
         await withTaskGroup(of: (Int, [Int]).self) { group in
             var next = 0
             while next < texts.count && next < limit {           // prime up to `limit` tasks
-                let i = next; group.addTask { (i, self.encode(texts[i])) }; next += 1
+                let i = next
+                group.addTask {
+                    var scratch: [Int] = []
+                    scratch.reserveCapacity(64)
+                    var ids: [Int] = []
+                    ids.reserveCapacity(texts[i].utf8.count / 3 + 4)
+                    self.encode(texts[i], scratch: &scratch, into: &ids)
+                    return (i, ids)
+                }
+                next += 1
             }
             for await (i, ids) in group {                        // drain, refilling one-for-one
                 result[i] = ids
                 if next < texts.count {
-                    let j = next; group.addTask { (j, self.encode(texts[j])) }; next += 1
+                    let j = next
+                    group.addTask {
+                        var scratch: [Int] = []
+                        scratch.reserveCapacity(64)
+                        var ids: [Int] = []
+                        ids.reserveCapacity(texts[j].utf8.count / 3 + 4)
+                        self.encode(texts[j], scratch: &scratch, into: &ids)
+                        return (j, ids)
+                    }
+                    next += 1
                 }
             }
         }
@@ -89,9 +122,9 @@ public final class Tokenizer: @unchecked Sendable {   // immutable after init â†
 
     // MARK: - internals
 
-    private func encodeSegment(_ segment: String, into ids: inout [Int]) {
+    private func encodeSegment(_ segment: String, scratch: inout [Int], into ids: inout [Int]) {
         for pretoken in Pretokenizer.pretokenize(segment, digitGroup: digitGroup) {
-            bpe.encodePretoken(pretoken, into: &ids)
+            bpe.encodePretoken(pretoken, syms: &scratch, into: &ids)
         }
     }
 }

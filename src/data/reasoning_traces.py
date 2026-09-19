@@ -27,7 +27,8 @@ ANSWER_OPEN, ANSWER_CLOSE = "<answer>", "</answer>"
 # verify against the live dataset card before the real build. "openthoughts2" (OpenThoughts2-1M,
 # which supersets 114k -- confirmed apache-2.0 on its own card, #65 corpus-extension session).
 SOURCE_LICENSES = {"mot": "odc-by", "topup": "generated", "handauthored": "cc0",
-                   "openthoughts": "apache-2.0", "openthoughts2": "apache-2.0"}
+                   "openthoughts": "apache-2.0", "openthoughts2": "apache-2.0",
+                   "code_reasoning": "cc0"}
 
 
 def format_trace(reasoning: str, answer: str) -> str:
@@ -201,6 +202,16 @@ _HANDAUTHORED_TRACES = [
      "No, 91 = 7 x 13."),
 ]
 
+# Curated thinking-before-coding & mathematical logic traces (CC0) (#306)
+_CODE_REASONING_TRACES = [
+    ("Write a TypeScript function to check if a binary tree is a valid BST.",
+     "1. A BST is valid if all left subtree values are < node.val and right values are > node.val.\n2. Validate recursively by tracking bounds (min, max): min < node.val < max.\n3. Base case: empty node returns true.\n4. If node.val <= min or node.val >= max, return false.\n5. Recurse: validate(left, min, node.val) && validate(right, node.val, max).",
+     "function isValidBST(root: any, min = -Infinity, max = Infinity): boolean {\n  if (!root) return true;\n  if (root.val <= min || root.val >= max) return false;\n  return isValidBST(root.left, min, root.val) && isValidBST(root.right, root.val, max);\n}"),
+    ("Prove that the sum of the first n odd positive integers equals n^2.",
+     "1. Base case n = 1: The first odd integer is 1. Formula: 1^2 = 1. True.\n2. Induction hypothesis: Assume sum(k) = 1 + 3 + ... + (2k - 1) = k^2 for k >= 1.\n3. Inductive step: sum(k + 1) = sum(k) + (2(k + 1) - 1) = k^2 + (2k + 1) = (k + 1)^2.\n4. By mathematical induction, sum of the first n odd positive integers is n^2 for all n >= 1.",
+     "Proof by induction:\n- Base step (n=1): 1 = 1^2 holds.\n- Inductive step: Assume 1 + 3 + ... + (2k - 1) = k^2. The (k+1)-th odd integer is 2k + 1.\n  Adding gives k^2 + 2k + 1 = (k + 1)^2.\nTherefore, the sum of the first n odd positive integers is n^2 for all n >= 1."),
+]
+
 
 def handauthored_trace_records() -> Iterator[dict]:
     """The checked-in hand-authored reasoning traces (always available, offline)."""
@@ -208,11 +219,20 @@ def handauthored_trace_records() -> Iterator[dict]:
         yield trace_to_messages(question, reasoning, answer, source="handauthored")
 
 
+def code_reasoning_trace_records(max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Checked-in thinking-before-coding & formal logic traces (CC0) (#306)."""
+    for i, (question, reasoning, answer) in enumerate(_CODE_REASONING_TRACES):
+        if max_examples is not None and i >= max_examples:
+            break
+        yield trace_to_messages(question, reasoning, answer, source="code_reasoning")
+
+
 # --------------------------------------------------------------------------- #
 # Aggregator
 # --------------------------------------------------------------------------- #
 _LOADERS = {
     "handauthored": lambda n: handauthored_trace_records(),
+    "code_reasoning": lambda n: code_reasoning_trace_records(max_examples=n),
     "mot": lambda n: load_mixture_of_thoughts(max_examples=n),
     "openthoughts": lambda n: load_openthoughts(max_examples=n),
     "openthoughts2": lambda n: load_openthoughts2(max_examples=n),

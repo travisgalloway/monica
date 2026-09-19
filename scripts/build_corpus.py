@@ -146,7 +146,9 @@ def consolidate_cleaned(cleaned_dir: Path | str, out_file: Path | str) -> Tuple[
 def pack_cleaned_shards(cleaned_jsonl: Path, shards_out: Path, tokenizer_path: Path,
                         seq_len: int = 8192, shard_size_mb: int = 512,
                         tokenize_bin: Path | None = None,
-                        chunk_align: int | None = None) -> dict:
+                        chunk_align: int | None = None,
+                        fim_rate: float | None = None,
+                        fim_seed: int | None = None) -> dict:
     """Pack cleaned.jsonl into uint16 .bin + .bounds + manifest.json shards."""
     shards_out = Path(shards_out)
     shards_out.mkdir(parents=True, exist_ok=True)
@@ -161,6 +163,10 @@ def pack_cleaned_shards(cleaned_jsonl: Path, shards_out: Path, tokenizer_path: P
         ]
         if chunk_align:
             cmd.extend(["--chunk-align", str(chunk_align)])
+        if fim_rate is not None:
+            cmd.extend(["--fim-rate", str(fim_rate)])
+        if fim_seed is not None:
+            cmd.extend(["--fim-seed", str(fim_seed)])
         subprocess.run(cmd, check=True)
     else:
         # Fallback to Python pack_sequences

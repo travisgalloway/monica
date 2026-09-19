@@ -71,3 +71,15 @@ def test_records_load_through_sft_loader(tmp_path):
     loader = SFTLoader(tok_dir / "reasoning.jsonl", seq_len=1024, batch_size=2)
     inputs, targets, mask = next(loader.epoch())
     assert inputs.shape == targets.shape == mask.shape and mask.sum() > 0
+
+
+def test_code_reasoning_trace_records_cover_algorithms_and_logic():
+    from src.data.reasoning_traces import code_reasoning_trace_records
+    recs = list(code_reasoning_trace_records())
+    assert len(recs) == 2
+    for r in recs:
+        assert r["source"] == "code_reasoning" and r["license"] == "cc0"
+        assistant_content = r["messages"][-1]["content"]
+        assert "<think>" in assistant_content and "</think>" in assistant_content
+        assert "<answer>" in assistant_content and "</answer>" in assistant_content
+
