@@ -54,11 +54,20 @@ class MicroBatchStream:
     """
 
     def __init__(self, curriculum: LengthCurriculum, loader_factory: LoaderFactory,
-                 seed: int, *, extra_fingerprint: Optional[dict] = None):
+                 seed: int, *, extra_fingerprint: Optional[dict] = None,
+                 replay_loader_factory: Optional[LoaderFactory] = None,
+                 decay_replay_ratio: float = 0.0,
+                 schedule: Optional[Any] = None,
+                 decay_start_step: Optional[int] = None):
         self.curriculum = curriculum
         self.loader_factory = loader_factory
         self.seed = int(seed)
         self.extra_fingerprint = dict(extra_fingerprint or {})
+
+        self.replay_loader_factory = replay_loader_factory
+        self.decay_replay_ratio = float(decay_replay_ratio)
+        self.schedule = schedule
+        self.decay_start_step = decay_start_step
 
         self.stage_idx = 0
         self.micro_in_stage = 0
@@ -66,9 +75,19 @@ class MicroBatchStream:
         self.epoch_idx = 0
         self.batches_into_epoch = 0
 
+        # Replay stream state & position (#364)
+        self.replay_micro = 0
+        self.replay_epoch_idx = 0
+        self.replay_batches_into_epoch = 0
+        self.decay_micro = 0
+
         self._loaders: dict[int, Any] = {}       # memoized per stage (memmap => cheap)
         self._it = None                          # live, PRIMED epoch iterator
         self._pending = None                     # the batch priming pulled off it
+
+        self._replay_loaders: dict[int, Any] = {}
+        self._replay_it = None
+        self._replay_pending = None
 
     # -- active stage ------------------------------------------------------------
     @property
@@ -109,6 +128,22 @@ class MicroBatchStream:
             self._loaders[i] = loader
         return self._loaders[i]
 
+    def replay_loader(self, stage_idx: Optional[int] = None):
+        """The replay loader for a stage, built once and memoized."""
+        if self.replay_loader_factory is None:
+            return None
+        i = self.stage_idx if stage_idx is None else stage_idx
+        if i not in self._replay_loaders:
+            st = self.curriculum.stages[i]
+            loader = self.replay_loader_factory(st.seq_len, st.batch_size)
+            if len(loader) <= 0:
+                raise ValueError(
+                    f"replay curriculum stage {i} (seq_len={st.seq_len}, "
+                    f"batch_size={st.batch_size}) yields no batches per epoch — the "
+                    "replay corpus is too small for this stage's shape")
+            self._replay_loaders[i] = loader
+        return self._replay_loaders[i]
+
     # -- iteration ---------------------------------------------------------------
     def __iter__(self):
         return self
@@ -127,6 +162,16 @@ class MicroBatchStream:
                                      skip_batches=self.batches_into_epoch))
         self._pending = next(self._it, None)
 
+    def _open_replay_epoch(self) -> None:
+        """Open the current replay epoch's iterator and prime it."""
+        loader = self.replay_loader()
+        if loader is None:
+            return
+        reseed = self.seed + 10_000_000 + self.replay_epoch_idx
+        self._replay_it = iter(loader.epoch(reseed=reseed,
+                                            skip_batches=self.replay_batches_into_epoch))
+        self._replay_pending = next(self._replay_it, None)
+
     def _advance_stage(self) -> None:
         """Cross into the next stage: abandon the partial epoch, start a fresh one."""
         self.stage_idx += 1
@@ -136,9 +181,34 @@ class MicroBatchStream:
         self._it = None
         self._pending = None
 
-    def __next__(self):
+        if self.replay_loader_factory is not None:
+            self.replay_epoch_idx += 1
+            self.replay_batches_into_epoch = 0
+            self._replay_it = None
+            self._replay_pending = None
+
+    @property
+    def current_step(self) -> int:
+        return self.global_micro // self.curriculum.grad_accum
+
+    def is_in_decay_phase(self, step: Optional[int] = None) -> bool:
+        if self.replay_loader_factory is None or self.decay_replay_ratio <= 0.0:
+            return False
+        if step is None:
+            step = self.current_step
+        if self.schedule is not None:
+            if hasattr(self.schedule, "phase_at"):
+                return self.schedule.phase_at(step) == "decay"
+            if hasattr(self.schedule, "decay_steps") and hasattr(self.schedule, "total_steps"):
+                decay_start = self.schedule.total_steps - self.schedule.decay_steps
+                return step >= decay_start
+        if self.decay_start_step is not None:
+            return step >= self.decay_start_step
+        return True
+
+    def _next_primary(self):
         batch = None
-        for _ in range(2):               # at most: finish this epoch, then a fresh one
+        for _ in range(2):
             if self._it is None:
                 self._open_epoch()
             if self._pending is not None:
@@ -148,17 +218,54 @@ class MicroBatchStream:
             if nxt is not None:
                 batch = nxt
                 break
-            self.epoch_idx += 1          # epoch exhausted — roll to the next one
+            self.epoch_idx += 1
             self.batches_into_epoch = 0
             self._it = None
         if batch is None:
             raise ValueError(
                 f"curriculum stage {self.stage_idx} produced no batch for a fresh epoch "
                 "— the loader's epoch() is empty despite len(loader) >= 1")
+        self.batches_into_epoch += 1
+        return batch
+
+    def _next_replay(self):
+        batch = None
+        for _ in range(2):
+            if self._replay_it is None:
+                self._open_replay_epoch()
+            if self._replay_pending is not None:
+                batch, self._replay_pending = self._replay_pending, None
+                break
+            nxt = next(self._replay_it, None)
+            if nxt is not None:
+                batch = nxt
+                break
+            self.replay_epoch_idx += 1
+            self.replay_batches_into_epoch = 0
+            self._replay_it = None
+        if batch is None:
+            raise ValueError(
+                f"replay loader in curriculum stage {self.stage_idx} produced no batch "
+                "for a fresh epoch — the loader's epoch() is empty despite len(loader) >= 1")
+        self.replay_micro += 1
+        self.replay_batches_into_epoch += 1
+        return batch
+
+    def __next__(self):
+        in_decay = self.is_in_decay_phase()
+        if in_decay:
+            # Deterministic rate accumulator for replay blending during decay phase (#364)
+            use_replay = int((self.decay_micro + 1) * self.decay_replay_ratio) > int(self.decay_micro * self.decay_replay_ratio)
+            self.decay_micro += 1
+            if use_replay:
+                batch = self._next_replay()
+            else:
+                batch = self._next_primary()
+        else:
+            batch = self._next_primary()
 
         self.micro_in_stage += 1
         self.global_micro += 1
-        self.batches_into_epoch += 1
 
         # Normalize the boundary EAGERLY so a checkpoint taken exactly ON a stage
         # boundary names the new stage at micro_in_stage 0 with a fresh epoch, rather
@@ -232,10 +339,20 @@ class MicroBatchStream:
     # -- persistence -------------------------------------------------------------
     def fingerprint(self) -> dict:
         """The identity a saved position depends on. A change here invalidates it."""
-        return {"seed": self.seed,
-                "grad_accum": self.curriculum.grad_accum,
-                **self.curriculum.fingerprint(),
-                **self.extra_fingerprint}
+        fp = {"seed": self.seed,
+              "grad_accum": self.curriculum.grad_accum,
+              **self.curriculum.fingerprint(),
+              **self.extra_fingerprint}
+        if self.replay_loader_factory is not None:
+            fp["decay_replay_ratio"] = self.decay_replay_ratio
+        return fp
+
+    def _replay_rng_state(self) -> Any:
+        """The live replay epoch's loader RNG state, or None when no epoch in flight."""
+        if self._replay_it is None:
+            return None
+        rng = getattr(self._replay_loaders.get(self.stage_idx), "rng", None)
+        return rng.bit_generator.state if rng is not None else None
 
     def _rng_state(self) -> Any:
         """The live epoch's loader RNG state, or None when there is no epoch in flight.
@@ -252,7 +369,7 @@ class MicroBatchStream:
         return rng.bit_generator.state if rng is not None else None
 
     def state_dict(self) -> dict:
-        return {
+        d = {
             "version": STATE_VERSION,
             "stage_idx": self.stage_idx,
             "micro_in_stage": self.micro_in_stage,
@@ -265,6 +382,20 @@ class MicroBatchStream:
                                for s in self.curriculum.stages],
             "fingerprint": self.fingerprint(),
         }
+        if self.replay_loader_factory is not None or self.replay_micro > 0 or self.decay_micro > 0:
+            replay_data = {
+                "replay_micro": self.replay_micro,
+                "replay_epoch_idx": self.replay_epoch_idx,
+                "replay_batches_into_epoch": self.replay_batches_into_epoch,
+                "replay_rng_state": _jsonable(self._replay_rng_state()),
+                "decay_micro": self.decay_micro,
+            }
+            d["replay_state"] = replay_data
+            d["replay_micro"] = self.replay_micro
+            d["replay_epoch_idx"] = self.replay_epoch_idx
+            d["replay_batches_into_epoch"] = self.replay_batches_into_epoch
+            d["decay_micro"] = self.decay_micro
+        return d
 
     def load_state_dict(self, state: dict, *, strict: bool = True) -> None:
         """Restore an exact position. Raises on any mismatch — never resumes approximately.
@@ -324,3 +455,24 @@ class MicroBatchStream:
                     "shuffle than the one that was checkpointed. The resumed data stream "
                     "would NOT match the interrupted run. Pass --ignore-data-state to "
                     "discard the saved position and restart the data stream.")
+
+        if "replay_state" in state or "replay_micro" in state:
+            r_state = state.get("replay_state") or state
+            self.replay_micro = int(r_state.get("replay_micro", 0))
+            self.replay_epoch_idx = int(r_state.get("replay_epoch_idx", 0))
+            self.replay_batches_into_epoch = int(r_state.get("replay_batches_into_epoch", 0))
+            self.decay_micro = int(r_state.get("decay_micro", 0))
+            self._replay_it = None
+            self._replay_pending = None
+
+            saved_replay_rng = r_state.get("replay_rng_state")
+            if saved_replay_rng is not None and self.replay_loader() is not None:
+                self._open_replay_epoch()
+                current_replay = json.loads(json.dumps(_jsonable(self._replay_rng_state())))
+                if current_replay != json.loads(json.dumps(saved_replay_rng)):
+                    raise ValueError(
+                        "replay dataloader RNG tripwire failed after restoring the saved position: "
+                        f"seed={self.seed} replay_epoch_idx={self.replay_epoch_idx} reproduces a "
+                        "different shuffle than the one that was checkpointed. The resumed replay "
+                        "data stream would NOT match the interrupted run. Pass --ignore-data-state to "
+                        "discard the saved position and restart the data stream.")

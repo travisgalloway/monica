@@ -53,6 +53,10 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--lr-schedule", choices=("cosine", "wsd"), default="cosine")
     ap.add_argument("--decay-frac", type=float, default=0.2,
                     help="WSD: fraction of total_steps spent decaying")
+    ap.add_argument("--decay-replay-ratio", type=float, default=0.25,
+                    help="WSD decay-phase general knowledge replay ratio (default: 0.25)")
+    ap.add_argument("--replay-data-dir", type=Path, default=None,
+                    help="directory with general knowledge replay shards (curated web, math, prose)")
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--eval-every", type=int, default=200)
@@ -220,6 +224,11 @@ def main() -> None:
     max_b = args.eval_batches or None
     val_eval = lambda m: evaluate(m, val_loader, max_batches=max_b, to_numpy=np_to)
 
+    replay_loader_factory = None
+    if args.replay_data_dir is not None:
+        from src.train.replay import build_replay_loader_factory
+        replay_loader_factory = build_replay_loader_factory(args.replay_data_dir, seed=args.seed)
+
     moe_diag = None
     if args.moe_diag_every:
         from src.eval.moe_routing import (expert_histograms, format_routing_report,
@@ -333,12 +342,16 @@ def main() -> None:
         ckpt_every=args.ckpt_every, out_dir=str(out), seed=args.seed,
         lr_schedule=args.lr_schedule, decay_frac=args.decay_frac,
         moe_diag_every=args.moe_diag_every,
+        decay_replay_ratio=args.decay_replay_ratio if args.replay_data_dir is not None else 0.0,
+        replay_data_dir=str(args.replay_data_dir) if args.replay_data_dir is not None else None,
     )
 
     n_params = sum(int(np.asarray(v).size) for _, v in model._portable_state_dict().items())
     print(f"[run] params~{n_params/1e6:.1f}M  total_steps={total_steps}  warmup={warmup}  "
           f"tokens/step={tokens_per_step}  precision={cfg.precision}  "
           f"schedule={args.lr_schedule}")
+    if args.replay_data_dir is not None:
+        print(f"[replay] dir={args.replay_data_dir}  decay_replay_ratio={args.decay_replay_ratio}")
 
     if curriculum is not None:
         print(f"[curriculum] {args.curriculum!r} -> {len(curriculum.stages)} stages, "
@@ -364,6 +377,7 @@ def main() -> None:
                    on_checkpoint=on_checkpoint,
                    start_step=start_step, curriculum=curriculum,
                    loader_factory=loader_factory if curriculum is not None else None,
+                   replay_loader_factory=replay_loader_factory,
                    start_data_state=start_data_state,
                    ignore_data_state=args.ignore_data_state)
 

@@ -21,6 +21,7 @@ from typing import Protocol, runtime_checkable
 @runtime_checkable
 class Schedule(Protocol):
     def lr_at(self, step: int) -> float: ...
+    def phase_at(self, step: int) -> str: ...
 
 
 @dataclass
@@ -42,6 +43,13 @@ class CosineSchedule:
             raise ValueError("total_steps must be >= warmup_steps")
         if not 0 < self.min_lr_ratio <= 1:
             raise ValueError("min_lr_ratio must be in (0, 1]")
+
+    def phase_at(self, step: int) -> str:
+        if step < 0:
+            raise ValueError("step must be >= 0")
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return "warmup"
+        return "decay"
 
     def lr_at(self, step: int) -> float:
         if step < 0:
@@ -90,6 +98,19 @@ class WSDSchedule:
         if not 0 < self.min_lr_ratio <= 1:
             raise ValueError("min_lr_ratio must be in (0, 1]")
 
+    @property
+    def decay_start(self) -> int:
+        return self.total_steps - self.decay_steps
+
+    def phase_at(self, step: int) -> str:
+        if step < 0:
+            raise ValueError("step must be >= 0")
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return "warmup"
+        if step < self.decay_start:
+            return "stable"
+        return "decay"
+
     def lr_at(self, step: int) -> float:
         if step < 0:
             raise ValueError("step must be >= 0")
@@ -99,13 +120,12 @@ class WSDSchedule:
             # Linear warmup from 0 up to base_lr (identical to CosineSchedule).
             return self.base_lr * (step + 1) / self.warmup_steps
 
-        decay_start = self.total_steps - self.decay_steps
-        if step < decay_start:
+        if step < self.decay_start:
             # Stable plateau at base_lr, between warmup and the decay window.
             return self.base_lr
 
         # 1-sqrt decay from base_lr down to floor (WSD standard; cheap re-decay).
-        progress = min(1.0, (step - decay_start) / max(1, self.decay_steps))
+        progress = min(1.0, (step - self.decay_start) / max(1, self.decay_steps))
         factor = 1.0 - math.sqrt(progress)
         return floor + (self.base_lr - floor) * factor
 
