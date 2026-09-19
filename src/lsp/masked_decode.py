@@ -51,6 +51,7 @@ def generate_masked(
     rng: Optional[np.random.Generator] = None,
     stop_strings: Optional[Sequence[str]] = None,
     strategy: Optional[str] = None,
+    grammar_masker: Optional[object] = None,
 ) -> GenResult:
     """Free-running generation, exactly like `generate_baseline`, except each
     step consults `masker.mask_for(...)` (a `CompletionMasker`, or `None` for the
@@ -86,8 +87,14 @@ def generate_masked(
                 # sorted/deduped by `mask_for`, so skip the set/sort when there's
                 # no EOS set to fold in.
                 allowed = sorted(set(allowed) | eos)
+        grammar_allowed = None
+        if grammar_masker is not None:
+            grammar_allowed = grammar_masker.mask_for(prompt + gen_text, vocab_size=int(np.asarray(logits).size))
+            if grammar_allowed is not None and eos:
+                if getattr(grammar_masker, "can_end", lambda t: True)(prompt + gen_text):
+                    grammar_allowed = sorted(set(grammar_allowed) | eos)
         tok = sample(logits, temperature=temperature, rng=rng, previous_tokens=gen_ids,
-                     allowed_ids=allowed)
+                     allowed_ids=allowed, grammar_allowed_ids=grammar_allowed)
         if tok in eos:
             break
         logits = lm.step(tok)
