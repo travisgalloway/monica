@@ -50,7 +50,7 @@ import sys
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall")
+ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall", "adaptive_reasoning", "reasoning")
 DEFAULT_SUITES = "recall,needle,fim"
 
 
@@ -351,6 +351,154 @@ def _run_repo_recall(args, model, to_numpy, encode, rng):
                     "topo_top1_accuracy": result["topo_top1_accuracy"],
                     "random_top1_accuracy": result["random_top1_accuracy"]}
 
+def format_adaptive_reasoning_table(result: dict) -> str:
+    lines = [
+        "-----------------------------------------------------------------------------------------------------",
+        "adaptive_reasoning: direct completion vs reasoning trace accuracy & token consumption",
+        "-----------------------------------------------------------------------------------------------------",
+        "mode        instances   token_acc   mean_total_tokens   mean_reasoning_tokens",
+    ]
+    d = result.get("direct", {})
+    r = result.get("reasoning", {})
+    lines.append(f"direct      {d.get('n_instances', 0):<11d} {d.get('mean_token_accuracy', 0.0):<11.4f} {d.get('mean_total_tokens', 0.0):<19.1f} {d.get('mean_reasoning_tokens', 0.0):<19.1f}")
+    lines.append(f"reasoning   {r.get('n_instances', 0):<11d} {r.get('mean_token_accuracy', 0.0):<11.4f} {r.get('mean_total_tokens', 0.0):<19.1f} {r.get('mean_reasoning_tokens', 0.0):<19.1f}")
+    lines.append("-----------------------------------------------------------------------------------------------------")
+    return "\n".join(lines)
+
+
+def _run_adaptive_reasoning(args, model, to_numpy, encode, rng):
+    """Evaluate accuracy versus token consumption across direct completion and reasoning modes (#362).
+
+    Measures:
+    - Direct completion: no chain-of-thought tokens (<think> suppressed), direct code answer.
+    - Multi-step reasoning: structured reasoning traces within <think>...</think> before answer.
+    Emits shared schema records for both 'direct' and 'reasoning' buckets.
+    """
+    import numpy as np
+    from src.data.reasoning_traces import _CODE_REASONING_TRACES, _HANDAUTHORED_TRACES
+    from src.eval.code_suite import ScoreRow, make_record, score_rows
+
+    raw_instances = []
+    for i, (q, r, a) in enumerate(_CODE_REASONING_TRACES):
+        raw_instances.append((f"code_{i:03d}", q, r, a))
+    for i, (q, r, a) in enumerate(_HANDAUTHORED_TRACES):
+        raw_instances.append((f"hand_{i:03d}", q, r, a))
+
+    if args.limit is not None:
+        raw_instances = raw_instances[:args.limit]
+
+    direct_rows: List[ScoreRow] = []
+    reasoning_rows: List[ScoreRow] = []
+    meta_direct = []
+    meta_reasoning = []
+
+    for inst_id, question, reasoning, answer in raw_instances:
+        dir_prompt_text = f"<|im_start|>system\nYou are a coding assistant. Provide direct code completions.<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        dir_ans_text = f"{answer}<|im_end|>"
+        dir_p_toks = np.asarray(list(encode(dir_prompt_text)), dtype=np.int64)
+        dir_a_toks = np.asarray(list(encode(dir_ans_text)), dtype=np.int64)
+        if dir_p_toks.size > 0 and dir_a_toks.size > 0:
+            direct_rows.append(ScoreRow(
+                tokens=np.concatenate([dir_p_toks, dir_a_toks]),
+                span_start=int(dir_p_toks.size),
+                span_len=int(dir_a_toks.size),
+            ))
+            meta_direct.append({
+                "id": f"{inst_id}_direct",
+                "distance": int(dir_p_toks.size),
+                "n_scored_tokens": int(dir_a_toks.size),
+                "total_tokens": int(dir_p_toks.size + dir_a_toks.size),
+                "reasoning_tokens": 0,
+            })
+
+        reas_prompt_text = f"<|im_start|>system\nYou are a reasoning coding assistant. Think within <think>...</think> before answering.<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        reas_ans_text = f"<think>\n{reasoning}\n</think>\n<answer>\n{answer}\n</answer><|im_end|>"
+        reas_p_toks = np.asarray(list(encode(reas_prompt_text)), dtype=np.int64)
+        reas_a_toks = np.asarray(list(encode(reas_ans_text)), dtype=np.int64)
+        reas_trace_toks = np.asarray(list(encode(f"<think>\n{reasoning}\n</think>\n")), dtype=np.int64)
+        if reas_p_toks.size > 0 and reas_a_toks.size > 0:
+            reasoning_rows.append(ScoreRow(
+                tokens=np.concatenate([reas_p_toks, reas_a_toks]),
+                span_start=int(reas_p_toks.size),
+                span_len=int(reas_a_toks.size),
+            ))
+            meta_reasoning.append({
+                "id": f"{inst_id}_reasoning",
+                "distance": int(reas_p_toks.size),
+                "n_scored_tokens": int(reas_a_toks.size),
+                "total_tokens": int(reas_p_toks.size + reas_a_toks.size),
+                "reasoning_tokens": int(reas_trace_toks.size),
+            })
+
+    scored_direct = score_rows(model, direct_rows, batch_size=args.batch_size, to_numpy=to_numpy) if direct_rows else []
+    scored_reasoning = score_rows(model, reasoning_rows, batch_size=args.batch_size, to_numpy=to_numpy) if reasoning_rows else []
+
+    records: List[dict] = []
+    for md, s in zip(meta_direct, scored_direct):
+        records.append(make_record(
+            suite="adaptive_reasoning",
+            id=md["id"],
+            bucket="direct",
+            distance=md["distance"],
+            n_scored_tokens=md["n_scored_tokens"],
+            ce_nats=s["ce_nats"],
+            token_accuracy=s["token_accuracy"],
+            exact_match=s["exact_match"],
+            rank_top1=s.get("rank_top1"),
+            mrr=s.get("mrr"),
+            meta={"mode": "direct", "total_tokens": md["total_tokens"], "reasoning_tokens": 0},
+        ))
+
+    for mr, s in zip(meta_reasoning, scored_reasoning):
+        records.append(make_record(
+            suite="adaptive_reasoning",
+            id=mr["id"],
+            bucket="reasoning",
+            distance=mr["distance"],
+            n_scored_tokens=mr["n_scored_tokens"],
+            ce_nats=s["ce_nats"],
+            token_accuracy=s["token_accuracy"],
+            exact_match=s["exact_match"],
+            rank_top1=s.get("rank_top1"),
+            mrr=s.get("mrr"),
+            meta={"mode": "reasoning", "total_tokens": mr["total_tokens"], "reasoning_tokens": mr["reasoning_tokens"]},
+        ))
+
+    direct_acc = [r["token_accuracy"] for r in records if r["bucket"] == "direct" and r["token_accuracy"] is not None]
+    reasoning_acc = [r["token_accuracy"] for r in records if r["bucket"] == "reasoning" and r["token_accuracy"] is not None]
+    direct_tokens = [r["meta"]["total_tokens"] for r in records if r["bucket"] == "direct"]
+    reasoning_tokens = [r["meta"]["total_tokens"] for r in records if r["bucket"] == "reasoning"]
+    cot_tokens = [r["meta"]["reasoning_tokens"] for r in records if r["bucket"] == "reasoning"]
+
+    summary = {
+        "direct": {
+            "n_instances": len(scored_direct),
+            "mean_token_accuracy": float(np.mean(direct_acc)) if direct_acc else 0.0,
+            "mean_total_tokens": float(np.mean(direct_tokens)) if direct_tokens else 0.0,
+            "mean_reasoning_tokens": 0.0,
+        },
+        "reasoning": {
+            "n_instances": len(scored_reasoning),
+            "mean_token_accuracy": float(np.mean(reasoning_acc)) if reasoning_acc else 0.0,
+            "mean_total_tokens": float(np.mean(reasoning_tokens)) if reasoning_tokens else 0.0,
+            "mean_reasoning_tokens": float(np.mean(cot_tokens)) if cot_tokens else 0.0,
+        },
+        "tradeoff": {
+            "token_overhead_ratio": float(np.mean(reasoning_tokens) / max(1.0, float(np.mean(direct_tokens)))) if (direct_tokens and reasoning_tokens) else 1.0,
+        },
+        "overall": {
+            "n_instances": len(records),
+            "token_accuracy": float(np.mean([r["token_accuracy"] for r in records if r["token_accuracy"] is not None])) if records else 0.0,
+            "exact_match_rate": float(np.mean([r["exact_match"] for r in records if r["exact_match"] is not None])) if records else 0.0,
+            "ce": float(np.mean([r["ce_nats"] for r in records if r["ce_nats"] is not None])) if records else 0.0,
+        },
+    }
+    return {"records": records, **summary}, {
+        "n_problems": len(raw_instances),
+        "modes": ["direct", "reasoning"],
+    }
+
+
 def _run_tsc(args):
     """Type-aware completion — surfaced, NOT rebuilt.
 
@@ -442,6 +590,8 @@ def main() -> int:
                 result, src = _run_tsc(args)
             elif suite == "repo_recall":
                 result, src = _run_repo_recall(args, model, to_numpy, encode, rng)
+            elif suite in ("adaptive_reasoning", "reasoning"):
+                result, src = _run_adaptive_reasoning(args, model, to_numpy, encode, rng)
             else:                                        # unreachable: validated in _parse_args
                 raise RuntimeError(f"unhandled suite {suite!r}")
         except RuntimeError as e:
@@ -468,6 +618,8 @@ def main() -> int:
         elif suite == "tsc":
             print(f"tsc: clean_rate={result['summary']['clean_rate']} "
                   f"over {result['summary']['n']} records")
+        elif suite in ("adaptive_reasoning", "reasoning"):
+            print(format_adaptive_reasoning_table(result))
 
     if not summaries:
         raise SystemExit("every requested suite was skipped — nothing was measured. "

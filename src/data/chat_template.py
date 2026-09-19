@@ -27,7 +27,7 @@ dependency (works with `tokenize.ByteTokenizer` offline).
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -36,22 +36,98 @@ CHAT_EOS = IM_END
 
 _ROLES = ("system", "user", "assistant")
 
+# --- Dual-mode reasoning conventions (#362) -------------------------------------------
+MODE_DIRECT = "direct"
+MODE_REASONING = "reasoning"
+VALID_MODES = (MODE_DIRECT, MODE_REASONING)
+
+THINK_START = "<think>"
+THINK_END = "</think>"
+FIM_PREFIX = "<|fim_prefix|>"
+FIM_SUFFIX = "<|fim_suffix|>"
+FIM_MIDDLE = "<|fim_middle|>"
+FIM_PAD = "<|fim_pad|>"
+
+SYSTEM_PROMPT_DIRECT = (
+    "You are a coding assistant. Provide direct code completions without chain-of-thought reasoning."
+)
+SYSTEM_PROMPT_REASONING = (
+    "You are a reasoning coding assistant. Provide structured reasoning traces within <think>...</think> before outputting the final answer or code."
+)
+
+
+def is_fim_prompt(prompt: str | Sequence[int], *, fim_prefix_id: int = 1) -> bool:
+    """Return True if prompt contains a FIM prefix sentinel."""
+    if isinstance(prompt, str):
+        return FIM_PREFIX in prompt
+    if fim_prefix_id in prompt:
+        return True
+    fim_bytes = list(FIM_PREFIX.encode("utf-8"))
+    if len(prompt) >= len(fim_bytes):
+        for i in range(len(prompt) - len(fim_bytes) + 1):
+            if list(prompt[i : i + len(fim_bytes)]) == fim_bytes:
+                return True
+    return False
+
+
+def get_mode_for_prompt(
+    prompt: str | Sequence[int],
+    *,
+    default_mode: str = MODE_DIRECT,
+    fim_prefix_id: int = 1,
+) -> str:
+    """Determine whether a prompt indicates direct completion (e.g. FIM) or reasoning."""
+    if is_fim_prompt(prompt, fim_prefix_id=fim_prefix_id):
+        return MODE_DIRECT
+    if isinstance(prompt, str):
+        if IM_START in prompt or THINK_START in prompt or "### Instruction:" in prompt:
+            return MODE_REASONING
+    return default_mode
+
+
+def format_mode_messages(
+    messages: List[dict],
+    *,
+    mode: str = MODE_DIRECT,
+    system_prompt: Optional[str] = None,
+) -> List[dict]:
+    """Ensure messages list includes a system prompt tailored for mode."""
+    if mode not in VALID_MODES:
+        raise ValueError(f"unknown mode {mode!r}, expected one of {VALID_MODES}")
+    has_system = any(m.get("role") == "system" for m in messages)
+    if has_system:
+        return list(messages)
+    prompt = system_prompt or (
+        SYSTEM_PROMPT_REASONING if mode == MODE_REASONING else SYSTEM_PROMPT_DIRECT
+    )
+    return [{"role": "system", "content": prompt}] + list(messages)
+
 
 def _render_turn(role: str, content: str) -> str:
-    """One ChatML turn: `<|im_start|>{role}\\n{content}<|im_end|>` (content stripped)."""
+    """One ChatML turn: `<|im_start|>{role}\n{content}<|im_end|>` (content stripped)."""
     if role not in _ROLES:
         raise ValueError(f"unknown chat role {role!r} (expected one of {_ROLES})")
     return f"{IM_START}{role}\n{content.strip()}{IM_END}"
 
 
-def render(messages: List[dict], *, add_generation_prompt: bool = False) -> str:
+def render(
+    messages: List[dict],
+    *,
+    add_generation_prompt: bool = False,
+    mode: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> str:
     """Render a conversation to one ChatML string.
 
     `messages` is `[{"role": "system"|"user"|"assistant", "content": str}, ...]`; turns are joined
-    by newlines. With `add_generation_prompt=True` the string ends at `<|im_start|>assistant\\n`
+    by newlines. With `add_generation_prompt=True` the string ends at `<|im_start|>assistant\n`
     (the open turn the model continues from at serving time) — the exact prefix that the matching
     `response_spans` assistant span begins after.
+    When `mode` is specified ("direct" or "reasoning"), adds mode-appropriate system instructions
+    if none is present in `messages`.
     """
+    if mode is not None:
+        messages = format_mode_messages(messages, mode=mode, system_prompt=system_prompt)
     parts = [_render_turn(m["role"], m["content"]) for m in messages]
     text = "\n".join(parts)
     if add_generation_prompt:
