@@ -56,6 +56,7 @@ CROSS_BACKEND_TESTS = (
     "test_backend_parity_seg_ids",
     "test_portable_weights_roundtrip_both_directions",
     "test_moe_routing_entropy_parity_mlx_vs_torch",
+    "test_critic_heads_backend_parity_mlx_vs_torch",
 )
 
 
@@ -236,6 +237,83 @@ def test_moe_routing_entropy_parity_mlx_vs_torch(tmp_path):
         assert a["entropy"] is not None and b["entropy"] is not None
         assert a["entropy"] == pytest.approx(b["entropy"], rel=1e-4, abs=1e-5)
         assert a["n_tokens"] == b["n_tokens"]
+
+
+@requires_both_backends
+def test_critic_heads_backend_parity_mlx_vs_torch(tmp_path):
+    """Auxiliary decision critic heads (#386): identical portable weights in both
+    backends -> forward_with_critics agrees in fp32 within 1e-4 relative tolerance
+    across logits and calibrated critic outputs (noul, score, choice).
+    """
+    from src.model.critic import CriticConfig, DecisionCriticHead as RefHead
+    from src.model.mlx_backend import MLXMambaModel, DecisionCriticHead as MLXCriticHead
+    from src.model.cuda_backend import CUDAMambaModel, DecisionCriticHead as TorchCriticHead
+
+    cfg = load_config(CFG)
+    cfg.critic_heads = {
+        "gate": CriticConfig(d_model=cfg.d_model, hidden_dim=16, primitive="noul", temperature=1.2),
+        "score": CriticConfig(d_model=cfg.d_model, hidden_dim=16, primitive="score", n_classes=4, temperature=0.9),
+        "choice": CriticConfig(d_model=cfg.d_model, hidden_dim=16, primitive="choice", n_classes=3,
+                                choice_names=["a", "b", "c"], temperature=1.1),
+    }
+
+    # 1. Standalone parity against portable reference
+    for name, c_cfg in cfg.critic_heads.items():
+        ref = RefHead(c_cfg, rng=np.random.default_rng(42))
+        mlx_h = MLXCriticHead(c_cfg)
+        mlx_h.copy_from_reference(ref)
+        th_h = TorchCriticHead(c_cfg)
+        th_h.copy_from_reference(ref)
+
+        x_test = np.random.default_rng(0).normal(size=(5, c_cfg.d_model)).astype(np.float32)
+        y_ref = ref.forward_logits(x_test)
+        y_mlx = np.array(mlx_h.forward_logits(x_test))
+        with torch.no_grad():
+            y_th = th_h.forward_logits(torch.from_numpy(x_test)).detach().cpu().numpy()
+
+        assert np.allclose(y_ref, y_mlx, rtol=1e-4, atol=1e-5)
+        assert np.allclose(y_ref, y_th, rtol=1e-4, atol=1e-5)
+        assert np.allclose(y_mlx, y_th, rtol=1e-4, atol=1e-5)
+
+    # 2. End-to-end model forward_with_critics parity
+    torch.manual_seed(0)
+    src = CUDAMambaModel(cfg)
+    path = str(tmp_path / "weights.safetensors")
+    src.save(path)
+
+    mlx_m = MLXMambaModel(cfg)
+    mlx_m.load(path)
+    cuda_m = CUDAMambaModel(cfg)
+    cuda_m.load(path)
+
+    tokens = _tokens(cfg, B=2, L=24)
+    mlx_logits, mlx_critics = mlx_m.forward_with_critics(tokens)
+    with torch.no_grad():
+        cuda_logits, cuda_critics = cuda_m.forward_with_critics(tokens)
+
+    # LM vocabulary logits parity
+    assert np.allclose(_mlx_np(mlx_logits), _torch_np(cuda_logits), rtol=1e-4, atol=1e-5)
+
+    # Critic heads parity
+    assert set(mlx_critics.keys()) == set(cuda_critics.keys()) == set(cfg.critic_heads.keys())
+    for name in cfg.critic_heads:
+        m_c = mlx_critics[name]
+        c_c = cuda_critics[name]
+
+        # Logits parity
+        assert np.allclose(_mlx_np(m_c["logits"]), _torch_np(c_c["logits"]), rtol=1e-4, atol=1e-5)
+
+        # Calibrated outputs parity
+        if "prob" in m_c:
+            assert np.allclose(m_c["prob"], c_c["prob"], rtol=1e-4, atol=1e-5)
+            assert m_c["decision"] == c_c["decision"]
+        if "score" in m_c:
+            assert np.allclose(m_c["score"], c_c["score"], rtol=1e-4, atol=1e-5)
+            assert m_c["best_level"] == c_c["best_level"]
+        if "choice" in m_c:
+            assert m_c["choice"] == c_c["choice"]
+            assert m_c["choice_idx"] == c_c["choice_idx"]
+        assert np.allclose(m_c["confidence"], c_c["confidence"], rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.skipif(not HAVE_TORCH, reason="needs torch")

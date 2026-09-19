@@ -24,9 +24,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import yaml
+
+from .critic import CriticConfig
 
 
 @dataclass
@@ -180,6 +182,26 @@ class MambaConfig:
     # (forward) and one-step recurrence (step) stay parity-exact.
     long_ctx_factor: float = 1.0
 
+    # --- auxiliary decision critic heads (#386) ---
+    critic_heads: Optional[Dict[str, CriticConfig]] = None
+
+    def __post_init__(self):
+        if self.critic_heads is not None:
+            converted = {}
+            for name, head in self.critic_heads.items():
+                if isinstance(head, dict):
+                    h_dict = dict(head)
+                    if 'd_model' not in h_dict:
+                        h_dict['d_model'] = self.d_model
+                    converted[name] = CriticConfig(**h_dict)
+                elif isinstance(head, CriticConfig):
+                    converted[name] = head
+                else:
+                    raise TypeError(
+                        f'critic_heads values must be CriticConfig or dict, got {type(head).__name__}'
+                    )
+            self.critic_heads = converted
+
     # --- dt-projection bias init (LOAD-BEARING) ---
     # Inverse-softplus of a sample in [dt_min, dt_max] initializes the dt bias.
     # Without this the model fails to learn recall. Carry these into every backend.
@@ -299,6 +321,16 @@ class MambaConfig:
         # toward capacity here; `active_parameter_breakdown` counts only the top_k routed.
         if n_moe:
             bd["moe"] = n_moe * self._moe_layer_params(self.n_experts)
+        # Auxiliary critic heads (#386)
+        if self.critic_heads:
+            critic_total = 0
+            for head in self.critic_heads.values():
+                d = self.d_model
+                h = head.hidden_dim
+                out_dim = head.n_classes
+                critic_total += (d * h + h + h * out_dim + out_dim)
+            bd["critic_heads"] = critic_total
+
         # Tied embedding reuses the input matrix as the LM head -> no extra params.
         if not self.tie_embeddings:
             bd["lm_head"] = self.vocab_size * d_model
@@ -489,6 +521,26 @@ class MambaConfig:
                     f"{self.precision!r} (bf16 recommended: no loss-scaler conflict "
                     "with Transformer Engine's DelayedScaling)."
                 )
+        if self.critic_heads is not None:
+            if not isinstance(self.critic_heads, dict):
+                raise ValueError("critic_heads must be a dict or None")
+            for name, head in self.critic_heads.items():
+                if not isinstance(head, CriticConfig):
+                    raise ValueError(
+                        f"critic head {name!r} must be an instance of CriticConfig, got {type(head).__name__}"
+                    )
+                if head.primitive not in ("noul", "score", "choice"):
+                    raise ValueError(
+                        f"critic head {name!r} primitive {head.primitive!r} must be one of ('noul', 'score', 'choice')"
+                    )
+                if head.d_model != self.d_model:
+                    raise ValueError(
+                        f"critic head {name!r} d_model={head.d_model} must match model d_model={self.d_model}"
+                    )
+                if head.hidden_dim is None or head.hidden_dim <= 0 or self.d_model % head.hidden_dim != 0:
+                    raise ValueError(
+                        f"critic head {name!r} hidden_dim={head.hidden_dim} must divide d_model={self.d_model} cleanly"
+                    )
 
     def to_dict(self) -> dict:
         return asdict(self)

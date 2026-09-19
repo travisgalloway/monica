@@ -11,7 +11,6 @@ Validates:
 
 from __future__ import annotations
 
-import math
 import numpy as np
 import pytest
 
@@ -165,3 +164,135 @@ def test_go_no_go_architectural_gate():
     assert result.calibrated_ece < 0.08
     assert result.brier_improvement_pct >= 15.0
     assert result.gate_details["gate_seam_invariance (pure numpy)"] is True
+
+
+try:
+    import mlx.core  # noqa: F401
+    HAVE_MLX = True
+except ImportError:
+    HAVE_MLX = False
+
+try:
+    import torch  # noqa: F401
+    HAVE_TORCH = True
+except ImportError:
+    HAVE_TORCH = False
+
+
+def test_mamba_config_critic_heads_validation():
+    """Verify MambaConfig schema validation for auxiliary critic heads (#386)."""
+    from src.model.blocks import MambaConfig
+
+    # 1. Valid configuration with CriticConfig object and dict
+    cfg = MambaConfig(
+        d_model=64,
+        n_layers=2,
+        critic_heads={
+            "noul_gate": CriticConfig(d_model=64, hidden_dim=16, primitive="noul"),
+            "score_rubric": {"primitive": "score", "hidden_dim": 16, "n_classes": 4},
+        },
+    )
+    cfg.validate()
+    assert isinstance(cfg.critic_heads["score_rubric"], CriticConfig)
+    assert cfg.critic_heads["score_rubric"].d_model == 64
+    bd = cfg.parameter_breakdown()
+    assert "critic_heads" in bd
+    assert bd["critic_heads"] > 0
+
+    # 2. Rejection of hidden_dim that does not divide d_model cleanly
+    with pytest.raises(ValueError, match="hidden_dim=25 must divide d_model=64 cleanly"):
+        bad_cfg = MambaConfig(
+            d_model=64,
+            n_layers=2,
+            critic_heads={"bad_dim": CriticConfig(d_model=64, hidden_dim=25, primitive="noul")},
+        )
+        bad_cfg.validate()
+
+    # 3. Rejection of invalid primitive
+    with pytest.raises(ValueError, match="primitive 'unsupported' must be one of"):
+        bad_cfg = MambaConfig(
+            d_model=64,
+            n_layers=2,
+            critic_heads={"bad_prim": CriticConfig(d_model=64, hidden_dim=16, primitive="unsupported")},
+        )
+        bad_cfg.validate()
+
+    # 4. Rejection of d_model mismatch
+    with pytest.raises(ValueError, match="d_model=128 must match model d_model=64"):
+        bad_cfg = MambaConfig(
+            d_model=64,
+            n_layers=2,
+            critic_heads={"bad_dmodel": CriticConfig(d_model=128, hidden_dim=16, primitive="noul")},
+        )
+        bad_cfg.validate()
+
+
+@pytest.mark.skipif(not HAVE_MLX, reason="needs mlx")
+def test_mlx_critic_head_matches_portable_reference():
+    """Verify MLX DecisionCriticHead execution matches portable critic.py reference (#386)."""
+    from src.model.mlx_backend import DecisionCriticHead as MLXCriticHead
+
+    for prim, n_classes in [("noul", 1), ("score", 4), ("choice", 3)]:
+        cfg = CriticConfig(d_model=64, hidden_dim=16, primitive=prim, n_classes=n_classes, temperature=1.2)
+        ref = DecisionCriticHead(cfg, rng=np.random.default_rng(42))
+        mlx_h = MLXCriticHead(cfg)
+        mlx_h.copy_from_reference(ref)
+
+        x = np.random.default_rng(0).normal(size=(5, 64)).astype(np.float32)
+        y_ref = ref.forward_logits(x)
+        y_mlx = np.array(mlx_h.forward_logits(x))
+        assert np.allclose(y_ref, y_mlx, rtol=1e-4, atol=1e-5)
+
+        # Single vector predictions
+        x_single = x[0]
+        if prim == "noul":
+            res_ref = ref.predict_noul(x_single)
+            res_mlx = mlx_h.predict_noul(x_single)
+            assert np.isclose(res_ref["prob"], res_mlx["prob"], atol=1e-5)
+            assert res_ref["decision"] == res_mlx["decision"]
+        elif prim == "score":
+            res_ref = ref.predict_score(x_single)
+            res_mlx = mlx_h.predict_score(x_single)
+            assert np.isclose(res_ref["score"], res_mlx["score"], atol=1e-5)
+            assert np.allclose(res_ref["probs"], res_mlx["probs"], atol=1e-5)
+        elif prim == "choice":
+            res_ref = ref.predict_choice(x_single)
+            res_mlx = mlx_h.predict_choice(x_single)
+            assert res_ref["choice"] == res_mlx["choice"]
+            assert np.allclose(res_ref["probs"], res_mlx["probs"], atol=1e-5)
+
+
+@pytest.mark.skipif(not HAVE_TORCH, reason="needs torch")
+def test_cuda_critic_head_matches_portable_reference():
+    """Verify CUDA/PyTorch DecisionCriticHead execution matches portable critic.py reference (#386)."""
+    from src.model.cuda_backend import DecisionCriticHead as TorchCriticHead
+
+    for prim, n_classes in [("noul", 1), ("score", 4), ("choice", 3)]:
+        cfg = CriticConfig(d_model=64, hidden_dim=16, primitive=prim, n_classes=n_classes, temperature=1.2)
+        ref = DecisionCriticHead(cfg, rng=np.random.default_rng(42))
+        th_h = TorchCriticHead(cfg)
+        th_h.copy_from_reference(ref)
+
+        x = np.random.default_rng(0).normal(size=(5, 64)).astype(np.float32)
+        y_ref = ref.forward_logits(x)
+        with torch.no_grad():
+            y_th = th_h.forward_logits(torch.from_numpy(x)).detach().cpu().numpy()
+        assert np.allclose(y_ref, y_th, rtol=1e-4, atol=1e-5)
+
+        # Single vector predictions
+        x_single = x[0]
+        if prim == "noul":
+            res_ref = ref.predict_noul(x_single)
+            res_th = th_h.predict_noul(torch.from_numpy(x_single))
+            assert np.isclose(res_ref["prob"], res_th["prob"], atol=1e-5)
+            assert res_ref["decision"] == res_th["decision"]
+        elif prim == "score":
+            res_ref = ref.predict_score(x_single)
+            res_th = th_h.predict_score(torch.from_numpy(x_single))
+            assert np.isclose(res_ref["score"], res_th["score"], atol=1e-5)
+            assert np.allclose(res_ref["probs"], res_th["probs"], atol=1e-5)
+        elif prim == "choice":
+            res_ref = ref.predict_choice(x_single)
+            res_th = th_h.predict_choice(torch.from_numpy(x_single))
+            assert res_ref["choice"] == res_th["choice"]
+            assert np.allclose(res_ref["probs"], res_th["probs"], atol=1e-5)

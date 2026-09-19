@@ -30,6 +30,7 @@
   "moe_impl": "auto",
   "fp8_experts": false,
   "long_ctx_factor": 1.0,
+  "critic_heads": null,
   "dt_min": 0.001,
   "dt_max": 0.1,
   "dt_init_floor": 0.0001
