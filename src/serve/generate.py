@@ -22,6 +22,124 @@ from typing import Callable, List, Optional, Sequence
 import numpy as np
 
 
+class AdaptiveReasoningGate:
+    """Adaptive dual-mode reasoning gate for code generation (#362).
+
+    Suppresses <think> tokens during inline FIM completions to minimize latency,
+    while permitting structured multi-step reasoning traces (<think> ... </think>)
+    bounded by token limits during instruction-driven refactoring and chat.
+    """
+
+    def __init__(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        mode: Optional[str] = None,
+        fim_prefix_ids: Optional[int | Sequence[int] | set[int]] = (1,),
+        think_token_ids: Optional[int | Sequence[int] | set[int]] = None,
+        think_close_ids: Optional[int | Sequence[int] | set[int]] = None,
+        max_reasoning_tokens: Optional[int] = None,
+        decode_fn: Optional[Callable[[Sequence[int]], str]] = None,
+    ):
+        self.prompt_ids = [int(t) for t in prompt_ids]
+        self.max_reasoning_tokens = max_reasoning_tokens
+        self.decode_fn = decode_fn
+
+        def _to_set(val):
+            if val is None:
+                return set()
+            if isinstance(val, int):
+                return {int(val)}
+            return {int(v) for v in val}
+
+        self.fim_prefix_ids = _to_set(fim_prefix_ids)
+        self.think_token_ids = _to_set(think_token_ids)
+        self.think_close_ids = _to_set(think_close_ids)
+
+        self.is_fim = self._detect_fim()
+        if mode is not None:
+            self.mode = mode.lower()
+        elif self.is_fim:
+            self.mode = "direct"
+        else:
+            self.mode = "reasoning"
+
+        self.in_reasoning = False
+        self.reasoning_tokens_count = 0
+        self.reasoning_completed = False
+
+    def _detect_fim(self) -> bool:
+        """Check whether prompt_ids contains a FIM prefix sentinel."""
+        if any(fid in self.prompt_ids for fid in self.fim_prefix_ids):
+            return True
+        if self.decode_fn is not None:
+            try:
+                if "<|fim_prefix|>" in self.decode_fn(self.prompt_ids):
+                    return True
+            except Exception:
+                pass
+        fim_bytes = list(b"<|fim_prefix|>")
+        if len(self.prompt_ids) >= len(fim_bytes):
+            for i in range(len(self.prompt_ids) - len(fim_bytes) + 1):
+                if self.prompt_ids[i : i + len(fim_bytes)] == fim_bytes:
+                    return True
+        return False
+
+    def filter_logits(self, logits: np.ndarray, generated: Sequence[int]) -> np.ndarray:
+        """Filter logits based on mode and reasoning token limits."""
+        row = np.array(logits, copy=True)
+        vocab_size = row.size
+
+        # Direct / FIM mode: strictly disallow reasoning tokens (<think>)
+        if self.mode == "direct" or self.is_fim:
+            for tid in self.think_token_ids:
+                if 0 <= tid < vocab_size:
+                    row[tid] = -np.inf
+            return row
+
+        # Instruction / reasoning mode:
+        # If reasoning already finished in this turn, forbid reopening <think>
+        if self.reasoning_completed:
+            for tid in self.think_token_ids:
+                if 0 <= tid < vocab_size:
+                    row[tid] = -np.inf
+
+        # If inside reasoning trace and token limit reached, force close or suppress
+        if self.in_reasoning and self.max_reasoning_tokens is not None:
+            if self.reasoning_tokens_count >= self.max_reasoning_tokens:
+                if self.think_close_ids:
+                    # Cleanly force </think>
+                    mask = np.full(vocab_size, -np.inf, dtype=np.float32)
+                    for cid in self.think_close_ids:
+                        if 0 <= cid < vocab_size:
+                            mask[cid] = 100.0
+                    return mask
+                else:
+                    for tid in self.think_token_ids:
+                        if 0 <= tid < vocab_size:
+                            row[tid] = -np.inf
+
+        return row
+
+    def record_token(self, token_id: int) -> None:
+        """Advance reasoning state upon emitting token_id."""
+        if token_id in self.think_token_ids:
+            self.in_reasoning = True
+        elif token_id in self.think_close_ids:
+            self.in_reasoning = False
+            self.reasoning_completed = True
+        elif self.in_reasoning:
+            self.reasoning_tokens_count += 1
+
+    def __call__(self, logits: np.ndarray, previous_tokens: Optional[Sequence[int]] = None) -> np.ndarray:
+        generated = (
+            previous_tokens[len(self.prompt_ids):]
+            if previous_tokens is not None and len(previous_tokens) >= len(self.prompt_ids)
+            else []
+        )
+        return self.filter_logits(logits, generated)
+
+
 def generate(
     store,
     session_id: str,
@@ -37,6 +155,13 @@ def generate(
     prefill: bool = True,
     sampler_hook: Optional[Callable[..., Optional[np.ndarray]] | Sequence[Callable[..., Optional[np.ndarray]]]] = None,
     sampler_hooks: Optional[Sequence[Callable[..., Optional[np.ndarray]]]] = None,
+    reasoning_mode: Optional[str] = None,
+    fim_prefix_id: Optional[int | Sequence[int]] = 1,
+    think_token_id: Optional[int | Sequence[int]] = None,
+    think_close_id: Optional[int | Sequence[int]] = None,
+    max_reasoning_tokens: Optional[int] = None,
+    adaptive_reasoning: bool = True,
+    decode_fn: Optional[Callable[[Sequence[int]], str]] = None,
 ) -> List[int]:
     """Generate up to `max_new_tokens` continuation ids for `session_id`.
 
@@ -70,6 +195,10 @@ def generate(
     is True, or `(logits)`. If a hook returns a non-None array, it replaces the logits
     for subsequent hooks and the sampler; returning None leaves logits untouched
     (observational/telemetry hook).
+
+    `adaptive_reasoning` (#362): dual-mode gate suppressing `<think>` tokens during FIM
+    while permitting structured reasoning traces up to `max_reasoning_tokens` during
+    instruction/chat tasks.
     """
     if len(prompt_ids) == 0:
         raise ValueError("prompt_ids must be non-empty")
@@ -90,9 +219,27 @@ def generate(
     if sampler_hooks is not None:
         hooks.extend(sampler_hooks)
 
+    gate: Optional[AdaptiveReasoningGate] = None
+    if adaptive_reasoning and (
+        reasoning_mode is not None
+        or think_token_id is not None
+        or (fim_prefix_id is not None and fim_prefix_id in prompt)
+    ):
+        gate = AdaptiveReasoningGate(
+            prompt_ids=prompt,
+            mode=reasoning_mode,
+            fim_prefix_ids=fim_prefix_id,
+            think_token_ids=think_token_id,
+            think_close_ids=think_close_id,
+            max_reasoning_tokens=max_reasoning_tokens,
+            decode_fn=decode_fn,
+        )
+
     generated: List[int] = []
     for _ in range(max_new_tokens):
         row = to_numpy(logits)[0]  # (1, vocab) -> (vocab,)
+        if gate is not None:
+            row = gate.filter_logits(row, generated)
         for hook in hooks:
             ctx = prompt + generated
             try:
@@ -111,6 +258,8 @@ def generate(
         if eos_id is not None and nxt == eos_id:
             break
         generated.append(nxt)
+        if gate is not None:
+            gate.record_token(nxt)
         if on_token is not None:
             on_token(nxt)
         # Feed the emitted token back BEFORE the stop check so the session state always

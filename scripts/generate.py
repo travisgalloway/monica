@@ -29,7 +29,12 @@ below is importable, and testable, without a backend.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from functools import partial
 from pathlib import Path
 from typing import Callable, Optional
@@ -251,6 +256,14 @@ def main() -> None:
     ap.add_argument("--rewind-depth", type=_nonnegative_int, default=32,
                     help="retained turn boundaries in --interactive mode (LRU-capped; "
                          "0 disables rewind, negative is an error)")
+    ap.add_argument("--reasoning-mode", choices=("auto", "direct", "reasoning"), default="auto",
+                    help="adaptive dual-mode reasoning gate (auto: direct for FIM, reasoning for chat)")
+    ap.add_argument("--max-reasoning-tokens", type=int, default=None,
+                    help="ceiling on reasoning tokens generated within <think>...</think>")
+    ap.add_argument("--fim-prefix", default=None,
+                    help="FIM prefix for inline code completion")
+    ap.add_argument("--fim-suffix", default=None,
+                    help="FIM suffix for inline code completion")
     ap.add_argument("--max-new-tokens", type=int, default=100)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=None)
@@ -272,8 +285,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.chat and args.interactive:
         ap.error("--chat and --interactive are different REPLs; pick one")
-    if not args.chat and not args.interactive and args.prompt is None:
-        ap.error("provide --prompt for completion mode, --chat for the instruction "
+    if not args.chat and not args.interactive and args.prompt is None and args.fim_prefix is None:
+        ap.error("provide --prompt or --fim-prefix for completion mode, --chat for the instruction "
                  "REPL, or --interactive for the stateful continuation REPL")
 
     from src.data.tokenize import (
@@ -317,6 +330,24 @@ def main() -> None:
     store = SessionStore(model, max_concurrent=1)
     to_numpy = backend.to_numpy
 
+    def _resolve_special(text: str) -> Optional[int]:
+        try:
+            ids = tok.encode(text, add_special_tokens=False)
+            if len(ids) == 1:
+                return ids[0]
+        except Exception:
+            pass
+        if hasattr(tok, "convert_tokens_to_ids"):
+            tid = tok.convert_tokens_to_ids(text)
+            if tid is not None and isinstance(tid, int) and tid >= 0:
+                return tid
+        return None
+
+    fim_prefix_id = _resolve_special("<|fim_prefix|>") or 1
+    think_token_id = _resolve_special("<think>")
+    think_close_id = _resolve_special("</think>")
+    reasoning_mode = None if args.reasoning_mode == "auto" else args.reasoning_mode
+
     def run(text: str, *, stop_marker: str | None) -> str:
         """Encode `text`, emit the continuation to stdout, on one fresh session.
 
@@ -344,6 +375,12 @@ def main() -> None:
                     store, sid, ids, sampler=sampler, to_numpy=to_numpy,
                     max_new_tokens=args.max_new_tokens, eos_id=eos_id,
                     pass_context=True,
+                    reasoning_mode=reasoning_mode,
+                    fim_prefix_id=fim_prefix_id,
+                    think_token_id=think_token_id,
+                    think_close_id=think_close_id,
+                    max_reasoning_tokens=args.max_reasoning_tokens,
+                    decode_fn=tok.decode,
                     on_token=lambda t: (sys.stdout.write(tok.decode([t])),
                                         sys.stdout.flush()),
                 )
@@ -352,6 +389,12 @@ def main() -> None:
                     store, sid, ids, sampler=sampler, to_numpy=to_numpy,
                     max_new_tokens=args.max_new_tokens, eos_id=eos_id,
                     pass_context=True,
+                    reasoning_mode=reasoning_mode,
+                    fim_prefix_id=fim_prefix_id,
+                    think_token_id=think_token_id,
+                    think_close_id=think_close_id,
+                    max_reasoning_tokens=args.max_reasoning_tokens,
+                    decode_fn=tok.decode,
                     stop_fn=lambda gen: stop_marker in tok.decode(gen),
                 )
                 out = tok.decode(out_ids)
@@ -420,8 +463,14 @@ def main() -> None:
             reply = run(prompt, stop_marker=INSTRUCTION_MARKER)
             messages.append({"role": "assistant", "content": reply.strip()})
     else:
-        sys.stdout.write(args.prompt)
-        run(args.prompt, stop_marker=None)
+        if args.fim_prefix is not None:
+            prompt = f"<|fim_prefix|>{args.fim_prefix}<|fim_suffix|>{args.fim_suffix or ''}<|fim_middle|>"
+            run(prompt, stop_marker=None)
+        elif args.prompt and "<|fim_prefix|>" in args.prompt:
+            run(args.prompt, stop_marker=None)
+        else:
+            sys.stdout.write(args.prompt)
+            run(args.prompt, stop_marker=None)
 
 
 if __name__ == "__main__":
