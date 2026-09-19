@@ -1,0 +1,41 @@
+"""Alias wrapper exporting safety tests for issue #351."""
+
+from .test_agent_tools_safety import (
+    test_agent_runtime_react_loop_with_safety_and_diagnostics,
+    test_diagnostic_summary_formatting,
+    test_file_read_record_dataclass,
+    test_file_read_registry_registration_and_hash,
+    test_post_edit_diagnostics_json_syntax,
+    test_post_edit_diagnostics_python_clean,
+    test_post_edit_diagnostics_python_syntax_error,
+    test_post_edit_diagnostics_typescript_lsp,
+    test_post_write_diagnostics_python_syntax_error,
+    test_read_before_write_gate_rejects_unread_edit,
+    test_read_before_write_gate_rejects_unread_overwrite,
+    test_resolve_safe_workspace_path_symlink_jailbreak,
+    test_resolve_safe_workspace_path_traversal_jailbreak,
+    test_resolve_safe_workspace_path_valid_paths,
+    test_run_file_diagnostics_direct,
+    test_session_reset_clears_read_registry_requiring_re_read,
+    test_write_new_file_succeeds_and_registers_in_read_registry,
+)
+
+__all__ = [
+    "test_agent_runtime_react_loop_with_safety_and_diagnostics",
+    "test_diagnostic_summary_formatting",
+    "test_file_read_record_dataclass",
+    "test_file_read_registry_registration_and_hash",
+    "test_post_edit_diagnostics_json_syntax",
+    "test_post_edit_diagnostics_python_clean",
+    "test_post_edit_diagnostics_python_syntax_error",
+    "test_post_edit_diagnostics_typescript_lsp",
+    "test_post_write_diagnostics_python_syntax_error",
+    "test_read_before_write_gate_rejects_unread_edit",
+    "test_read_before_write_gate_rejects_unread_overwrite",
+    "test_resolve_safe_workspace_path_symlink_jailbreak",
+    "test_resolve_safe_workspace_path_traversal_jailbreak",
+    "test_resolve_safe_workspace_path_valid_paths",
+    "test_run_file_diagnostics_direct",
+    "test_session_reset_clears_read_registry_requiring_re_read",
+    "test_write_new_file_succeeds_and_registers_in_read_registry",
+]

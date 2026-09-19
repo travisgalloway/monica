@@ -45,6 +45,12 @@ from ..data.tool_sources import (
 from ..eval.bfcl_adapter import parse_tool_calls
 from ..serve.sampling import sample
 from .fetcher import fetch_web_page
+from .safety import (
+    FileReadRegistry,
+    format_diagnostic_summary,
+    resolve_safe_workspace_path,
+    run_file_diagnostics,
+)
 from .search import web_search
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -417,7 +423,15 @@ class AntiSpinCircuitBreaker:
 # --------------------------------------------------------------------------- #
 
 class WorkspaceToolExecutor:
-    """Sandboxed execution provider for CODING_AGENT_TOOLS on a local repository."""
+    """Sandboxed execution provider for CODING_AGENT_TOOLS on a local repository (#349, #351).
+
+    Enforces deterministic safety gates (#351):
+      - Workspace Containment: Path jailbreak checks preventing symlinks or relative
+        traversals outside repository root.
+      - Read-Before-Write Gate: Reject edits and overwrites to files not read in the session.
+      - Immediate Post-Mutation Diagnostics: Fast static analysis and linter feedback
+        attached directly to tool observations.
+    """
 
     def __init__(
         self,
@@ -425,21 +439,42 @@ class WorkspaceToolExecutor:
         timeout_s: float = 30.0,
         *,
         enable_web_tools: bool = True,
+        enforce_read_before_write: bool = True,
+        enable_diagnostic_feedback: bool = True,
+        read_registry: FileReadRegistry | None = None,
+        diagnostic_provider: Any | None = None,
+        ts_lsp_service: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_dir or os.getcwd()).resolve()
         self.timeout_s = float(timeout_s)
         self.enable_web_tools = bool(enable_web_tools)
+        self.enforce_read_before_write = bool(enforce_read_before_write)
+        self.enable_diagnostic_feedback = bool(enable_diagnostic_feedback)
+        self.read_registry = read_registry if read_registry is not None else FileReadRegistry()
+        self.diagnostic_provider = diagnostic_provider
+        self.ts_lsp_service = ts_lsp_service
+
+    def reset(self) -> None:
+        """Reset session-level safety state (read registry and content hashes)."""
+        self.read_registry.clear()
 
     def _resolve_safe_path(self, path_str: str) -> tuple[Path | None, str | None]:
-        """Resolve a workspace path, preventing directory traversal outside root."""
+        """Resolve a workspace path, preventing directory traversal and symlink jailbreaks outside root."""
+        return resolve_safe_workspace_path(path_str, self.workspace_root)
+
+    def _run_diagnostics(self, target: Path, content: str) -> list[dict[str, Any]]:
+        """Run fast post-mutation static analysis and linter diagnostics (#351)."""
+        if not self.enable_diagnostic_feedback:
+            return []
         try:
-            rel = Path(path_str)
-            target = (self.workspace_root / rel).resolve()
-            if not target.is_relative_to(self.workspace_root):
-                return None, f"Security error: path '{path_str}' escapes workspace boundary"
-            return target, None
-        except (ValueError, TypeError, OSError) as e:
-            return None, f"Invalid path '{path_str}': {e}"
+            return run_file_diagnostics(
+                target,
+                content=content,
+                custom_provider=self.diagnostic_provider,
+                ts_lsp_service=self.ts_lsp_service,
+            )
+        except Exception:  # noqa: BLE001
+            return []
 
     def execute_bash(self, command: str) -> dict[str, Any]:
         """Execute a shell command within the repository workspace."""
@@ -477,15 +512,20 @@ class WorkspaceToolExecutor:
         """View content lines of a file in the workspace."""
         target, err = self._resolve_safe_path(path)
         if err or target is None:
-            return {"error": err, "is_error": True}
+            return {"error": err, "is_error": True, "safety_violation": "path_jailbreak"}
 
         if not target.is_file():
             return {"error": f"File not found: {path}", "is_error": True}
 
         try:
             with open(target, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+                content = f.read()
 
+            rel_path = str(target.relative_to(self.workspace_root))
+            # Register in session read registry with SHA-256 content hash (#351)
+            self.read_registry.register_read(rel_path, content)
+
+            lines = content.splitlines(keepends=True)
             total_lines = len(lines)
             s_idx = max(1, int(start_line)) if start_line is not None else 1
             e_idx = min(total_lines, int(end_line)) if end_line is not None else total_lines
@@ -497,7 +537,7 @@ class WorkspaceToolExecutor:
 
             numbered = [f"{s_idx + i}: {line}" for i, line in enumerate(selected_lines)]
             return {
-                "path": str(target.relative_to(self.workspace_root)),
+                "path": rel_path,
                 "total_lines": total_lines,
                 "start_line": s_idx,
                 "end_line": e_idx,
@@ -508,13 +548,26 @@ class WorkspaceToolExecutor:
             return {"error": f"Failed to read file {path}: {e}", "is_error": True}
 
     def edit_file(self, path: str, old_str: str, new_str: str) -> dict[str, Any]:
-        """Replace a unique occurrence of old_str with new_str in a workspace file."""
+        """Replace a unique occurrence of old_str with new_str in a workspace file (#351)."""
         target, err = self._resolve_safe_path(path)
         if err or target is None:
-            return {"error": err, "is_error": True}
+            return {"error": err, "is_error": True, "safety_violation": "path_jailbreak"}
 
         if not target.is_file():
             return {"error": f"File not found: {path}", "is_error": True}
+
+        rel_path = str(target.relative_to(self.workspace_root))
+
+        # Read-before-write safety gate (#351)
+        if self.enforce_read_before_write and not self.read_registry.is_read(rel_path):
+            return {
+                "error": (
+                    f"Read-before-write safety violation: file '{path}' has not been read in this session. "
+                    f"Use view_file to inspect the file before modifying it."
+                ),
+                "is_error": True,
+                "safety_violation": "unread_file",
+            }
 
         try:
             with open(target, "r", encoding="utf-8") as f:
@@ -536,13 +589,71 @@ class WorkspaceToolExecutor:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(updated)
 
+            # Update session read registry with new content hash (#351)
+            self.read_registry.register_write(rel_path, updated)
+
+            # Post-mutation diagnostic feedback (#351)
+            diagnostics = self._run_diagnostics(target, updated)
+            msg = f"Successfully edited {path}"
+            if diagnostics:
+                summary = format_diagnostic_summary(diagnostics)
+                msg = f"{msg}. {summary}"
+
             return {
                 "status": "ok",
-                "path": str(target.relative_to(self.workspace_root)),
-                "message": f"Successfully edited {path}",
+                "path": rel_path,
+                "message": msg,
+                "diagnostics": diagnostics,
             }
         except (OSError, UnicodeDecodeError) as e:
             return {"error": f"Failed to edit file {path}: {e}", "is_error": True}
+
+    def write_file(self, path: str, content: str) -> dict[str, Any]:
+        """Write or overwrite content to a workspace file (#351)."""
+        target, err = self._resolve_safe_path(path)
+        if err or target is None:
+            return {"error": err, "is_error": True, "safety_violation": "path_jailbreak"}
+
+        rel_path = str(target.relative_to(self.workspace_root))
+
+        # Read-before-write safety check (#351): existing files must be read before overwrite
+        if (
+            self.enforce_read_before_write
+            and target.is_file()
+            and not self.read_registry.is_read(rel_path)
+        ):
+            return {
+                    "error": (
+                        f"Read-before-write safety violation: file '{path}' already exists but has not been read in this session. "
+                        f"Use view_file to inspect the file before overwriting it."
+                    ),
+                    "is_error": True,
+                    "safety_violation": "unread_file",
+                }
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # Update session read registry with new content hash (#351)
+            self.read_registry.register_write(rel_path, content)
+
+            # Post-mutation diagnostic feedback (#351)
+            diagnostics = self._run_diagnostics(target, content)
+            msg = f"Successfully wrote {path}"
+            if diagnostics:
+                summary = format_diagnostic_summary(diagnostics)
+                msg = f"{msg}. {summary}"
+
+            return {
+                "status": "ok",
+                "path": rel_path,
+                "message": msg,
+                "diagnostics": diagnostics,
+            }
+        except (OSError, UnicodeEncodeError) as e:
+            return {"error": f"Failed to write file {path}: {e}", "is_error": True}
 
     def grep_search(self, query: str, path: str | None = None) -> dict[str, Any]:
         """Search for a regex or string pattern across files in the workspace."""
@@ -550,7 +661,7 @@ class WorkspaceToolExecutor:
         if path:
             target, err = self._resolve_safe_path(path)
             if err or target is None:
-                return {"error": err, "is_error": True}
+                return {"error": err, "is_error": True, "safety_violation": "path_jailbreak"}
             search_dir = target
 
         results: list[dict[str, Any]] = []
@@ -595,7 +706,7 @@ class WorkspaceToolExecutor:
         if dir:
             target, err = self._resolve_safe_path(dir)
             if err or target is None:
-                return {"error": err, "is_error": True}
+                return {"error": err, "is_error": True, "safety_violation": "path_jailbreak"}
             search_dir = target
 
         results: list[str] = []
@@ -634,6 +745,11 @@ class WorkspaceToolExecutor:
                 path=str(args.get("path", "")),
                 old_str=str(args.get("old_str", "")),
                 new_str=str(args.get("new_str", "")),
+            )
+        elif name == "write_file":
+            return self.write_file(
+                path=str(args.get("path", "")),
+                content=str(args.get("content", "")),
             )
         elif name == "grep_search":
             return self.grep_search(query=str(args.get("query", "")), path=args.get("path"))
@@ -931,8 +1047,12 @@ class AgentRuntime:
         turn_budget = int(max_turns) if max_turns is not None else self.max_turns
         start_time = time.monotonic()
 
-        # Reset anti-spin circuit breaker for this run
+        # Reset anti-spin circuit breaker and session safety state for this run (#351)
         self.circuit_breaker.reset()
+        if hasattr(self.tool_executor, "reset") and callable(self.tool_executor.reset):
+            self.tool_executor.reset()
+        elif hasattr(self.tool_executor, "read_registry") and hasattr(self.tool_executor.read_registry, "clear"):
+            self.tool_executor.read_registry.clear()
 
         # Build initial messages
         system_content = render_tool_system(self.tools, preamble=self.system_prompt)

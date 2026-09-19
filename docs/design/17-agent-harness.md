@@ -1,6 +1,6 @@
-# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, and Native Web Tools (#349, #350, #366, #367)
+# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, Native Web Tools, and Safety Gates (#349, #350, #351, #366, #367)
 
-This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), and native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367) above the hardware seam.
+This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367), and deterministic safety gates (`src/agent/safety.py`, #351) above the hardware seam.
 
 ## 1. Autonomous Multi-Turn Execution Loop (`src/agent/runtime.py`)
 
@@ -227,3 +227,64 @@ Evaluation in arXiv:2609.20804 confirmed that models virtually never invoke exte
 ### Telemetry and Integration
 
 `AgentRuntime` evaluates `ContextCompactor` at the start of each turn. When compaction occurs, the runtime appends a `compaction` phase transition to the active turn and logs a `context_compacted` telemetry event containing pre-compaction and post-compaction token counts, elided observation counts, elided character totals, and summarized turn counts.
+
+## 6. Deterministic Safety Gates and Immediate Diagnostic Feedback (#351)
+
+In arXiv:2609.20804, orthogonal deterministic substrate guards proved crucial for harness reliability by surfacing errors immediately and preventing destructive actions:
+1. **Immediate Post-Edit Diagnostic Feedback**: In `edit_file` and `write_file` tool handlers, the harness automatically runs fast static analysis and linter diagnostics immediately upon file mutation. Diagnostic findings are appended directly to the tool observation returned to the agent, catching syntax errors and undefined symbols before the agent attempts expensive test runs.
+2. **Read-Before-Write Safety Gate**: A session-scoped `FileReadRegistry` maintains records of all files read during the active session along with their SHA-256 content hashes. Edits or writes targeting existing files that have not been read in the current session are rejected with an informative error message prompting the agent to view the file first.
+3. **Workspace Containment**: Strict path containment checks prevent relative traversal escapes (`..`), absolute path escapes outside the workspace boundary, and symlink jailbreaks (including traversing through symlinks pointing outside the repository root).
+
+### Read-Before-Write Safety Registry (`FileReadRegistry`)
+
+The registry maintains in-memory records of accessed files:
+- `register_read(path, content)`: Computes SHA-256 digest of file content and registers read timestamp and size.
+- `register_write(path, content)`: Updates the recorded SHA-256 digest following a successful mutation, allowing subsequent mutations in the same session without redundant reads.
+- `is_read(path)`: Verifies whether the target path was accessed during the current session.
+- `reset()`: Invoked at the start of each `AgentRuntime.run()` session to ensure read records are strictly session-scoped.
+
+When an edit or overwrite targets an unread existing file, the tool handler rejects the action:
+
+```json
+{
+  "error": "Read-before-write safety violation: file 'module.py' has not been read in this session. Use view_file to inspect the file before modifying it.",
+  "is_error": true,
+  "safety_violation": "unread_file"
+}
+```
+
+### Immediate Post-Mutation Diagnostic Feedback (`run_file_diagnostics`)
+
+Upon writing or editing a file on disk, `WorkspaceToolExecutor` automatically invokes fast static analysis:
+- **Python (`.py`, `.pyi`)**: Executes `ruff check --output-format=json --stdin-filename <path> -` over stdin. If `ruff` is unavailable, falls back to `pyflakes` or `ast.parse` syntax checking. Syntax errors and linter issues are parsed into structured items (`line`, `column`, `message`, `code`, `severity`, `source`).
+- **TypeScript / JavaScript (`.ts`, `.tsx`, `.js`, `.jsx`)**: Dispatches to `TsLspService` (or custom diagnostic providers), invoking `service.update(path, content)` and querying `service.diagnostics(path)`.
+- **JSON (`.json`)**: Validates JSON syntax via standard library `json.loads`.
+- Findings are attached to the tool observation payload in `diagnostics` and summarized in `message`.
+
+```json
+{
+  "status": "ok",
+  "path": "app.py",
+  "message": "Successfully edited app.py. Static analysis: 1 issue(s) detected. Line 1: [invalid-syntax] Expected a parameter or the end of the parameter list",
+  "diagnostics": [
+    {
+      "line": 1,
+      "column": 12,
+      "message": "Expected a parameter or the end of the parameter list",
+      "code": "invalid-syntax",
+      "severity": "error",
+      "source": "ruff"
+    }
+  ]
+}
+```
+
+### Workspace Containment (`resolve_safe_workspace_path`)
+
+All path-accepting tools (`view_file`, `edit_file`, `write_file`, `find_files`, `grep_search`) resolve paths via `resolve_safe_workspace_path(path_str, workspace_root)`:
+- `Path.resolve()` canonicalizes paths, fully expanding symlinks and normalizing `..`.
+- Rejects paths where `candidate.is_relative_to(workspace_root)` is `False`.
+- Rejects non-existent files targeted through symlinked external parent directories.
+- Rejects empty strings and paths containing null bytes (`\x00`).
+- Rejections return structured error objects with `"safety_violation": "path_jailbreak"`.
+
