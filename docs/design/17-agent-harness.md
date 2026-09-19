@@ -1,6 +1,6 @@
-# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, and Native Web Tools (#349, #366, #367)
+# Agent Harness: Autonomous Execution Loop, Anti-Spin Circuit Breakers, Staged Context Compaction, and Native Web Tools (#349, #350, #366, #367)
 
-This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), and native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367) above the hardware seam.
+This document describes how the Monica agent harness implements autonomous multi-turn ReAct execution loops (`src/agent/runtime.py`, #349), anti-spin circuit breakers (#349), staged context compaction (`src/agent/compaction.py`, #350), and native web tools (`src/agent/search.py`, `src/agent/fetcher.py`, #366, #367) above the hardware seam.
 
 ## 1. Autonomous Multi-Turn Execution Loop (`src/agent/runtime.py`)
 
@@ -180,3 +180,50 @@ The agent harness operates in automated ReAct loops where network interruptions 
 1. **Hard Request Timeouts**: Default 5.0 seconds for `web_search` and 8.0 seconds for `fetch_web_page`.
 2. **In-Turn Deduplication**: Both clients maintain in-memory session caches to serve repeated identical requests instantly without repeating network traffic.
 3. **Structured Error Reporting**: Network errors, HTTP status errors, and timeouts return structured result objects with explanatory error messages rather than unhandled exceptions.
+
+
+## 5. Staged Context Compaction (T4: Soft Elision and Hard Summarization, #350)
+
+Empirical findings from arXiv:2609.20804 show that staged two-tier context compaction (T4) delivers the lowest token consumption across benchmarks while matching full-context accuracy. The compaction pipeline combines rule-based observation elision at a soft threshold with language-model summarization at a hard threshold.
+
+```
++-----------------------------------------------------------------------------+
+|                     Staged Context Compaction Pipeline                      |
+|                                                                             |
+|  1. Ingestion: Partition history into Preamble, Middle Turns, Recent Window  |
+|                                                                             |
+|  2. Check Soft Threshold (~0.60 usable context budget):                     |
+|       - If context <= soft threshold: retain history unchanged.             |
+|       - If context > soft threshold: trigger Soft Elision (M1).             |
+|         Replace bulky middle observations with [Output elided: N chars].    |
+|                                                                             |
+|  3. Check Hard Threshold (~0.85 usable context budget):                     |
+|       - If context <= hard threshold after elision: complete compaction.    |
+|       - If context > hard threshold: trigger Hard Summarization (M3).       |
+|         Compress oldest middle turns into a concise narrative summary.      |
+|                                                                             |
+|  4. Invariant: System preamble and recent turns (>= 2) preserved verbatim.  |
++-----------------------------------------------------------------------------+
+```
+
+### Two-Tier Compaction Stages
+
+1. **Soft Threshold Elision (M1, ~0.60 Usable Context)**:
+   When conversation token usage exceeds the configured soft threshold (default 0.60 of `max_context_tokens`), the compactor inspects observation messages in the middle region. Bulky observation bodies, such as compiler build logs, test outputs, and large file reads exceeding `elision_char_threshold` (default 200 characters), are replaced with `[Output elided: N chars]`, where N records the original character count. This operation incurs zero compute or API cost.
+
+2. **Hard Threshold Summarization (M3, ~0.85 Usable Context)**:
+   If conversation token count continues to exceed the hard threshold (default 0.85 of `max_context_tokens`) after soft elision, the compactor invokes language-model summarization. It extracts actions, tool invocations, and key findings from the oldest middle turns and compresses them into a concise narrative summary message (`[Context Summary: <narrative>]`). If no external language model is supplied, the compactor generates a deterministic extractive narrative summary.
+
+### Protected Window Invariant
+
+The compactor enforces a strict window preservation invariant:
+1. **System Preamble**: The initial system instructions and the first user message containing the task prompt are never elided or summarized. They are strictly preserved verbatim.
+2. **Recent Window**: The most recent >= 2 turns (default `protect_recent_turns = 2`, approximately 0.30 usable context) are never elided or summarized. Even if an observation in the recent window exceeds the elision threshold, it remains intact to ensure immediate conversational context is available to the model.
+
+### Omission of Lossless Recall Machinery
+
+Evaluation in arXiv:2609.20804 confirmed that models virtually never invoke external retrieval tools (`recall_event`) when offered (-0.36% net delta; median calls = 0). Maintaining vector indices, disk caches, and additional tool definitions introduces cognitive distraction in model decision-making and adds prompt token overhead. The implementation explicitly omits recall tools and storage caches.
+
+### Telemetry and Integration
+
+`AgentRuntime` evaluates `ContextCompactor` at the start of each turn. When compaction occurs, the runtime appends a `compaction` phase transition to the active turn and logs a `context_compacted` telemetry event containing pre-compaction and post-compaction token counts, elided observation counts, elided character totals, and summarized turn counts.

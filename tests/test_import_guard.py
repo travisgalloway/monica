@@ -62,6 +62,7 @@ PORTABLE_MODULES = [
     "src.agent.fetcher",
     "src.agent.search",
     "src.agent.runtime",
+    "src.agent.compaction",
     "src.data.sft_data",
     "src.data.sft_loader",
     "src.data.sft_corpus",
