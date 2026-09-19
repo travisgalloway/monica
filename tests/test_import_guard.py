@@ -64,6 +64,7 @@ PORTABLE_MODULES = [
     "src.agent.runtime",
     "src.agent.compaction",
     "src.agent.safety",
+    "src.agent.planning",
     "src.data.sft_data",
     "src.data.sft_loader",
     "src.data.sft_corpus",

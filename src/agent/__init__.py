@@ -1,4 +1,4 @@
-"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #351, #366, #367)."""
+"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #351, #352, #366, #367)."""
 
 from .compaction import (
     CompactionConfig,
@@ -9,6 +9,13 @@ from .compaction import (
     partition_conversation,
 )
 from .fetcher import FetchResult, PageFetcherClient, fetch_web_page
+from .planning import (
+    PlanItem,
+    PlanManager,
+    PlanningPolicy,
+    parse_plan_markdown,
+    resolve_planning_policy,
+)
 from .runtime import (
     AgentRunResult,
     AgentRuntime,
@@ -48,6 +55,9 @@ __all__ = [
     "InMemoryTrajectoryLogger",
     "JsonlTrajectoryLogger",
     "PageFetcherClient",
+    "PlanItem",
+    "PlanManager",
+    "PlanningPolicy",
     "SearchResult",
     "ToolCall",
     "ToolObservation",
@@ -55,7 +65,9 @@ __all__ = [
     "estimate_tokens",
     "fetch_web_page",
     "format_diagnostic_summary",
+    "parse_plan_markdown",
     "partition_conversation",
+    "resolve_planning_policy",
     "resolve_safe_workspace_path",
     "run_agent_loop",
     "run_file_diagnostics",

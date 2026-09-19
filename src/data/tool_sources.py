@@ -228,6 +228,47 @@ FETCH_WEB_PAGE_TOOL: dict = {
     },
 }
 
+# Native plan state mutation tool schema (#352)
+UPDATE_PLAN_TOOL: dict = {
+    "name": "update_plan",
+    "description": "Update plan checklist item states ([ ] -> [x]) or initialize the execution plan",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "step": {
+                "type": "integer",
+                "description": "1-based index of the plan step to update",
+            },
+            "completed": {
+                "type": "boolean",
+                "description": "Whether the plan step is completed (true for [x], false for [ ])",
+                "default": True,
+            },
+            "plan": {
+                "type": "string",
+                "description": "Optional markdown checklist to initialize or replace the plan (- [ ] / - [x])",
+            },
+            "steps": {
+                "type": "array",
+                "description": "Optional list of step descriptions to initialize the plan",
+                "items": {"type": "string"},
+            },
+            "updates": {
+                "type": "array",
+                "description": "Optional batch list of updates: [{'step': 1, 'completed': true}]",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "integer"},
+                        "completed": {"type": "boolean"},
+                    },
+                    "required": ["step"],
+                },
+            },
+        },
+    },
+}
+
 _DISTRACTOR_POOL: List[dict] = [
     {"name": "send_email", "description": "Send an email to a recipient",
      "parameters": {"type": "object",
