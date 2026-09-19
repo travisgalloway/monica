@@ -94,12 +94,19 @@ public struct FIMOptions {
 /// short/sentinel filters and therefore got a rate roll; `transformed` is the subset the roll
 /// selected. Skips are reported, never silent — a corpus that silently stopped being FIM'd would
 /// be indistinguishable from one that never was.
-public struct FIMStats {
+public struct FIMStats: Sendable {
     public var eligible: Int = 0
     public var transformed: Int = 0
     public var skippedShort: Int = 0
     public var skippedSentinel: Int = 0
     public init() {}
+
+    public mutating func add(_ other: FIMStats) {
+        eligible += other.eligible
+        transformed += other.transformed
+        skippedShort += other.skippedShort
+        skippedSentinel += other.skippedSentinel
+    }
 }
 
 public enum FIM {
@@ -114,6 +121,14 @@ public enum FIM {
         let idx = UInt64(bitPattern: Int64(index))
         var g = SplitMix64(seed: globalSeed &+ (idx &* 0x9E37_79B9_7F4A_7C15))
         return g.next()
+    }
+
+    /// Token ids for one document, returning a local `FIMStats` struct (thread-safe for concurrent tasks).
+    public static func transform(document: String, index: Int, tokenizer: Tokenizer,
+                                 options: FIMOptions) -> (tokens: [Int], stats: FIMStats) {
+        var stats = FIMStats()
+        let tokens = transform(document: document, index: index, tokenizer: tokenizer, options: options, stats: &stats)
+        return (tokens, stats)
     }
 
     /// Token ids for one document, FIM-transformed with probability `options.rateBasisPoints`.
@@ -143,11 +158,12 @@ public enum FIM {
         // split out into a real sentinel id by `Tokenizer.encode` (Tokenizer.swift:70-84), which
         // would corrupt the PSM frame — two `<|fim_prefix|>` ids in one stream, or a sentinel
         // inside the middle span. Skip FIM for that document; never emit a malformed frame.
-        // The scan is on raw UTF-8 bytes (not `String.contains`, which compares Characters and
-        // therefore drags in grapheme/canonical-equivalence tables) to keep it platform-stable.
-        for special in tokenizer.specials where containsSubsequence(bytes, Array(special.text.utf8)) {
-            stats.skippedSentinel += 1
-            return tokenizer.encode(document)
+        // Fast path: if bytes contains no '<', none of the special sentinel strings can appear.
+        if bytes.contains(UInt8(ascii: "<")) {
+            for special in tokenizer.specials where containsSubsequence(bytes, Array(special.text.utf8)) {
+                stats.skippedSentinel += 1
+                return tokenizer.encode(document)
+            }
         }
 
         stats.eligible += 1

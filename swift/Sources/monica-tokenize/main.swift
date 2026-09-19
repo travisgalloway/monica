@@ -226,7 +226,7 @@ func cmdDecode(_ flags: [String: String]) {
     print(tok.decode(ids), terminator: "")
 }
 
-func cmdPack(_ flags: [String: String]) {
+func cmdPack(_ flags: [String: String]) async {
     let tok = loadTokenizer(flags)
     guard let inPath = flags["in"] else { fail("pack: --in <jsonl|txt> is required") }
     guard let outPath = flags["out"] else { fail("pack: --out <dir> is required") }
@@ -250,16 +250,39 @@ func cmdPack(_ flags: [String: String]) {
 
     let docs = readDocs(inPath)
     let eos = tok.eosTokenId
-    var tokenized: [[Int]] = []
-    tokenized.reserveCapacity(docs.count)
-    for (i, doc) in docs.enumerated() {
-        // The index is `readDocs`'s, which is stable regardless of which docs `pack` later drops
-        // as empty — so a document's FIM outcome never depends on its neighbours.
-        var ids = FIM.transform(document: doc, index: i, tokenizer: tok,
-                                options: fimOptions, stats: &fimStats)
-        ids.append(eos)
-        tokenized.append(ids)
+    var tokenized = [[Int]](repeating: [], count: docs.count)
+    let limit = max(1, ProcessInfo.processInfo.activeProcessorCount)
+
+    await withTaskGroup(of: (Int, [Int], FIMStats).self) { group in
+        var next = 0
+        while next < docs.count && next < limit {
+            let i = next
+            group.addTask {
+                var localStats = FIMStats()
+                var ids = FIM.transform(document: docs[i], index: i, tokenizer: tok,
+                                        options: fimOptions, stats: &localStats)
+                ids.append(eos)
+                return (i, ids, localStats)
+            }
+            next += 1
+        }
+        for await (i, ids, localStats) in group {
+            tokenized[i] = ids
+            fimStats.add(localStats)
+            if next < docs.count {
+                let j = next
+                group.addTask {
+                    var localStats = FIMStats()
+                    var ids = FIM.transform(document: docs[j], index: j, tokenizer: tok,
+                                            options: fimOptions, stats: &localStats)
+                    ids.append(eos)
+                    return (j, ids, localStats)
+                }
+                next += 1
+            }
+        }
     }
+
     do {
         let m = try Packing.pack(docs: tokenized, outDir: URL(fileURLWithPath: outPath),
                                  seqLen: seqLen, shardSizeMB: shardMB,
@@ -400,7 +423,7 @@ switch cmd {
 case "train":  cmdTrain(flags)
 case "encode": cmdEncode(flags)
 case "decode": cmdDecode(flags)
-case "pack":   cmdPack(flags)
+case "pack":   await cmdPack(flags)
 case "stats":  await cmdStats(flags)
 default:       fail("unknown subcommand '\(cmd)' (train|encode|decode|pack|stats)")
 }

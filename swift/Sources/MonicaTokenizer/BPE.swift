@@ -10,67 +10,72 @@
 public final class BPE: @unchecked Sendable {   // immutable after init → safe to share
 
     let specialCount: Int
-    let mergeRank: [UInt64: Int]      // packed pair → merge order index (lower = earlier)
-    let pairToMerged: [UInt64: Int]   // packed pair → resulting merged token id
+    let baseOffset: Int
+    let mergeRank: [UInt32: Int]      // packed pair (UInt32: a << 16 | b) → merge order index (lower = earlier)
     let idToBytes: [[UInt8]]          // token id → its raw bytes (for decode)
     public let vocabSize: Int
 
-    /// Pack an ordered id pair into one `UInt64` key. Token ids must fit in `UInt32`; the code
-    /// tokenizer's vocab is ≤ 65536 (the uint16 packing cap, #191/#251) — far within that bound.
+    /// Pack an ordered id pair into one `UInt64` key (for backward compatibility).
     @inline(__always)
     public static func key(_ a: Int, _ b: Int) -> UInt64 {
         (UInt64(UInt32(a)) << 32) | UInt64(UInt32(b))
     }
 
+    /// Fast 32-bit key packing for tokens <= 65536.
+    @inline(__always)
+    public static func key32(_ a: Int, _ b: Int) -> UInt32 {
+        (UInt32(a) << 16) | UInt32(b)
+    }
+
     public init(format: TokenizerFormat) {
         let sc = format.specialTokens.count
-        let baseOffset = sc + 256
+        let base = sc + 256
         specialCount = sc
+        baseOffset = base
 
         var idBytes: [[UInt8]] = []
-        idBytes.reserveCapacity(baseOffset + format.merges.count)
+        idBytes.reserveCapacity(base + format.merges.count)
         for s in format.specialTokens { idBytes.append(Array(s.utf8)) }   // specials
         for v in 0..<256 { idBytes.append([UInt8(v)]) }                   // base bytes
 
-        var rank: [UInt64: Int] = [:]
-        var p2m: [UInt64: Int] = [:]
+        var rank: [UInt32: Int] = [:]
         rank.reserveCapacity(format.merges.count)
-        p2m.reserveCapacity(format.merges.count)
         for (m, pair) in format.merges.enumerated() {
             let a = pair[0], b = pair[1]
             idBytes.append(idBytes[a] + idBytes[b])
-            let k = BPE.key(a, b)
-            rank[k] = m
-            p2m[k] = baseOffset + m
+            rank[BPE.key32(a, b)] = m
         }
 
         mergeRank = rank
-        pairToMerged = p2m
         idToBytes = idBytes
         vocabSize = idBytes.count
     }
 
-    /// Encode one pre-token's raw bytes, appending its ids to `out`. Repeatedly applies the
-    /// adjacent pair with the lowest merge rank (a linear min-scan — pre-tokens are short, so
-    /// this beats a heap in practice) until no adjacent pair has a rank.
+    /// Encode one pre-token's raw bytes, appending its ids to `out`.
     public func encodePretoken(_ bytes: [UInt8], into out: inout [Int]) {
-        if bytes.isEmpty { return }
-        let byteOffset = specialCount
         var syms: [Int] = []
         syms.reserveCapacity(bytes.count)
+        encodePretoken(bytes, syms: &syms, into: &out)
+    }
+
+    /// Encode one pre-token's raw bytes using a caller-supplied scratch buffer to avoid heap allocations.
+    public func encodePretoken(_ bytes: [UInt8], syms: inout [Int], into out: inout [Int]) {
+        if bytes.isEmpty { return }
+        syms.removeAll(keepingCapacity: true)
+        let byteOffset = specialCount
         for b in bytes { syms.append(byteOffset + Int(b)) }
 
         while syms.count >= 2 {
             var bestRank = Int.max
             var bestPos = -1
             for p in 0..<(syms.count - 1) {
-                if let r = mergeRank[BPE.key(syms[p], syms[p + 1])], r < bestRank {
+                if let r = mergeRank[BPE.key32(syms[p], syms[p + 1])], r < bestRank {
                     bestRank = r
                     bestPos = p
                 }
             }
             if bestPos < 0 { break }
-            syms[bestPos] = pairToMerged[BPE.key(syms[bestPos], syms[bestPos + 1])]!
+            syms[bestPos] = baseOffset + bestRank
             syms.remove(at: bestPos + 1)
         }
         out.append(contentsOf: syms)

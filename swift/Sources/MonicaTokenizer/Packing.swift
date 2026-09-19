@@ -83,13 +83,16 @@ public enum Packing {
 
         func emit(_ count: Int) throws {
             let name = String(format: "part-%05d", idx)
-            var data = Data(); data.reserveCapacity(count * 2)
-            for t in 0..<count {
-                let v = tokBuf[t]
-                data.append(UInt8(v & 0xff)); data.append(UInt8(v >> 8))   // little-endian
+            let binURL = outDir.appendingPathComponent("\(name).bin")
+            let boundsURL = outDir.appendingPathComponent("\(name).bounds")
+
+            // Direct buffer write (UInt16 is native little-endian on all target platforms: arm64 & x86_64)
+            try tokBuf[0..<count].withUnsafeBufferPointer { ptr in
+                let bytePtr = UnsafeRawBufferPointer(start: ptr.baseAddress, count: count * bytesPerToken)
+                let data = Data(bytes: bytePtr.baseAddress!, count: count * bytesPerToken)
+                try data.write(to: binURL)
             }
-            try data.write(to: outDir.appendingPathComponent("\(name).bin"))
-            try Data(bndBuf[0..<count]).write(to: outDir.appendingPathComponent("\(name).bounds"))
+            try Data(bndBuf[0..<count]).write(to: boundsURL)
             let seq = count / seqLen
             shards.append(ShardInfo(name: name, n_sequences: seq, n_tokens: count))
             idx += 1; nSeqs += seq; nTokens += count
@@ -102,14 +105,14 @@ public enum Packing {
             var ids = doc
             if let ca = chunkAlign {
                 let rem = ids.count % ca
-                if rem != 0 { ids += Array(repeating: padId, count: ca - rem) }
+                if rem != 0 { ids.append(contentsOf: repeatElement(padId, count: ca - rem)) }
             }
             for v in ids {
                 guard v >= 0 && v <= 0xffff else { throw PackingError.tokenOutOfRange(v) }
                 tokBuf.append(UInt16(v))
             }
             bndBuf.append(1)
-            if ids.count > 1 { bndBuf.append(contentsOf: Array(repeating: 0, count: ids.count - 1)) }
+            if ids.count > 1 { bndBuf.append(contentsOf: repeatElement(0, count: ids.count - 1)) }
             while tokBuf.count >= budget { try emit(budget) }
         }
         let full = (tokBuf.count / seqLen) * seqLen   // flush remaining complete sequences

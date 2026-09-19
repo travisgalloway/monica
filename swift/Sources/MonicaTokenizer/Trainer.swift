@@ -38,18 +38,22 @@ public enum Trainer {
             (bytes.map { specialCount + Int($0) }, count)
         }
 
-        // 3. Greedily merge the most frequent adjacent pair until the vocab is full.
+        // 3. Precompute pair counts and inverted word index.
+        var pairCounts: [UInt64: Int] = [:]
+        var pairToWords: [UInt64: [Int]] = [:]
+        for (wi, w) in words.enumerated() where w.syms.count >= 2 {
+            for p in 0..<(w.syms.count - 1) {
+                let k = BPE.key(w.syms[p], w.syms[p + 1])
+                pairCounts[k, default: 0] += w.count
+                pairToWords[k, default: []].append(wi)
+            }
+        }
+
+        // 4. Greedily merge the most frequent adjacent pair until the vocab is full.
         var merges: [[Int]] = []
         let targetMerges = max(0, vocabSize - baseOffset)
-        for _ in 0..<targetMerges {
-            var pairCounts: [UInt64: Int] = [:]
-            for w in words where w.syms.count >= 2 {
-                for p in 0..<(w.syms.count - 1) {
-                    pairCounts[BPE.key(w.syms[p], w.syms[p + 1]), default: 0] += w.count
-                }
-            }
-            if pairCounts.isEmpty { break }
 
+        for _ in 0..<targetMerges {
             // Deterministic pick: max count, tie → smaller packed key.
             var bestKey: UInt64 = .max
             var bestCount = 0
@@ -57,14 +61,44 @@ public enum Trainer {
                 bestCount = c
                 bestKey = k
             }
+            if bestCount <= 0 { break }
 
             let a = Int(bestKey >> 32)
             let b = Int(bestKey & 0xffff_ffff)
             let newId = baseOffset + merges.count
             merges.append([a, b])
+            pairCounts.removeValue(forKey: bestKey)
 
-            for wi in 0..<words.count {
-                words[wi].syms = applyMerge(words[wi].syms, a: a, b: b, newId: newId)
+            guard let affected = pairToWords.removeValue(forKey: bestKey) else { continue }
+            var seenWords = Set<Int>()
+            for wi in affected {
+                if !seenWords.insert(wi).inserted { continue }
+                let oldSyms = words[wi].syms
+                guard oldSyms.count >= 2 else { continue }
+                let count = words[wi].count
+
+                // Subtract old pairs
+                for p in 0..<(oldSyms.count - 1) {
+                    let k = BPE.key(oldSyms[p], oldSyms[p + 1])
+                    if let cur = pairCounts[k] {
+                        let updated = cur - count
+                        if updated <= 0 { pairCounts.removeValue(forKey: k) }
+                        else { pairCounts[k] = updated }
+                    }
+                }
+
+                // Apply merge
+                let newSyms = applyMerge(oldSyms, a: a, b: b, newId: newId)
+                words[wi].syms = newSyms
+
+                // Add new pairs
+                if newSyms.count >= 2 {
+                    for p in 0..<(newSyms.count - 1) {
+                        let k = BPE.key(newSyms[p], newSyms[p + 1])
+                        pairCounts[k, default: 0] += count
+                        pairToWords[k, default: []].append(wi)
+                    }
+                }
             }
         }
 

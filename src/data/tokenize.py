@@ -100,34 +100,76 @@ class ByteTokenizer:
         return bytes(int(i) & 0xFF for i in ids).decode("utf-8", "replace")
 
 
-def tokenize_texts(texts: Iterable[str], tokenizer, stats: dict | None = None) -> Iterable[int]:
+def _encode_batch_docs(batch: List[str], tokenizer, eos: int | None, stats: dict | None = None) -> List[List[int]]:
+    """Encode a batch of documents using tokenizer's fast batched interface."""
+    if stats is not None:
+        stats["n_bytes"] += sum(len(t.encode("utf-8")) for t in batch)
+    encoded = tokenizer(batch, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    out: List[List[int]] = []
+    for ids in encoded:
+        doc_ids = list(ids)
+        if eos is not None:
+            doc_ids.append(eos)
+        if doc_ids:
+            out.append(doc_ids)
+    return out
+
+
+def tokenize_texts(texts: Iterable[str], tokenizer, stats: dict | None = None, batch_size: int = 1000) -> Iterable[int]:
     """Yield a flat stream of token ids across all documents (with EOS if available).
     When `stats` is given, accumulate the total UTF-8 byte count of the consumed docs
     into stats['n_bytes'] (used for the tokenizer-invariant bits-per-byte metric, #192).
-    Counting happens per doc as it is pulled from this generator, so with `--max-tokens`
-    capping the stream mid-corpus only fully-started docs are counted (the final partial
-    doc may be slightly over-counted) — a coarse-cap corner, not special-cased."""
+    Batches texts to unlock multi-threaded fast tokenization when supported."""
     eos = getattr(tokenizer, "eos_token_id", None)
+    has_batch = hasattr(tokenizer, "batch_encode_plus") and not isinstance(tokenizer, ByteTokenizer)
+
+    if not has_batch:
+        for text in texts:
+            if stats is not None:
+                stats["n_bytes"] += len(text.encode("utf-8"))
+            for tid in tokenizer.encode(text):
+                yield tid
+            if eos is not None:
+                yield eos
+        return
+
+    batch: List[str] = []
     for text in texts:
-        if stats is not None:
-            stats["n_bytes"] += len(text.encode("utf-8"))
-        for tid in tokenizer.encode(text):
-            yield tid
-        if eos is not None:
-            yield eos
+        batch.append(text)
+        if len(batch) >= batch_size:
+            for ids in _encode_batch_docs(batch, tokenizer, eos, stats):
+                yield from ids
+            batch.clear()
+    if batch:
+        for ids in _encode_batch_docs(batch, tokenizer, eos, stats):
+            yield from ids
 
 
-def tokenize_docs(texts: Iterable[str], tokenizer) -> Iterator[List[int]]:
+def tokenize_docs(texts: Iterable[str], tokenizer, batch_size: int = 1000) -> Iterator[List[int]]:
     """Yield one token-id list PER document (EOS appended if available). Unlike
     `tokenize_texts` this preserves document boundaries — `shard.pack_sequences` needs
-    them to mark doc-starts so the SSM state can be reset across packed docs (#68/#74)."""
+    them to mark doc-starts so the SSM state can be reset across packed docs (#68/#74).
+    Batches texts to unlock multi-threaded fast tokenization when supported."""
     eos = getattr(tokenizer, "eos_token_id", None)
+    has_batch = hasattr(tokenizer, "batch_encode_plus") and not isinstance(tokenizer, ByteTokenizer)
+
+    if not has_batch:
+        for text in texts:
+            ids = list(tokenizer.encode(text))
+            if eos is not None:
+                ids.append(eos)
+            if ids:
+                yield ids
+        return
+
+    batch: List[str] = []
     for text in texts:
-        ids = list(tokenizer.encode(text))
-        if eos is not None:
-            ids.append(eos)
-        if ids:
-            yield ids
+        batch.append(text)
+        if len(batch) >= batch_size:
+            yield from _encode_batch_docs(batch, tokenizer, eos, None)
+            batch.clear()
+    if batch:
+        yield from _encode_batch_docs(batch, tokenizer, eos, None)
 
 
 def _capped(stream: Iterable[int], max_tokens: int | None) -> Iterator[int]:
