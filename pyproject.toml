@@ -40,7 +40,7 @@ stack-v2 = ["boto3>=1.34"]
 # (true top-level statement boundaries; src/lsp/ts_boundaries.py, imported lazily so
 # the seam/import-guard are unaffected). Lightweight cross-platform wheels — kept out
 # of the heavy `eval` (lm-eval/torch) extra on purpose.
-tree-sitter = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23"]
+tree-sitter = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "tree-sitter-python>=0.23"]
 # CUDA / PyTorch backend (Linux/CUDA host; also runs CPU-only for conformance on a Mac).
 cuda = ["torch>=2.0"]
 # Optional fused CUDA kernels (#40): mamba-ssm provides the Triton SSD chunked scan

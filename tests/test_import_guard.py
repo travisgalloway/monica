@@ -128,6 +128,7 @@ PORTABLE_MODULES = [
     "src.serve.sampling",
     "src.serve.generate",
     "src.serve.spec_decode",
+    "src.serve.grammar",
 ]
 
 FORBIDDEN_ROOTS = ("mlx", "torch", "bitsandbytes")

@@ -21,6 +21,10 @@ top-p renormalizes over survivors only. An *empty* `allowed_ids` is a caller bug
 `no_repeat_ngram_size` uniform-draw fallback below, which would inject a random token
 into what is supposed to be a constrained arm.
 
+`grammar_allowed_ids` / `grammar_mask` (#360): grammar-constrained decoding mask. When
+both `allowed_ids` (symbol table) and grammar constraints are provided, they compose
+via bitwise intersection of allowed token sets without logit corruption.
+
 Above the seam: pure numpy, no backend. The caller converts backend logits to numpy
 at the boundary (as `src/eval/val_loss.py` does), so this never touches mlx/torch.
 """
@@ -43,6 +47,8 @@ def sample(
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: Optional[int] = None,
     allowed_ids: Optional[Sequence[int]] = None,
+    grammar_allowed_ids: Optional[Sequence[int]] = None,
+    grammar_mask: Optional[np.ndarray] = None,
     banned_ids: Optional[Sequence[int]] = None,
 ) -> int:
     """Return one token id sampled from a 1-D logits vector.
@@ -73,21 +79,58 @@ def sample(
     id, the "all logits non-finite" fallback draws uniformly from `allowed_ids`
     only, never from the full vocab — constrained decode must never escape its
     constraint set even on that fallback path.
+
+    `grammar_allowed_ids` / `grammar_mask` (#360): grammar-constrained decode. Composes
+    with `allowed_ids` by taking the bitwise intersection of allowed token sets.
     """
     logits = np.asarray(logits, dtype=np.float64).reshape(-1)
 
-    if allowed_ids is not None:
-        if len(allowed_ids) == 0:
+    # Resolve active allowed IDs from semantic (#226) and grammar (#360) constraints
+    active_allowed_ids: Optional[Sequence[int]] = None
+    if allowed_ids is not None or grammar_allowed_ids is not None or grammar_mask is not None:
+        g_ids_set = None
+        if grammar_allowed_ids is not None:
+            if len(grammar_allowed_ids) == 0:
+                raise ValueError(
+                    "grammar_allowed_ids is empty — the caller must never hand sample() an empty "
+                    "constraint set (that is a masker bug, not 'nothing is valid')")
+            g_ids_set = set(int(x) for x in grammar_allowed_ids)
+        elif grammar_mask is not None:
+            gm = np.asarray(grammar_mask)
+            if gm.dtype == bool:
+                g_ids_set = set(np.flatnonzero(gm).tolist())
+            else:
+                g_ids_set = set(np.flatnonzero(np.isfinite(gm)).tolist())
+            if not g_ids_set:
+                raise ValueError("grammar_mask allowed set is empty")
+
+        if allowed_ids is not None and g_ids_set is not None:
+            if len(allowed_ids) == 0:
+                raise ValueError(
+                    "allowed_ids is empty — the caller must never hand sample() an empty "
+                    "constraint set (that is a masker bug, not 'nothing is valid'; the "
+                    "caller should bypass the mask for this step instead)")
+            # Bitwise intersection of allowed token sets (#360), preserving allowed_ids order
+            composed = [i for i in allowed_ids if i in g_ids_set]
+            if not composed:
+                raise ValueError(
+                    "Intersection of allowed_ids and grammar constraints is empty")
+            active_allowed_ids = composed
+        elif allowed_ids is not None:
+            active_allowed_ids = allowed_ids
+        elif grammar_allowed_ids is not None:
+            active_allowed_ids = grammar_allowed_ids
+        else:
+            active_allowed_ids = sorted(g_ids_set)
+
+    if active_allowed_ids is not None:
+        if len(active_allowed_ids) == 0:
             raise ValueError(
                 "allowed_ids is empty — the caller must never hand sample() an empty "
                 "constraint set (that is a masker bug, not 'nothing is valid'; the "
                 "caller should bypass the mask for this step instead)")
-        ids = np.asarray(list(allowed_ids), dtype=np.int64)
-        # Dedupe preserving first-seen order (#285): duplicates are harmless for the
-        # mask (writing 0.0 twice to a slot is the same mask) but bias the uniform
-        # `rng.choice` fallback below toward whatever the caller happened to list
-        # twice. `np.unique` with `return_index` gives the index of each value's
-        # FIRST occurrence; taking those indices in sorted order restores input order.
+        ids = np.asarray(list(active_allowed_ids), dtype=np.int64)
+        # Dedupe preserving first-seen order (#285)
         ids = ids[np.sort(np.unique(ids, return_index=True)[1])]
         ids = ids[(ids >= 0) & (ids < logits.size)]
         if ids.size == 0:
@@ -106,7 +149,7 @@ def sample(
         raw_b = np.asarray(list(banned_ids), dtype=np.int64)
         b_ids = raw_b[(raw_b >= 0) & (raw_b < logits.size)]
         if b_ids.size:
-            logits = logits.copy() if allowed_ids is None else logits
+            logits = logits.copy() if active_allowed_ids is None else logits
             logits[b_ids] = -np.inf
 
     if previous_tokens is not None and len(previous_tokens) and (
@@ -136,7 +179,7 @@ def sample(
         # rather than the greedy path returning a banned argmax or `_softmax`
         # producing NaN probs that crash `rng.choice` mid-generation.
         rng = rng or np.random.default_rng()
-        if allowed_ids is not None:
+        if active_allowed_ids is not None:
             # `ids` (built above) is the validated, in-range allowed set -- never
             # empty here (an empty/all-out-of-range allowed_ids already raised).
             # Drawing from the full vocab instead would silently return a token

@@ -130,6 +130,7 @@ def create_repair_sampler(
     *,
     base_sampler: Optional[Callable[..., int]] = None,
     masker: Optional[object] = None,
+    grammar_masker: Optional[object] = None,
     decode_fn: Optional[Callable[[Sequence[int]], str]] = None,
     prompt_text: str = "",
     temperature: float = 0.0,
@@ -167,7 +168,15 @@ def create_repair_sampler(
             if allowed is not None and eos_ids:
                 allowed = sorted(set(allowed) | eos_ids)
 
-        if base_sampler is not None and banned is None and allowed is None:
+        grammar_allowed = None
+        if grammar_masker is not None and decode_fn is not None and previous_tokens is not None:
+            text = prompt_text + decode_fn(previous_tokens)
+            grammar_allowed = grammar_masker.mask_for(text, vocab_size=int(np.asarray(logits).size))
+            if grammar_allowed is not None and eos_ids:
+                if getattr(grammar_masker, "can_end", lambda t: True)(text):
+                    grammar_allowed = sorted(set(grammar_allowed) | eos_ids)
+
+        if base_sampler is not None and banned is None and allowed is None and grammar_allowed is None:
             try:
                 return base_sampler(logits, previous_tokens=previous_tokens)
             except TypeError:
@@ -179,6 +188,7 @@ def create_repair_sampler(
             rng=rng,
             previous_tokens=previous_tokens,
             allowed_ids=allowed,
+            grammar_allowed_ids=grammar_allowed,
             banned_ids=list(banned) if banned else None,
         )
 
