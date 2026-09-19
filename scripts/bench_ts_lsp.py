@@ -242,6 +242,10 @@ def _sanity_probe(service: TsLspService, files: Dict[str, str]) -> dict:
     symbols = service.document_symbols(target)
     checks["document_symbols_nonempty"] = bool(symbols)
 
+    # Drains initial in-flight didOpen diagnostics so they cannot race the break.
+    clean_initial = service.diagnostics(target)
+    checks["diagnostics_clean_initially"] = clean_initial == []
+
     broken = mod_text.replace("v.x", "v.gorblak", 1)
     service.update(target, broken)
     broken_diags = service.diagnostics(target)
@@ -264,6 +268,7 @@ def _sanity_probe_direct(direct: TsServerDirect, files: Dict[str, str]) -> dict:
     mod_text = files[target]
     checks: Dict[str, bool] = {}
 
+    checks["diagnostics_clean_initially"] = direct.diagnostics(target) == []
     direct.update(target, _broken_variant(mod_text, 0))
     checks["diagnostics_detects_break"] = any(
         d.code == "TS2339" for d in direct.diagnostics(target))

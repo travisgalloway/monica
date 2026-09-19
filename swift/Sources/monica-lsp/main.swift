@@ -629,6 +629,9 @@ func runBench(flags: [String: String], argv: [String], tsconfigText: String, scr
     let completions = dotOffset >= 0 ? ((try? client.completions(target, offset: dotOffset)) ?? []) : []
     checks["completions_contains_x"] = completions.contains { $0.label == "x" }
 
+    let cleanDiagsInitial = client.diagnostics(target)
+    checks["diagnostics_clean_initially"] = cleanDiagsInitial.isEmpty
+
     let broken = modText.replacingOccurrences(of: "v.x", with: "v.gorblak", range: modText.range(of: "v.x"))
     _ = try? client.update(target, text: broken)
     let brokenDiags = client.diagnostics(target)
