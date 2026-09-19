@@ -98,8 +98,13 @@ def test_score_rollouts_empty_and_single():
 
 def test_rlvr_cli_end_to_end_concurrency(tmp_path):
     """Run a real 2-step RLVR execution with concurrent verifier workers and caching."""
+    import importlib.util
     import subprocess
     import sys
+
+    if importlib.util.find_spec("mlx") is None and importlib.util.find_spec("torch") is None:
+        pytest.skip("test requires either mlx or torch backend")
+
     from src.model.backend import get_backend
     from src.model.blocks import load_config
 

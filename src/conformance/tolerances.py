@@ -1,4 +1,4 @@
-"""The precision -> tolerance contract (#266): a genuinely different, looser gate for
+r"""The precision -> tolerance contract (#266): a genuinely different, looser gate for
 fp16/bf16 than the fp32 one, derived from measurement rather than picked to make a run
 go green.
 
