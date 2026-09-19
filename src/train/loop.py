@@ -43,6 +43,8 @@ class TrainConfig:
     lr_schedule: str = "cosine"
     decay_frac: float = 0.2
     moe_diag_every: int = 0  # #217: steps between MoE routing diagnostic passes, 0 = off.
+    decay_replay_ratio: float = 0.0  # #364: WSD decay-phase replay ratio (0.0 = off)
+    replay_data_dir: Optional[str] = None  # #364: directory with replay shards
                               # Like eval_every, only fires on a step that is also a
                               # log_every step — pick a multiple of log_every.
 
@@ -82,6 +84,8 @@ def train(
     start_step: int = 0,
     curriculum: Optional[LengthCurriculum] = None,
     loader_factory: Optional[Callable[[int, int], Any]] = None,
+    replay_loader: Optional[Any] = None,
+    replay_loader_factory: Optional[Callable[[int, int], Any]] = None,
     start_data_state: Optional[dict] = None,
     ignore_data_state: bool = False,
 ) -> dict:
@@ -125,7 +129,16 @@ def train(
     step = start_step
     log = logger or (lambda payload: print(payload))
 
-    stream = MicroBatchStream(curriculum, loader_factory, cfg.seed)
+    if replay_loader is not None and replay_loader_factory is None:
+        replay_loader_factory = lambda sl, bs: replay_loader
+    elif replay_loader_factory is None and cfg.replay_data_dir is not None:
+        from .replay import build_replay_loader_factory
+        replay_loader_factory = build_replay_loader_factory(cfg.replay_data_dir, seed=cfg.seed)
+
+    stream = MicroBatchStream(curriculum, loader_factory, cfg.seed,
+                              replay_loader_factory=replay_loader_factory,
+                              decay_replay_ratio=cfg.decay_replay_ratio,
+                              schedule=schedule)
     if start_data_state is not None and not ignore_data_state:
         stream.load_state_dict(start_data_state)
         want = curriculum.stage_index_at(start_step)
@@ -177,6 +190,10 @@ def train(
                        "seq_len": stage.seq_len, "batch_size": stage.batch_size,
                        "stage": stage.index, "tokens_per_step": tokens_per_step,
                        "tokens": tokens_seen}
+            if hasattr(schedule, "phase_at"):
+                payload["phase"] = schedule.phase_at(step)
+            if cfg.decay_replay_ratio > 0 and replay_loader_factory is not None:
+                payload["replay_micro"] = stream.replay_micro
             if val_eval and step % cfg.eval_every == 0:
                 payload.update(val_eval(model))
             if moe_diag and cfg.moe_diag_every and step % cfg.moe_diag_every == 0:
