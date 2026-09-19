@@ -1138,6 +1138,18 @@ class MLXMambaModel(ModelInterface, nn.Module):
                 h = layer_fn(h, seg)                                  # boundary-aware (#68)
         return self._head(self.norm_f(h))
 
+    def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
+        """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387)."""
+        h = _cast(self.embedding(mx.array(token_batch)), self._cd)
+        if seg_ids is None:
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h)
+        else:
+            seg = mx.array(seg_ids)
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h, seg)
+        return self.norm_f(h)
+
     def forward_with_critics(
         self,
         token_batch: Array = None,

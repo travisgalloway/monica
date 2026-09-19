@@ -77,6 +77,7 @@ PORTABLE_MODULES = [
     "src.train.grpo",
     "src.train.verifiers",
     "src.train.diagnostic_supervision",
+    "src.train.critic_train",
     "src.train.schedule",
     "src.train.checkpoint",
     "src.train.loss_scale",

@@ -1482,6 +1482,17 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
         return self._forward_compute(h, seg)
 
+    def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
+        """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387)."""
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        h = _cast(self.embedding(ids), self._cd)
+        seg = None
+        if seg_ids is not None:
+            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+        for layer in self.layers:
+            h = self._layer_forward(layer, h, seg)
+        return self.norm_f(h)
+
     def forward_with_critics(
         self,
         token_batch: Array = None,
