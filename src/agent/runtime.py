@@ -805,6 +805,7 @@ class AgentRuntime:
         redirection_threshold: int = DEFAULT_REDIRECTION_THRESHOLD,
         termination_threshold: int = DEFAULT_TERMINATION_THRESHOLD,
         trajectory_logger: TrajectoryLogger | Callable[[AgentRunResult], None] | str | Path | None = None,
+        compactor: Any | None = None,
     ) -> None:
         self.lm = lm
         self.tools = list(tools) if tools is not None else list(CODING_AGENT_TOOLS) + [WEB_SEARCH_TOOL, FETCH_WEB_PAGE_TOOL]
@@ -833,6 +834,8 @@ class AgentRuntime:
             self.trajectory_logger = trajectory_logger  # type: ignore
         else:
             self.trajectory_logger = None
+
+        self.compactor = compactor
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> tuple[Any, bool, float]:
         """Execute a tool call using configured executor, handling exceptions safely."""
@@ -959,6 +962,26 @@ class AgentRuntime:
                 {"event": "turn_start", "turn": turn_idx, "timestamp": time.time()}
             ]
             phase_transitions: list[str] = ["thought"]
+
+            # Staged context compaction (#350)
+            if self.compactor is not None:
+                if hasattr(self.compactor, "compact_with_report"):
+                    messages, comp_report = self.compactor.compact_with_report(messages)
+                    if comp_report.compacted:
+                        phase_transitions.append("compaction")
+                        turn_events.append({
+                            "event": "context_compacted",
+                            "elision_applied": comp_report.elision_applied,
+                            "summarization_applied": comp_report.summarization_applied,
+                            "initial_tokens": comp_report.initial_tokens,
+                            "final_tokens": comp_report.final_tokens,
+                            "elided_observations": comp_report.elided_observations,
+                            "summarized_turns": comp_report.summarized_turns,
+                        })
+                elif hasattr(self.compactor, "compact"):
+                    messages = self.compactor.compact(messages)
+                elif callable(self.compactor):
+                    messages = self.compactor(messages)
 
             # Generate model turn
             try:
@@ -1175,6 +1198,7 @@ def run_agent_loop(
     termination_threshold: int = DEFAULT_TERMINATION_THRESHOLD,
     trajectory_logger: TrajectoryLogger | Callable[[AgentRunResult], None] | str | Path | None = None,
     system_prompt: str | None = None,
+    compactor: Any | None = None,
 ) -> AgentRunResult:
     """Convenience functional wrapper around AgentRuntime."""
     runtime = AgentRuntime(
@@ -1189,5 +1213,6 @@ def run_agent_loop(
         redirection_threshold=redirection_threshold,
         termination_threshold=termination_threshold,
         trajectory_logger=trajectory_logger,
+        compactor=compactor,
     )
     return runtime.run(task)
