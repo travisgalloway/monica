@@ -15,7 +15,7 @@ Status is one of `Planned`, `In progress`, `Shipped`, `Deprecated` — nothing e
 meaning *partially done*; that state lives in the per-layer columns. A capability reaches
 `Shipped` only when its full definition of done passes.
 
-Last audited 2026-09-15 (`/closure-audit`, whole repo).
+Last audited 2026-09-19 (`/closure-audit`, whole repo).
 
 ## Data pipeline
 
@@ -167,3 +167,4 @@ red gate green) are in `docs/design/14-inference-engine.md` §§D1–D6.
 | OPS-1 | A person can run the M4 smoke gate (resume exactness + eval) | done | done | done | n/a | Shipped | — | design/06 |
 | OPS-2 | A person gets every gate run automatically in CI | done | done | done | done | Shipped | #249, #302, #312 | design/06 |
 | OPS-3 | A person can read a provenance-tagged benchmark ledger | done | n/a | n/a | done | Shipped | #170 | benchmarks |
+| OPS-4 | A person can provision and manage cloud GPU pods and SSH tunnels | done | n/a | done | n/a | Shipped | #354 | design/16 |

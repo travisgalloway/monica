@@ -280,3 +280,22 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
   Swift port keeps it line-for-line, but the comment reads as if it guards a live case. Found while
   fuzz-comparing the Swift port against this function (250k random cases, 0 mismatches). Severity:
   dead code / misleading comment, non-blocking.
+
+- [2026-09-19] `src/model/cuda_backend.py:488`, PyTorch Dynamo dynamic shape tracing failed on
+  negative modulo in chunk padding (`-L % chunk_size` producing negative SymInt), causing Dynamo
+  compilation failure on variable-length sequence batches. Resolved by using positive remainder
+  `(chunk_size - (L % chunk_size)) % chunk_size`. Found during CUDA POC run on RunPod A100.
+  Severity: compiler correctness, resolved.
+
+- [2026-09-19] `src/model/mlx_moe.py:72`, MLX 0.32.2+ broke dropless MoE gather VJP when indexing
+  across dynamically grouped expert tensors, requiring an explicit gradient pass-through in
+  `gather_experts`. Found during MLX CI suite execution. Severity: backend correctness, resolved.
+
+- [2026-09-19] `scripts/cloud_pod.py:87`, RunPod API rejects standalone container disk allocations
+  with non-zero container volume sizes when no network volume is attached. Resolved by defaulting
+  `volume-gb` to 0 for standalone pods. Found during cloud pod provisioning. Severity: operational,
+  resolved.
+
+- [2026-09-19] `src/data/storage.py:54`, Cloudflare R2 rejects boto3 S3 clients configured with default
+  AWS `us-east-1` region endpoints. Resolved by defaulting `region_name` to `"auto"`. Found during R2
+  sync integration. Severity: operational, resolved.
