@@ -110,14 +110,26 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
     and for MoE configs with `moe_balance_rate` unset.
     """
     def loss_fn(model, inputs, targets):
-        logits = model.forward(inputs)                      # (B, L, V)
-        V = logits.shape[-1]
-        t = mx.array(targets).reshape(-1).astype(mx.int32)
-        # Cross-entropy in fp32 (wide-vocab softmax stability). The MLX backend's
-        # `_head` already returns fp32 logits, so this is a no-op there; the cast
-        # keeps the contract explicit and backend-independent.
-        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
-                                     t, reduction="mean")
+        if getattr(model.config, "mtp_depth", 0) > 0:
+            logits, aux_logits = model.forward_with_mtp(inputs)
+            V = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce_next = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                             t, reduction="mean")
+            mtp_loss = mx.zeros(())
+            targets_arr = mx.array(targets)
+            for k, aux_logit in enumerate(aux_logits, start=1):
+                t_k = targets_arr[:, k:].reshape(-1).astype(mx.int32)
+                ce_k = nn.losses.cross_entropy(aux_logit.reshape(-1, V).astype(mx.float32),
+                                              t_k, reduction="mean")
+                mtp_loss = mtp_loss + ce_k
+            ce = ce_next + float(model.config.mtp_loss_weight) * mtp_loss
+        else:
+            logits = model.forward(inputs)                      # (B, L, V)
+            V = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                         t, reduction="mean")
         return ce * scaler.scale if scaler else ce
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
@@ -144,13 +156,34 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
     with pretraining via `_accumulate_and_step`. `balancer` (#213) as in `make_train_step`.
     """
     def loss_fn(model, inputs, targets, mask):
-        logits = model.forward(inputs)                      # (B, L, V)
-        V = logits.shape[-1]
-        t = mx.array(targets).reshape(-1).astype(mx.int32)
-        ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
-                                     t, reduction="none")    # (B*L,)
-        m = mx.array(mask).reshape(-1).astype(mx.float32)
-        loss = (ce * m).sum() / mx.maximum(m.sum(), 1.0)     # response-token mean
+        if getattr(model.config, "mtp_depth", 0) > 0:
+            logits, aux_logits = model.forward_with_mtp(inputs)
+            V = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                         t, reduction="none")
+            m = mx.array(mask).reshape(-1).astype(mx.float32)
+            loss_next = (ce * m).sum() / mx.maximum(m.sum(), 1.0)
+
+            mtp_loss = mx.zeros(())
+            targets_arr = mx.array(targets)
+            mask_arr = mx.array(mask)
+            for k, aux_logit in enumerate(aux_logits, start=1):
+                t_k = targets_arr[:, k:].reshape(-1).astype(mx.int32)
+                m_k = mask_arr[:, k:].reshape(-1).astype(mx.float32)
+                ce_k = nn.losses.cross_entropy(aux_logit.reshape(-1, V).astype(mx.float32),
+                                              t_k, reduction="none")
+                loss_k = (ce_k * m_k).sum() / mx.maximum(m_k.sum(), 1.0)
+                mtp_loss = mtp_loss + loss_k
+            loss = loss_next + float(model.config.mtp_loss_weight) * mtp_loss
+        else:
+            logits = model.forward(inputs)                      # (B, L, V)
+            V = logits.shape[-1]
+            t = mx.array(targets).reshape(-1).astype(mx.int32)
+            ce = nn.losses.cross_entropy(logits.reshape(-1, V).astype(mx.float32),
+                                         t, reduction="none")    # (B*L,)
+            m = mx.array(mask).reshape(-1).astype(mx.float32)
+            loss = (ce * m).sum() / mx.maximum(m.sum(), 1.0)     # response-token mean
         return loss * scaler.scale if scaler else loss
 
     value_and_grad = nn.value_and_grad(model, loss_fn)

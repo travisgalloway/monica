@@ -191,10 +191,21 @@ class MambaConfig:
     # (forward) and one-step recurrence (step) stay parity-exact.
     long_ctx_factor: float = 1.0
 
+    # --- sequential multi-token prediction (#356) ---
+    # Gloeckle et al. (Meta FAIR, 2024) and DeepSeek-V3 sequential MTP.
+    # mtp_depth K: number of sequential auxiliary prediction heads (0 = off).
+    # mtp_loss_weight: compound loss weight lambda_MTP for auxiliary MTP heads.
+    mtp_depth: int = 0
+    mtp_loss_weight: float = 0.3
+
     # --- auxiliary decision critic heads (#386) ---
     critic_heads: Optional[Dict[str, CriticConfig]] = None
 
     def __post_init__(self):
+        if not isinstance(self.mtp_depth, int) or isinstance(self.mtp_depth, bool) or self.mtp_depth < 0:
+            raise ValueError(f"mtp_depth={self.mtp_depth} must be a non-negative integer")
+        if not isinstance(self.mtp_loss_weight, (int, float)) or isinstance(self.mtp_loss_weight, bool) or self.mtp_loss_weight < 0.0:
+            raise ValueError(f"mtp_loss_weight={self.mtp_loss_weight} must be a non-negative float")
         if self.critic_heads is not None:
             converted = {}
             for name, head in self.critic_heads.items():
@@ -366,6 +377,17 @@ class MambaConfig:
                 out_dim = head.n_classes
                 critic_total += (d * h + h + h * out_dim + out_dim)
             bd["critic_heads"] = critic_total
+
+        # Sequential Multi-Token Prediction heads (#356)
+        if self.mtp_depth > 0:
+            mtp_block_params = (
+                self.d_model                      # norm_h
+                + self.d_model                    # norm_e
+                + 2 * self.d_model * self.d_model # proj
+                + per_layer                       # lightweight hybrid layer (Mamba)
+                + self.d_model                    # norm_f
+            )
+            bd["mtp"] = self.mtp_depth * mtp_block_params
 
         # Tied embedding reuses the input matrix as the LM head -> no extra params.
         if not self.tie_embeddings:
@@ -574,6 +596,10 @@ class MambaConfig:
                     f"{self.precision!r} (bf16 recommended: no loss-scaler conflict "
                     "with Transformer Engine's DelayedScaling)."
                 )
+        if not isinstance(self.mtp_depth, int) or isinstance(self.mtp_depth, bool) or self.mtp_depth < 0:
+            raise ValueError(f"mtp_depth={self.mtp_depth} must be a non-negative integer")
+        if not isinstance(self.mtp_loss_weight, (int, float)) or isinstance(self.mtp_loss_weight, bool) or self.mtp_loss_weight < 0.0:
+            raise ValueError(f"mtp_loss_weight={self.mtp_loss_weight} must be a non-negative float")
         if self.critic_heads is not None:
             if not isinstance(self.critic_heads, dict):
                 raise ValueError("critic_heads must be a dict or None")
@@ -631,3 +657,63 @@ def is_muon_param(name: str, ndim: int) -> bool:
     if name.endswith(_MUON_EXCLUDE_SUFFIX):
         return False
     return True
+
+
+class MTPBlock:
+    """Portable architecture specification for Sequential Multi-Token Prediction (MTP) (#356).
+
+    Each layer combines the trunk hidden state h_t and ground-truth token embedding
+    e(x_{t+k-1}) through a linear projection, applies a lightweight hybrid layer,
+    and projects to logits using the shared trunk embedding matrix.
+    """
+
+    def __init__(self, config: MambaConfig, depth: int = 1):
+        if not isinstance(depth, int) or depth < 1:
+            raise ValueError(f"depth={depth} must be an integer >= 1")
+        self.config = config
+        self.depth = depth
+
+    @property
+    def num_parameters(self) -> int:
+        """Trainable parameter count for this MTP module (excluding tied LM head)."""
+        d_model = self.config.d_model
+        d_inner = self.config.d_inner
+        n_heads = self.config.n_heads
+        dt_rank = self.config.dt_rank_resolved
+        N = self.config.d_state
+        per_layer = (
+            d_model
+            + 2 * d_inner * d_model
+            + d_inner * (self.config.d_conv + 1)
+            + d_inner * (dt_rank + 2 * N)
+            + dt_rank * n_heads + n_heads
+            + 2 * n_heads
+            + d_inner * d_model
+        )
+        return d_model + d_model + 2 * d_model * d_model + per_layer + d_model
+
+    def __call__(
+        self,
+        h: np.ndarray,
+        embed: np.ndarray,
+        shared_embedding_weight: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Reference numpy evaluation for verification and portable testing."""
+        import numpy as _np
+        h_arr = _np.asarray(h, dtype=_np.float32)
+        e_arr = _np.asarray(embed, dtype=_np.float32)
+
+        def _rmsnorm(x):
+            rms = _np.sqrt(_np.mean(_np.square(x), axis=-1, keepdims=True) + 1e-5)
+            return x / rms
+
+        hn = _rmsnorm(h_arr)
+        en = _rmsnorm(e_arr)
+        cat = _np.concatenate([hn, en], axis=-1)
+        d_model = self.config.d_model
+        proj_out = cat[..., :d_model] + cat[..., d_model:]
+        out = _rmsnorm(proj_out)
+        if shared_embedding_weight is not None:
+            w = _np.asarray(shared_embedding_weight, dtype=_np.float32)
+            return out @ w.T
+        return out

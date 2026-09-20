@@ -69,6 +69,35 @@ class ModelInterface(ABC):
             f"{type(self).__name__} does not implement forward_with_critics"
         )
 
+    def forward_mtp(self, token_batch: Array, seg_ids: Array = None) -> list[Array]:
+        """Full-sequence forward pass returning auxiliary MTP logits for all depths k (#356).
+
+        Returns:
+            aux_logits: list of arrays where element k-1 has shape (batch, seq_len - k, vocab_size).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_mtp"
+        )
+
+    def forward_with_mtp(
+        self, token_batch: Array, seg_ids: Array = None
+    ) -> Tuple[Array, list[Array]]:
+        """Full-sequence forward pass returning (logits, aux_mtp_logits) (#356)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_with_mtp"
+        )
+
+    def step_mtp(
+        self, h_last: Array, token_pred: Array, state: Optional[State] = None, depth: int = 1
+    ) -> Tuple[Array, State]:
+        """Single-step recurrence for auxiliary MTP head at specified depth (#356).
+
+        Combines trunk hidden state h_last and predicted token embedding, returning (logits, state).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement step_mtp"
+        )
+
     def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
         """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387).
 

@@ -1489,6 +1489,81 @@ class DecisionCriticHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Sequential Multi-Token Prediction (MTP) layer (#356)
+# --------------------------------------------------------------------------- #
+class MTPBlock(nn.Module):
+    """Sequential Multi-Token Prediction (MTP) layer in PyTorch / CUDA (#356).
+
+    Combines trunk hidden state h_t and token embedding through a linear projection,
+    applies a lightweight hybrid layer (MambaBlock), and projects to logits using
+    the shared trunk embedding matrix.
+    """
+
+    def __init__(self, config: MambaConfig, depth: int = 1):
+        super().__init__()
+        self.config = config
+        self.depth = depth
+        self.norm_h = RMSNorm(config.d_model)
+        self.norm_e = RMSNorm(config.d_model)
+        self.proj = nn.Linear(2 * config.d_model, config.d_model, bias=False)
+        self.layer = MambaBlock(config)
+        self.norm_f = RMSNorm(config.d_model)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        embed: torch.Tensor,
+        shared_embedding_weight: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+        *,
+        return_hidden: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        cd = _DTYPES[self.config.precision]
+        h_n = self.norm_h(h)
+        e_n = self.norm_e(embed)
+        he = torch.cat([h_n, e_n], dim=-1)
+        x = _linear(self.proj, _cast(he, cd), cd)
+        out = self.layer(x, seg_ids=seg_ids)
+        h_out = self.norm_f(out)
+        logits = None
+        if shared_embedding_weight is not None:
+            h_f32 = _f32(h_out)
+            logits = h_f32 @ shared_embedding_weight.t()
+        if return_hidden:
+            return logits, h_out
+        return logits if logits is not None else h_out
+
+    def step(
+        self,
+        h: torch.Tensor,
+        embed: torch.Tensor,
+        state: State,
+        shared_embedding_weight: Optional[torch.Tensor] = None,
+        *,
+        return_hidden: bool = False,
+    ) -> Union[Tuple[torch.Tensor, State], Tuple[torch.Tensor, State, torch.Tensor]]:
+        cd = _DTYPES[self.config.precision]
+        if h.ndim == 1:
+            h = h.unsqueeze(0)
+        if embed.ndim == 1:
+            embed = embed.unsqueeze(0)
+        h_n = self.norm_h(h)
+        e_n = self.norm_e(embed)
+        he = torch.cat([h_n, e_n], dim=-1)
+        x = _linear(self.proj, _cast(he, cd), cd)
+        out, new_state = self.layer.step(x, state)
+        h_out = self.norm_f(out)
+        logits = None
+        if shared_embedding_weight is not None:
+            h_f32 = _f32(h_out)
+            logits = h_f32 @ shared_embedding_weight.t()
+        if return_hidden:
+            return (logits if logits is not None else h_out), new_state, h_out
+        return (logits if logits is not None else h_out), new_state
+
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class CUDAMambaModel(ModelInterface, nn.Module):
@@ -1523,6 +1598,9 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         if config.critic_heads:
             for name, head_cfg in config.critic_heads.items():
                 self.critic_heads[name] = DecisionCriticHead(head_cfg)
+        self.mtp_blocks = nn.ModuleList()
+        if getattr(config, "mtp_depth", 0) > 0:
+            self.mtp_blocks = nn.ModuleList([MTPBlock(config, depth=k) for k in range(1, config.mtp_depth + 1)])
         self._state = None
         self.to(self._device)
         if self._device.type == "cuda":
@@ -1628,13 +1706,54 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         return self._head(self.norm_f(h))
 
     # --- ModelInterface ---
-    def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
+    def forward(self, token_batch: Array, seg_ids: Array = None, *, return_mtp: bool = False) -> Union[Array, Tuple[Array, list[Array]]]:
+        if return_mtp:
+            return self.forward_with_mtp(token_batch, seg_ids)
         ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
         h = _cast(self.embedding(ids), self._cd)     # activation stream in cd
         seg = None
         if seg_ids is not None:                      # (B, L) document ids -> boundary-aware (#68)
             seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
         return self._forward_compute(h, seg)
+
+    def forward_mtp(self, token_batch: Array, seg_ids: Array = None) -> list[Array]:
+        """Full-sequence forward pass returning auxiliary MTP logits for each depth k (#356)."""
+        _, aux_logits = self.forward_with_mtp(token_batch, seg_ids)
+        return aux_logits
+
+    def forward_with_mtp(
+        self, token_batch: Array, seg_ids: Array = None
+    ) -> Tuple[Array, list[Array]]:
+        """Full-sequence forward pass returning (logits, aux_mtp_logits) (#356)."""
+        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        embed = _cast(self.embedding(ids), self._cd)
+        seg = None
+        if seg_ids is not None:
+            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+        h = embed
+        for layer in self.layers:
+            h = self._layer_forward(layer, h, seg)
+        h_trunk = self.norm_f(h)
+        logits = self._head(h_trunk)
+
+        aux_logits = []
+        if getattr(self.config, "mtp_depth", 0) > 0 and len(self.mtp_blocks) > 0:
+            curr_h = h_trunk
+            L = ids.shape[1]
+            self._fsdp_unshard(self.embedding)
+            shared_weight = self.embedding.weight if self._tie_embeddings else self.lm_head.weight
+            for k, mtp_block in enumerate(self.mtp_blocks, start=1):
+                if L <= k:
+                    break
+                h_in = curr_h[:, : L - k, :]
+                e_in = embed[:, k:, :]
+                seg_in = seg[:, : L - k] if seg is not None else None
+                mtp_logit, next_h = mtp_block(
+                    h_in, e_in, shared_embedding_weight=shared_weight, seg_ids=seg_in, return_hidden=True
+                )
+                aux_logits.append(mtp_logit)
+                curr_h = next_h
+        return logits, aux_logits
 
     def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
         """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387)."""
@@ -1701,7 +1820,7 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             h = h[:, -1]                                 # (B, d_model) -> logits (B, V)
         return self._head(h), state
 
-    def step(self, token: Array, state: State) -> Tuple[Array, State]:
+    def step(self, token: Array, state: State, *, return_hidden: bool = False) -> Union[Tuple[Array, State], Tuple[Array, State, Array]]:
         ids = torch.as_tensor(np.asarray(token), dtype=torch.long, device=self._device)
         h = _cast(self.embedding(ids), self._cd)
         new_state = []
@@ -1709,7 +1828,45 @@ class CUDAMambaModel(ModelInterface, nn.Module):
             self._fsdp_unshard(layer)     # see _fsdp_unshard's docstring (#271)
             h, st2 = layer.step(h, st)
             new_state.append(st2)
-        return self._head(self.norm_f(h)), new_state
+        h_norm = self.norm_f(h)
+        logits = self._head(h_norm)
+        if return_hidden:
+            return logits, new_state, h_norm
+        return logits, new_state
+
+    def step_mtp(
+        self, h_last: Array, token_pred: Array, state: Optional[State] = None, depth: int = 1
+    ) -> Tuple[Array, State]:
+        if not (1 <= depth <= len(self.mtp_blocks)):
+            raise ValueError(f"depth={depth} invalid for mtp_blocks of length {len(self.mtp_blocks)}")
+        h_t = torch.as_tensor(np.asarray(h_last), dtype=torch.float32, device=self._device)
+        if state is None:
+            state = self.init_mtp_state(h_t.shape[0], depth=depth)
+        pred_tok = torch.as_tensor(np.asarray(token_pred), dtype=torch.long, device=self._device)
+        embed = _cast(self.embedding(pred_tok), self._cd)
+        self._fsdp_unshard(self.embedding)
+        shared_weight = self.embedding.weight if self._tie_embeddings else self.lm_head.weight
+        return self.mtp_blocks[depth - 1].step(h_t, embed, state, shared_embedding_weight=shared_weight)
+
+    def init_mtp_state(self, batch_size: int, depth: int = 1) -> State:
+        """Fresh recurrent state for the MTP block at specified depth."""
+        c = self.config
+        di, k = c.d_inner, c.d_conv
+        H, P, N = c.n_heads, c.head_dim, c.d_state
+        dev = self._device
+        return (torch.zeros((batch_size, k - 1, di), device=dev),
+                torch.zeros((batch_size, H, P, N), device=dev))
+
+    def verify_block(self, tokens: Sequence[int], state: State):
+        """Speculative-decoding verify pass: consume tokens through the step recurrence."""
+        toks = [int(t) for t in tokens]
+        logits_list, state_list = [], []
+        h_state = state
+        for tok in toks:
+            logit, h_state = self.step(torch.as_tensor([tok], device=self._device), h_state)
+            logits_list.append(logit)
+            state_list.append(h_state)
+        return logits_list, state_list
 
     def eval_batch_ce(self, inputs: Array, targets: Array) -> float:
         """Fast on-device cross-entropy evaluation: avoids transferring full (B, L, V) logits to host."""
