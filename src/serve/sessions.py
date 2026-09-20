@@ -57,6 +57,29 @@ def per_session_state_floats(config: MambaConfig) -> int:
     return config.n_layers * per_layer
 
 
+def kv_cache_elements_per_token(config: MambaConfig) -> int:
+    """Number of elements stored in the key-value cache per token across all attention layers.
+
+    With MLA enabled (#355), each attention layer caches only the low-rank latent vector
+    c^{KV} (mla_latent_dim) and decoupled rotary key k^R (mla_rope_dim).
+    Otherwise (standard MHA), each layer stores full keys and values (2 * n_attn_heads * attn_head_dim).
+    """
+    if not config.n_attention_layers:
+        return 0
+    if config.use_mla:
+        per_layer = config.mla_latent_dim_resolved + config.mla_rope_dim_resolved
+    else:
+        per_layer = 2 * config.n_attn_heads_resolved * config.attn_head_dim
+    return config.n_attention_layers * per_layer
+
+
+def kv_cache_memory_bytes(config: MambaConfig, seq_len: int, *, precision: Optional[str] = None) -> int:
+    """Key-value cache memory consumption in bytes at sequence length `seq_len`."""
+    prec = precision or config.precision
+    bytes_per = 4 if prec == "fp32" else 2
+    return kv_cache_elements_per_token(config) * seq_len * bytes_per
+
+
 def per_session_state_bytes(config: MambaConfig, *, conservative_fp32: bool = True) -> int:
     """Bytes for one session's state. Defaults to a conservative fp32 upper bound.
 

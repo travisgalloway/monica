@@ -126,6 +126,15 @@ class MambaConfig:
     # Must divide d_model. Unused when attn_every is None and attn_layers is None.
     n_attn_heads: Optional[int] = None
 
+    # --- Multi-Head Latent Attention (#355) ---
+    # Low-rank key-value latent compression (DeepSeek-style) for hybrid attention layers.
+    # When enabled, attention layers project keys and values into a compressed latent
+    # vector c^{KV} of dimension `mla_latent_dim` and use a decoupled rotary key of
+    # dimension `mla_rope_dim`.
+    use_mla: bool = False
+    mla_latent_dim: Optional[int] = None
+    mla_rope_dim: Optional[int] = None
+
     # --- sparse Mixture-of-Experts (#53) ---
     # Make every Mth block a sparse-MoE FFN block INSTEAD OF a Mamba block (the same
     # interleave the hybrid uses for attention). MoE-Mamba/ME-Mamba: route each token to
@@ -236,6 +245,18 @@ class MambaConfig:
         with attn_head_dim = d_model // n_attn_heads (so d_attn == d_model)."""
         return self.d_model // self.n_attn_heads_resolved
 
+    @property
+    def mla_latent_dim_resolved(self) -> int:
+        if self.mla_latent_dim is not None:
+            return int(self.mla_latent_dim)
+        return min(256, self.d_model // 2) if self.d_model >= 32 else 16
+
+    @property
+    def mla_rope_dim_resolved(self) -> int:
+        if self.mla_rope_dim is not None:
+            return int(self.mla_rope_dim)
+        return min(64, self.attn_head_dim) if self.attn_head_dim >= 16 else 8
+
     def is_attention_layer(self, i: int) -> bool:
         """True if block `i` (0-indexed) is a causal-attention block, not a Mamba block."""
         if self.attn_layers is not None:
@@ -313,7 +334,22 @@ class MambaConfig:
         # (d_attn -> d_model); d_attn = n_attn_heads * attn_head_dim = d_model.
         if n_attn:
             d_attn = self.n_attn_heads_resolved * self.attn_head_dim
-            attn_per_layer = d_model + 3 * d_model * d_attn + d_attn * d_model
+            if self.use_mla:
+                dc = self.mla_latent_dim_resolved
+                dr = self.mla_rope_dim_resolved
+                H = self.n_attn_heads_resolved
+                attn_per_layer = (
+                    d_model
+                    + d_model * dc
+                    + dc * d_attn
+                    + dc * d_attn
+                    + d_model * dr
+                    + d_model * d_attn
+                    + d_model * (H * dr)
+                    + d_attn * d_model
+                )
+            else:
+                attn_per_layer = d_model + 3 * d_model * d_attn + d_attn * d_model
             bd["attention"] = n_attn * attn_per_layer
         # MoE (#53): sparse-FFN blocks REPLACE that many Mamba blocks. Each is a pre-norm
         # + a bias-free router (d_model -> n_experts) + n_experts SwiGLU experts (gate, up:
@@ -425,6 +461,23 @@ class MambaConfig:
                 f"head_dim={self.head_dim} must divide d_inner={self.d_inner} "
                 "(d_inner = expand*d_model)."
             )
+        if self.use_mla:
+            dc = self.mla_latent_dim_resolved
+            dr = self.mla_rope_dim_resolved
+            if not isinstance(dc, int) or isinstance(dc, bool) or dc <= 0:
+                raise ValueError(f"mla_latent_dim={dc} must be a positive integer")
+            if not isinstance(dr, int) or isinstance(dr, bool) or dr <= 0:
+                raise ValueError(f"mla_rope_dim={dr} must be a positive integer")
+            if dc % 8 != 0:
+                raise ValueError(
+                    f"mla_latent_dim={dc} must divide hardware alignment boundaries (multiple of 8)"
+                )
+            if dr % 8 != 0:
+                raise ValueError(
+                    f"mla_rope_dim={dr} must divide hardware alignment boundaries (multiple of 8)"
+                )
+            if dr > self.d_model:
+                raise ValueError(f"mla_rope_dim={dr} cannot exceed d_model={self.d_model}")
         if self.attn_every is not None and self.attn_layers is not None:
             raise ValueError("cannot specify both attn_every and attn_layers")
         if self.attn_every is not None:

@@ -53,6 +53,7 @@ REQUIRE_BOTH = os.environ.get("MONICA_REQUIRE_BOTH_BACKENDS") == "1"
 CROSS_BACKEND_TESTS = (
     "test_backend_parity_mlx_vs_torch",
     "test_backend_parity_hybrid",
+    "test_backend_parity_mla",
     "test_backend_parity_seg_ids",
     "test_portable_weights_roundtrip_both_directions",
     "test_moe_routing_entropy_parity_mlx_vs_torch",
@@ -126,6 +127,36 @@ def test_backend_parity_hybrid(tmp_path):
     torch.manual_seed(0)
     src = CUDAMambaModel(cfg)
     assert any(type(l).__name__ == "AttentionBlock" for l in src.layers)
+    path = str(tmp_path / "weights.safetensors")
+    src.save(path)
+
+    mlx_m = MLXMambaModel(cfg); mlx_m.load(path)
+    cuda_m = CUDAMambaModel(cfg); cuda_m.load(path)
+
+    tokens = _tokens(cfg, B=2, L=24)
+    with torch.no_grad():
+        result = check_backend_parity(mlx_m, cuda_m, tokens,
+                                      to_numpy_a=_mlx_np, to_numpy_b=_torch_np,
+                                      rtol=1e-4, atol=1e-5)
+    assert result["ok"], result
+
+
+@requires_both_backends
+def test_backend_parity_mla(tmp_path):
+    """Multi-Head Latent Attention (MLA #355): identical portable weights in both backends ->
+    `forward` agrees in fp32 within 1e-4 relative tolerance. Proves the MLA projection
+    matrices (W_DKV, W_UK, W_UV, W_KR, q_proj, q_rope_proj, o_proj) port MLX<->torch."""
+    import dataclasses
+    from src.model.mlx_backend import MLXMambaModel
+    from src.model.cuda_backend import CUDAMambaModel
+
+    cfg = load_config("config/toy-hybrid.yaml")
+    cfg = dataclasses.replace(cfg, use_mla=True)
+    cfg.validate()
+
+    torch.manual_seed(0)
+    src = CUDAMambaModel(cfg)
+    assert any(type(l).__name__ == "AttentionBlock" and getattr(l, "use_mla", False) for l in src.layers)
     path = str(tmp_path / "weights.safetensors")
     src.save(path)
 

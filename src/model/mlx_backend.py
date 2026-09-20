@@ -542,12 +542,55 @@ class AttentionBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
         self.config = config
+        self.use_mla = bool(config.use_mla)
         self.H = config.n_attn_heads_resolved
         self.Dh = config.attn_head_dim
         d_attn = self.H * self.Dh
         self.norm = RMSNorm(config.d_model)
-        self.qkv_proj = nn.Linear(config.d_model, 3 * d_attn, bias=False)
+        if self.use_mla:
+            self.dc = config.mla_latent_dim_resolved
+            self.dr = config.mla_rope_dim_resolved
+            self.w_dkv = nn.Linear(config.d_model, self.dc, bias=False)
+            self.w_uk = nn.Linear(self.dc, d_attn, bias=False)
+            self.w_uv = nn.Linear(self.dc, d_attn, bias=False)
+            self.w_kr = nn.Linear(config.d_model, self.dr, bias=False)
+            self.q_proj = nn.Linear(config.d_model, d_attn, bias=False)
+            self.q_rope_proj = nn.Linear(config.d_model, self.H * self.dr, bias=False)
+        else:
+            self.qkv_proj = nn.Linear(config.d_model, 3 * d_attn, bias=False)
         self.o_proj = nn.Linear(d_attn, config.d_model, bias=False)
+
+    @property
+    def W_DKV(self):
+        return self.w_dkv
+
+    @property
+    def W_UK(self):
+        return self.w_uk
+
+    @property
+    def W_UV(self):
+        return self.w_uv
+
+    @property
+    def W_KR(self):
+        return self.w_kr
+
+    @property
+    def w_q(self):
+        return self.q_proj
+
+    @property
+    def W_Q(self):
+        return self.q_proj
+
+    @property
+    def w_qr(self):
+        return self.q_rope_proj
+
+    @property
+    def W_QR(self):
+        return self.q_rope_proj
 
     def _qkv(self, xn: Array, cd):
         B = xn.shape[0]
@@ -558,7 +601,119 @@ class AttentionBlock(nn.Module):
             return _f32(t).reshape(B, T, self.H, self.Dh).transpose(0, 2, 1, 3)
         return heads(q), heads(k), heads(v)
 
+    def _forward_seq_mla(self, x: Array, seg_ids: Array = None) -> Array:
+        cd = _DTYPES[self.config.precision]
+        B, L = x.shape[0], x.shape[1]
+        xn = self.norm(x)
+        qc = _linear(self.q_proj, xn, cd)
+        qc = _f32(qc).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+        qr = _linear(self.q_rope_proj, xn, cd)
+        qr = _f32(qr).reshape(B, L, self.H, self.dr).transpose(0, 2, 1, 3)
+        cos, sin = _rope_cos_sin(mx.arange(L), self.dr)
+        qr = _apply_rope(qr, cos, sin)
+
+        c_kv = _linear(self.w_dkv, xn, cd)
+        kc = _linear(self.w_uk, c_kv, cd)
+        kc = _f32(kc).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+        v = _linear(self.w_uv, c_kv, cd)
+        v = _f32(v).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+
+        kr = _linear(self.w_kr, xn, cd)
+        kr = _f32(kr).reshape(B, 1, L, self.dr)
+        kr = _apply_rope(kr, cos, sin)
+
+        scale = 1.0 / math.sqrt(self.Dh + self.dr)
+        scores_c = qc @ kc.transpose(0, 1, 3, 2)
+        scores_r = qr @ kr.transpose(0, 1, 3, 2)
+        scores = (scores_c + scores_r) * scale
+
+        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
+        if seg_ids is None:
+            scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        else:
+            seg = mx.array(seg_ids)
+            same = seg[:, :, None] == seg[:, None, :]
+            allow = causal[None] & same
+            scores = mx.where(allow[:, None], scores, mx.array(float("-inf"), dtype=scores.dtype))
+
+        out = _softmax_lastdim(scores) @ v
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd)
+
+    def _forward_prefill_mla(self, x: Array, seg_ids: Array = None) -> Tuple[Array, State]:
+        cd = _DTYPES[self.config.precision]
+        B, L = x.shape[0], x.shape[1]
+        xn = self.norm(x)
+        qc = _linear(self.q_proj, xn, cd)
+        qc = _f32(qc).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+        qr = _linear(self.q_rope_proj, xn, cd)
+        qr = _f32(qr).reshape(B, L, self.H, self.dr).transpose(0, 2, 1, 3)
+        cos, sin = _rope_cos_sin(mx.arange(L), self.dr)
+        qr = _apply_rope(qr, cos, sin)
+
+        c_kv = _linear(self.w_dkv, xn, cd)
+        c_kv_f32 = _f32(c_kv).reshape(B, 1, L, self.dc)
+        kc = _linear(self.w_uk, c_kv, cd)
+        kc = _f32(kc).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+        v = _linear(self.w_uv, c_kv, cd)
+        v = _f32(v).reshape(B, L, self.H, self.Dh).transpose(0, 2, 1, 3)
+
+        kr = _linear(self.w_kr, xn, cd)
+        kr = _f32(kr).reshape(B, 1, L, self.dr)
+        kr = _apply_rope(kr, cos, sin)
+
+        scale = 1.0 / math.sqrt(self.Dh + self.dr)
+        scores_c = qc @ kc.transpose(0, 1, 3, 2)
+        scores_r = qr @ kr.transpose(0, 1, 3, 2)
+        scores = (scores_c + scores_r) * scale
+
+        causal = mx.tril(mx.ones((L, L), dtype=mx.bool_))
+        scores = mx.where(causal, scores, mx.array(float("-inf"), dtype=scores.dtype))
+        out = _softmax_lastdim(scores) @ v
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (c_kv_f32, kr)
+
+    def _step_mla(self, x: Array, state: State) -> Tuple[Array, State]:
+        cd = _DTYPES[self.config.precision]
+        c_kv_cache, k_r_cache = state
+        t = c_kv_cache.shape[2]
+        B = x.shape[0]
+        xn = self.norm(x)
+
+        qc = _linear(self.q_proj, xn, cd)
+        qc = _f32(qc).reshape(B, 1, self.H, self.Dh).transpose(0, 2, 1, 3)
+        qr = _linear(self.q_rope_proj, xn, cd)
+        qr = _f32(qr).reshape(B, 1, self.H, self.dr).transpose(0, 2, 1, 3)
+        cos, sin = _rope_cos_sin(mx.arange(t, t + 1), self.dr)
+        qr = _apply_rope(qr, cos, sin)
+
+        c_t = _linear(self.w_dkv, xn, cd)
+        c_t_f32 = _f32(c_t).reshape(B, 1, 1, self.dc)
+        kr_t = _linear(self.w_kr, xn, cd)
+        kr_t_f32 = _f32(kr_t).reshape(B, 1, 1, self.dr)
+        kr_t_f32 = _apply_rope(kr_t_f32, cos, sin)
+
+        c_kv_cache = mx.concatenate([c_kv_cache, c_t_f32], axis=2)
+        k_r_cache = mx.concatenate([k_r_cache, kr_t_f32], axis=2)
+
+        c_kv_flat = c_kv_cache.reshape(B, t + 1, self.dc)
+        kc = _linear(self.w_uk, c_kv_flat, cd)
+        kc = _f32(kc).reshape(B, t + 1, self.H, self.Dh).transpose(0, 2, 1, 3)
+        v = _linear(self.w_uv, c_kv_flat, cd)
+        v = _f32(v).reshape(B, t + 1, self.H, self.Dh).transpose(0, 2, 1, 3)
+
+        scale = 1.0 / math.sqrt(self.Dh + self.dr)
+        scores_c = qc @ kc.transpose(0, 1, 3, 2)
+        scores_r = qr @ k_r_cache.transpose(0, 1, 3, 2)
+        scores = (scores_c + scores_r) * scale
+
+        out = _softmax_lastdim(scores) @ v
+        out = out.transpose(0, 2, 1, 3).reshape(B, self.H * self.Dh)
+        return x + _linear(self.o_proj, _cast(out, cd), cd), (c_kv_cache, k_r_cache)
+
     def forward_seq(self, x: Array, seg_ids: Array = None) -> Array:
+        if self.use_mla:
+            return self._forward_seq_mla(x, seg_ids)
         cd = _DTYPES[self.config.precision]
         L = x.shape[1]
         xn = self.norm(x)
@@ -588,6 +743,8 @@ class AttentionBlock(nn.Module):
         unchanged; both fp32 (B, H, L, Dh), matching what `step` accumulates. RoPE positions
         run from 0, so this is valid only from a fresh (zero-length) cache; see
         `ModelInterface.prefill`."""
+        if self.use_mla:
+            return self._forward_prefill_mla(x, seg_ids)
         cd = _DTYPES[self.config.precision]
         L = x.shape[1]
         xn = self.norm(x)
@@ -602,6 +759,8 @@ class AttentionBlock(nn.Module):
         return x + _linear(self.o_proj, _cast(out, cd), cd), (k, v)
 
     def step(self, x: Array, state: State) -> Tuple[Array, State]:
+        if self.use_mla:
+            return self._step_mla(x, state)
         cd = _DTYPES[self.config.precision]
         k_cache, v_cache = state                             # (B,H,T,Dh) each, fp32
         t = k_cache.shape[2]                                 # absolute position
@@ -1367,6 +1526,10 @@ class MLXMambaModel(ModelInterface, nn.Module):
         # Per attention layer: a zero-length KV cache (k,v), each (B,Ha,0,Dh), grown by step.
         def layer_state(i):
             if c.is_attention_layer(i):
+                if c.use_mla:
+                    dc = c.mla_latent_dim_resolved
+                    dr = c.mla_rope_dim_resolved
+                    return (mx.zeros((batch_size, 1, 0, dc)), mx.zeros((batch_size, 1, 0, dr)))
                 z = mx.zeros((batch_size, Ha, 0, Dh))
                 return (z, z)
             if c.is_moe_layer(i):
