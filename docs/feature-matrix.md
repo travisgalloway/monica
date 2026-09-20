@@ -70,7 +70,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | TRAIN-5 | A person can use a WSD learning-rate schedule | done | done | done | n/a | Shipped | #238 | design/05 |
 | TRAIN-6 | A person can train with the Muon/AdamW hybrid | n/a | n/a | done | n/a | Shipped | #237 | design/13 |
 | TRAIN-7 | A person can shard a run across GPUs (FSDP2 + expert-parallel) | done | n/a | done | n/a | Shipped | #271 | design/13 |
-| TRAIN-8 | A person can train with 8-bit moments and fp8 expert GEMMs | n/a | n/a | done | n/a | In progress | #240 | design/13 |
+| TRAIN-8 | A person can train with 8-bit moments and fp8 expert GEMMs | n/a | n/a | done | n/a | Shipped | #240 | design/13 |
 | TRAIN-9 | A person can read structured progress from a run | done | n/a | n/a | n/a | Shipped | — | design/05 |
 
 ## Post-training
