@@ -850,3 +850,90 @@ def evaluate_web_backend(
         "by_bucket": summary["by_bucket"],
         "overall": summary["overall"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Cloud, Infra, Containers & Automation Suite (#344)
+# --------------------------------------------------------------------------- #
+
+CLOUD_INFRA_BUCKETS: Tuple[str, ...] = (
+    "terraform",
+    "docker",
+    "kubernetes",
+    "shell",
+    "html_tailwind",
+)
+
+
+def evaluate_cloud_infra(
+    test_cases: Sequence[dict],
+    *,
+    verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against Cloud, Infra, Containers & Automation verifiers (#344).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `domain`: domain name ('terraform', 'docker', 'kubernetes', 'shell', 'html_tailwind')
+      - `code`: candidate code/manifest text
+      - `reference`: optional reference code
+      - `expected_clean`: bool indicating if the test case is clean (reward == 1.0) vs faulty/hacked
+      - `prompt`: optional prompt string prefix
+
+    Emits records conforming to RECORD_FIELDS:
+      suite='cloud_infra', bucket=domain, distance=len(code), etc.
+    Returns summary dict with per-bucket and overall statistics.
+    """
+    if verifier is None:
+        from ..train.verifiers.cloud_infra import CloudInfraVerifier
+        verifier = CloudInfraVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        domain = str(inst.get("domain", "terraform"))
+        code = str(inst.get("code", ""))
+        reference = inst.get("reference")
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+
+        reward = verifier.reward(code, reference=reference, prompt=prompt, domain=domain)
+        is_clean = (reward is not None and reward == 1.0)
+        success = (is_clean == expected_clean)
+
+        records.append(
+            make_record(
+                suite="cloud_infra",
+                id=inst_id,
+                bucket=domain,
+                distance=len(code),
+                n_scored_tokens=len(code.split()) if code else 0,
+                ce_nats=0.0 if is_clean else 1.0,
+                token_accuracy=1.0 if success else 0.0,
+                exact_match=1.0 if (reward == 1.0) else 0.0,
+                rank_top1=success,
+                mrr=1.0 if success else 0.0,
+                meta={
+                    "domain": domain,
+                    "reward": reward,
+                    "expected_clean": expected_clean,
+                    "is_clean": is_clean,
+                    "success": success,
+                },
+            )
+        )
+
+    buckets_present = [b for b in CLOUD_INFRA_BUCKETS if any(r["bucket"] == b for r in records)] or list(CLOUD_INFRA_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }
