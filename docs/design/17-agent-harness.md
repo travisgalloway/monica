@@ -348,3 +348,59 @@ The `update_plan` tool allows models to mutate checklist states:
 - `steps`: Array of string step descriptions.
 - `updates`: Batch update list specifying step indices and completion statuses.
 
+
+## 8. Benchmark POC & MVP Runs (`src/agent/benchmark.py`, `scripts/run_agent_benchmark.py`, #371)
+
+Milestone 12 tracks the operational execution runs of the autonomous ReAct coding agent harness against synthetic and real-world software engineering benchmarks across two stages:
+
+```
++-----------------------------------------------------------------------------------+
+|               Autonomous Coding Agent Benchmark Architecture                      |
+|                                                                                   |
+|  Stage 1: POC Run (Operational Stress Scenarios)                                  |
+|    1. Anti-Spin Circuit Breaker: 5-repeat redirect, 8-repeat early termination     |
+|    2. Staged Context Compaction: 0.60 soft elision, 0.85 hard summarization       |
+|    3. Post-Edit Diagnostics & Safety: instant syntax feedback, read-before-write   |
+|    4. Out-of-History Plan Injection: prompt conditioning & clean exit gate        |
+|    5. Native Web Access: compact search (<400 tok), SSRF defense, 12k char limit  |
+|                                                                                   |
+|  Stage 2: MVP Run (Full Benchmark Evaluation)                                     |
+|    - SWE-bench-lite: multi-file repository bugfixes & regression suites           |
+|    - HumanEval: TypeScript function synthesis & test suites (eval_sets/)          |
+|    - Repo Refactoring: RLVR behavioral invariance & interface decoupling          |
+|                                                                                   |
+|  Telemetry Profiles: pass@k, token consumption, trajectory length, latency profiles|
+|  Cloud Specifications: RunPod hardware tiers, GPU-hours, and cost modeling        |
++-----------------------------------------------------------------------------------+
+```
+
+### Stage 1: POC Run (Synthetic & Sandbox Validation)
+Stage 1 tests the agent harness under operational stress in isolated sandbox workspaces:
+1. **Anti-Spin Circuit Breakers (#349)**: Monitors consecutive identical tool calls or failures. Injects corrective redirection warnings at 5 repeats and terminates execution early at 8 repeats (`status="circuit_breaker_tripped"`) without wasting the max turn budget.
+2. **Staged Context Compaction (#350)**: Applies rule-based soft elision to bulky middle observations at 60% usable context, and hard LLM summarization at 85% usable context. Preamble and the most recent turns are strictly preserved verbatim without context window blowup.
+3. **Post-Edit Diagnostic Feedback & Safety Gates (#351)**: Attaches immediate AST/LSP syntax diagnostics directly to file mutation tool observations. Rejects edits to unread files under read-before-write safety, and catches path traversal jailbreaks.
+4. **Out-of-History Plan Injection (#352)**: Maintains structured plans in external state, injecting active checklist blocks into prompt conditioning without accumulating noisy conversational turns. Triggers clean exit gate upon checklist completion.
+5. **Native Web Search & Page Fetch (#366-#368)**: Enforces compact search result schemas (<400 tokens), blocks loopback and RFC 1918 addresses via SSRF defense, and caps page fetch content at 12,000 characters.
+
+### Stage 2: MVP Run (Full Benchmark Evaluation)
+Stage 2 evaluates the harness against repository-level benchmarks:
+- **SWE-bench-lite**: Multi-file repository tasks requiring multi-turn code exploration, localization, editing, and bash test verification.
+- **HumanEval**: TypeScript function generation and assertion testing drawn from `eval_sets/humaneval_ts/humaneval_ts.jsonl`.
+- **Repo Refactoring Suites**: Multi-file refactoring tasks (e.g. monolithic code to Strategy and Dependency Injection patterns) interfacing directly with deterministic RLVR verifiers (`RefactoringVerifier` and `ExecutionVerifier`) to verify 100% test pass rates, interface mockability, zero real socket/DB leakage, and zero escape hatches.
+
+### Telemetry Profiling & Output Persistence
+The benchmark pipeline records comprehensive operational metrics:
+- **Pass@k**: Evaluates solution pass rates (`pass@1`).
+- **Token Consumption**: Measures prompt tokens, completion tokens, total tokens, and per-task averages.
+- **Trajectory Profiles**: Analyzes turn distributions, mean trajectory length, min, and max turns per task.
+- **Latency Profiles**: Breaks down model generation wall time, tool execution wall time, and total task wall time.
+- **Transcripts**: Streams structured JSON results (`--output`) and per-instance JSONL execution transcripts (`--transcript`).
+
+### Cloud Compute & RunPod Execution Specifications
+For full-scale evaluation across hundreds of benchmark tasks with local models:
+- **Hardware Tiers**:
+  - `a40` (Recommended): NVIDIA A40 (48GB VRAM) at ~$0.40/hr (Community). Ideal for sub-frontier models and multi-agent harness sweeps.
+  - `rtx4090`: NVIDIA GeForce RTX 4090 (24GB VRAM) at ~$0.44/hr.
+  - `a100`: NVIDIA A100-PCIE-80GB (80GB VRAM) at ~$1.89/hr (Secure). High memory bandwidth for concurrent large-context agent runs.
+  - `h100`: NVIDIA H100-SXM-80GB (80GB VRAM) at ~$3.29/hr (Secure).
+- **Execution Safety Policy**: Autonomous subagents do not provision remote cloud GPU instances directly. The CLI provides `--cloud-spec` and `--dry-run` modes to output cloud compute parameters, runtime estimates, and launch commands for human review before deployment.

@@ -1,5 +1,14 @@
-"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #351, #352, #366, #367)."""
+"""Agent runtime, context compaction, and tool execution infrastructure (#349, #350, #351, #352, #366, #367, #371)."""
 
+from .benchmark import (
+    BenchmarkRunSummary,
+    BenchmarkTask,
+    TaskExecutionResult,
+    get_cloud_run_spec,
+    run_agent_benchmark,
+    run_mvp_stage,
+    run_poc_stage,
+)
 from .compaction import (
     CompactionConfig,
     CompactionReport,
@@ -44,6 +53,8 @@ __all__ = [
     "AgentRuntime",
     "AgentTurn",
     "AntiSpinCircuitBreaker",
+    "BenchmarkRunSummary",
+    "BenchmarkTask",
     "BraveSearchClient",
     "CircuitBreakerStatus",
     "CompactionConfig",
@@ -60,6 +71,7 @@ __all__ = [
     "PlanManager",
     "PlanningPolicy",
     "SearchResult",
+    "TaskExecutionResult",
     "ToolCall",
     "ToolObservation",
     "TrajectoryTelemetry",
@@ -67,11 +79,15 @@ __all__ = [
     "estimate_tokens",
     "fetch_web_page",
     "format_diagnostic_summary",
+    "get_cloud_run_spec",
     "parse_plan_markdown",
     "partition_conversation",
     "resolve_planning_policy",
     "resolve_safe_workspace_path",
+    "run_agent_benchmark",
     "run_agent_loop",
     "run_file_diagnostics",
+    "run_mvp_stage",
+    "run_poc_stage",
     "web_search",
 ]
