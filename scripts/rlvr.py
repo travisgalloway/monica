@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts", "ts-web", "typescript-web", "react", "python-web", "fastapi", "django", "go-web", "java-web", "spring", "csharp-web", "dotnet", "php-web", "laravel", "ruby-web", "rails", "web-backend", "web"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -147,6 +147,29 @@ def main() -> None:
         from src.train.verifiers.data_contracts import resolve_graphql_toolchain
         resolve_graphql_toolchain()
     elif args.reward in ("data-pipeline", "pipeline", "clean-architecture", "architecture", "data-contracts"):
+        pass
+    elif args.reward in ("ts-web", "typescript-web", "react"):
+        from src.train.verifiers.web_backend import resolve_ts_web_toolchain
+        resolve_ts_web_toolchain()
+    elif args.reward in ("python-web", "fastapi", "django"):
+        from src.train.verifiers.web_backend import resolve_python_web_toolchain
+        resolve_python_web_toolchain()
+    elif args.reward == "go-web":
+        from src.train.verifiers.web_backend import resolve_go_web_toolchain
+        resolve_go_web_toolchain()
+    elif args.reward in ("java-web", "spring"):
+        from src.train.verifiers.web_backend import resolve_java_web_toolchain
+        resolve_java_web_toolchain()
+    elif args.reward in ("csharp-web", "dotnet"):
+        from src.train.verifiers.web_backend import resolve_csharp_web_toolchain
+        resolve_csharp_web_toolchain()
+    elif args.reward in ("php-web", "laravel"):
+        from src.train.verifiers.web_backend import resolve_php_web_toolchain
+        resolve_php_web_toolchain()
+    elif args.reward in ("ruby-web", "rails"):
+        from src.train.verifiers.web_backend import resolve_ruby_web_toolchain
+        resolve_ruby_web_toolchain()
+    elif args.reward in ("web-backend", "web"):
         pass
 
     from src.model.backend import get_backend
@@ -271,6 +294,46 @@ def main() -> None:
         elif args.reward == "data-contracts":
             from src.train.verifiers.data_contracts import DataContractsVerifier
             raw_verifier = DataContractsVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("ts-web", "typescript-web", "react"):
+            from src.train.verifiers.web_backend import TypeScriptWebVerifier
+            raw_verifier = TypeScriptWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("python-web", "fastapi", "django"):
+            from src.train.verifiers.web_backend import PythonWebVerifier
+            raw_verifier = PythonWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "go-web":
+            from src.train.verifiers.web_backend import GoWebVerifier
+            raw_verifier = GoWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("java-web", "spring"):
+            from src.train.verifiers.web_backend import JavaWebVerifier
+            raw_verifier = JavaWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("csharp-web", "dotnet"):
+            from src.train.verifiers.web_backend import CSharpWebVerifier
+            raw_verifier = CSharpWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("php-web", "laravel"):
+            from src.train.verifiers.web_backend import PhpWebVerifier
+            raw_verifier = PhpWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("ruby-web", "rails"):
+            from src.train.verifiers.web_backend import RubyWebVerifier
+            raw_verifier = RubyWebVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("web-backend", "web"):
+            from src.train.verifiers.web_backend import WebBackendVerifier
+            raw_verifier = WebBackendVerifier(fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
         else:
