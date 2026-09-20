@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts", "ts-web", "typescript-web", "react", "python-web", "fastapi", "django", "go-web", "java-web", "spring", "csharp-web", "dotnet", "php-web", "laravel", "ruby-web", "rails", "web-backend", "web", "cloud-infra", "terraform", "docker", "kubernetes", "k8s", "shell", "bash", "html-tailwind", "tailwind", "migration-replay", "migration", "contract-diff", "contract_diff"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts", "ts-web", "typescript-web", "react", "python-web", "fastapi", "django", "go-web", "java-web", "spring", "csharp-web", "dotnet", "php-web", "laravel", "ruby-web", "rails", "web-backend", "web", "cloud-infra", "terraform", "docker", "kubernetes", "k8s", "shell", "bash", "html-tailwind", "tailwind", "migration-replay", "migration", "contract-diff", "contract_diff", "execution"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -173,6 +173,10 @@ def main() -> None:
         pass
     elif args.reward in ("cloud-infra", "terraform", "docker", "kubernetes", "k8s", "shell", "bash", "html-tailwind", "tailwind"):
         pass
+    elif args.reward == "execution":
+        from src.train.verifiers.execution import resolve_execution_toolchain
+        if not resolve_execution_toolchain():
+            raise SystemExit("no toolchain for --reward execution (python or node required on PATH)")
 
     from src.model.backend import get_backend
     from src.model.blocks import load_config
@@ -378,6 +382,11 @@ def main() -> None:
             raw_verifier = ContractDiffVerifier(fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
+        elif args.reward == "execution":
+            from src.train.verifiers.execution import SandboxedCodeVerifier
+            raw_verifier = SandboxedCodeVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
         else:
             raise ValueError(f"unknown reward {args.reward}")
 
@@ -416,6 +425,14 @@ def main() -> None:
                 extra_kwargs["abstain"] = prob["abstain"]
             if "constraints" in prob:
                 extra_kwargs["constraints"] = prob["constraints"]
+            if "tests" in prob:
+                extra_kwargs["tests"] = prob["tests"]
+            if "test_code" in prob:
+                extra_kwargs["test_code"] = prob["test_code"]
+            if "language" in prob:
+                extra_kwargs["language"] = prob["language"]
+            if "runner" in prob:
+                extra_kwargs["runner"] = prob["runner"]
             step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"], **extra_kwargs)
                               if verifier is not None else reward_fn)
             # Batched rollout generation: parallel prefill + concurrent decode across group_size
