@@ -185,6 +185,7 @@ def main() -> None:
     if backend.name == "cuda":
         import torch
         guard = torch.no_grad()
+        torch.set_float32_matmul_precision("highest")
 
     n_decode = 4
     prompt_len = 16

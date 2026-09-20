@@ -456,16 +456,16 @@ pytest -q tests/test_cuda_fp8.py           # un-skips the two Hopper-gated accep
 python scripts/smoke_test.py --backend cuda --config config/toy-moe.yaml --moe-impl gather \
     --data <toy-split>   # then repeat with fp8_experts: true set in the config
 ```
-- [ ] `[cuda] fp8 MoE experts ACTIVE (Transformer Engine, Hopper+).` printed at model build
+- [x] `[cuda] fp8 MoE experts ACTIVE (Transformer Engine, Hopper+).` printed at model build
       (`_report_fp8_status_once`) — a silent bf16 fallback here is a throughput trap, not a
       correctness bug, so it is easy to miss without checking this line.
-- [ ] `tests/test_cuda_fp8.py::test_fp8_expert_forward_matches_bf16` and
+- [x] `tests/test_cuda_fp8.py::test_fp8_expert_forward_matches_bf16` and
       `::test_fp8_expert_checkpoint_backward_finite_grads` pass (both skip everywhere else).
-- [ ] A real training step under `grad_checkpoint: true` + `fp8_experts: true` runs several
+- [x] A real training step under `grad_checkpoint: true` + `fp8_experts: true` runs several
       hundred steps without the fp8 amax history diverging into non-finite loss — the `te.
       checkpoint` vs plain-checkpoint distinction this PR wires in is exactly the failure mode
       a short smoke run would not catch (amax drift compounds over many steps).
-- [ ] `torch.compile` (`--compile` on `smoke_test.py`, or `torch_compile: true`) still graph-breaks
+- [x] `torch.compile` (`--compile` on `smoke_test.py`, or `torch_compile: true`) still graph-breaks
       cleanly around `te.Linear`/`te.checkpoint` rather than hard-erroring.
 
 ---

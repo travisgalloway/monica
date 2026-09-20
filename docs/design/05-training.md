@@ -275,7 +275,7 @@ mamba-ssm kernels, grad checkpointing), so these are the net-new ones.
 | Hybrid **Muon + AdamW** optimizer | #237 / `3b02e6b` | `src/model/cuda_muon.py`, selected at the `make_optimizer` seam in `src/model/backend.py` | **landed** |
 | **WSD** LR schedule | #238 / `8fe62f7` | `src/train/schedule.py` (`WSDSchedule`) — see above | **landed** |
 | **`torch.compile`** default-on for real CUDA runs | #239 / `7a71073` | `src/model/cuda_backend.py` | **landed** |
-| **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240, landed with #214 | `src/model/cuda_backend.py` (`_te_linear_cls`, `MoEBlock._fp8_ctx`, `_layer_forward`'s TE-checkpoint branch) | **wired**, hardware-unverified (no Hopper CI runner) |
+| **fp8** MoE-expert linears (Transformer Engine, Hopper) | #240, landed with #214 | `src/model/cuda_backend.py` (`_te_linear_cls`, `MoEBlock._fp8_ctx`, `_layer_forward`'s TE-checkpoint branch) | **verified on Hopper (H100)** |
 | **8-bit AdamW moments** (bitsandbytes) | #214 | `src/model/backend.py` (`_cuda_backend._make_optimizer`'s `_adamw` helper) | **wired**, hardware-unverified (no CUDA CI runner) |
 | **FSDP/ZeRO-2 + in-node expert parallel** | #271 (split from #214) | — nothing in the tree; `torch.distributed` is not imported anywhere | **not built** — blocks #223, not #222 |
 

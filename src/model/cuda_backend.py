@@ -27,6 +27,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
+
+def _dynamo_disable(fn):
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "disable"):
+        return dynamo.disable(fn)
+    return fn
+
 from .blocks import MambaConfig
 from .critic import CriticConfig
 from .interface import ModelInterface, State, Array
@@ -212,6 +219,12 @@ def _f32(t: Array) -> Array:
 
 def _cast(t: Array, cd) -> Array:
     return t if t.dtype == cd else t.to(cd)
+
+
+def _to_tensor(x: Any, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype=dtype, device=device)
+    return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
 
 def _linear(layer: nn.Linear, x: Array, cd) -> Array:
@@ -914,9 +927,24 @@ class _Expert(nn.Module):
 
     def forward(self, xn: Array, cd) -> Array:
         if self._te:
-            # TE linears own their GEMM (fp8 under an fp8_autocast context — not yet
-            # wired, #240 — or bf16/fp16 outside one); call the modules directly.
-            return self.down(_silu(self.gate(xn)) * self.up(xn))
+            # TE linears own their GEMM (fp8 under an fp8_autocast context — #214/#240).
+            # Hopper FP8 Tensor Cores (cuBLASLt) require leading dimension lda % 16 == 0
+            # for both forward and backward (wgrad GEMM). Grouped-gather routing dispatches
+            # arbitrary slice sizes `c` (including 0 or non-multiples of 16) to each expert.
+            # Flatten to 2D, pad total rows N to a positive multiple of 16 if needed, and slice back.
+            orig_shape = xn.shape
+            D = orig_shape[-1]
+            flat_x = xn.reshape(-1, D)
+            N = flat_x.shape[0]
+            rem = N % 16
+            if rem != 0 or N == 0:
+                pad = (16 - rem) if rem != 0 else 16
+                flat_x_padded = torch.cat([flat_x, flat_x.new_zeros((pad, D))], dim=0)
+                out = self.down(_silu(self.gate(flat_x_padded)) * self.up(flat_x_padded))
+                out = out[:N]
+            else:
+                out = self.down(_silu(self.gate(flat_x)) * self.up(flat_x))
+            return out.reshape(orig_shape)
         return _linear(self.down,
                        _silu(_linear(self.gate, xn, cd)) * _linear(self.up, xn, cd), cd)
 
@@ -1050,21 +1078,26 @@ class MoEBlock(nn.Module):
         self._n_routed = 0
         return {"load": load, "entropy": (total / n) if n else None, "n_tokens": int(n)}
 
+    @contextlib.contextmanager
     def _fp8_ctx(self):
         """Context manager for the expert-compute region (#214/#240). A `te.Linear`
         called OUTSIDE an `fp8_autocast` context silently runs in bf16, not fp8, so
         `_expert_linear` alone does not turn fp8 on — every expert GEMM call site in
-        `_moe` must be wrapped in this. `contextlib.nullcontext()` when fp8 is off or
+        `_moe` must be wrapped in this. A no-op context when fp8 is off or
         unavailable, so the non-fp8 path is untouched byte-for-byte (no TE import even
         attempted). The router's logits/probs are computed by the CALLER, above this
         context — the router is a plain `nn.Linear` and always routes in fp32, and
         must stay bit-identical between fp8 and bf16 runs regardless (see the
         zero-tolerance routing-identity test in `tests/test_cuda_fp8.py`)."""
         if not (self.config.fp8_experts and fp8_status()):
-            return contextlib.nullcontext()
+            yield
+            return
         import transformer_engine.pytorch as te
         from transformer_engine.common.recipe import DelayedScaling
-        return te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling())
+        cd = torch.bfloat16 if self.config.precision == "bf16" else (
+            torch.float16 if self.config.precision == "fp16" else torch.float32)
+        with torch.autocast("cuda", dtype=cd), te.fp8_autocast(enabled=True, fp8_recipe=DelayedScaling()):
+            yield
 
     def _moe_dense(self, xn: Array, cd, gate: Array) -> Array:
         # `self.experts` is a ModuleDict (see __init__) — `.values()` in insertion
@@ -1270,6 +1303,7 @@ class MoEBlock(nn.Module):
                 y = y + sum(_f32(se(xn, cd)) for se in self.shared_experts)
         return _cast(y, cd)
 
+    @_dynamo_disable
     def forward(self, x: Array, seg_ids: Array = None) -> Array:
         return x + self._moe(self.norm(x))                   # pointwise: seg_ids irrelevant
 
@@ -1688,9 +1722,10 @@ class CUDAMambaModel(ModelInterface, nn.Module):
                 # CPU/CI or non-Hopper CUDA must fall through to the plain-checkpoint path
                 # below, matching `MoEBlock._fp8_ctx`'s own fp8_status() gate.
                 import transformer_engine.pytorch as te
-                if seg_ids is None:
-                    return te.checkpoint(layer, h)
-                return te.checkpoint(layer, h, seg_ids)
+                with layer._fp8_ctx():
+                    if seg_ids is None:
+                        return te.checkpoint(layer, h)
+                    return te.checkpoint(layer, h, seg_ids)
             if seg_ids is None:
                 return _checkpoint(layer, h, use_reentrant=False)
             return _checkpoint(layer, h, seg_ids, use_reentrant=False)
@@ -1709,11 +1744,11 @@ class CUDAMambaModel(ModelInterface, nn.Module):
     def forward(self, token_batch: Array, seg_ids: Array = None, *, return_mtp: bool = False) -> Union[Array, Tuple[Array, list[Array]]]:
         if return_mtp:
             return self.forward_with_mtp(token_batch, seg_ids)
-        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        ids = _to_tensor(token_batch, torch.long, self._device)
         h = _cast(self.embedding(ids), self._cd)     # activation stream in cd
         seg = None
         if seg_ids is not None:                      # (B, L) document ids -> boundary-aware (#68)
-            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+            seg = _to_tensor(seg_ids, torch.long, self._device)
         return self._forward_compute(h, seg)
 
     def forward_mtp(self, token_batch: Array, seg_ids: Array = None) -> list[Array]:
@@ -1725,11 +1760,11 @@ class CUDAMambaModel(ModelInterface, nn.Module):
         self, token_batch: Array, seg_ids: Array = None
     ) -> Tuple[Array, list[Array]]:
         """Full-sequence forward pass returning (logits, aux_mtp_logits) (#356)."""
-        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        ids = _to_tensor(token_batch, torch.long, self._device)
         embed = _cast(self.embedding(ids), self._cd)
         seg = None
         if seg_ids is not None:
-            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+            seg = _to_tensor(seg_ids, torch.long, self._device)
         h = embed
         for layer in self.layers:
             h = self._layer_forward(layer, h, seg)
@@ -1757,11 +1792,11 @@ class CUDAMambaModel(ModelInterface, nn.Module):
 
     def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
         """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387)."""
-        ids = torch.as_tensor(np.asarray(token_batch), dtype=torch.long, device=self._device)
+        ids = _to_tensor(token_batch, torch.long, self._device)
         h = _cast(self.embedding(ids), self._cd)
         seg = None
         if seg_ids is not None:
-            seg = torch.as_tensor(np.asarray(seg_ids), dtype=torch.long, device=self._device)
+            seg = _to_tensor(seg_ids, torch.long, self._device)
         for layer in self.layers:
             h = self._layer_forward(layer, h, seg)
         return self.norm_f(h)

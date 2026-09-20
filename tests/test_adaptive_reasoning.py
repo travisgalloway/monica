@@ -361,6 +361,12 @@ def test_deterministic_mode_switching_identical_runs():
 
 def test_scripts_generate_cli_fim_direct_insertion():
     """FIM completions in scripts/generate.py insert directly without echoing prompt framing."""
+    try:
+        from src.model.backend import get_backend
+        get_backend("auto")
+    except (ImportError, ModuleNotFoundError, SystemExit):
+        pytest.skip("no hardware backend (torch/mlx) available for scripts/generate.py")
+
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT)
     res = subprocess.run(

@@ -460,6 +460,12 @@ def test_best_of_n_threshold_zero_matches_unfiltered():
 
 def test_cli_subprocess_critic_filter_invocation(tmp_path):
     """Verify scripts/generate.py execution with --critic-filter via CLI invocation."""
+    try:
+        from src.model.backend import get_backend
+        get_backend("auto")
+    except (ImportError, ModuleNotFoundError, SystemExit):
+        pytest.skip("no hardware backend (torch/mlx) available for scripts/generate.py")
+
     import subprocess
 
     cmd = [
@@ -484,6 +490,12 @@ def test_cli_subprocess_critic_filter_invocation(tmp_path):
 
 def test_cli_subprocess_standard_sampling_unaffected():
     """Verify scripts/generate.py standard sampling works without --critic-filter."""
+    try:
+        from src.model.backend import get_backend
+        get_backend("auto")
+    except (ImportError, ModuleNotFoundError, SystemExit):
+        pytest.skip("no hardware backend (torch/mlx) available for scripts/generate.py")
+
     import subprocess
 
     cmd = [
@@ -504,6 +516,7 @@ def test_cli_subprocess_standard_sampling_unaffected():
 
 def test_spec_decode_throughput_and_acceptance_metrics():
     """Verify speculative decoding acceptance rates and token generation throughput logging."""
+    mx = pytest.importorskip("mlx.core")
     from scripts.spec_decode import spec_decode
 
     class DummySpecModel:
@@ -511,20 +524,16 @@ def test_spec_decode_throughput_and_acceptance_metrics():
             self.config = SimpleNamespace(vocab_size=16)
 
         def prefill(self, p_arr, last_only=True):
-            import mlx.core as mx
             return mx.zeros((1, 16)), []
 
         def step(self, x, state):
-            import mlx.core as mx
             return mx.zeros((1, 16)), state
 
         def verify_block(self, draft, state):
-            import mlx.core as mx
             logits = [mx.zeros((1, 16)) for _ in draft]
             states = [state for _ in draft]
             return logits, states
 
-    import mlx.core as mx
     dummy_model = DummySpecModel()
     prompt = [1, 2, 3, 4, 1, 2, 3]  # has repeated n-gram so propose() generates draft
 

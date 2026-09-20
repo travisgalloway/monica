@@ -106,7 +106,11 @@ def test_fp8_expert_forward_matches_bf16(_hopper):
     model_fp8 = CUDAMambaModel(cfg_fp8, device="cuda")
     # Same weights for both — an fp8 vs bf16 GEMM is the only variable under test; a
     # different random init would confound the comparison.
-    model_fp8.load_state_dict(model_bf16.state_dict(), strict=True)
+    # strict=False because te.Linear defines _extra_state for FP8 scaling metadata,
+    # which plain nn.Linear lacks in its state dict.
+    missing, unexpected = model_fp8.load_state_dict(model_bf16.state_dict(), strict=False)
+    assert not unexpected, f"unexpected keys in fp8 state dict: {unexpected}"
+    assert all(k.endswith("_extra_state") for k in missing), f"unexpected missing keys: {missing}"
     model_bf16.eval()
     model_fp8.eval()
     model_bf16.set_moe_load_counting(True)
