@@ -69,6 +69,27 @@ def _bytes_per(dtype: str) -> int:
     return BYTES_PER_DTYPE[dtype]
 
 
+def kv_cache_elements_per_token(cfg: MambaConfig) -> int:
+    """Number of elements stored in the key-value cache per token across all attention layers.
+
+    With MLA enabled (#355), each attention layer caches only the low-rank latent vector
+    c^{KV} (mla_latent_dim) and the decoupled rotary key k^R (mla_rope_dim).
+    Otherwise (standard MHA), each layer stores full keys and values (2 * n_attn_heads * attn_head_dim).
+    """
+    if not cfg.n_attention_layers:
+        return 0
+    if cfg.use_mla:
+        per_layer = cfg.mla_latent_dim_resolved + cfg.mla_rope_dim_resolved
+    else:
+        per_layer = 2 * cfg.n_attn_heads_resolved * cfg.attn_head_dim
+    return cfg.n_attention_layers * per_layer
+
+
+def kv_cache_memory_bytes(cfg: MambaConfig, seq_len: int, dtype: str = "fp16") -> int:
+    """Key-value cache memory in bytes at sequence length `seq_len`."""
+    return kv_cache_elements_per_token(cfg) * seq_len * _bytes_per(dtype)
+
+
 def inference_bytes(cfg: MambaConfig, dtype: str = "bf16") -> int:
     """Bytes to hold the model for inference. No KV cache -> weights are the footprint."""
     return cfg.num_parameters() * _bytes_per(dtype)

@@ -50,6 +50,8 @@ def main() -> None:
     ap.add_argument("--moe-impl", choices=("auto", "dense", "gather"), default=None,
                     help="#214: override config.moe_impl (the MoE compute strategy) "
                          "without editing the YAML; no-op on a config with no MoE layers")
+    ap.add_argument("--use-mla", action="store_true", default=False,
+                    help="enable Multi-Head Latent Attention (MLA #355) for hybrid attention layers")
     args = ap.parse_args()
 
     # Backend selection stays behind the seam factory; only portable modules are
@@ -65,6 +67,9 @@ def main() -> None:
     cfg = load_config(str(args.config))
     if args.moe_impl is not None:
         cfg = dataclasses.replace(cfg, moe_impl=args.moe_impl)
+        cfg.validate()
+    if args.use_mla:
+        cfg = dataclasses.replace(cfg, use_mla=True)
         cfg.validate()
     assert cfg.precision == "fp32", "smoke test requires fp32 for exact resume"
     # A dense-config-only restriction used to sit here ("MoE is MLX-only"). That is now
