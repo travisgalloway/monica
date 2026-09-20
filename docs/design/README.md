@@ -71,6 +71,10 @@ Every claim here is sourced from a docstring or config comment in the code, with
 17. [Agent harness: execution loop, compaction & discovery](17-agent-harness.md) — the M12 agent harness
     architecture (#349, #350, #366, #367): autonomous ReAct loop, staged context compaction (T4:
     soft elision + hard summarization), two-stage web search, in-turn caching, and anti-spin breakers.
+18. [Containerized execution sandbox](18-container-sandbox.md) — isolated execution backend
+    (Docker/Podman, #353): ephemeral container lifecycles, workspace filesystem mounting,
+    resource/timeout limits, and seamless toggling between local subprocess and containerized
+    execution for agent tools and RLVR verifiers.
 
 > **The live program is topic 13** (M12, [#198](https://github.com/travisgalloway/monica/issues/198)):
 > a from-scratch Mamba-2 hybrid **MoE code model** with the structural-signal (SSI) fold as a
@@ -108,3 +112,4 @@ Every claim here is sourced from a docstring or config comment in the code, with
 | Data framework | `datatrove` + R2 + RunPod | builds the M12 corpus (Essential-Web + Stack-v2, #193) + reserve data. For the M12 code corpus, Python **cleans** (→ `cleaned.jsonl`); the native Swift `monica-tokenize pack` **tokenizes+packs** | `docs/design/08-corpus-pipeline.md` |
 | Native engine (M13) | **Swift + MLX, Mac-first** (B1); ggml/llama.cpp port deferred | reuses our MLX numerics/weights/quant and the native `swift/Sources/MonicaTokenizer`; parity-checkable against the Python seam at fp32 ~1e-4. Not Mac-locked (mlx-swift#320 CUDA build) but Apple Silicon first; ggml is gated on arch freeze + MoE-Mamba support and has no training path | `docs/design/14-inference-engine.md` |
 | Build method (reserve) | **distillation** from a frozen teacher — Qwen3 vocab, `Qwen/Qwen3-4B-Thinking-2507`, ~1B student | M10 program, **dropped 2026-07-19**; machinery built then pruned from the tree (#189/#248), design record kept as history | `docs/reserve/10-distillation.md` |
+| Sandboxed execution (M12) | Docker / Podman CLI with resource & timeout guards | environmental isolation for untrusted rollouts and verifiers (arXiv:2609.20804) | `src/runtime/sandbox.py`, `docs/design/18-container-sandbox.md` |

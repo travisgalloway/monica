@@ -76,35 +76,58 @@ class CodeVerifier:
     (partial credit; use >=5 tests per problem so a thin suite can't be gamed — the main
     RLVR failure mode).
 
-    UNSAFE: executes untrusted model output in a subprocess. Disabled by default; set
-    `enabled=True` to opt in (never in CI). Python only — TS/Rust/SQL belong in an external
-    sandbox.
+    UNSAFE when run locally: executes untrusted model output in a subprocess. Disabled by
+    default; set `enabled=True` to opt in for local execution.
+    For safe execution in untrusted rollouts and RLVR sweeps, pass an isolated container sandbox
+    (`sandbox=ContainerSandbox(...)` or `sandbox="container"` / `"docker"`).
     """
 
-    def __init__(self, *, timeout: float = 5.0, enabled: bool = False):
+    def __init__(
+        self,
+        *,
+        timeout: float = 5.0,
+        enabled: bool = False,
+        sandbox: Any | None = None,
+    ) -> None:
         self.timeout = timeout
         self.enabled = enabled
+        if isinstance(sandbox, str):
+            from src.runtime.sandbox import create_sandbox
+
+            self.sandbox = create_sandbox(sandbox, timeout_s=timeout)
+        else:
+            self.sandbox = sandbox
 
     def reward(self, code: str, tests: Sequence[str]) -> float:
-        if not self.enabled:
+        is_local = self.sandbox is None or getattr(self.sandbox, "is_local", False)
+        if not self.enabled and is_local:
             raise RuntimeError(
                 "CodeVerifier is disabled (it executes untrusted code). "
-                "Pass enabled=True to opt in — never in CI.")
+                "Pass enabled=True to opt in — never in CI."
+            )
         if not tests:
             return 0.0
         passed = 0
         for t in tests:
             program = f"{code}\n{t}\n"
-            try:
-                # Discard untrusted stdout/stderr (a candidate can print unbounded data);
-                # only the exit code matters.
-                r = subprocess.run([sys.executable, "-c", program],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=self.timeout)
-                passed += int(r.returncode == 0)
-            except subprocess.TimeoutExpired:
-                pass
+            if self.sandbox is not None:
+                res = self.sandbox.run_python(program, timeout=self.timeout)
+                passed += int(res.exit_code == 0)
+            else:
+                try:
+                    # Discard untrusted stdout/stderr (a candidate can print unbounded data);
+                    # only the exit code matters.
+                    r = subprocess.run(
+                        [sys.executable, "-c", program],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self.timeout,
+                    )
+                    passed += int(r.returncode == 0)
+                except subprocess.TimeoutExpired:
+                    pass
         return passed / len(tests)
+
 
 
 # --------------------------------------------------------------------------- #

@@ -484,6 +484,7 @@ class WorkspaceToolExecutor:
         diagnostic_provider: Any | None = None,
         ts_lsp_service: Any | None = None,
         plan_manager: PlanManager | None = None,
+        sandbox: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_dir or os.getcwd()).resolve()
         self.timeout_s = float(timeout_s)
@@ -494,6 +495,16 @@ class WorkspaceToolExecutor:
         self.diagnostic_provider = diagnostic_provider
         self.ts_lsp_service = ts_lsp_service
         self.plan_manager = plan_manager
+        if isinstance(sandbox, str):
+            from src.runtime.sandbox import create_sandbox
+
+            self.sandbox: Any | None = create_sandbox(
+                sandbox,
+                workspace_dir=self.workspace_root,
+                timeout_s=self.timeout_s,
+            )
+        else:
+            self.sandbox = sandbox
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
             "execute_bash": lambda a: self.execute_bash(str(a.get("command", ""))),
             "view_file": lambda a: self.view_file(
@@ -562,6 +573,22 @@ class WorkspaceToolExecutor:
 
     def execute_bash(self, command: str) -> dict[str, Any]:
         """Execute a shell command within the repository workspace."""
+        if self.sandbox is not None:
+            res = self.sandbox.run_bash(
+                command,
+                cwd=self.workspace_root,
+                timeout=self.timeout_s,
+            )
+            out: dict[str, Any] = {
+                "exit_code": res.exit_code,
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "is_error": res.is_error,
+            }
+            if res.error:
+                out["error"] = res.error
+            return out
+
         try:
             proc = subprocess.run(
                 command,
@@ -999,6 +1026,7 @@ class AgentRuntime:
         compactor: Any | None = None,
         plan_manager: PlanManager | None = None,
         planning_policy: str | PlanningPolicy | None = None,
+        sandbox: Any | None = None,
     ) -> None:
         self.lm = lm
         raw_tools = list(tools) if tools is not None else list(CODING_AGENT_TOOLS)
@@ -1016,7 +1044,10 @@ class AgentRuntime:
         if tool_executor is not None:
             self.tool_executor = tool_executor
         else:
-            self.tool_executor = WorkspaceToolExecutor(workspace_dir=workspace_dir)
+            self.tool_executor = WorkspaceToolExecutor(
+                workspace_dir=workspace_dir,
+                sandbox=sandbox,
+            )
 
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.max_turns = int(max_turns)
@@ -1555,6 +1586,7 @@ def run_agent_loop(
     compactor: Any | None = None,
     plan_manager: PlanManager | None = None,
     planning_policy: str | PlanningPolicy | None = None,
+    sandbox: Any | None = None,
 ) -> AgentRunResult:
     """Convenience functional wrapper around AgentRuntime."""
     runtime = AgentRuntime(
@@ -1572,5 +1604,6 @@ def run_agent_loop(
         compactor=compactor,
         plan_manager=plan_manager,
         planning_policy=planning_policy,
+        sandbox=sandbox,
     )
     return runtime.run(task)
