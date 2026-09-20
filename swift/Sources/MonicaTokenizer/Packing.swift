@@ -230,12 +230,15 @@ public enum Packing {
     @discardableResult
     public static func packRepos(repos: [RepoProject], tokenizer: Tokenizer,
                                  outDir: URL, seqLen: Int = 32768, shardSizeMB: Int = 512,
-                                 chunkAlign: Int? = nil, padId: Int = 0) throws -> Manifest {
+                                 chunkAlign: Int? = nil, padId: Int = 0,
+                                 fimOptions: FIMOptions? = nil) throws -> Manifest {
         guard seqLen > 0 else {
             throw PackingError.invalidArgument("seqLen must be positive, got \(seqLen)")
         }
         var docs: [PackedDoc] = []
         let eos = tokenizer.eosTokenId
+        var fimStats = FIMStats()
+        var docIndex = 0
 
         for repo in repos {
             if repo.files.isEmpty { continue }
@@ -246,9 +249,15 @@ public enum Packing {
                 repoTokens.append(contentsOf: tokenizer.encodeFileSeparator(path: file.path))
                 if let toks = file.tokens {
                     repoTokens.append(contentsOf: toks)
+                } else if let opts = fimOptions, opts.rateBasisPoints > 0 {
+                    let fTokens = FIM.transform(document: file.fileText, index: docIndex,
+                                                tokenizer: tokenizer, options: opts,
+                                                stats: &fimStats)
+                    repoTokens.append(contentsOf: fTokens)
                 } else {
                     repoTokens.append(contentsOf: tokenizer.encode(file.fileText))
                 }
+                docIndex += 1
             }
             repoTokens.append(eos)
             // The entire repository is packed with isBoundary: true at its first token,

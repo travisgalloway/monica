@@ -278,6 +278,18 @@ func cmdPack(_ flags: [String: String]) async {
     guard let inPath = inPath else { fail("pack: --in <jsonl|txt> or --repo-manifest <path> is required") }
     guard let outPath = flags["out"] else { fail("pack: --out <dir> is required") }
 
+    // FIM insertion (#215, #358) happens here, at pack time, because this is the only place documents
+    // still exist as whole objects — `src/data/split.py` drops the `.bounds` sidecars, so the
+    // Python trainer never sees doc structure. Trade-off, accepted and recorded in FIM.swift:
+    // changing the rate means re-packing the corpus, not editing a config.
+    let fimModeRaw = flags["fim-mode"] ?? "psm"
+    guard let fimMode = FIMMode(rawValue: fimModeRaw) else {
+        fail("--fim-mode must be one of 'psm', 'spm', 'joint', got '\(fimModeRaw)'")
+    }
+    let fimOptions = FIMOptions(rateBasisPoints: rateBasisPoints(flags, "fim-rate"),
+                                seed: uint64Flag(flags, "fim-seed", default: 0),
+                                mode: fimMode)
+
     // Check if packing multi-file repository projects (#359)
     let repoProjects: [Packing.RepoProject]? = manifestFlag != nil ? tryLoadRepoManifest(manifestFlag!, flags: flags) : tryLoadRepoManifest(inPath, flags: flags)
 
@@ -289,7 +301,8 @@ func cmdPack(_ flags: [String: String]) async {
             let m = try Packing.packRepos(repos: repos, tokenizer: tok,
                                          outDir: URL(fileURLWithPath: outPath),
                                          seqLen: seqLen, shardSizeMB: shardMB,
-                                         chunkAlign: chunkAlign)
+                                         chunkAlign: chunkAlign,
+                                         fimOptions: fimOptions)
             let totalFiles = repos.reduce(0) { $0 + $1.files.count }
             print("packed repository DAG: \(repos.count) repo(s), \(totalFiles) file(s), \(m.n_sequences) seq x \(seqLen) (\(m.n_tokens) tokens, \(m.shards.count) shard(s)) -> \(outPath)")
             return
@@ -307,18 +320,6 @@ func cmdPack(_ flags: [String: String]) async {
     } else {
         chunkAlign = nil
     }
-
-    // FIM insertion (#215) happens here, at pack time, because this is the only place documents
-    // still exist as whole objects — `src/data/split.py` drops the `.bounds` sidecars, so the
-    // Python trainer never sees doc structure. Trade-off, accepted and recorded in FIM.swift:
-    // changing the rate means re-packing the corpus, not editing a config.
-    let fimModeRaw = flags["fim-mode"] ?? "psm"
-    guard let fimMode = FIMMode(rawValue: fimModeRaw) else {
-        fail("--fim-mode must be one of 'psm', 'spm', 'joint', got '\(fimModeRaw)'")
-    }
-    let fimOptions = FIMOptions(rateBasisPoints: rateBasisPoints(flags, "fim-rate"),
-                                seed: uint64Flag(flags, "fim-seed", default: 0),
-                                mode: fimMode)
     var fimStats = FIMStats()
 
     let docs = readDocs(inPath)

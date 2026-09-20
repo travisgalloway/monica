@@ -63,6 +63,7 @@ def find_default_tokenizer(explicit: str | Path | None = None) -> Path | None:
         return p if p.exists() else None
     candidates = [
         REPO_ROOT / "data" / "tokenizer" / "vocab-32768.json",
+        REPO_ROOT / "configs" / "tokenizer" / "vocab.json",
         Path.home() / "monica-data" / "vocab-sweep-251-half" / "tok" / "vocab-32768.json",
         Path.home() / "monica-data" / "vocab-sweep-251" / "tok" / "vocab-32768.json",
         Path.home() / "monica-data" / "vocab-sweep-251-half" / "tok" / "vocab-49152.json",
@@ -70,23 +71,324 @@ def find_default_tokenizer(explicit: str | Path | None = None) -> Path | None:
     for c in candidates:
         if c.exists():
             return c
+    tok_bin = find_monica_tokenize()
+    if tok_bin is not None:
+        fixture = REPO_ROOT / "swift" / "Fixtures" / "parity-corpus.jsonl"
+        if fixture.exists():
+            out_tok = REPO_ROOT / "data" / "tokenizer" / "vocab-32768.json"
+            out_tok.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run([str(tok_bin), "train", "--in", str(fixture), "--out", str(out_tok), "--vocab-size", "32768"], check=True)
+            if out_tok.exists():
+                return out_tok
     return None
 
 
+def ensure_sample_corpus(out_file: Path) -> Path:
+    """Generate a rich sample source repository mixture exercising #357, #358, and #359."""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    if out_file.exists() and out_file.stat().st_size > 5000:
+        return out_file
+
+    parity_corpus = REPO_ROOT / "swift" / "Fixtures" / "parity-corpus.jsonl"
+    humaneval = REPO_ROOT / "eval_sets" / "humaneval_ts" / "humaneval_ts.jsonl"
+
+    contam_line = ""
+    if humaneval.exists():
+        with open(humaneval, encoding="utf-8") as f:
+            first = f.readline()
+            if first.strip():
+                contam_line = json.loads(first)["prompt"]
+
+    records = []
+
+    # Project 1: auth-gateway (TypeScript multi-file repository)
+    repo1 = "auth-gateway"
+    p1_files = [
+        ("src/types/token.ts", """export interface TokenPayload {
+    sub: string;
+    username: string;
+    role: "admin" | "member" | "guest";
+    iat: number;
+    exp: number;
+}
+
+export interface SessionContext {
+    token: string;
+    payload: TokenPayload;
+    active: boolean;
+}
+"""),
+        ("src/utils/crypto.ts", """import { TokenPayload } from "../types/token";
+
+export function generateNonce(length: number = 16): string {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let nonce = "";
+    for (let i = 0; i < length; i += 1) {
+        const idx = Math.floor(Math.random() * chars.length);
+        nonce += chars.charAt(idx);
+    }
+    return nonce;
+}
+
+export function validateExpiry(payload: TokenPayload): boolean {
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp <= now) {
+        return false;
+    }
+    return true;
+}
+"""),
+        ("src/services/session.ts", """import { SessionContext, TokenPayload } from "../types/token";
+import { generateNonce, validateExpiry } from "../utils/crypto";
+
+export class SessionService {
+    private activeSessions = new Map<string, SessionContext>();
+
+    public createSession(payload: TokenPayload): SessionContext {
+        const nonce = generateNonce(32);
+        const context: SessionContext = {
+            token: nonce,
+            payload,
+            active: validateExpiry(payload),
+        };
+        this.activeSessions.set(nonce, context);
+        return context;
+    }
+
+    public getSession(token: string): SessionContext | undefined {
+        const session = this.activeSessions.get(token);
+        if (session && !validateExpiry(session.payload)) {
+            session.active = false;
+        }
+        return session;
+    }
+}
+"""),
+        ("src/middleware/guard.ts", """import { SessionService } from "../services/session";
+import { SessionContext } from "../types/token";
+
+export function authorizeRole(
+    sessionService: SessionService,
+    token: string,
+    requiredRole: string
+): boolean {
+    const session = sessionService.getSession(token);
+    if (!session || !session.active) {
+        return false;
+    }
+    if (requiredRole === "admin" && session.payload.role !== "admin") {
+        return false;
+    }
+    return true;
+}
+"""),
+        ("src/index.ts", """import { SessionService } from "./services/session";
+import { authorizeRole } from "./middleware/guard";
+import { TokenPayload } from "./types/token";
+
+export function bootstrapAuthApp(): void {
+    const svc = new SessionService();
+    const adminUser: TokenPayload = {
+        sub: "user-101",
+        username: "system_admin",
+        role: "admin",
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 3600,
+    };
+    const session = svc.createSession(adminUser);
+    const authorized = authorizeRole(svc, session.token, "admin");
+    console.log(`Auth initialization complete. Authorized: ${authorized}`);
+}
+"""),
+    ]
+    for p, code in p1_files:
+        # Replicate code blocks to provide adequate sequence tokens
+        body = code + "\n" + code
+        records.append({"text": body, "path": p, "repo": repo1, "metadata": {"lang": "typescript", "license": "mit", "repo": repo1, "is_code": True}})
+
+    # Project 2: matrix-compute (Python multi-file repository)
+    repo2 = "matrix-compute"
+    p2_files = [
+        ("math_engine/config.py", """from dataclasses import dataclass
+
+@dataclass
+class EngineConfig:
+    dimension: int = 128
+    precision: str = "float32"
+    device: str = "cpu"
+    normalize_inputs: bool = True
+"""),
+        ("math_engine/linear.py", """from math_engine.config import EngineConfig
+
+class Matrix2D:
+    def __init__(self, rows: int, cols: int, config: EngineConfig | None = None):
+        self.rows = rows
+        self.cols = cols
+        self.config = config or EngineConfig()
+        self.data: list[list[float]] = [[0.0 for _ in range(cols)] for _ in range(rows)]
+
+    def set_identity(self) -> None:
+        for r in range(self.rows):
+            for c in range(self.cols):
+                self.data[r][c] = 1.0 if r == c else 0.0
+
+    def trace(self) -> float:
+        total = 0.0
+        limit = min(self.rows, self.cols)
+        for i in range(limit):
+            total += self.data[i][i]
+        return total
+"""),
+        ("math_engine/statistics.py", """from math_engine.linear import Matrix2D
+
+def compute_row_means(mat: Matrix2D) -> list[float]:
+    means = []
+    for row in mat.data:
+        if not row:
+            means.append(0.0)
+            continue
+        total = sum(row)
+        means.append(total / float(len(row)))
+    return means
+"""),
+        ("math_engine/solver.py", """from math_engine.config import EngineConfig
+from math_engine.linear import Matrix2D
+from math_engine.statistics import compute_row_means
+
+class LinearSolver:
+    def __init__(self, config: EngineConfig):
+        self.config = config
+        self.matrix = Matrix2D(config.dimension, config.dimension, config)
+        self.matrix.set_identity()
+
+    def solve_trace_and_means(self) -> tuple[float, list[float]]:
+        t = self.matrix.trace()
+        m = compute_row_means(self.matrix)
+        return t, m
+"""),
+        ("main.py", """from math_engine.config import EngineConfig
+from math_engine.solver import LinearSolver
+
+def run_computation():
+    cfg = EngineConfig(dimension=64)
+    solver = LinearSolver(cfg)
+    t, means = solver.solve_trace_and_means()
+    print(f"Computed matrix trace: {t} across {len(means)} dimensions")
+
+if __name__ == "__main__":
+    run_computation()
+"""),
+    ]
+    for p, code in p2_files:
+        body = code + "\n" + code
+        records.append({"text": body, "path": p, "repo": repo2, "metadata": {"lang": "python", "license": "apache-2.0", "repo": repo2, "is_code": True}})
+
+    # Project 3: event-dispatcher (TypeScript multi-file repository)
+    repo3 = "event-dispatcher"
+    p3_files = [
+        ("src/schemas/events.ts", """export interface BaseEvent {
+    eventId: string;
+    timestamp: number;
+    sourceService: string;
+}
+
+export interface UserRegistrationEvent extends BaseEvent {
+    userId: string;
+    email: string;
+    tier: "free" | "pro";
+}
+"""),
+        ("src/pipes/validator.ts", """import { BaseEvent, UserRegistrationEvent } from "../schemas/events";
+
+export function validateEventStructure(evt: BaseEvent): boolean {
+    if (!evt.eventId || evt.eventId.length === 0) {
+        return false;
+    }
+    if (evt.timestamp <= 0) {
+        return false;
+    }
+    return true;
+}
+
+export function isUserRegistration(evt: BaseEvent): evt is UserRegistrationEvent {
+    return (evt as UserRegistrationEvent).userId !== undefined;
+}
+"""),
+        ("src/dispatcher.ts", """import { BaseEvent } from "./schemas/events";
+import { validateEventStructure, isUserRegistration } from "./pipes/validator";
+
+export class EventDispatcher {
+    private handlers = new Map<string, Array<(e: BaseEvent) => void>>();
+
+    public registerHandler(eventType: string, handler: (e: BaseEvent) => void): void {
+        const list = this.handlers.get(eventType) || [];
+        list.push(handler);
+        this.handlers.set(eventType, list);
+    }
+
+    public dispatch(evt: BaseEvent): boolean {
+        if (!validateEventStructure(evt)) {
+            return false;
+        }
+        const listeners = this.handlers.get(evt.sourceService) || [];
+        for (const fn of listeners) {
+            fn(evt);
+        }
+        return true;
+    }
+}
+"""),
+    ]
+    for p, code in p3_files:
+        body = code + "\n" + code
+        records.append({"text": body, "path": p, "repo": repo3, "metadata": {"lang": "typescript", "license": "mit", "repo": repo3, "is_code": True}})
+
+    # Additional text and prose records from parity corpus
+    if parity_corpus.exists():
+        with open(parity_corpus, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    item = json.loads(line)
+                    records.append({
+                        "text": item.get("text", ""),
+                        "metadata": {"lang": "en", "license": "odc-by", "is_code": False},
+                    })
+
+    # Add secret line to verify scrubber
+    records.append({
+        "text": """// Sensitive configuration file\nconst AWS_SECRET_KEY = "AKIA1234567890EXAMPLE";\nexport function getKey(): string { return AWS_SECRET_KEY; }\n""",
+        "path": "src/secret.ts",
+        "metadata": {"lang": "typescript", "license": "mit", "is_code": True},
+    })
+
+    # Add contam line to verify decontaminator
+    if contam_line:
+        records.append({
+            "text": contam_line,
+            "path": "eval_contam.ts",
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True},
+        })
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    return out_file
+
 def find_default_sample(explicit: str | Path | None = None) -> Path | None:
-    """Locate sample corpus file."""
+    """Locate sample corpus file, creating rich sample repo mixture if none exists."""
     if explicit:
         p = Path(explicit)
         return p if p.exists() else None
     candidates = [
+        REPO_ROOT / "data" / "sample" / "sample.jsonl",
         Path.home() / "monica-data" / "vocab-sweep-251-half" / "sample" / "sample.jsonl",
         Path.home() / "monica-data" / "vocab-sweep-251" / "sample" / "sample.jsonl",
-        REPO_ROOT / "data" / "sample" / "sample.jsonl",
+        REPO_ROOT / "data" / "sample_slice" / "raw.jsonl",
     ]
     for c in candidates:
         if c.exists():
             return c
-    return None
+    return ensure_sample_corpus(REPO_ROOT / "data" / "sample" / "sample.jsonl")
 
 
 def iter_cleaned_docs(cleaned_dir: Path | str) -> Iterator[dict]:
@@ -143,30 +445,97 @@ def consolidate_cleaned(cleaned_dir: Path | str, out_file: Path | str) -> Tuple[
     return n_docs, lang_mix, total_bytes
 
 
+def extract_and_sort_repos(
+    docs_iterable: Iterable[dict],
+    dag_sort: bool = True,
+) -> Tuple[List[dict], List[dict]]:
+    """Group repository file entries, apply topological sort via import DAG (#359),
+    and construct repo projects manifest.
+
+    Returns:
+        (sorted_docs, repo_projects)
+    """
+    from src.data.repo_graph import build_repo_graph
+
+    repos: Dict[str, Dict[str, str]] = {}
+    standalone_docs: List[dict] = []
+
+    for doc in docs_iterable:
+        text = doc.get("text", "")
+        if not text:
+            continue
+        md = doc.get("metadata") or {}
+        repo_name = doc.get("repo") or md.get("repo")
+        path = doc.get("path") or md.get("path")
+        if repo_name and path:
+            if repo_name not in repos:
+                repos[repo_name] = {}
+            repos[repo_name][path] = text
+        else:
+            standalone_docs.append(doc)
+
+    all_sorted_docs: List[dict] = []
+    repo_projects: List[dict] = []
+
+    for repo_name, file_map in repos.items():
+        if dag_sort and len(file_map) > 1:
+            try:
+                graph = build_repo_graph(file_map)
+                sorted_paths = graph.topological_sort()
+            except Exception:
+                sorted_paths = sorted(file_map.keys())
+        else:
+            sorted_paths = sorted(file_map.keys())
+
+        file_entries = []
+        for p in sorted_paths:
+            content = file_map[p]
+            file_entries.append({"path": p, "content": content})
+            lang = "typescript" if p.endswith((".ts", ".tsx")) else "python" if p.endswith(".py") else "text"
+            all_sorted_docs.append({
+                "text": content,
+                "path": p,
+                "repo": repo_name,
+                "lang": lang,
+                "metadata": {"lang": lang, "license": "mit", "repo": repo_name, "is_code": True},
+            })
+        repo_projects.append({"repo": repo_name, "files": file_entries})
+
+    all_sorted_docs.extend(standalone_docs)
+    return all_sorted_docs, repo_projects
+
+
 def pack_cleaned_shards(cleaned_jsonl: Path, shards_out: Path, tokenizer_path: Path,
                         seq_len: int = 8192, shard_size_mb: int = 512,
                         tokenize_bin: Path | None = None,
                         chunk_align: int | None = None,
                         fim_rate: float | None = None,
-                        fim_seed: int | None = None) -> dict:
-    """Pack cleaned.jsonl into uint16 .bin + .bounds + manifest.json shards."""
+                        fim_seed: int | None = None,
+                        fim_mode: str | None = None,
+                        repo_manifest: Path | None = None) -> dict:
+    """Pack cleaned.jsonl or repo_manifest into uint16 .bin + .bounds + manifest.json shards."""
     shards_out = Path(shards_out)
     shards_out.mkdir(parents=True, exist_ok=True)
     if tokenize_bin is not None:
         cmd = [
             str(tokenize_bin), "pack",
             "--tokenizer", str(tokenizer_path),
-            "--in", str(cleaned_jsonl),
             "--out", str(shards_out),
             "--seq-len", str(seq_len),
             "--shard-size-mb", str(shard_size_mb),
         ]
+        if repo_manifest is not None and Path(repo_manifest).exists():
+            cmd.extend(["--repo-manifest", str(repo_manifest)])
+        else:
+            cmd.extend(["--in", str(cleaned_jsonl)])
         if chunk_align:
             cmd.extend(["--chunk-align", str(chunk_align)])
         if fim_rate is not None:
             cmd.extend(["--fim-rate", str(fim_rate)])
         if fim_seed is not None:
             cmd.extend(["--fim-seed", str(fim_seed)])
+        if fim_mode is not None:
+            cmd.extend(["--fim-mode", str(fim_mode)])
         subprocess.run(cmd, check=True)
     else:
         # Fallback to Python pack_sequences
@@ -193,6 +562,10 @@ def run_corpus_pipeline(
     out_dir: Path | str = "data/mhm_sample_clean",
     *,
     from_jsonl: Path | str | None = None,
+    from_repo: Path | str | None = None,
+    repo_name: str | None = None,
+    dag_sort: bool = True,
+    repo_manifest: Path | str | None = None,
     limit: int = -1,
     split: str = "train",
     executor_kind: str = "local",
@@ -214,6 +587,10 @@ def run_corpus_pipeline(
     shard_size_mb: int = 512,
     val_tokens: int | None = None,
     tokenize_bin: Path | str | None = None,
+    fim_mode: str = "joint",
+    fim_rate: float | None = 0.5,
+    fim_seed: int | None = 42,
+    r2_sync_uri: str | None = None,
 ) -> dict:
     """End-to-end driver: clean -> optional dedup -> consolidate -> pack -> split."""
     from src.data import datatrove_pipeline as dt
@@ -221,9 +598,52 @@ def run_corpus_pipeline(
     out_dir = Path(out_dir)
     logging_dir = Path(logging_dir or (out_dir / "logs"))
 
-    # 1. Resolve source reader
+    # 1. Resolve source reader and repository manifests
     sample_path = None
-    if source == "fineweb-edu":
+    repo_projects_list = []
+    active_repo_manifest = Path(repo_manifest) if repo_manifest else None
+
+    if source == "repo" or from_repo is not None:
+        target_repo = Path(from_repo or from_jsonl or "eval_sets/code_recall/fixture_repo.jsonl")
+        if not target_repo.exists():
+            raise FileNotFoundError(f"Repository path not found: {target_repo}")
+        raw_items = []
+        if target_repo.is_dir():
+            from src.data.repo_graph import build_repo_graph
+            g = build_repo_graph(target_repo)
+            for f in g.files:
+                fp = target_repo / f
+                if fp.exists():
+                    raw_items.append({"path": f, "text": fp.read_text(encoding="utf-8"), "repo": repo_name or target_repo.stem})
+        else:
+            with open(target_repo, encoding="utf-8") as rf:
+                for line in rf:
+                    if line.strip():
+                        obj = json.loads(line)
+                        if "files" in obj and isinstance(obj["files"], list):
+                            rname = obj.get("repo") or obj.get("repo_name") or repo_name or target_repo.stem
+                            for f in obj["files"]:
+                                raw_items.append({
+                                    "path": f.get("path"),
+                                    "text": f.get("content") or f.get("text") or "",
+                                    "repo": rname,
+                                    "metadata": {"lang": "typescript" if str(f.get("path")).endswith((".ts", ".tsx")) else "python", "license": "mit", "repo": rname, "is_code": True},
+                                })
+                        elif "path" in obj:
+                            raw_items.append({
+                                "path": obj.get("path"),
+                                "text": obj.get("text") or obj.get("content") or "",
+                                "repo": repo_name or target_repo.stem,
+                                "metadata": obj.get("metadata") or {"lang": "typescript" if str(obj.get("path")).endswith((".ts", ".tsx")) else "python", "license": "mit", "repo": repo_name or target_repo.stem, "is_code": True},
+                            })
+        sorted_docs, repo_projects_list = extract_and_sort_repos(raw_items, dag_sort=dag_sort)
+        temp_input = out_dir / "raw_repo_input.jsonl"
+        temp_input.parent.mkdir(parents=True, exist_ok=True)
+        with open(temp_input, "w", encoding="utf-8") as wf:
+            for doc in sorted_docs:
+                wf.write(json.dumps(doc) + "\n")
+        reader = dt.jsonl_reader(str(temp_input), limit=limit)
+    elif source == "fineweb-edu":
         reader = dt.fineweb_edu_reader(limit=limit, split=split)
     elif source in ("sample", "jsonl"):
         sample_path = find_default_sample(from_jsonl)
@@ -232,7 +652,25 @@ def run_corpus_pipeline(
                 f"Sample corpus not found (given: {from_jsonl}). Provide --from-jsonl <path> "
                 "or run scripts/vocab_sweep.py --sample-only to populate monica-data/."
             )
-        reader = dt.jsonl_reader(str(sample_path), limit=limit)
+        # Check if sample source contains repository file entries to sort by DAG (#359)
+        if dag_sort:
+            sample_docs = []
+            with open(sample_path, encoding="utf-8") as sf:
+                for line in sf:
+                    if line.strip():
+                        sample_docs.append(json.loads(line))
+            sorted_docs, repo_projects_list = extract_and_sort_repos(sample_docs, dag_sort=dag_sort)
+            if repo_projects_list:
+                temp_input = out_dir / "sorted_sample_input.jsonl"
+                temp_input.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp_input, "w", encoding="utf-8") as wf:
+                    for doc in sorted_docs:
+                        wf.write(json.dumps(doc) + "\n")
+                reader = dt.jsonl_reader(str(temp_input), limit=limit)
+            else:
+                reader = dt.jsonl_reader(str(sample_path), limit=limit)
+        else:
+            reader = dt.jsonl_reader(str(sample_path), limit=limit)
     else:
         raise ValueError(f"Unknown source {source!r}")
 
@@ -324,10 +762,38 @@ def run_corpus_pipeline(
                 f"Tokenizer JSON file not found (given: {tokenizer}). Provide --tokenizer <path>."
             )
 
+        # If repository projects were extracted, write repo manifest JSONL
+        if repo_projects_list and active_repo_manifest is None:
+            # Map cleaned texts into repo projects
+            cleaned_map = {}
+            for doc in iter_cleaned_docs(text_dir):
+                md = doc.get("metadata") or {}
+                p = doc.get("path") or md.get("path")
+                t = doc.get("text")
+                if p and t:
+                    cleaned_map[p] = t
+            cleaned_repos = []
+            for rp in repo_projects_list:
+                rf = [f for f in rp["files"] if f["path"] in cleaned_map]
+                if rf:
+                    cleaned_repos.append({
+                        "repo": rp["repo"],
+                        "files": [{"path": f["path"], "content": cleaned_map[f["path"]]} for f in rf],
+                    })
+            if cleaned_repos:
+                active_repo_manifest = out_dir / "repo_manifest.jsonl"
+                with open(active_repo_manifest, "w", encoding="utf-8") as rmf:
+                    for cr in cleaned_repos:
+                        rmf.write(json.dumps(cr) + "\n")
+
         manifest = pack_cleaned_shards(
             cleaned_jsonl, shards_dir, tok_file if tok_file else Path("dummy"),
             seq_len=seq_len, shard_size_mb=shard_size_mb,
             tokenize_bin=tok_bin,
+            fim_rate=fim_rate,
+            fim_seed=fim_seed,
+            fim_mode=fim_mode,
+            repo_manifest=active_repo_manifest,
         )
 
         # Enrich manifest with language mix, filter rate, and decontamination provenance
@@ -335,6 +801,11 @@ def run_corpus_pipeline(
         manifest["filter_rate"] = filter_rate
         manifest["decontamination"] = decontam_info
         manifest["total_raw_bytes"] = total_bytes
+        manifest["fim_mode"] = fim_mode
+        manifest["fim_rate"] = fim_rate
+        manifest["repo_dag_sorted"] = dag_sort
+        if repo_projects_list:
+            manifest["repos"] = [r["repo"] for r in repo_projects_list]
         if tok_file:
             manifest["tokenizer_file"] = tok_file.name
 
@@ -354,6 +825,13 @@ def run_corpus_pipeline(
             }
             print(f"validation split ({val_tokens} tokens) -> {split_dir}")
 
+        # 8. Optional Cloudflare R2 mirror (#370 Stage 2)
+        if r2_sync_uri:
+            from src.data.r2_sync import sync_up
+            sync_up(shards_dir, r2_sync_uri)
+            result["r2_sync_uri"] = r2_sync_uri
+            print(f"synced packed shards to R2 -> {r2_sync_uri}")
+
         print(f"packed {manifest.get('n_sequences', 0)} seq x {seq_len} "
               f"({manifest.get('n_tokens', 0)} tokens) -> {shards_dir}")
 
@@ -363,10 +841,26 @@ def run_corpus_pipeline(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample"), default="fineweb-edu",
-                    help="corpus source (fineweb-edu, local jsonl, or sample mixture; #70/#252)")
+    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample", "repo"), default="sample",
+                    help="corpus source (fineweb-edu, local jsonl, sample mixture, or repo; #70/#252/#370)")
     ap.add_argument("--from-jsonl", default=None,
                     help="path to input JSONL file or directory (for --source jsonl or sample)")
+    ap.add_argument("--from-repo", default=None,
+                    help="path to repository directory or jsonl for --source repo")
+    ap.add_argument("--repo-name", default=None,
+                    help="repository name for --source repo")
+    ap.add_argument("--dag-sort", action=argparse.BooleanOptionalAction, default=True,
+                    help="topologically sort multi-file repository dependencies (#359)")
+    ap.add_argument("--repo-manifest", default=None,
+                    help="path to custom repository manifest JSONL for packing")
+    ap.add_argument("--fim-mode", choices=("psm", "spm", "joint"), default="joint",
+                    help="FIM sentinel ordering mode: psm, spm, or joint (#358)")
+    ap.add_argument("--fim-rate", type=float, default=0.5,
+                    help="probability of FIM transformation on code documents/files (default 0.5; #215/#358)")
+    ap.add_argument("--fim-seed", type=int, default=42,
+                    help="deterministic seed for FIM transformations (default 42)")
+    ap.add_argument("--r2-sync", default=None,
+                    help="destination Cloudflare R2 / S3 URI to mirror packed shards (docs/infrastructure.md)")
     ap.add_argument("--out", required=True,
                     help="output directory prefix (writes <out>/cleaned, <out>/cleaned.jsonl)")
     ap.add_argument("--limit", type=int, default=-1, help="max docs to read (-1 = no cap)")
@@ -429,6 +923,14 @@ def main() -> None:
         shard_size_mb=args.shard_size_mb,
         val_tokens=args.val_tokens,
         tokenize_bin=args.tokenize_bin,
+        from_repo=args.from_repo,
+        repo_name=args.repo_name,
+        dag_sort=args.dag_sort,
+        repo_manifest=args.repo_manifest,
+        fim_mode=args.fim_mode,
+        fim_rate=args.fim_rate,
+        fim_seed=args.fim_seed,
+        r2_sync_uri=args.r2_sync,
     )
 
     # A streaming HF reader truncated by --limit leaves a non-daemon prefetch thread alive, which
