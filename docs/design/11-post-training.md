@@ -125,6 +125,14 @@ Deterministic static analysis and AST verifiers grade infrastructure as code, co
 - **Web Core & UI Styling (HTML5, CSS3, Tailwind CSS)**: Inspects HTML document structure, requiring semantic elements (`<main>`, `<header>`, `<nav>`, `<article>`, `<section>`, `<footer>`) over `<div>` spam. Enforces ARIA accessibility contracts (valid roles, required `alt` on `<img>`, accessible inputs) and verifies Tailwind CSS utility tokens against standard utility specs.
 - **Telemetry and Unified Verifier**: Provides `CloudInfraVerifier` with automatic domain inference, reports segregated telemetry metrics (tracking syntax vs. linter vs. escape-hatch penalties), wires CLI rewards into `scripts/rlvr.py`, and records benchmark evaluation via `evaluate_cloud_infra` in `src/eval/code_suite.py`.
 
+### Repository context, symbol grounding, and compiler blast radius verifiers (#345)
+
+Deterministic static analysis verifiers and probes evaluate repository-scale cross-file comprehension, symbol resolution, and compiler blast radius prediction without code execution:
+- **Cross-File Symbol Grounding & RULER-over-Code**: Measures teacher-forced Top-1 Recall and Mean Reciprocal Rank (MRR) across scaled 8k to 32k token contexts in `src/eval/code_suite.py`. Probes span cross-file type annotations (`: UserProfile`), imported symbols in import clauses, and function invocations. Evaluates candidate rank by negative log-probability against near-miss exports.
+- **Information-Gain Probe**: Measures cross-entropy delta (Delta CE = CE_without - CE_with) on implementation tokens with and without repository interface declarations. Validates that preceding interface context provides quantifiable information gain during code generation.
+- **Compiler-Grounded Blast Radius Verifier**: Evaluates model predictions of impacted files and call-sites when function signatures or interface declarations mutate. Computes ground truth via headless compiler diagnostics (`tsc --noEmit` or `pyright`) and deterministic in-process AST static analysis. Rewards precision, recall, and F1 of predicted call-sites against exact compiler error locations (`TS2554: Expected N arguments`, file, line) in under 150ms.
+- **Anti-Goodhart & Degeneracy Guards**: `BlastRadiusVerifier` in `src/train/verifiers/repository_context.py` rejects empty, whitespace, and comment-only completions. Anti-Goodhart filters penalize escape hatches (`@ts-ignore`, `eval`) with a reward of -1.0. Benchmark evaluation is recorded through `evaluate_blast_radius` in `src/eval/code_suite.py`.
+
 ## Tool use (#102, optional)
 
 **What.** Emit a structured function call the runtime executes and feeds back, optionally in a

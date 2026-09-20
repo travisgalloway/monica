@@ -35,7 +35,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -924,6 +924,601 @@ def evaluate_cloud_infra(
         )
 
     buckets_present = [b for b in CLOUD_INFRA_BUCKETS if any(r["bucket"] == b for r in records)] or list(CLOUD_INFRA_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Repository-Scale Symbol Grounding & RULER-over-Code Suite (#345)
+# --------------------------------------------------------------------------- #
+
+REPO_GROUNDING_SYMBOL_KINDS: Tuple[str, ...] = (
+    "type_annotation",
+    "imported_symbol",
+    "function_invocation",
+)
+
+REPO_GROUNDING_CONTEXT_BUCKETS: Tuple[str, ...] = (
+    "8k",
+    "16k",
+    "24k",
+    "32k",
+)
+
+
+@dataclass(frozen=True)
+class RepoGroundingInstance:
+    """One cross-file symbol grounding probe instance across scaled repository contexts (#345)."""
+
+    id: str
+    symbol_kind: str  # "type_annotation", "imported_symbol", "function_invocation"
+    context_bucket: str  # "8k", "16k", "24k", "32k"
+    symbol: str
+    definer: str
+    consumer: str
+    prefix_tokens: np.ndarray
+    candidates: Tuple[str, ...]
+    candidate_tokens: Tuple[np.ndarray, ...]
+    answer_index: int
+    context_length: int
+    meta: Dict[str, Any]
+
+
+def _bucket_for_ctx_len(length: int) -> str:
+    if length <= 8192:
+        return "8k"
+    elif length <= 16384:
+        return "16k"
+    elif length <= 24576:
+        return "24k"
+    return "32k"
+
+
+def build_repo_grounding_instances(
+    files: Sequence[dict],
+    encode: Callable[[str], Sequence[int]],
+    rng: Optional[np.random.Generator] = None,
+    *,
+    context_lengths: Sequence[int] = (8192, 16384, 32768),
+    n_candidates: int = 4,
+    max_instances: Optional[int] = None,
+) -> List[RepoGroundingInstance]:
+    """Extract symbol grounding instances across 8k-32k token context windows.
+
+    Probes 3 distinct symbol usage categories:
+    1. `imported_symbol`: imported identifier in import clauses.
+    2. `type_annotation`: type references (param annotations, return types, interfaces).
+    3. `function_invocation`: cross-file function/method calls.
+
+    Pads the multi-file repository context with distractor/filler files so the symbol
+    query appears at controlled 8k, 16k, or 32k context horizons.
+    """
+    if n_candidates < 2:
+        raise ValueError(f"n_candidates must be >= 2, got {n_candidates}")
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    from ..data.repo_graph import build_repo_graph
+
+    graph = build_repo_graph(files)
+    by_path = {f["path"]: f["text"] for f in files}
+    all_exports = sorted({s for syms in graph.exports.values() for s in syms})
+    paths = sorted(graph.files)
+
+    instances: List[RepoGroundingInstance] = []
+
+    for consumer in paths:
+        consumer_text = by_path[consumer]
+        dependencies = sorted(graph.dependencies.get(consumer, set()))
+        for definer in dependencies:
+            definer_text = by_path[definer]
+            exported_syms = sorted(graph.exports.get(definer, set()))
+
+            for sym in exported_syms:
+                # 1. Imported Symbol probe
+                ts_imp = re.search(r"import\s*\{[^}]*\b" + re.escape(sym) + r"\b[^}]*\}\s*from", consumer_text)
+                py_imp = re.search(r"from\s+[\.\w]+\s+import\s+[^#\n]*\b" + re.escape(sym) + r"\b", consumer_text)
+                imp_match = ts_imp or py_imp
+                if imp_match:
+                    start = imp_match.start()
+                    inside = consumer_text[start: imp_match.end()]
+                    sym_pos = inside.find(sym)
+                    if sym_pos >= 0:
+                        query_prefix = consumer_text[: start + sym_pos]
+                        _make_grounding_instances(
+                            instances=instances,
+                            symbol_kind="imported_symbol",
+                            sym=sym,
+                            definer=definer,
+                            consumer=consumer,
+                            query_prefix=query_prefix,
+                            definer_text=definer_text,
+                            by_path=by_path,
+                            paths=paths,
+                            encode=encode,
+                            all_exports=all_exports,
+                            context_lengths=context_lengths,
+                            n_candidates=n_candidates,
+                            rng=rng,
+                            max_instances=max_instances,
+                        )
+                        if max_instances is not None and len(instances) >= max_instances:
+                            return instances
+
+                # 2. Type Annotation probe
+                ts_type = re.search(r"(?::\s*|\bextends\s+|\bimplements\s+|<)\s*" + re.escape(sym) + r"\b", consumer_text)
+                py_type = re.search(r":\s*" + re.escape(sym) + r"\b", consumer_text)
+                type_match = ts_type or py_type
+                if type_match:
+                    pos = consumer_text.find(sym, type_match.start())
+                    if pos >= 0:
+                        query_prefix = consumer_text[:pos]
+                        _make_grounding_instances(
+                            instances=instances,
+                            symbol_kind="type_annotation",
+                            sym=sym,
+                            definer=definer,
+                            consumer=consumer,
+                            query_prefix=query_prefix,
+                            definer_text=definer_text,
+                            by_path=by_path,
+                            paths=paths,
+                            encode=encode,
+                            all_exports=all_exports,
+                            context_lengths=context_lengths,
+                            n_candidates=n_candidates,
+                            rng=rng,
+                            max_instances=max_instances,
+                        )
+                        if max_instances is not None and len(instances) >= max_instances:
+                            return instances
+
+                # 3. Function Invocation probe
+                fn_call = re.search(r"\b" + re.escape(sym) + r"\s*\(", consumer_text)
+                if fn_call:
+                    pos = fn_call.start()
+                    query_prefix = consumer_text[:pos]
+                    _make_grounding_instances(
+                        instances=instances,
+                        symbol_kind="function_invocation",
+                        sym=sym,
+                        definer=definer,
+                        consumer=consumer,
+                        query_prefix=query_prefix,
+                        definer_text=definer_text,
+                        by_path=by_path,
+                        paths=paths,
+                        encode=encode,
+                        all_exports=all_exports,
+                        context_lengths=context_lengths,
+                        n_candidates=n_candidates,
+                        rng=rng,
+                        max_instances=max_instances,
+                    )
+                    if max_instances is not None and len(instances) >= max_instances:
+                        return instances
+
+    return instances
+
+
+def _make_grounding_instances(
+    *,
+    instances: List[RepoGroundingInstance],
+    symbol_kind: str,
+    sym: str,
+    definer: str,
+    consumer: str,
+    query_prefix: str,
+    definer_text: str,
+    by_path: Dict[str, str],
+    paths: List[str],
+    encode: Callable[[str], Sequence[int]],
+    all_exports: List[str],
+    context_lengths: Sequence[int],
+    n_candidates: int,
+    rng: np.random.Generator,
+    max_instances: Optional[int],
+) -> None:
+    pool_distractors = [s for s in all_exports if s != sym]
+    if not pool_distractors:
+        pool_distractors = [f"{sym}Helper", f"{sym}Service", f"{sym}Handler", f"get{sym.capitalize()}"]
+    take = min(n_candidates - 1, len(pool_distractors))
+    chosen = [pool_distractors[i] for i in rng.choice(len(pool_distractors), size=take, replace=False)]
+    candidates = tuple(sorted(set(chosen) | {sym}))
+    answer_index = candidates.index(sym)
+    candidate_tokens = tuple(np.asarray(list(encode(c)), dtype=np.int64).reshape(-1) for c in candidates)
+    if any(ct.size < 1 for ct in candidate_tokens):
+        return
+
+    sep = "\n<|file_sep|>\n"
+    base_prefix = definer_text + sep + query_prefix
+    base_toks = np.asarray(list(encode(base_prefix)), dtype=np.int64).reshape(-1)
+
+    distractor_pool = [by_path[p] for p in paths if p not in (definer, consumer)]
+    if not distractor_pool:
+        distractor_pool = [
+            "// Unrelated repository module\nexport function calculateMetrics(x: number) { return x * 2; }\n"
+        ]
+
+    for target_len in context_lengths:
+        bucket_name = _bucket_for_ctx_len(target_len)
+        current_toks = base_toks
+        if current_toks.size < target_len:
+            pad_parts: List[str] = []
+            cur_len = int(current_toks.size)
+            idx = 0
+            while cur_len < target_len:
+                d_text = distractor_pool[idx % len(distractor_pool)]
+                pad_parts.append(d_text)
+                cur_len += len(d_text.split())
+                idx += 1
+                if idx > 2000:
+                    break
+            padded_text = sep.join(pad_parts) + sep + base_prefix
+            current_toks = np.asarray(list(encode(padded_text)), dtype=np.int64).reshape(-1)
+            if current_toks.size > target_len:
+                current_toks = current_toks[-target_len:]
+
+        inst = RepoGroundingInstance(
+            id=f"{consumer}::{sym}::{symbol_kind}::{bucket_name}",
+            symbol_kind=symbol_kind,
+            context_bucket=bucket_name,
+            symbol=sym,
+            definer=definer,
+            consumer=consumer,
+            prefix_tokens=current_toks,
+            candidates=candidates,
+            candidate_tokens=candidate_tokens,
+            answer_index=answer_index,
+            context_length=int(current_toks.size),
+            meta={"symbol": sym, "definer": definer, "consumer": consumer, "symbol_kind": symbol_kind, "bucket": bucket_name},
+        )
+        instances.append(inst)
+        if max_instances is not None and len(instances) >= max_instances:
+            break
+
+
+def evaluate_repository_symbol_recall(
+    model: Any,
+    instances: Sequence[RepoGroundingInstance],
+    *,
+    batch_size: int = 8,
+    pad_id: int = 0,
+    to_numpy: Callable = np.asarray,
+    rank_metric: str = "ce_nats",
+) -> dict:
+    """Evaluate cross-file symbol recall across type annotations, imports, and invocations (#345).
+
+    Emits records conforming to RECORD_FIELDS with suite='repo_symbol_grounding'.
+    Reports Top-1 Recall and Mean Reciprocal Rank (MRR) bucketed by symbol kind and context depth.
+    """
+    if not instances:
+        raise ValueError("evaluate_repository_symbol_recall(): instances cannot be empty")
+
+    rows: List[ScoreRow] = []
+    owners: List[Tuple[int, int]] = []
+    for i, inst in enumerate(instances):
+        for j, ct in enumerate(inst.candidate_tokens):
+            rows.append(ScoreRow(tokens=np.concatenate([inst.prefix_tokens, ct]), span_start=int(inst.prefix_tokens.size), span_len=int(ct.size)))
+            owners.append((i, j))
+
+    scored = score_rows(model, rows, pad_id=pad_id, batch_size=batch_size, to_numpy=to_numpy)
+
+    per_instance: List[Dict[int, dict]] = [{} for _ in instances]
+    for (i, j), s in zip(owners, scored):
+        per_instance[i][j] = s
+
+    records: List[dict] = []
+    for i, inst in enumerate(instances):
+        answer = per_instance[i][inst.answer_index]
+        ordering = sorted(range(len(inst.candidates)), key=lambda j: (per_instance[i][j][rank_metric], inst.candidates[j]))
+        rank = ordering.index(inst.answer_index) + 1
+        records.append(make_record(
+            suite="repo_symbol_grounding",
+            id=inst.id,
+            bucket=inst.symbol_kind,
+            distance=inst.context_length,
+            n_scored_tokens=answer["n_scored_tokens"],
+            ce_nats=answer["ce_nats"],
+            token_accuracy=answer["token_accuracy"],
+            exact_match=answer["exact_match"],
+            rank_top1=(rank == 1),
+            mrr=1.0 / rank,
+            meta={
+                "symbol": inst.symbol,
+                "symbol_kind": inst.symbol_kind,
+                "context_bucket": inst.context_bucket,
+                "definer": inst.definer,
+                "consumer": inst.consumer,
+                "rank": rank,
+                "n_candidates": len(inst.candidates),
+            },
+        ))
+
+    by_symbol_kind: Dict[str, dict] = {}
+    for kind in REPO_GROUNDING_SYMBOL_KINDS:
+        sub = [r for r in records if r["meta"]["symbol_kind"] == kind]
+        by_symbol_kind[kind] = {
+            "top1_recall": float(np.mean([r["rank_top1"] for r in sub])) if sub else 0.0,
+            "mrr": float(np.mean([r["mrr"] for r in sub])) if sub else 0.0,
+            "n_instances": len(sub),
+        }
+
+    by_context_bucket: Dict[str, dict] = {}
+    for b in REPO_GROUNDING_CONTEXT_BUCKETS:
+        sub = [r for r in records if r["meta"]["context_bucket"] == b]
+        by_context_bucket[b] = {
+            "top1_recall": float(np.mean([r["rank_top1"] for r in sub])) if sub else 0.0,
+            "mrr": float(np.mean([r["mrr"] for r in sub])) if sub else 0.0,
+            "n_instances": len(sub),
+        }
+
+    top1 = float(np.mean([r["rank_top1"] for r in records]))
+    mrr = float(np.mean([r["mrr"] for r in records]))
+    summary = summarize_bucketed(records, list(REPO_GROUNDING_SYMBOL_KINDS))
+
+    return {
+        "records": records,
+        "top1_recall": top1,
+        "mrr": mrr,
+        "by_symbol_kind": by_symbol_kind,
+        "by_context_bucket": by_context_bucket,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Information-Gain Probe (Delta CE with vs without interface context) (#345)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class InfoGainInstance:
+    """One information-gain probe instance measuring Delta CE on implementation tokens (#345)."""
+
+    id: str
+    target_file: str
+    with_context_tokens: np.ndarray
+    with_span_start: int
+    without_context_tokens: np.ndarray
+    without_span_start: int
+    span_len: int
+    interface_files: Tuple[str, ...]
+    meta: Dict[str, Any]
+
+
+def build_information_gain_instances(
+    files: Sequence[dict],
+    encode: Callable[[str], Sequence[int]],
+    *,
+    file_sep: str = "\n<|file_sep|>\n",
+    max_instances: Optional[int] = None,
+) -> List[InfoGainInstance]:
+    """Extract information-gain probe instances from repository code.
+
+    Measures model loss (cross-entropy) over implementation code blocks:
+    - Condition A (with_context): Interface / type definitions prepended before implementation.
+    - Condition B (without_context): Implementation code scored in isolation (no interface context).
+    """
+    from ..data.repo_graph import build_repo_graph
+
+    graph = build_repo_graph(files)
+    by_path = {f["path"]: f["text"] for f in files}
+    instances: List[InfoGainInstance] = []
+
+    for consumer in sorted(graph.files):
+        consumer_text = by_path[consumer]
+        dependencies = sorted(graph.dependencies.get(consumer, set()))
+        if not dependencies:
+            continue
+
+        interface_context = file_sep.join(by_path[d] for d in dependencies) + file_sep
+        if len(consumer_text.strip()) < 20:
+            continue
+
+        split_pt = max(1, len(consumer_text) // 2)
+        prefix_str = consumer_text[:split_pt]
+        body_str = consumer_text[split_pt:]
+        if not body_str.strip():
+            continue
+
+        body_toks = np.asarray(list(encode(body_str)), dtype=np.int64).reshape(-1)
+        if body_toks.size < 2:
+            continue
+
+        with_prefix = interface_context + prefix_str
+        with_pre_toks = np.asarray(list(encode(with_prefix)), dtype=np.int64).reshape(-1)
+        if with_pre_toks.size < 1:
+            continue
+        with_toks = np.concatenate([with_pre_toks, body_toks])
+
+        without_pre_toks = np.asarray(list(encode(prefix_str)), dtype=np.int64).reshape(-1)
+        if without_pre_toks.size < 1:
+            without_pre_toks = np.asarray(list(encode("// local context\n")), dtype=np.int64).reshape(-1)
+        without_toks = np.concatenate([without_pre_toks, body_toks])
+
+        instances.append(InfoGainInstance(
+            id=f"{consumer}::info_gain",
+            target_file=consumer,
+            with_context_tokens=with_toks,
+            with_span_start=int(with_pre_toks.size),
+            without_context_tokens=without_toks,
+            without_span_start=int(without_pre_toks.size),
+            span_len=int(body_toks.size),
+            interface_files=tuple(dependencies),
+            meta={"consumer": consumer, "dependencies": dependencies, "span_len": int(body_toks.size)},
+        ))
+        if max_instances is not None and len(instances) >= max_instances:
+            break
+
+    return instances
+
+
+def evaluate_information_gain(
+    model: Any,
+    instances: Sequence[InfoGainInstance],
+    *,
+    batch_size: int = 8,
+    pad_id: int = 0,
+    to_numpy: Callable = np.asarray,
+) -> dict:
+    """Measure Delta CE on implementation tokens with and without repository interface context (#345).
+
+    Delta CE = CE_without - CE_with (positive Delta CE indicates information gain from repo context).
+    Emits records conforming to RECORD_FIELDS with suite='repo_information_gain'.
+    """
+    if not instances:
+        raise ValueError("evaluate_information_gain(): instances cannot be empty")
+
+    rows: List[ScoreRow] = []
+    for inst in instances:
+        rows.append(ScoreRow(tokens=inst.with_context_tokens, span_start=inst.with_span_start, span_len=inst.span_len))
+        rows.append(ScoreRow(tokens=inst.without_context_tokens, span_start=inst.without_span_start, span_len=inst.span_len))
+
+    scored = score_rows(model, rows, pad_id=pad_id, batch_size=batch_size, to_numpy=to_numpy)
+
+    records: List[dict] = []
+    delta_ces: List[float] = []
+
+    for i, inst in enumerate(instances):
+        s_with = scored[2 * i]
+        s_without = scored[2 * i + 1]
+        ce_with = float(s_with["ce_nats"])
+        ce_without = float(s_without["ce_nats"])
+        delta_ce = ce_without - ce_with
+        delta_ces.append(delta_ce)
+
+        records.append(make_record(
+            suite="repo_information_gain",
+            id=inst.id,
+            bucket="information_gain",
+            distance=int(inst.with_context_tokens.size),
+            n_scored_tokens=inst.span_len,
+            ce_nats=delta_ce,
+            token_accuracy=float(s_with["token_accuracy"]),
+            exact_match=float(s_with["exact_match"]),
+            rank_top1=(delta_ce > 0),
+            mrr=1.0 if (delta_ce > 0) else 0.0,
+            meta={
+                "target_file": inst.target_file,
+                "interface_files": list(inst.interface_files),
+                "ce_with": ce_with,
+                "ce_without": ce_without,
+                "delta_ce": delta_ce,
+            },
+        ))
+
+    mean_delta = float(np.mean(delta_ces))
+    summary = summarize_bucketed(records, ["information_gain"])
+
+    return {
+        "records": records,
+        "mean_delta_ce": mean_delta,
+        "n_instances": len(instances),
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Compiler-Grounded Blast Radius Verifier Evaluation (#345)
+# --------------------------------------------------------------------------- #
+
+BLAST_RADIUS_BUCKETS: Tuple[str, ...] = (
+    "signature_mutation",
+    "type_removal",
+    "interface_rename",
+    "required_param_added",
+)
+
+
+def evaluate_blast_radius(
+    test_cases: Sequence[dict],
+    *,
+    verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against compiler blast radius prediction verifier (#345).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `bucket`: category name ('signature_mutation', 'type_removal', 'interface_rename', 'required_param_added')
+      - `completion`: candidate prediction text or JSON
+      - `repo`: repository file mapping `{path: content}`
+      - `mutated_file`: mutated file path
+      - `mutated_content`: mutated file content
+      - `reference` / `ground_truth`: optional ground truth locations
+      - `expected_clean`: bool indicating if reward == 1.0 is expected
+
+    Emits records conforming to RECORD_FIELDS:
+      suite='blast_radius', bucket=bucket, distance=len(completion), etc.
+    Returns summary dict with per-bucket and overall statistics.
+    """
+    if verifier is None:
+        from ..train.verifiers.repository_context import BlastRadiusVerifier
+        verifier = BlastRadiusVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        bucket = str(inst.get("bucket", "signature_mutation"))
+        completion = str(inst.get("completion", ""))
+        repo = inst.get("repo")
+        mutated_file = inst.get("mutated_file")
+        mutated_content = inst.get("mutated_content")
+        ground_truth = inst.get("ground_truth", inst.get("reference"))
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+
+        eval_res = verifier.evaluate(
+            completion=completion,
+            reference=ground_truth,
+            prompt=prompt,
+            repo=repo,
+            mutated_file=mutated_file,
+            mutated_content=mutated_content,
+        )
+
+        reward = float(eval_res["reward"])
+        is_clean = (reward == 1.0)
+        success = (is_clean == expected_clean)
+
+        records.append(
+            make_record(
+                suite="blast_radius",
+                id=inst_id,
+                bucket=bucket,
+                distance=len(completion),
+                n_scored_tokens=len(completion.split()) if completion else 0,
+                ce_nats=0.0 if is_clean else 1.0,
+                token_accuracy=float(eval_res["precision"]),
+                exact_match=1.0 if is_clean else 0.0,
+                rank_top1=success,
+                mrr=float(eval_res["f1"]),
+                meta={
+                    "bucket": bucket,
+                    "reward": reward,
+                    "precision": eval_res["precision"],
+                    "recall": eval_res["recall"],
+                    "f1": eval_res["f1"],
+                    "expected_clean": expected_clean,
+                    "is_clean": is_clean,
+                    "success": success,
+                },
+            )
+        )
+
+    buckets_present = [b for b in BLAST_RADIUS_BUCKETS if any(r["bucket"] == b for r in records)] or list(BLAST_RADIUS_BUCKETS)
     summary = summarize_bucketed(records, buckets_present)
     total = len(records)
     passed = sum(1 for r in records if r["rank_top1"])
