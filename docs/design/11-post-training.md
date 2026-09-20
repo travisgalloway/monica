@@ -30,18 +30,28 @@ SFT and GRPO refines it.
 
 ## Instruct (#101, corpus #95)
 
-**What.** Turn a text-continuer into a model that follows instructions, adopts a chat template,
-and respects a system prompt — the foundation every later layer assumes.
+**What.** Turn the from-scratch hybrid MoE code model into an instruction-following assistant that
+strictly adopts the ChatML template, follows code refactoring directives, and adheres to system
+prompts (`src/data/chat_template.py`).
 
-**Why a stage at all.** The conversion teacher (`Qwen/Qwen3-4B-Thinking-2507`) is already
-instruction-tuned (and reasoning/thinking-tuned), so the hybrid inherits much of this through the
-matching — but the architecture conversion can blur instruction-following, so an explicit instruct
-SFT stage re-establishes it.
+**M12 Reframing.** Re-framed from the discontinued M10 distillation program to align with the M12
+from-scratch hybrid MoE architecture. Without a teacher model, instruction-following and chat
+discipline are established directly through the repository's SFT machinery (`scripts/sft.py`,
+`src/data/sft_corpus.py`, and `src/data/instruct_sft.py`).
 
-**Method.** SFT on general instruction–response pairs under the Qwen chat template (a set such as
-UltraChat plus the reasoning traces, which also carry instruction-following), optionally DPO (#77)
-for format/preference polish, via TRL `SFTTrainer` / `DPOTrainer` shapes. References: InstructGPT,
-FLAN, DPO.
+**Method & Machinery.** SFT on clean-license code instruction and multi-turn refactoring corpora
+(`src/data/sft_sources.py`: `code`, `handauthored`, `architecture`, `oasst1`) rendered under the
+ChatML template with response masking:
+- `loss_mask` is strictly zero on system prompts, user turns, and turn headers (`<|im_start|>assistant\n`).
+- `loss_mask` is active solely on assistant responses and the terminal `<|im_end|>`.
+- Masked validation loss and masked val-perplexity are tracked and logged (`metrics.jsonl`).
+
+```bash
+python -m src.data.instruct_sft --sources handauthored code architecture --tokenizer qwen25 --out-root data/shared
+.venv/bin/python scripts/sft.py --config config/poc.yaml \
+    --data data/shared/sft/tokenized/qwen25-8k --corpus-form instruct \
+    --init runs/poc/weights.safetensors --out runs/sft-instruct
+```
 
 ## Thinking (#96 SFT, #103 GRPO)
 
@@ -205,11 +215,17 @@ the ChatML render + assistant-span masking (the assistant turn is trained up to 
 trailing `<|im_end|>`, so the model learns to stop on it); the shared instruct corpus under
 `shared/sft/` is produced by `src/data/instruct_sft.py` (#95).
 
-Since #306 this is **verified at load, not merely recorded**. Every builder writes `chat_eos` and
-`template` into its manifest, and `src/data/sft_corpus.resolve_sft_corpus` refuses a corpus whose
-`chat_eos` differs from `chat_template.CHAT_EOS`, whose `template` is not `qwen-chatml`, or which
-**lacks** the `chat_eos` key at all — an older manifest is unknown provenance, not a pass. Before
-that check existed, a corpus built under a different template would have trained silently.
+Since #306 and #101 this is **enforced end-to-end across SFT, RLVR, and serving**:
+1. **SFT (`src/data/sft_corpus.py`)**: verified at load. Every builder writes `chat_eos` and
+   `template` into its manifest, and `resolve_sft_corpus` refuses a corpus whose `chat_eos` differs
+   from `chat_template.CHAT_EOS` or whose `template` is not `qwen-chatml`. Response masking covers
+   the assistant completion up to and including `<|im_end|>`.
+2. **RLVR (`scripts/rlvr.py`)**: `enforce_chat_eos_consistency()` and `resolve_eos_ids()` ensure
+   rollouts terminate on `<|im_end|>` rather than over-generating into invalid turns. Mismatched
+   `--chat-eos` configurations fail fast with `ValueError`.
+3. **Serving (`src/serve/generate.py` & `scripts/generate.py`)**: `generate()` supports composite
+   EOS sets (`eos_id: int | Sequence[int] | set[int]`), and `scripts/generate.py --chat` defaults to
+   ChatML template with `<|im_end|>` stop token and prompt isolation.
 
 ## Shared with production
 

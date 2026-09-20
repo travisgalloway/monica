@@ -77,7 +77,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 
 | ID | Capability | Portable | MLX | CUDA | Swift | Status | Issue | Design |
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
-| POST-1 | A person can run supervised fine-tuning | done | done | done | done | Shipped | #195 | design/11 |
+| POST-1 | A person can run supervised fine-tuning | done | done | done | done | Shipped | #195, #101 | design/11 |
 | POST-2 | A person can run DPO | done | done | done | n/a | Shipped | — | design/11 |
 | POST-3 | A person can run GRPO/RLVR against a verifier reward | done | done | done | n/a | Shipped | #230 | design/11 |
 | POST-4 | A person can generate on-policy preference pairs | done | done | n/a | n/a | Shipped | — | design/11 |

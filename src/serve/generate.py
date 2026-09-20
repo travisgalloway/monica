@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from ..data.chat_template import CHAT_EOS
 
 
 @dataclass
@@ -336,6 +337,73 @@ class AdaptiveReasoningGate:
         return self.filter_logits(logits, generated)
 
 
+
+def resolve_chat_eos_id(tokenizer: Any, chat_eos: str = CHAT_EOS) -> int | None:
+    """Resolve the integer token ID for chat_eos on the tokenizer, if it exists as a single token."""
+    if tokenizer is None:
+        return None
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    if hasattr(inner, "convert_tokens_to_ids"):
+        try:
+            tid = inner.convert_tokens_to_ids(chat_eos)
+            if isinstance(tid, int) and tid >= 0:
+                return tid
+        except Exception:
+            pass
+    if hasattr(tokenizer, "encode"):
+        try:
+            ids = tokenizer.encode(chat_eos, add_special_tokens=False)
+            if len(ids) == 1:
+                return int(ids[0])
+        except Exception:
+            pass
+    return None
+
+
+def resolve_eos_ids(
+    tokenizer: Any,
+    chat_eos: str | None = None,
+    *,
+    include_chat_eos: bool = True,
+) -> set[int]:
+    """Resolve all valid EOS / end-of-turn token IDs for serving and rollout generation.
+
+    Includes tokenizer.eos_token_id (if present) and the chat EOS token ID (defaulting
+    to CHAT_EOS '<|im_end|>') when include_chat_eos is True.
+    """
+    eos_ids: set[int] = set()
+    if tokenizer is None:
+        return eos_ids
+    tok_eos = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(tok_eos, int):
+        eos_ids.add(tok_eos)
+    elif isinstance(tok_eos, (list, tuple, set)):
+        eos_ids.update(int(x) for x in tok_eos)
+
+    if include_chat_eos:
+        target_chat_eos = chat_eos if chat_eos is not None else CHAT_EOS
+        cid = resolve_chat_eos_id(tokenizer, target_chat_eos)
+        if cid is not None:
+            eos_ids.add(cid)
+    return eos_ids
+
+
+def enforce_chat_eos_consistency(
+    tokenizer: Any = None,
+    expected_chat_eos: str = CHAT_EOS,
+    *,
+    where: str = "serving",
+) -> set[int]:
+    """Enforce that expected_chat_eos matches CHAT_EOS across SFT, RLVR, and serving (docs/design/11-post-training.md)."""
+    if expected_chat_eos != CHAT_EOS:
+        raise ValueError(
+            f"{where}: chat_eos mismatch — expected {CHAT_EOS!r} (chat_template.CHAT_EOS), "
+            f"found {expected_chat_eos!r}. SFT, RL and serving must share one chat EOS "
+            f"(docs/design/11-post-training.md)."
+        )
+    return resolve_eos_ids(tokenizer, chat_eos=expected_chat_eos, include_chat_eos=True)
+
+
 def generate(
     store,
     session_id: str,
@@ -344,7 +412,9 @@ def generate(
     sampler: Callable[..., int],
     to_numpy: Callable[[object], np.ndarray] = np.asarray,
     max_new_tokens: int = 128,
-    eos_id: int | None = None,
+    eos_id: int | Sequence[int] | set[int] | None = None,
+    chat_eos: str | None = None,
+    enforce_chat_eos: bool = False,
     stop_fn: Callable[[list[int]], bool] | None = None,
     on_token: Callable[[int], None] | None = None,
     pass_context: bool = False,
@@ -402,6 +472,9 @@ def generate(
     if len(prompt_ids) == 0:
         raise ValueError("prompt_ids must be non-empty")
 
+    if enforce_chat_eos:
+        enforce_chat_eos_consistency(None, expected_chat_eos=chat_eos or CHAT_EOS, where="generate()")
+
     prompt = [int(t) for t in prompt_ids]
     if prefill:
         logits = store.prefill(session_id, prompt)
@@ -454,8 +527,12 @@ def generate(
                 nxt = sampler(row)
         else:
             nxt = sampler(row)
-        if eos_id is not None and nxt == eos_id:
-            break
+        if eos_id is not None:
+            if isinstance(eos_id, (set, list, tuple, frozenset)):
+                if nxt in eos_id:
+                    break
+            elif nxt == eos_id:
+                break
         generated.append(nxt)
         if gate is not None:
             gate.record_token(nxt)
