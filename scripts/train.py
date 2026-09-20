@@ -260,8 +260,21 @@ def main() -> None:
                        "moe_kill_overlap": kill["overlap"],
                        "moe_kill_threshold": kill["threshold"],
                        "moe_kill_triggered": kill["triggered"]})
+            alert = report.get("cross_domain_alert", {})
+            if alert.get("status") == "FLAGGED":
+                print(f"[moe-cross-domain-collapse] WARNING: code and non-code routing overlap "
+                      f"{alert['overlap']:.4f} >= {alert['threshold']:.4f}: potential expert underutilization.")
+                logger({"event": "moe_cross_domain_collapse",
+                        "moe_cross_domain_overlap": alert["overlap"],
+                        "moe_cross_domain_threshold": alert["threshold"],
+                        "moe_cross_domain_collapse": True})
+
             return {"moe_domain_overlap": report["mean_overlap"],
                     "moe_domain_overlap_max": report["max_overlap"],
+                    "moe_domain_overlap_noncode": report.get("moe_domain_overlap_noncode"),
+                    "moe_domain_overlap_code_vs_prose": report.get("moe_domain_overlap_code_vs_prose"),
+                    "moe_domain_overlap_code_vs_noncode": report.get("code_vs_noncode_overlap"),
+                    "moe_cross_domain_collapse": (alert.get("status") == "FLAGGED" if alert.get("status") != "BLIND" else None),
                     "moe_kill_pair": kill["pair"],
                     "moe_kill_overlap": kill["overlap"],
                     "moe_kill_triggered": kill["triggered"],

@@ -44,7 +44,7 @@ step 50,000. Callers must read the verdict in that light.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -154,15 +154,190 @@ def histogram_overlap(h_a: list, h_b: list) -> dict:
     return {"per_layer": per_layer, "mean": mean}
 
 
-def specialization_report(hists: Dict[str, list]) -> dict:
-    """Pairwise `histogram_overlap` across every measured domain pair.
+DEFAULT_DOMAIN_CATEGORIES: Dict[str, str] = {
+    # web
+    "web": "web",
+    "essential-web": "web",
+    "essential_web": "web",
+    "essentialweb": "web",
+    "fineweb": "web",
+    "fineweb-edu": "web",
+    "fineweb_edu": "web",
+    # prose
+    "prose": "prose",
+    "rfc": "prose",
+    "rfcs": "prose",
+    "adr": "prose",
+    "adrs": "prose",
+    "technical-prose": "prose",
+    "technical_prose": "prose",
+    "docs": "prose",
+    # math
+    "math": "math",
+    "logic": "math",
+    "openwebmath": "math",
+    "open-web-math": "math",
+    "proof-pile": "math",
+    "proof-pile-2": "math",
+    "proof_pile": "math",
+    "proof_pile_2": "math",
+}
+
+
+def domain_category(name: str, mapping: Optional[Dict[str, str]] = None) -> str:
+    """Return the category for a domain name ('code', 'prose', 'math', 'web', etc.).
+
+    Defaults to 'code' for any domain not categorized as non-code.
+    """
+    if mapping and name in mapping:
+        return mapping[name]
+    clean = name.lower().replace("_", "-")
+    if clean in DEFAULT_DOMAIN_CATEGORIES:
+        return DEFAULT_DOMAIN_CATEGORIES[clean]
+    for key, cat in DEFAULT_DOMAIN_CATEGORIES.items():
+        if clean == key or clean.startswith(f"{key}-") or clean.endswith(f"-{key}"):
+            return cat
+    return "code"
+
+
+def is_noncode(category: str) -> bool:
+    """Check if a category is non-code ('web', 'prose', 'math', etc.)."""
+    return category != "code"
+
+
+def inter_category_overlap_matrix(
+    hists_or_report: Any,
+    domain_categories: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """Compute the inter-category domain overlap matrix (#365).
+
+    Accepts either:
+      - a specialization report dict containing 'by_pair' and 'domains'
+      - a dictionary of expert histograms {domain: [[counts...]]}
+
+    Returns a symmetric nested dict: {cat_a: {cat_b: mean_overlap}}.
+    The diagonal cat_a == cat_b is the intra-category mean overlap among distinct
+    domains in that category, or 1.0 if only one domain exists in that category.
+    """
+    if isinstance(hists_or_report, dict) and "by_pair" in hists_or_report:
+        by_pair = hists_or_report["by_pair"]
+        measured = list(hists_or_report.get("domains", []))
+    else:
+        hists = {k: v for k, v in hists_or_report.items() if v is not None}
+        measured = sorted(hists.keys())
+        by_pair = {}
+        for i, a in enumerate(measured):
+            for b in measured[i + 1:]:
+                key = "|".join(sorted((a, b)))
+                by_pair[key] = histogram_overlap(hists[a], hists[b])
+
+    cat_of = {d: domain_category(d, domain_categories) for d in measured}
+    categories = sorted(set(cat_of.values()))
+    matrix: Dict[str, Dict[str, Optional[float]]] = {c: {} for c in categories}
+
+    for i, c1 in enumerate(categories):
+        for c2 in categories[i:]:
+            if c1 == c2:
+                pairs = [
+                    by_pair[k]["mean"]
+                    for k in by_pair
+                    if cat_of.get(k.split("|")[0]) == c1 and cat_of.get(k.split("|")[1]) == c1
+                ]
+                val: Optional[float] = float(np.mean(pairs)) if pairs else 1.0
+            else:
+                pairs = [
+                    by_pair[k]["mean"]
+                    for k in by_pair
+                    if (cat_of.get(k.split("|")[0]) == c1 and cat_of.get(k.split("|")[1]) == c2)
+                    or (cat_of.get(k.split("|")[0]) == c2 and cat_of.get(k.split("|")[1]) == c1)
+                ]
+                val = float(np.mean(pairs)) if pairs else None
+            matrix[c1][c2] = val
+            matrix[c2][c1] = val
+
+    return matrix
+
+
+def cross_domain_collapse_check(
+    report: dict,
+    *,
+    threshold: float = 0.95,
+    warmup_step: int = 0,
+    step: Optional[int] = None,
+) -> dict:
+    """Check for routing capacity collapse between code and non-code domains (#365).
+
+    Advisory check: flags [moe-cross-domain-collapse] if code and non-code overlap
+    exceeds threshold (default 0.95) after initial training warmup, alerting operators
+    to potential expert underutilization.
+
+    Adheres strictly to the BLIND rule: if non-code or code domain validation sets
+    are unobserved or empty, reports BLIND, never healthy.
+    """
+    overlap = report.get("code_vs_noncode_overlap")
+    if overlap is None:
+        return {
+            "status": "BLIND",
+            "triggered": None,
+            "specializing": None,
+            "overlap": None,
+            "threshold": threshold,
+            "message": "[moe-cross-domain-collapse] BLIND: non-code or code domain unobserved or empty",
+        }
+
+    if step is not None and step < warmup_step:
+        return {
+            "status": "WARMUP",
+            "triggered": False,
+            "specializing": True,
+            "overlap": overlap,
+            "threshold": threshold,
+            "message": f"[moe-cross-domain-collapse] WARMUP: step {step} < {warmup_step} warmup steps",
+        }
+
+    triggered = bool(overlap >= threshold)
+    status = "FLAGGED" if triggered else "OK"
+    if triggered:
+        msg = (f"[moe-cross-domain-collapse] FLAGGED: code vs non-code overlap "
+               f"{overlap:.4f} >= {threshold:.4f} (potential expert underutilization)")
+    else:
+        msg = f"[moe-cross-domain-collapse] OK: code vs non-code overlap {overlap:.4f} < {threshold:.4f}"
+
+    return {
+        "status": status,
+        "triggered": triggered,
+        "specializing": not triggered,
+        "overlap": overlap,
+        "threshold": threshold,
+        "message": msg,
+    }
+
+
+def specialization_report(
+    hists: Dict[str, Optional[list]],
+    domain_categories: Optional[Dict[str, str]] = None,
+    *,
+    step: Optional[int] = None,
+    warmup_steps: int = 0,
+) -> dict:
+    """Pairwise `histogram_overlap` across every measured domain pair with
+    cross-category specialization diagnostics (#365).
 
     Returns
       {"domains": [sorted measured names],
        "by_pair": {"a|b": {"per_layer": [...], "mean": float}},   # a < b, sorted key
        "mean_overlap": float,          # mean over pairs
        "max_overlap": float, "max_pair": "a|b",
-       "unmeasured_domains": [...]}    # the `None` entries from expert_histograms
+       "unmeasured_domains": [...],    # the `None` entries from expert_histograms
+       "category_matrix": {...},       # inter-category overlap matrix
+       "intra_category": {...},        # overlap within each category
+       "inter_category": {...},        # overlap between distinct category pairs
+       "code_vs_prose_overlap": float or None,
+       "code_vs_noncode_overlap": float or None,
+       "noncode_overlap": float or None,
+       "moe_domain_overlap_noncode": float or None,
+       "moe_domain_overlap_code_vs_prose": float or None,
+       "cross_domain_alert": {...}}
 
     Raises when fewer than two domains were measured — one domain yields no pair, and an
     empty `by_pair` must not read as "well separated".
@@ -184,6 +359,69 @@ def specialization_report(hists: Dict[str, list]) -> dict:
 
     mean_overlap = sum(v["mean"] for v in by_pair.values()) / len(by_pair)
     max_pair = max(by_pair, key=lambda k: by_pair[k]["mean"])
+
+    cat_of = {d: domain_category(d, domain_categories) for d in measured}
+    categories = sorted(set(cat_of.values()))
+
+    intra_category: Dict[str, dict] = {}
+    for c in categories:
+        pairs = [
+            k for k in by_pair
+            if cat_of[k.split("|")[0]] == c and cat_of[k.split("|")[1]] == c
+        ]
+        if pairs:
+            intra_category[c] = {
+                "mean": float(np.mean([by_pair[k]["mean"] for k in pairs])),
+                "pairs": sorted(pairs),
+            }
+
+    inter_category: Dict[str, dict] = {}
+    for i, c1 in enumerate(categories):
+        for c2 in categories[i + 1:]:
+            key = "|".join(sorted((c1, c2)))
+            pairs = [
+                k for k in by_pair
+                if (cat_of[k.split("|")[0]] == c1 and cat_of[k.split("|")[1]] == c2)
+                or (cat_of[k.split("|")[0]] == c2 and cat_of[k.split("|")[1]] == c1)
+            ]
+            if pairs:
+                inter_category[key] = {
+                    "mean": float(np.mean([by_pair[k]["mean"] for k in pairs])),
+                    "pairs": sorted(pairs),
+                }
+
+    matrix = inter_category_overlap_matrix(
+        {"by_pair": by_pair, "domains": measured},
+        domain_categories=domain_categories,
+    )
+
+    cvp_pairs = [
+        by_pair[k]["mean"] for k in by_pair
+        if (cat_of[k.split("|")[0]] == "code" and cat_of[k.split("|")[1]] == "prose")
+        or (cat_of[k.split("|")[0]] == "prose" and cat_of[k.split("|")[1]] == "code")
+    ]
+    code_vs_prose = float(np.mean(cvp_pairs)) if cvp_pairs else None
+
+    nc_pairs = [
+        by_pair[k]["mean"] for k in by_pair
+        if is_noncode(cat_of[k.split("|")[0]]) and is_noncode(cat_of[k.split("|")[1]])
+    ]
+    noncode_overlap = float(np.mean(nc_pairs)) if nc_pairs else None
+
+    cvnc_pairs = [
+        by_pair[k]["mean"] for k in by_pair
+        if (cat_of[k.split("|")[0]] == "code" and is_noncode(cat_of[k.split("|")[1]]))
+        or (is_noncode(cat_of[k.split("|")[0]]) and cat_of[k.split("|")[1]] == "code")
+    ]
+    code_vs_noncode = float(np.mean(cvnc_pairs)) if cvnc_pairs else None
+
+    alert = cross_domain_collapse_check(
+        {"code_vs_noncode_overlap": code_vs_noncode},
+        threshold=0.95,
+        warmup_step=warmup_steps,
+        step=step,
+    )
+
     return {
         "domains": measured,
         "by_pair": by_pair,
@@ -191,6 +429,18 @@ def specialization_report(hists: Dict[str, list]) -> dict:
         "max_overlap": by_pair[max_pair]["mean"],
         "max_pair": max_pair,
         "unmeasured_domains": unmeasured,
+        "domain_categories": cat_of,
+        "categories": categories,
+        "category_matrix": matrix,
+        "intra_category": intra_category,
+        "inter_category": inter_category,
+        "code_vs_prose_overlap": code_vs_prose,
+        "code_vs_noncode_overlap": code_vs_noncode,
+        "noncode_overlap": noncode_overlap,
+        "moe_domain_overlap_noncode": noncode_overlap,
+        "moe_domain_overlap_code_vs_prose": code_vs_prose,
+        "moe_domain_overlap_code_vs_noncode": code_vs_noncode,
+        "cross_domain_alert": alert,
     }
 
 
@@ -238,17 +488,35 @@ def kill_check(report: dict, *, pair=("typescript", "math"), threshold: float = 
 
 
 def format_routing_report(report: dict, kill: Optional[dict] = None) -> str:
-    """Human table — one line per domain pair + the kill verdict, in
-    `domain_bpb.format_domain_bpb_table`'s style."""
+    """Human table — one line per domain pair + inter-category breakdown + kill and advisory verdicts,
+    in `domain_bpb.format_domain_bpb_table`'s style."""
     lines = ["MoE routing overlap by domain pair (1.0 = identical routing, 0.0 = disjoint):"]
     for key, entry in sorted(report["by_pair"].items()):
         lines.append(f"  {key:<32} overlap={entry['mean']:.4f}")
     lines.append(f"  {'mean':<32} overlap={report['mean_overlap']:.4f}")
     lines.append(f"  {'max (' + report['max_pair'] + ')':<32} overlap={report['max_overlap']:.4f}")
-    if report["unmeasured_domains"]:
+
+    inter = report.get("inter_category")
+    if inter:
+        lines.append("Inter-category routing overlap:")
+        for cat_pair, entry in sorted(inter.items()):
+            label = cat_pair.replace("|", " vs ")
+            lines.append(f"  {label:<32} overlap={entry['mean']:.4f}")
+
+    if report.get("code_vs_noncode_overlap") is not None:
+        lines.append(f"  {'code vs non-code':<32} overlap={report['code_vs_noncode_overlap']:.4f}")
+    if report.get("noncode_overlap") is not None:
+        lines.append(f"  {'non-code (intra)':<32} overlap={report['noncode_overlap']:.4f}")
+
+    if report.get("unmeasured_domains"):
         lines.append(f"  unmeasured: {', '.join(report['unmeasured_domains'])}")
     if kill is not None:
         verdict = "NOT specializing (>= threshold)" if kill["triggered"] else "specializing"
         lines.append(f"  kill-check {kill['pair']}: overlap={kill['overlap']:.4f} "
                      f"threshold={kill['threshold']:.4f} -> {verdict}")
+
+    alert = report.get("cross_domain_alert")
+    if alert is not None:
+        lines.append(f"  advisory: {alert['message']}")
+
     return "\n".join(lines)
