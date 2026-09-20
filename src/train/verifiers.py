@@ -23,6 +23,9 @@ module's top-level import surface stays stdlib-only.
 
 from __future__ import annotations
 
+from pathlib import Path as _Path
+__path__ = [str(_Path(__file__).parent / "verifiers")]
+
 import ast
 import json
 import re
@@ -1701,3 +1704,35 @@ def score_rollouts(
         futures = [pool.submit(reward_fn, c, reference) for c in completions]
         return [f.result() for f in futures]
 
+
+
+# --------------------------------------------------------------------------- #
+# #341 -- Systems, native & mobile stack verifiers (Rust, C/C++, Swift, Kotlin)
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.systems_mobile import (
+    CppCompilerOracle,
+    CppStaticVerifier,
+    CppVerifier,
+    KotlinCompilerOracle,
+    KotlinStaticVerifier,
+    KotlinVerifier,
+    RustCompilerOracle,
+    RustStaticVerifier,
+    RustVerifier,
+    SwiftCompilerOracle,
+    SwiftStaticVerifier,
+    SwiftVerifier,
+    SystemsMobileVerifier,
+    find_cpp_escape_hatches,
+    find_kotlin_escape_hatches,
+    find_rust_escape_hatches,
+    find_swift_escape_hatches,
+    parse_cpp_diagnostics,
+    parse_kotlin_diagnostics,
+    parse_rust_diagnostics,
+    parse_swift_diagnostics,
+    resolve_cpp_toolchain,
+    resolve_kotlin_toolchain,
+    resolve_rust_toolchain,
+    resolve_swift_toolchain,
+)
