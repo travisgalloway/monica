@@ -1865,3 +1865,20 @@ from src.train.verifiers.architecture import (
     parse_python_imports,
     parse_typescript_imports,
 )
+
+# --------------------------------------------------------------------------- #
+# #347 -- RLVR/Eval: Behavioral-invariance refactoring & interface decoupling
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.refactoring import (
+    RefactoringAnalysisResult,
+    RefactoringAstSummary,
+    RefactoringInvariantVerifier,
+    RefactoringOracle,
+    RefactoringPattern,
+    RefactoringTask,
+    SandboxedExecutionGate,
+    TestExecutionResult,
+    analyze_refactoring_ast,
+    find_refactoring_escape_hatches,
+    parse_multi_file_source as parse_refactoring_source,
+)

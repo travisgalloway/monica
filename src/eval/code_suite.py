@@ -1532,3 +1532,110 @@ def evaluate_blast_radius(
         "by_bucket": summary["by_bucket"],
         "overall": summary["overall"],
     }
+
+
+# --------------------------------------------------------------------------------------- #
+# Behavioral-Invariance Refactoring & Interface Decoupling Verifier Evaluation (#347)
+# --------------------------------------------------------------------------------------- #
+
+REFACTORING_BUCKETS: Tuple[str, ...] = (
+    "strategy",
+    "factory",
+    "repository",
+    "dependency_injection",
+    "mockability",
+)
+
+
+def evaluate_refactoring(
+    test_cases: Sequence[dict],
+    *,
+    verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against Refactoring Invariant & Interface Decoupling verifiers (#347).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `pattern`: pattern bucket ('strategy', 'factory', 'repository', 'dependency_injection', 'mockability')
+      - `code`: candidate refactored code (str, dict, or multi-file bundle)
+      - `tests`: functional unit/property test suite string or dict
+      - `mock_tests`: optional mockability test suite string or dict
+      - `reference`: optional ground truth refactored code
+      - `expected_clean`: bool indicating if the test case is clean (reward == 1.0) vs faulty/hacked
+      - `prompt`: optional prompt string prefix
+      - `target_interfaces`: optional sequence of expected interface names
+
+    Emits records conforming to RECORD_FIELDS:
+      suite='refactoring', bucket=pattern, distance=len(code), etc.
+    Returns summary dict with per-bucket and overall statistics.
+    """
+    if verifier is None:
+        from ..train.verifiers.refactoring import RefactoringInvariantVerifier
+        verifier = RefactoringInvariantVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        pattern = str(inst.get("pattern", "strategy"))
+        code = inst.get("code", "")
+        code_str = json.dumps(code) if isinstance(code, (dict, list)) else str(code)
+        tests = inst.get("tests")
+        mock_tests = inst.get("mock_tests")
+        reference = inst.get("reference")
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+        target_interfaces = inst.get("target_interfaces")
+
+        eval_res = verifier.evaluate(
+            code,
+            reference=reference,
+            prompt=prompt,
+            tests=tests,
+            mock_tests=mock_tests,
+            pattern=pattern,
+            target_interfaces=target_interfaces,
+        )
+        reward = float(eval_res["reward"])
+        is_clean = (reward == 1.0) and bool(eval_res.get("is_clean", False))
+        success = (is_clean == expected_clean)
+
+        records.append(
+            make_record(
+                suite="refactoring",
+                id=inst_id,
+                bucket=pattern,
+                distance=len(code_str),
+                n_scored_tokens=len(code_str.split()) if code_str else 0,
+                ce_nats=0.0 if is_clean else 1.0,
+                token_accuracy=1.0 if success else 0.0,
+                exact_match=1.0 if (reward == 1.0) else 0.0,
+                rank_top1=success,
+                mrr=1.0 if success else 0.0,
+                meta={
+                    "pattern": pattern,
+                    "reward": reward,
+                    "expected_clean": expected_clean,
+                    "is_clean": is_clean,
+                    "success": success,
+                    "functional_passed": eval_res.get("functional_passed", False),
+                    "mockability_passed": eval_res.get("mockability_passed", False),
+                    "no_socket_opened": eval_res.get("no_socket_opened", True),
+                    "no_db_opened": eval_res.get("no_db_opened", True),
+                },
+            )
+        )
+
+    buckets_present = [b for b in REFACTORING_BUCKETS if any(r["bucket"] == b for r in records)] or list(REFACTORING_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }
