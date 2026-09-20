@@ -22,7 +22,7 @@ from .blocks import MambaConfig, load_config
 GIB = 1024 ** 3
 
 # Bytes per element for the weight/activation dtype.
-BYTES_PER_DTYPE = {"fp32": 4, "fp16": 2, "bf16": 2}
+BYTES_PER_DTYPE = {"fp32": 4, "fp16": 2, "bf16": 2, "int8": 1, "uint8": 1, "kv8": 1}
 
 # Training memory ~ (weights + grads + optimizer state) per parameter, keyed by regime.
 # Four keys, two REGIMES (all-bf16 vs fp32-master), each with a plain/8-bit variant:
