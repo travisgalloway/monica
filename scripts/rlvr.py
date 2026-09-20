@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts", "ts-web", "typescript-web", "react", "python-web", "fastapi", "django", "go-web", "java-web", "spring", "csharp-web", "dotnet", "php-web", "laravel", "ruby-web", "rails", "web-backend", "web"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts", "ts-web", "typescript-web", "react", "python-web", "fastapi", "django", "go-web", "java-web", "spring", "csharp-web", "dotnet", "php-web", "laravel", "ruby-web", "rails", "web-backend", "web", "cloud-infra", "terraform", "docker", "kubernetes", "k8s", "shell", "bash", "html-tailwind", "tailwind"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -170,6 +170,8 @@ def main() -> None:
         from src.train.verifiers.web_backend import resolve_ruby_web_toolchain
         resolve_ruby_web_toolchain()
     elif args.reward in ("web-backend", "web"):
+        pass
+    elif args.reward in ("cloud-infra", "terraform", "docker", "kubernetes", "k8s", "shell", "bash", "html-tailwind", "tailwind"):
         pass
 
     from src.model.backend import get_backend
@@ -334,6 +336,36 @@ def main() -> None:
         elif args.reward in ("web-backend", "web"):
             from src.train.verifiers.web_backend import WebBackendVerifier
             raw_verifier = WebBackendVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "terraform":
+            from src.train.verifiers.cloud_infra import TerraformVerifier
+            raw_verifier = TerraformVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "docker":
+            from src.train.verifiers.cloud_infra import DockerfileVerifier
+            raw_verifier = DockerfileVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("kubernetes", "k8s"):
+            from src.train.verifiers.cloud_infra import KubernetesVerifier
+            raw_verifier = KubernetesVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("shell", "bash"):
+            from src.train.verifiers.cloud_infra import ShellVerifier
+            raw_verifier = ShellVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("html-tailwind", "tailwind"):
+            from src.train.verifiers.cloud_infra import HtmlTailwindVerifier
+            raw_verifier = HtmlTailwindVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "cloud-infra":
+            from src.train.verifiers.cloud_infra import CloudInfraVerifier
+            raw_verifier = CloudInfraVerifier(fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
         else:

@@ -115,6 +115,16 @@ Deterministic static analysis verifiers grade completions across web and enterpr
 - **Ruby and Rails**: Validates block balance, Rails model validation declarations, and Sorbet typed signatures (`sig { ... }`). Penalizes `# rubocop:disable` and `T.untyped`.
 - **Driver and Unified Evaluator**: Provides `WebBackendVerifier` with stack auto-detection, exposes reward flags in `scripts/rlvr.py`, and records benchmark evaluation through `evaluate_web_backend` in `src/eval/code_suite.py`.
 
+### Cloud, infra, containers, and automation verifiers (#344)
+
+Deterministic static analysis and AST verifiers grade infrastructure as code, container definitions, CI/CD automation scripts, and frontend markup without deploying infrastructure or executing untrusted binaries:
+- **Cloud IaC (Terraform / OpenTofu & HCL)**: Inspects HCL block structures, provider schemas, and variable typing. Resolves DAG symbol references across resources, variables, and local definitions, detecting undeclared dependencies and circular reference cycles. Anti-Goodhart guards reject hardcoded plaintext secrets (`password`, `aws_secret_key`, tokens) and unconstrained lifecycle drift escapes (`ignore_changes = all`).
+- **Containers & Packaging (Docker & Containerfiles)**: Validates multi-stage build stage declarations and cross-stage copy references (`COPY --from=stage`). Enforces unprivileged execution (`USER <non-root>`), pinned base image tags, and layer hygiene. Anti-Goodhart rules penalize `:latest` tags, running as root, and missing or disabled healthchecks (`HEALTHCHECK NONE`).
+- **Orchestration (Kubernetes YAML & Helm)**: Analyzes Kubernetes resource schemas across Pods, Deployments, Services, and StatefulSets. Checks resource specification completeness (`resources.requests` and `resources.limits`). Anti-Goodhart rules reject unbounded memory limits and missing `livenessProbe` / `readinessProbe` definitions on long-running workloads.
+- **Shell Scripting & POSIX Automation (Bash / POSIX sh)**: Verifies script hygiene, block balancing, and strict execution modes (`set -euo pipefail`). Detects dangerous unquoted variable expansions in critical commands (`rm`, `cp`, `mv`) and flags legacy backtick subshells. Anti-Goodhart rules penalize `eval` injection patterns and `# shellcheck disable` suppression bypasses.
+- **Web Core & UI Styling (HTML5, CSS3, Tailwind CSS)**: Inspects HTML document structure, requiring semantic elements (`<main>`, `<header>`, `<nav>`, `<article>`, `<section>`, `<footer>`) over `<div>` spam. Enforces ARIA accessibility contracts (valid roles, required `alt` on `<img>`, accessible inputs) and verifies Tailwind CSS utility tokens against standard utility specs.
+- **Telemetry and Unified Verifier**: Provides `CloudInfraVerifier` with automatic domain inference, reports segregated telemetry metrics (tracking syntax vs. linter vs. escape-hatch penalties), wires CLI rewards into `scripts/rlvr.py`, and records benchmark evaluation via `evaluate_cloud_infra` in `src/eval/code_suite.py`.
+
 ## Tool use (#102, optional)
 
 **What.** Emit a structured function call the runtime executes and feeds back, optionally in a

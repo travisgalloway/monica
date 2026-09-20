@@ -1819,3 +1819,31 @@ from src.train.verifiers.web_backend import (
     resolve_ruby_web_toolchain,
     resolve_ts_web_toolchain,
 )
+
+# --------------------------------------------------------------------------- #
+# #344 -- Cloud, Infra, Containers & Automation Verifiers
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.cloud_infra import (
+    BaseCloudInfraVerifier,
+    CloudInfraVerifier,
+    DockerfileOracle,
+    DockerfileVerifier,
+    HtmlTailwindOracle,
+    HtmlTailwindVerifier,
+    KubernetesOracle,
+    KubernetesVerifier,
+    ShellOracle,
+    ShellVerifier,
+    TerraformOracle,
+    TerraformVerifier,
+    find_docker_escape_hatches,
+    find_html_tailwind_escape_hatches,
+    find_kubernetes_escape_hatches,
+    find_shell_escape_hatches,
+    find_terraform_escape_hatches,
+    resolve_docker_toolchain,
+    resolve_html_tailwind_toolchain,
+    resolve_kubernetes_toolchain,
+    resolve_shell_toolchain,
+    resolve_terraform_toolchain,
+)
