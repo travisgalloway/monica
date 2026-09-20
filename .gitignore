@@ -168,7 +168,7 @@ activemq-data/
 .env
 .envrc
 .venv
-.venv-dt/
+.venv-dt
 # #298 version-comparison probe venvs (scripts/probe_mlx_buffer_reuse.py under an
 # explicitly pinned mlx==X.Y.Z); throwaway, never a dev environment.
 .venv-mlx*/
