@@ -50,7 +50,7 @@ import sys
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall", "adaptive_reasoning", "reasoning", "prose_recall")
+ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall", "adaptive_reasoning", "reasoning", "prose_recall", "moe_diag")
 DEFAULT_SUITES = "recall,needle,fim"
 
 
@@ -80,6 +80,10 @@ def _parse_args() -> argparse.Namespace:
                     default=REPO_ROOT / "eval_sets/code_needle/haystack.jsonl")
     ap.add_argument("--domains-json", type=Path, default=None,
                     help="domains.json from scripts/build_domain_val_sets.py (--suites domain-bpb)")
+    ap.add_argument("--moe-diag", action="store_true",
+                    help="run MoE routing diagnostics and output non-code vs code routing specialization report")
+    ap.add_argument("--moe-diag-domains", type=Path, default=None,
+                    help="domains.json for --moe-diag (defaults to --domains-json)")
     ap.add_argument("--shard-dir", type=Path, default=None,
                     help="Swift-packed SHARD dir for the FIM suite (not a split dir — split.py "
                          "drops the .bounds sidecars). Falls back to the fixture repo when absent.")
@@ -577,6 +581,23 @@ def _run_prose_recall(args, model, to_numpy, encode, rng):
                     "n_specs": len(specs), "n_distractors": len(distractors),
                     "distances": list(distances), "n_instances": len(instances)}
 
+
+def _run_moe_diag(args, model, to_numpy):
+    from src.eval.domain_bpb import load_domain_index
+    from src.eval.moe_routing import expert_histograms, specialization_report
+
+    domains_path = args.moe_diag_domains or args.domains_json
+    if not domains_path or not Path(domains_path).exists():
+        raise RuntimeError("--moe-diag needs --domains-json or --moe-diag-domains (build it "
+                           "with scripts/build_domain_val_sets.py)")
+    index = load_domain_index(domains_path)
+    domains = {name: entry["packed"] for name, entry in index.items()}
+    hists = expert_histograms(model, domains, batch_size=args.batch_size,
+                              seq_len=args.seq_len, max_batches=args.max_batches,
+                              to_numpy=to_numpy)
+    report = specialization_report(hists)
+    return report, {"domains_json": str(domains_path), "n_domains": len(domains)}
+
 # --------------------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------------------- #
@@ -630,6 +651,8 @@ def main() -> int:
                 result, src = _run_adaptive_reasoning(args, model, to_numpy, encode, rng)
             elif suite == "prose_recall":
                 result, src = _run_prose_recall(args, model, to_numpy, encode, rng)
+            elif suite == "moe_diag":
+                result, src = _run_moe_diag(args, model, to_numpy)
             else:                                        # unreachable: validated in _parse_args
                 raise RuntimeError(f"unhandled suite {suite!r}")
         except RuntimeError as e:
@@ -658,10 +681,33 @@ def main() -> int:
                   f"over {result['summary']['n']} records")
         elif suite in ("adaptive_reasoning", "reasoning"):
             print(format_adaptive_reasoning_table(result))
+        elif suite == "moe_diag":
+            from src.eval.moe_routing import format_routing_report
+            print("\n" + "=" * 80)
+            print("Non-Code vs Code Routing Specialization Report (#365)")
+            print("=" * 80)
+            print(format_routing_report(result))
+            print("=" * 80)
+
+    if getattr(args, "moe_diag", False) and "moe_diag" not in summaries:
+        t_diag = time.monotonic()
+        try:
+            moe_res, moe_src = _run_moe_diag(args, model, to_numpy)
+            summaries["moe_diag"] = moe_res
+            sources["moe_diag"] = moe_src
+            timings["moe_diag"] = time.monotonic() - t_diag
+            from src.eval.moe_routing import format_routing_report
+            print("\n" + "=" * 80)
+            print("Non-Code vs Code Routing Specialization Report (#365)")
+            print("=" * 80)
+            print(format_routing_report(moe_res))
+            print("=" * 80)
+        except RuntimeError as e:
+            skipped["moe_diag"] = str(e)
+            print(f"[moe_diag] SKIPPED: {e}")
 
     if not summaries:
-        raise SystemExit("every requested suite was skipped — nothing was measured. "
-                         f"Reasons: {skipped}")
+        raise SystemExit("every requested suite was skipped — nothing was measured. "                         f"Reasons: {skipped}")
 
     # Deterministic transcript order: (suite, id).
     all_records.sort(key=lambda r: (r["suite"], r["id"]))

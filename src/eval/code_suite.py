@@ -393,9 +393,31 @@ class StubCausalModel:
         self._table = (np.random.default_rng(seed)
                        .standard_normal((self.vocab_size, self.vocab_size))
                        .astype(np.float32))
+        self._moe_counting = False
+        self._moe_layers = 2
+        self._n_experts = 8
+        self._expert_counts = [[0.0] * self._n_experts for _ in range(self._moe_layers)]
+
+    def set_moe_load_counting(self, flag: bool) -> None:
+        self._moe_counting = bool(flag)
+
+    def pop_moe_load(self) -> list:
+        counts = [list(layer) for layer in self._expert_counts]
+        self._expert_counts = [[0.0] * self._n_experts for _ in range(self._moe_layers)]
+        return counts
 
     def forward(self, inputs):
-        return self._table[np.asarray(inputs) % self.vocab_size]
+        arr = np.asarray(inputs)
+        if getattr(self, "_moe_counting", False):
+            n_tokens = arr.size
+            if n_tokens > 0:
+                for l in range(self._moe_layers):
+                    # Distribute tokens across experts pseudo-deterministically from token IDs
+                    buckets = (arr % self._n_experts).reshape(-1)
+                    counts = np.bincount(buckets, minlength=self._n_experts)
+                    for e in range(self._n_experts):
+                        self._expert_counts[l][e] += float(counts[e])
+        return self._table[arr % self.vocab_size]
 
 
 # --------------------------------------------------------------------------------------- #

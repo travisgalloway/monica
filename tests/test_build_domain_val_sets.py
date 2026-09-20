@@ -179,3 +179,50 @@ def test_the_output_feeds_domain_bpb_end_to_end(tmp_path):
     assert set(res["by_domain"]) == {"python", "typescript"}
     for agg in res["by_domain"].values():
         assert agg is not None and agg["val_bpb"] > 0
+
+def test_non_code_domains_canonicalize_to_web_prose_math():
+    mod = _module()
+    # Web domains
+    assert mod.domain_of({"text": "t", "source": "essential-web"}, "source") == "web"
+    assert mod.domain_of({"text": "t", "source": "Essential_Web"}, "source") == "web"
+    assert mod.domain_of({"text": "t", "source": "fineweb"}, "source") == "web"
+
+    # Prose domains
+    assert mod.domain_of({"text": "t", "source": "rfc"}, "source") == "prose"
+    assert mod.domain_of({"text": "t", "source": "RFCs"}, "source") == "prose"
+    assert mod.domain_of({"text": "t", "source": "adr"}, "source") == "prose"
+    assert mod.domain_of({"text": "t", "source": "technical-prose"}, "source") == "prose"
+
+    # Math domains
+    assert mod.domain_of({"text": "t", "source": "openwebmath"}, "source") == "math"
+    assert mod.domain_of({"text": "t", "source": "proof-pile-2"}, "source") == "math"
+    assert mod.domain_of({"text": "t", "source": "math"}, "source") == "math"
+
+    # Code domains stay unchanged
+    assert mod.domain_of({"text": "t", "lang": "typescript"}, "lang") == "typescript"
+    assert mod.domain_of({"text": "t", "lang": "python"}, "lang") == "python"
+
+
+def test_builds_distinct_non_code_validation_partitions(tmp_path):
+    rows = []
+    # web
+    for i in range(5):
+        rows.append({"text": f"<html><body>web {i}</body></html>\n" * 20, "source": "essential-web", "lang": "en"})
+    # prose
+    for i in range(5):
+        rows.append({"text": f"RFC 9999 Section {i} Specification details.\n" * 20, "source": "rfc", "lang": "en"})
+    # math
+    for i in range(5):
+        rows.append({"text": f"Theorem {i}: For all x in X, x + 0 = x.\n" * 20, "source": "openwebmath", "lang": "en"})
+
+    inp = _corpus(tmp_path, rows)
+    out = tmp_path / "domains"
+    res = _run(inp, out, "--group-by", "domain", "--val-docs", "3")
+    assert res.returncode == 0, res.stderr
+
+    index = json.loads((out / "domains.json").read_text())
+    assert set(index["domains"]) == {"web", "prose", "math"}
+    for dom in ("web", "prose", "math"):
+        assert index["domains"][dom]["n_docs"] == 3
+        assert (out / dom / "val.bin").exists()
+        assert (out / dom / "val.meta.json").exists()

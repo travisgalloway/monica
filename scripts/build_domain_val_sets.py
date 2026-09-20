@@ -91,21 +91,60 @@ def _read_records(uri) -> Iterator[dict]:
                "license": rec.license, "meta": rec.meta}
 
 
+NON_CODE_DOMAINS: dict[str, tuple[str, ...]] = {
+    "web": ("essential-web", "essential_web", "essentialweb", "fineweb", "fineweb-edu", "fineweb_edu", "web"),
+    "prose": ("rfc", "rfcs", "adr", "adrs", "technical-prose", "technical_prose", "prose", "docs"),
+    "math": ("openwebmath", "open-web-math", "proof-pile", "proof-pile-2", "proof_pile", "proof_pile_2", "math", "logic"),
+}
+
+
+def canonicalize_domain(value: str) -> str:
+    """Map known non-code dataset/source identifiers to their canonical partition name:
+    'web' (Essential-Web), 'prose' (RFCs/ADRs), or 'math' (OpenWebMath/Proof-Pile-2).
+    Other domain values (e.g. programming languages) are returned unchanged.
+    """
+    clean = str(value).strip().lower().replace("_", "-")
+    for canonical, aliases in NON_CODE_DOMAINS.items():
+        if clean == canonical or clean in aliases:
+            return canonical
+        for alias in aliases:
+            if clean.startswith(f"{alias}-") or clean.endswith(f"-{alias}"):
+                return canonical
+    return str(value).strip()
+
+
 def domain_of(record: dict, group_by: str) -> Optional[str]:
     """The domain value for a record, or None when the field is absent/empty.
 
     A record with no domain value is **dropped and counted**, never bucketed into a
     catch-all — an "other" bucket silently mixes languages, which is the exact thing a
     per-domain BPB report exists to separate.
+
+    Non-code domains (Essential-Web, RFCs/ADRs, OpenWebMath/Proof-Pile-2) are normalized
+    to distinct canonical partitions: 'web', 'prose', and 'math'.
     """
     if group_by.startswith("meta:"):
         value = (record.get("meta") or {}).get(group_by[len("meta:"):])
+    elif group_by == "domain":
+        value = record.get("domain")
+        if value is None:
+            src = record.get("source")
+            if src and canonicalize_domain(src) in NON_CODE_DOMAINS:
+                value = src
+            else:
+                value = (record.get("meta") or {}).get("lang") or record.get("lang") or src
     else:
         value = record.get(group_by)
+        if value is None and group_by == "lang":
+            src = record.get("source") or record.get("domain")
+            if src and canonicalize_domain(src) in NON_CODE_DOMAINS:
+                value = src
     if value is None:
         return None
     value = str(value).strip()
-    return value or None
+    if not value:
+        return None
+    return canonicalize_domain(value)
 
 
 def _encoder(args):
@@ -126,7 +165,7 @@ def main() -> int:
                     help="cleaned corpus URI (Parquet shard dir via src.data.corpus.read_shards, "
                          "or a JSONL dir/file with the same keys)")
     ap.add_argument("--group-by", default="lang",
-                    help="'lang', 'source', 'license', or 'meta:<key>' (e.g. meta:lang for "
+                    help="'lang', 'source', 'domain', 'license', or 'meta:<key>' (e.g. meta:lang for "
                          "stack-v2's per-file language)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--val-docs", type=int, default=None,

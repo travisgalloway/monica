@@ -74,7 +74,12 @@ def test_moe_diag_fires_only_on_its_cadence_and_merges_into_the_payload():
 
     def moe_diag(model):
         calls.append(model)
-        return {"moe_domain_overlap": 0.5, "moe_kill_triggered": False}
+        return {
+            "moe_domain_overlap": 0.5,
+            "moe_domain_overlap_noncode": 0.35,
+            "moe_domain_overlap_code_vs_prose": 0.40,
+            "moe_kill_triggered": False,
+        }
 
     loader = FakeLoader(n_batches=100)
     cfg = TrainConfig(total_steps=6, grad_accum=1, warmup_steps=0, log_every=1,
@@ -85,7 +90,47 @@ def test_moe_diag_fires_only_on_its_cadence_and_merges_into_the_payload():
     diagged = [p for p in logs if "moe_domain_overlap" in p]
     assert {p["step"] for p in diagged} == {0, 2, 4}
     assert all(p["moe_kill_triggered"] is False for p in diagged)
+    assert all(p["moe_domain_overlap_noncode"] == 0.35 for p in diagged)
+    assert all(p["moe_domain_overlap_code_vs_prose"] == 0.40 for p in diagged)
     assert calls == ["the-model"] * 3           # moe_diag(model) called with the real model
+
+
+def test_metrics_jsonl_export_schema_with_moe_routing(tmp_path):
+    """#365: Verify metrics schema updated and exported into metrics.jsonl."""
+    import json
+    from src.train.logging import JsonlLogger
+
+    metrics_file = tmp_path / "metrics.jsonl"
+    logger = JsonlLogger(str(metrics_file), echo=False)
+
+    def fake_step(model, micro, lr):
+        return {"loss": 1.0, "grad_norm": 0.5}
+
+    def moe_diag(model):
+        return {
+            "moe_domain_overlap": 0.42,
+            "moe_domain_overlap_noncode": 0.35,
+            "moe_domain_overlap_code_vs_prose": 0.30,
+            "moe_domain_overlap_code_vs_noncode": 0.32,
+            "moe_cross_domain_collapse": False,
+            "moe_kill_triggered": False,
+        }
+
+    loader = FakeLoader(n_batches=100)
+    cfg = TrainConfig(total_steps=4, grad_accum=1, warmup_steps=0, log_every=1,
+                      eval_every=100, ckpt_every=100, moe_diag_every=2)
+    train("the-model", loader, cfg, fake_step, moe_diag=moe_diag, logger=logger)
+    logger.close()
+
+    lines = [json.loads(line) for line in metrics_file.read_text().splitlines()]
+    diagged = [row for row in lines if "moe_domain_overlap_noncode" in row]
+    assert len(diagged) == 2  # steps 0 and 2
+    for row in diagged:
+        assert row["moe_domain_overlap"] == pytest.approx(0.42)
+        assert row["moe_domain_overlap_noncode"] == pytest.approx(0.35)
+        assert row["moe_domain_overlap_code_vs_prose"] == pytest.approx(0.30)
+        assert row["moe_domain_overlap_code_vs_noncode"] == pytest.approx(0.32)
+        assert row["moe_cross_domain_collapse"] is False
 
 
 def test_moe_diag_every_zero_never_fires_and_does_not_raise():

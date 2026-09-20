@@ -248,3 +248,58 @@ def test_repo_recall_suite_runs_and_topological_beats_random(tmp_path):
     assert "repo_recall" in results["summaries"]
     summary = results["summaries"]["repo_recall"]
     assert summary["topo_top1_accuracy"] > summary["random_top1_accuracy"]
+
+def test_eval_code_suite_moe_diag_outputs_specialization_report(tmp_path):
+    # Build synthetic domain val sets with code, prose, and math
+    import numpy as np
+    from src.data.pack import pack_ids
+    out_domains = tmp_path / "domains"
+    out_domains.mkdir(parents=True, exist_ok=True)
+
+    domains_meta = {}
+    for d, tokens in [
+        ("typescript", np.arange(1000, dtype=np.uint16)),
+        ("rfc", np.arange(1000, dtype=np.uint16)),
+        ("openwebmath", np.arange(1000, dtype=np.uint16)),
+    ]:
+        d_dir = out_domains / d
+        d_dir.mkdir(parents=True, exist_ok=True)
+        packed = d_dir / "val.bin"
+        pack_ids(tokens, packed, dtype=np.uint16, n_bytes=len(tokens))
+        (d_dir / "val.meta.json").write_text(json.dumps({"dtype": "uint16", "n_tokens": len(tokens), "n_bytes": len(tokens)}))
+        domains_meta[d] = {
+            "packed": str(packed.relative_to(out_domains)),
+            "group_value": d,
+            "n_docs": 1,
+            "n_tokens": len(tokens),
+            "n_bytes": len(tokens),
+            "dtype": "uint16",
+        }
+
+    index = {"config": {}, "domains": domains_meta, "dropped_domains": {}}
+    domains_json = out_domains / "domains.json"
+    domains_json.write_text(json.dumps(index))
+
+    out_results = tmp_path / "eval_results.json"
+    res = subprocess.run(
+        [sys.executable, str(SCRIPT), "--stub-model", "--byte-tokenizer",
+         "--domains-json", str(domains_json), "--moe-diag", "--suites", "",
+         "--output", str(out_results), "--seed", "0"],
+        cwd=REPO_ROOT, capture_output=True, text=True)
+
+    assert res.returncode == 0, res.stderr
+    # Acceptance criterion: outputs non-code vs code routing specialization reports
+    assert "Non-Code vs Code Routing Specialization Report" in res.stdout
+    assert "MoE routing overlap by domain pair" in res.stdout
+    assert "code vs non-code" in res.stdout
+    assert "[moe-cross-domain-collapse]" in res.stdout
+
+    results = json.loads(out_results.read_text())
+    assert "moe_diag" in results["summaries"]
+    diag = results["summaries"]["moe_diag"]
+    assert "category_matrix" in diag
+    assert "code" in diag["category_matrix"]
+    assert "code_vs_noncode_overlap" in diag
+    assert "moe_domain_overlap_noncode" in diag
+    assert "moe_domain_overlap_code_vs_prose" in diag
+    assert "cross_domain_alert" in diag

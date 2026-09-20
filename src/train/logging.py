@@ -31,7 +31,8 @@ class JsonlLogger:
             # non-float branch below.
             keys = ("event", "step", "seq_len", "lr", "loss", "grad_norm",
                     "val_loss", "val_perplexity", "moe_util_var", "moe_router_entropy",
-                    "moe_domain_overlap", "moe_kill_triggered")
+                    "moe_domain_overlap", "moe_domain_overlap_noncode",
+                    "moe_domain_overlap_code_vs_prose", "moe_kill_triggered")
             parts = [f"{k}={payload[k]:.4g}" if isinstance(payload.get(k), float)
                      else f"{k}={payload[k]}" for k in keys if k in payload]
             print("  ".join(parts))

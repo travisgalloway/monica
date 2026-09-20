@@ -8,8 +8,10 @@ import numpy as np
 import pytest
 
 from src.data.pack import pack_ids
-from src.eval.moe_routing import (expert_histograms, format_routing_report,
-                                  histogram_overlap, kill_check, specialization_report)
+from src.eval.moe_routing import (cross_domain_collapse_check, domain_category,
+                                  expert_histograms, format_routing_report,
+                                  histogram_overlap, inter_category_overlap_matrix,
+                                  kill_check, specialization_report)
 
 
 # --------------------------------------------------------------------------- #
@@ -248,3 +250,111 @@ def test_expert_histograms_returns_scripted_hist_per_domain(tmp_path):
                             seq_len=8, batch_size=2, max_batches=2)
     assert out == {"a": [[9.0, 1.0]], "b": [[2.0, 8.0]]}
     assert model.counting is True
+
+# --------------------------------------------------------------------------- #
+# Inter-category domain overlap & cross-domain collapse diagnostics (#365)
+# --------------------------------------------------------------------------- #
+def test_inter_category_domain_overlap_matrix_on_synthetic_expert_load_tensors():
+    # 4 synthetic domains across 3 categories:
+    # "typescript": "code", "python": "code", "rfc": "prose", "math": "math"
+    # Synthetic expert load tensors (2 layers, 4 experts)
+    # code domains share experts 0 and 1
+    # prose domain routes to expert 2
+    # math domain routes to expert 3
+    hists = {
+        "typescript": [[10.0, 10.0, 0.0, 0.0], [10.0, 10.0, 0.0, 0.0]],
+        "python": [[8.0, 12.0, 0.0, 0.0], [12.0, 8.0, 0.0, 0.0]],
+        "rfc": [[0.0, 0.0, 20.0, 0.0], [0.0, 0.0, 20.0, 0.0]],
+        "math": [[0.0, 0.0, 0.0, 20.0], [0.0, 0.0, 0.0, 20.0]],
+    }
+    matrix = inter_category_overlap_matrix(hists)
+    assert set(matrix.keys()) == {"code", "math", "prose"}
+
+    # Intra-category "code" (typescript vs python):
+    # p = [0.5, 0.5], q = [0.4, 0.6] -> overlap 0.90 per layer
+    assert matrix["code"]["code"] == pytest.approx(0.9)
+
+    # Inter-category: code vs prose is disjoint -> 0.0
+    assert matrix["code"]["prose"] == pytest.approx(0.0)
+    assert matrix["prose"]["code"] == pytest.approx(0.0)
+
+    # Inter-category: code vs math is disjoint -> 0.0
+    assert matrix["code"]["math"] == pytest.approx(0.0)
+    assert matrix["math"]["code"] == pytest.approx(0.0)
+
+    # Inter-category: prose vs math is disjoint -> 0.0
+    assert matrix["prose"]["math"] == pytest.approx(0.0)
+    assert matrix["math"]["prose"] == pytest.approx(0.0)
+
+    # Single-domain categories have 1.0 self-overlap on diagonal
+    assert matrix["prose"]["prose"] == pytest.approx(1.0)
+    assert matrix["math"]["math"] == pytest.approx(1.0)
+
+
+def test_specialization_report_cross_category_metrics():
+    hists = {
+        "typescript": [[10.0, 10.0, 0.0, 0.0]],
+        "python": [[10.0, 10.0, 0.0, 0.0]],       # identical to typescript -> overlap 1.0
+        "rfc": [[0.0, 0.0, 10.0, 10.0]],          # non-code prose
+        "math": [[0.0, 0.0, 10.0, 10.0]],         # non-code math (identical to rfc)
+    }
+    report = specialization_report(hists)
+    assert report["intra_category"]["code"]["mean"] == pytest.approx(1.0)
+    assert report["code_vs_prose_overlap"] == pytest.approx(0.0)
+    assert report["code_vs_noncode_overlap"] == pytest.approx(0.0)
+    assert report["noncode_overlap"] == pytest.approx(1.0)
+    assert report["moe_domain_overlap_noncode"] == pytest.approx(1.0)
+    assert report["moe_domain_overlap_code_vs_prose"] == pytest.approx(0.0)
+    assert report["cross_domain_alert"]["status"] == "OK"
+    assert report["cross_domain_alert"]["triggered"] is False
+
+
+def test_cross_domain_collapse_alert_triggers_above_threshold():
+    # Code and non-code domains route to the same experts (> 0.95)
+    hists = {
+        "typescript": [[10.0, 0.0]],
+        "prose": [[9.8, 0.2]],    # overlap = 0.98 >= 0.95
+    }
+    report = specialization_report(hists)
+    assert report["code_vs_noncode_overlap"] == pytest.approx(0.98)
+    alert = report["cross_domain_alert"]
+    assert alert["status"] == "FLAGGED"
+    assert alert["triggered"] is True
+    assert "[moe-cross-domain-collapse]" in alert["message"]
+    assert "FLAGGED" in alert["message"]
+
+    text = format_routing_report(report)
+    assert "[moe-cross-domain-collapse]" in text
+    assert "FLAGGED" in text
+
+
+def test_cross_domain_collapse_blind_when_domain_unobserved():
+    # Only code domains measured, non-code domain is None (unobserved/empty)
+    hists = {
+        "typescript": [[10.0, 0.0]],
+        "python": [[0.0, 10.0]],
+        "prose": None,
+    }
+    report = specialization_report(hists)
+    assert report["code_vs_noncode_overlap"] is None
+    alert = report["cross_domain_alert"]
+    assert alert["status"] == "BLIND"
+    assert alert["triggered"] is None
+    assert alert["specializing"] is None
+    assert "BLIND" in alert["message"]
+
+    text = format_routing_report(report)
+    assert "[moe-cross-domain-collapse]" in text
+    assert "BLIND" in text
+
+
+def test_cross_domain_collapse_warmup_status():
+    hists = {
+        "typescript": [[10.0, 0.0]],
+        "prose": [[10.0, 0.0]],   # overlap 1.0, but in warmup
+    }
+    report = specialization_report(hists, step=50, warmup_steps=500)
+    alert = report["cross_domain_alert"]
+    assert alert["status"] == "WARMUP"
+    assert alert["triggered"] is False
+    assert "WARMUP" in alert["message"]
