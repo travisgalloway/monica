@@ -141,12 +141,26 @@ def make_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def _loss(mb) -> torch.Tensor:
         inputs, targets = mb
-        logits = model.forward(inputs)                       # (B, L, V)
-        V = logits.shape[-1]
-        t = torch.as_tensor(np.asarray(targets), dtype=torch.long,
-                            device=logits.device).reshape(-1)
-        # Cross-entropy in fp32 (wide-vocab softmax stability).
-        return F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="mean")
+        if getattr(model.config, "mtp_depth", 0) > 0:
+            logits, aux_logits = model.forward_with_mtp(inputs)
+            V = logits.shape[-1]
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long,
+                                device=logits.device).reshape(-1)
+            ce_next = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="mean")
+            mtp_loss = torch.tensor(0.0, device=logits.device)
+            targets_t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=logits.device)
+            for k, aux_logit in enumerate(aux_logits, start=1):
+                t_k = targets_t[:, k:].reshape(-1)
+                ce_k = F.cross_entropy(aux_logit.reshape(-1, V).float(), t_k, reduction="mean")
+                mtp_loss = mtp_loss + ce_k
+            return ce_next + float(model.config.mtp_loss_weight) * mtp_loss
+        else:
+            logits = model.forward(inputs)                       # (B, L, V)
+            V = logits.shape[-1]
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long,
+                                device=logits.device).reshape(-1)
+            # Cross-entropy in fp32 (wide-vocab softmax stability).
+            return F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="mean")
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,
@@ -175,13 +189,33 @@ def make_sft_train_step(model, optimizer, *, grad_clip: float = 1.0,
 
     def _loss(mb) -> torch.Tensor:
         inputs, targets, mask = mb
-        logits = model.forward(inputs)                       # (B, L, V)
-        V = logits.shape[-1]
-        device = logits.device
-        t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device).reshape(-1)
-        ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")   # (B*L,)
-        m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device).reshape(-1)
-        return (ce * m).sum() / torch.clamp(m.sum(), min=1.0)    # response-token mean
+        if getattr(model.config, "mtp_depth", 0) > 0:
+            logits, aux_logits = model.forward_with_mtp(inputs)
+            V = logits.shape[-1]
+            device = logits.device
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device).reshape(-1)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")
+            m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device).reshape(-1)
+            loss_next = (ce * m).sum() / torch.clamp(m.sum(), min=1.0)
+
+            mtp_loss = torch.tensor(0.0, device=device)
+            targets_t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device)
+            mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device)
+            for k, aux_logit in enumerate(aux_logits, start=1):
+                t_k = targets_t[:, k:].reshape(-1)
+                m_k = mask_t[:, k:].reshape(-1)
+                ce_k = F.cross_entropy(aux_logit.reshape(-1, V).float(), t_k, reduction="none")
+                loss_k = (ce_k * m_k).sum() / torch.clamp(m_k.sum(), min=1.0)
+                mtp_loss = mtp_loss + loss_k
+            return loss_next + float(model.config.mtp_loss_weight) * mtp_loss
+        else:
+            logits = model.forward(inputs)                       # (B, L, V)
+            V = logits.shape[-1]
+            device = logits.device
+            t = torch.as_tensor(np.asarray(targets), dtype=torch.long, device=device).reshape(-1)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), t, reduction="none")   # (B*L,)
+            m = torch.as_tensor(np.asarray(mask), dtype=torch.float32, device=device).reshape(-1)
+            return (ce * m).sum() / torch.clamp(m.sum(), min=1.0)    # response-token mean
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,

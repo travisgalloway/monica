@@ -42,6 +42,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--use-mtp", action="store_true", default=False,
+                    help="use depth-1 MTP head for speculative proposal candidates (#356)")
     ap.add_argument("--critic-filter", action="store_true", default=False,
                     help="abort flawed draft trajectories early using surrogate critic head (#388)")
     ap.add_argument("--critic-threshold", type=float, default=0.70,
@@ -109,7 +111,7 @@ def plain_decode(model, prompt, max_new, mx):
 
 
 def spec_decode(model, prompt, max_new, gamma, max_n, mx, *,
-                critic_filter: bool = False, critic_threshold: float = 0.70, critic: object = None):
+                use_mtp: bool = False, critic_filter: bool = False, critic_threshold: float = 0.70, critic: object = None):
     """Greedy self-speculative decoding with optional surrogate critic early rejection (#388)."""
     from src.serve.spec_decode import first_mismatch, propose, prune_draft_trajectory
 
@@ -122,7 +124,11 @@ def spec_decode(model, prompt, max_new, gamma, max_n, mx, *,
     t0 = time.perf_counter()
     while len(generated) < max_new:
         remaining = max_new - len(generated)
-        draft = propose(context, min(gamma, remaining), max_n)
+        from src.serve.spec_decode import propose_mtp
+        if use_mtp and hasattr(model, "mtp_blocks") and len(model.mtp_blocks) > 0:
+            draft = propose_mtp(model, context, next_token=_argmax(logits, mx), gamma=min(gamma, remaining))
+        else:
+            draft = propose(context, min(gamma, remaining), max_n)
         if not draft:
             # No tail recurs — take one ordinary verifier step.
             x = _argmax(logits, mx)

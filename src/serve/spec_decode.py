@@ -168,3 +168,224 @@ def prune_draft_trajectory(
         "probs": probs,
     }
     return pruned_draft, telemetry
+
+
+def propose_mtp(
+    model: Any,
+    context: Sequence[int] | None = None,
+    *,
+    h_last: Any = None,
+    next_token: int | None = None,
+    depth: int = 1,
+    gamma: int = 1,
+    to_numpy: Callable[[Any], np.ndarray] = np.asarray,
+) -> list[int]:
+    """Generate speculative verification candidates using the native MTP head (#356).
+
+    Proposes candidate continuation tokens using the model's depth-k MTP auxiliary head
+    without requiring a separate draft model checkpoint.
+
+    Args:
+        model: ModelInterface instance with active MTP blocks.
+        context: Prior token sequence if h_last/next_token not pre-computed.
+        h_last: Optional pre-computed post-norm trunk hidden state (1, d_model).
+        next_token: Optional pre-computed next token (int).
+        depth: Starting MTP head depth (default: 1).
+        gamma: Maximum candidate tokens to draft (default: 1).
+        to_numpy: Callable to convert backend tensors to numpy.
+
+    Returns:
+        draft: List of proposed candidate token IDs.
+    """
+    if not hasattr(model, "mtp_blocks") or len(model.mtp_blocks) == 0:
+        return []
+    if gamma <= 0:
+        return []
+
+    # If h_last or next_token not provided, compute them from context
+    if h_last is None or next_token is None:
+        if not context:
+            return []
+        try:
+            tokens = [int(t) for t in context]
+            batch = [tokens]
+            logits = model.forward(batch)
+            l_np = to_numpy(logits)
+            if next_token is None:
+                next_token = int(np.argmax(l_np[0, -1, :]))
+            if h_last is None:
+                if hasattr(model, "forward_hidden"):
+                    h_seq = model.forward_hidden(batch)
+                    h_last = h_seq[:, -1, :] if hasattr(h_seq, "shape") else h_seq[-1]
+                else:
+                    return []
+        except Exception:
+            return []
+
+    draft = []
+    curr_h = h_last
+    curr_tok = next_token
+    k = depth
+    max_k = min(len(model.mtp_blocks), k + gamma - 1)
+
+    while k <= max_k and len(draft) < gamma:
+        try:
+            mtp_logits, _ = model.step_mtp(curr_h, curr_tok, depth=k)
+            ml_np = to_numpy(mtp_logits)
+            cand = int(np.argmax(ml_np.reshape(-1)))
+            draft.append(cand)
+            curr_tok = cand
+            k += 1
+        except Exception:
+            break
+
+    return draft
+
+
+def spec_decode(
+    model: Any,
+    prompt: Sequence[int],
+    max_new: int = 128,
+    gamma: int = 1,
+    max_n: int = 8,
+    *,
+    use_mtp: bool = True,
+    critic_filter: bool = False,
+    critic_threshold: float = 0.70,
+    critic: Any = None,
+    backend: str = "auto",
+) -> tuple[list[int], float, dict[str, Any]]:
+    """Complete speculative decoding loop with native MTP proposals (#356).
+
+    Greedy self-speculative decoding supporting both native MTP head proposals and
+    prompt-lookup n-gram proposals. Preserves exact greedy decoding output.
+
+    Args:
+        model: ModelInterface instance.
+        prompt: Initial prompt token IDs.
+        max_new: Maximum new tokens to generate.
+        gamma: Draft tokens to propose per round.
+        max_n: Longest pattern length for prompt-lookup fallback.
+        use_mtp: Whether to use native MTP head proposals (default: True).
+        critic_filter: Whether to apply surrogate critic filtering (#388).
+        critic_threshold: P(clean) threshold for critic early abort.
+        critic: Optional critic evaluator.
+        backend: 'auto', 'mlx', or 'torch'.
+
+    Returns:
+        generated: List of generated token IDs (length <= max_new).
+        elapsed: Elapsed wall-clock time in seconds.
+        stats: Performance telemetry dict (rounds, drafted, accepted, accept_rate, etc.).
+    """
+    t0 = time.perf_counter()
+    ctx = [int(t) for t in prompt]
+    generated: list[int] = []
+    drafted, accepted, rounds = 0, 0, 0
+    critic_latency_ms = 0.0
+    draft_tokens_aborted = 0
+
+    # Initialize state
+    state = model.init_state(1)
+    # Step through prompt
+    logits = None
+    for t in ctx:
+        logits, state = model.step(np.array([t]), state)
+
+    # Detect if native MTP is available on this model
+    has_mtp = use_mtp and hasattr(model, "mtp_blocks") and len(model.mtp_blocks) > 0
+
+    while len(generated) < max_new:
+        remaining = max_new - len(generated)
+        x_greedy = int(np.argmax(np.asarray(logits).reshape(-1)))
+
+        if has_mtp:
+            # Step the trunk with greedy token to verify and get post-norm hidden state
+            res = model.step(np.array([x_greedy]), state, return_hidden=True)
+            if len(res) == 3:
+                logits_next, state_next, h_last = res
+            else:
+                logits_next, state_next = res[:2]
+                h_last = getattr(model, "norm_f", lambda x: x)(state_next[0][0])
+
+            generated.append(x_greedy)
+            ctx.append(x_greedy)
+            if len(generated) >= max_new:
+                break
+
+            # Draft using MTP depth-1 head
+            cand_tokens = propose_mtp(model, ctx, h_last=h_last, next_token=x_greedy, gamma=min(gamma, remaining - 1))
+            if cand_tokens:
+                cand = cand_tokens[0]
+                drafted += 1
+                rounds += 1
+                verifier_pred = int(np.argmax(np.asarray(logits_next).reshape(-1)))
+                if cand == verifier_pred:
+                    accepted += 1
+                    generated.append(cand)
+                    ctx.append(cand)
+                    logits, state = model.step(np.array([cand]), state_next)
+                else:
+                    logits = logits_next
+                    state = state_next
+            else:
+                logits = logits_next
+                state = state_next
+        else:
+            # Fallback: prompt-lookup drafter
+            draft = propose(ctx, min(gamma, remaining), max_n)
+            if not draft:
+                logits, state = model.step(np.array([x_greedy]), state)
+                generated.append(x_greedy)
+                ctx.append(x_greedy)
+                continue
+
+            if critic_filter:
+                draft, crit_telemetry = prune_draft_trajectory(
+                    ctx, draft, critic, threshold=critic_threshold, model=model
+                )
+                critic_latency_ms += crit_telemetry["critic_latency_ms"]
+                draft_tokens_aborted += crit_telemetry["tokens_aborted"]
+                if not draft:
+                    logits, state = model.step(np.array([x_greedy]), state)
+                    generated.append(x_greedy)
+                    ctx.append(x_greedy)
+                    continue
+
+            # Verify draft block
+            if hasattr(model, "verify_block"):
+                block_logits, block_states = model.verify_block(draft, state)
+                all_logits = [np.asarray(logits).reshape(-1)] + [np.asarray(bl).reshape(-1) for bl in block_logits]
+                preds = [int(np.argmax(l)) for l in all_logits]
+                m = first_mismatch(draft, preds[:len(draft)])
+                accept = draft[:m]
+                drafted += len(draft)
+                accepted += m
+                rounds += 1
+                if len(generated) + m >= max_new:
+                    generated.extend(accept)
+                    ctx.extend(accept)
+                    break
+                bonus = preds[m]
+                base_state = state if m == 0 else block_states[m - 1]
+                logits, state = model.step(np.array([bonus]), base_state)
+                emit = accept + [bonus]
+                generated.extend(emit)
+                ctx.extend(emit)
+            else:
+                logits, state = model.step(np.array([x_greedy]), state)
+                generated.append(x_greedy)
+                ctx.append(x_greedy)
+
+    elapsed = time.perf_counter() - t0
+    tok_per_sec = (len(generated) / elapsed) if elapsed > 0 else 0.0
+    stats = {
+        "rounds": rounds,
+        "drafted": drafted,
+        "accepted": accepted,
+        "accept_rate": (accepted / drafted) if drafted > 0 else 0.0,
+        "tokens_per_round": (len(generated) / rounds) if rounds > 0 else 0.0,
+        "tokens_per_second": tok_per_sec,
+        "critic_latency_ms": critic_latency_ms,
+        "draft_tokens_aborted": draft_tokens_aborted,
+    }
+    return generated[:max_new], elapsed, stats

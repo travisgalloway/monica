@@ -1239,6 +1239,94 @@ class DecisionCriticHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Sequential Multi-Token Prediction (MTP) layer (#356)
+# --------------------------------------------------------------------------- #
+class MTPBlock(nn.Module):
+    """Sequential Multi-Token Prediction (MTP) layer in MLX (#356).
+
+    Combines trunk hidden state h_t and token embedding through a linear projection,
+    applies a lightweight hybrid layer (MambaBlock), and projects to logits using
+    the shared trunk embedding matrix.
+    """
+
+    def __init__(self, config: MambaConfig, depth: int = 1):
+        super().__init__()
+        self.config = config
+        self.depth = depth
+        self.norm_h = RMSNorm(config.d_model)
+        self.norm_e = RMSNorm(config.d_model)
+        self.proj = nn.Linear(2 * config.d_model, config.d_model, bias=False)
+        self.layer = MambaBlock(config)
+        self.norm_f = RMSNorm(config.d_model)
+
+    def __call__(
+        self,
+        h: Array,
+        embed: Array,
+        shared_embedding_weight: Optional[Array] = None,
+        seg_ids: Optional[Array] = None,
+        *,
+        return_hidden: bool = False,
+    ) -> Union[Array, Tuple[Array, Array]]:
+        return self.forward_seq(
+            h, embed, shared_embedding_weight=shared_embedding_weight, seg_ids=seg_ids, return_hidden=return_hidden
+        )
+
+    def forward_seq(
+        self,
+        h: Array,
+        embed: Array,
+        shared_embedding_weight: Optional[Array] = None,
+        seg_ids: Optional[Array] = None,
+        *,
+        return_hidden: bool = False,
+    ) -> Union[Array, Tuple[Array, Array]]:
+        cd = _DTYPES[self.config.precision]
+        h_n = self.norm_h(h)
+        e_n = self.norm_e(embed)
+        he = mx.concatenate([h_n, e_n], axis=-1)
+        x = self.proj(_cast(he, cd))
+        out = self.layer.forward_seq(x, seg_ids=seg_ids)
+        h_out = self.norm_f(out)
+        logits = None
+        if shared_embedding_weight is not None:
+            h_f32 = _f32(h_out)
+            logits = h_f32 @ shared_embedding_weight.T
+        if return_hidden:
+            return logits, h_out
+        return logits if logits is not None else h_out
+
+    def step(
+        self,
+        h: Array,
+        embed: Array,
+        state: State,
+        shared_embedding_weight: Optional[Array] = None,
+        *,
+        return_hidden: bool = False,
+    ) -> Union[Tuple[Array, State], Tuple[Array, State, Array]]:
+        cd = _DTYPES[self.config.precision]
+        if h.ndim == 1:
+            h = h[None, :]
+        if embed.ndim == 1:
+            embed = embed[None, :]
+        h_n = self.norm_h(h)
+        e_n = self.norm_e(embed)
+        he = mx.concatenate([h_n, e_n], axis=-1)
+        x = self.proj(_cast(he, cd))
+        out, new_state = self.layer.step(x, state)
+        h_out = self.norm_f(out)
+        logits = None
+        if shared_embedding_weight is not None:
+            h_f32 = _f32(h_out)
+            logits = h_f32 @ shared_embedding_weight.T
+        if return_hidden:
+            return (logits if logits is not None else h_out), new_state, h_out
+        return (logits if logits is not None else h_out), new_state
+
 # Top-level model implementing the seam
 # --------------------------------------------------------------------------- #
 class MLXMambaModel(ModelInterface, nn.Module):
@@ -1260,6 +1348,9 @@ class MLXMambaModel(ModelInterface, nn.Module):
         if config.critic_heads:
             for name, head_cfg in config.critic_heads.items():
                 self.critic_heads[name] = DecisionCriticHead(head_cfg)
+        self.mtp_blocks = []
+        if getattr(config, "mtp_depth", 0) > 0:
+            self.mtp_blocks = [MTPBlock(config, depth=k) for k in range(1, config.mtp_depth + 1)]
         self._state = None
         # Gradient checkpointing: recompute each layer's forward in the backward pass
         # instead of retaining its activations. Essential at poc scale — without it the
@@ -1286,7 +1377,9 @@ class MLXMambaModel(ModelInterface, nn.Module):
         return self.lm_head(h)
 
     # --- ModelInterface ---
-    def forward(self, token_batch: Array, seg_ids: Array = None) -> Array:
+    def forward(self, token_batch: Array, seg_ids: Array = None, *, return_mtp: bool = False) -> Union[Array, Tuple[Array, list[Array]]]:
+        if return_mtp:
+            return self.forward_with_mtp(token_batch, seg_ids)
         h = _cast(self.embedding(mx.array(token_batch)), self._cd)   # activation stream in cd
         if seg_ids is None:
             for layer_fn in self._layer_fns:
@@ -1296,6 +1389,46 @@ class MLXMambaModel(ModelInterface, nn.Module):
             for layer_fn in self._layer_fns:
                 h = layer_fn(h, seg)                                  # boundary-aware (#68)
         return self._head(self.norm_f(h))
+
+    def forward_mtp(self, token_batch: Array, seg_ids: Array = None) -> list[Array]:
+        """Full-sequence forward pass returning auxiliary MTP logits for each depth k (#356)."""
+        _, aux_logits = self.forward_with_mtp(token_batch, seg_ids)
+        return aux_logits
+
+    def forward_with_mtp(
+        self, token_batch: Array, seg_ids: Array = None
+    ) -> Tuple[Array, list[Array]]:
+        """Full-sequence forward pass returning (logits, aux_mtp_logits) (#356)."""
+        ids = mx.array(token_batch)
+        embed = _cast(self.embedding(ids), self._cd)
+        seg = mx.array(seg_ids) if seg_ids is not None else None
+        h = embed
+        if seg is None:
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h)
+        else:
+            for layer_fn in self._layer_fns:
+                h = layer_fn(h, seg)
+        h_trunk = self.norm_f(h)
+        logits = self._head(h_trunk)
+
+        aux_logits = []
+        if getattr(self.config, "mtp_depth", 0) > 0 and len(self.mtp_blocks) > 0:
+            curr_h = h_trunk
+            L = ids.shape[1]
+            shared_weight = self.embedding.weight if self._tie_embeddings else self.lm_head.weight
+            for k, mtp_block in enumerate(self.mtp_blocks, start=1):
+                if L <= k:
+                    break
+                h_in = curr_h[:, : L - k, :]
+                e_in = embed[:, k:, :]
+                seg_in = seg[:, : L - k] if seg is not None else None
+                mtp_logit, next_h = mtp_block(
+                    h_in, e_in, shared_embedding_weight=shared_weight, seg_ids=seg_in, return_hidden=True
+                )
+                aux_logits.append(mtp_logit)
+                curr_h = next_h
+        return logits, aux_logits
 
     def forward_hidden(self, token_batch: Array, seg_ids: Array = None) -> Array:
         """Full-sequence forward pass returning post-norm hidden states (batch, seq_len, d_model) (#387)."""
@@ -1361,13 +1494,35 @@ class MLXMambaModel(ModelInterface, nn.Module):
             h = h[:, -1]                                 # (B, d_model) -> logits (B, V)
         return self._head(h), state
 
-    def step(self, token: Array, state: State) -> Tuple[Array, State]:
+    def step(self, token: Array, state: State, *, return_hidden: bool = False) -> Union[Tuple[Array, State], Tuple[Array, State, Array]]:
         h = _cast(self.embedding(mx.array(token)), self._cd)
         new_state = []
         for layer, st in zip(self.layers, state):
             h, st2 = layer.step(h, st)
             new_state.append(st2)
-        return self._head(self.norm_f(h)), new_state
+        h_norm = self.norm_f(h)
+        logits = self._head(h_norm)
+        if return_hidden:
+            return logits, new_state, h_norm
+        return logits, new_state
+
+    def step_mtp(
+        self, h_last: Array, token_pred: Array, state: Optional[State] = None, depth: int = 1
+    ) -> Tuple[Array, State]:
+        if not (1 <= depth <= len(self.mtp_blocks)):
+            raise ValueError(f"depth={depth} invalid for mtp_blocks of length {len(self.mtp_blocks)}")
+        if state is None:
+            state = self.init_mtp_state(h_last.shape[0], depth=depth)
+        embed = _cast(self.embedding(mx.array(token_pred)), self._cd)
+        shared_weight = self.embedding.weight if self._tie_embeddings else self.lm_head.weight
+        return self.mtp_blocks[depth - 1].step(h_last, embed, state, shared_embedding_weight=shared_weight)
+
+    def init_mtp_state(self, batch_size: int, depth: int = 1) -> State:
+        """Fresh recurrent state for the MTP block at specified depth."""
+        c = self.config
+        di, k = c.d_inner, c.d_conv
+        H, P, N = c.n_heads, c.head_dim, c.d_state
+        return (mx.zeros((batch_size, k - 1, di)), mx.zeros((batch_size, H, P, N)))
 
     def eval_batch_ce(self, inputs: Array, targets: Array) -> float:
         """Fast on-device cross-entropy evaluation: avoids transferring full (B, L, V) logits to host."""
