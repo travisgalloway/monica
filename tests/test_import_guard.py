@@ -100,6 +100,7 @@ PORTABLE_MODULES = [
     "src.eval.fim_eval",
     "src.eval.code_suite",
     "src.eval.code_recall",
+    "src.eval.prose_recall",
     "src.eval.code_needle",
     "src.eval.domain_bpb",
     "src.eval.moe_routing",

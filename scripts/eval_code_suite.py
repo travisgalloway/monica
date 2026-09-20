@@ -50,7 +50,7 @@ import sys
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall", "adaptive_reasoning", "reasoning")
+ALL_SUITES = ("recall", "needle", "fim", "domain-bpb", "external", "tsc", "repo_recall", "adaptive_reasoning", "reasoning", "prose_recall")
 DEFAULT_SUITES = "recall,needle,fim"
 
 
@@ -104,6 +104,14 @@ def _parse_args() -> argparse.Namespace:
                          "applies only to --suites tsc. Recorded in the config echo.")
     ap.add_argument("--tsc-set", type=Path,
                     default=REPO_ROOT / "eval_sets/ts_error_injection/eval.jsonl")
+    ap.add_argument("--prose-specs", type=Path,
+                    default=REPO_ROOT / "eval_sets/prose_recall/specs.jsonl",
+                    help="specification probe definitions JSONL (--suites prose_recall)")
+    ap.add_argument("--prose-distractors", type=Path,
+                    default=REPO_ROOT / "eval_sets/prose_recall/distractors.jsonl",
+                    help="distractor technical prose JSONL (--suites prose_recall)")
+    ap.add_argument("--prose-distances", default="512,1024,2048,4096,8192,16384",
+                    help="comma-separated token distances for --suites prose_recall")
 
     ap.add_argument("--output", type=Path, default=None, help="write the results JSON here")
     ap.add_argument("--transcript", type=Path, default=None,
@@ -541,6 +549,34 @@ def _run_tsc(args):
             {"tsc_set": str(args.tsc_set), "sources_active": oracle.sources_active})
 
 
+
+
+def _run_prose_recall(args, model, to_numpy, encode, rng):
+    from src.eval.prose_recall import (
+        build_prose_recall_instances,
+        evaluate_prose_recall,
+        load_distractor_texts,
+        load_prose_specs,
+    )
+
+    specs = load_prose_specs(args.prose_specs)
+    distractors = load_distractor_texts(args.prose_distractors)
+    distances = tuple(int(d.strip()) for d in args.prose_distances.split(",") if d.strip())
+    instances = build_prose_recall_instances(
+        specs, distractors, encode, rng,
+        distances=distances,
+        max_instances=args.limit,
+    )
+    if not instances:
+        raise SystemExit(
+            f"--suites prose_recall: no instances generated from specs {args.prose_specs} "
+            f"and distractors {args.prose_distractors}.")
+    result = evaluate_prose_recall(model, instances, batch_size=args.batch_size,
+                                   to_numpy=to_numpy)
+    return result, {"specs": str(args.prose_specs), "distractors": str(args.prose_distractors),
+                    "n_specs": len(specs), "n_distractors": len(distractors),
+                    "distances": list(distances), "n_instances": len(instances)}
+
 # --------------------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------------------- #
@@ -592,6 +628,8 @@ def main() -> int:
                 result, src = _run_repo_recall(args, model, to_numpy, encode, rng)
             elif suite in ("adaptive_reasoning", "reasoning"):
                 result, src = _run_adaptive_reasoning(args, model, to_numpy, encode, rng)
+            elif suite == "prose_recall":
+                result, src = _run_prose_recall(args, model, to_numpy, encode, rng)
             else:                                        # unreachable: validated in _parse_args
                 raise RuntimeError(f"unhandled suite {suite!r}")
         except RuntimeError as e:
