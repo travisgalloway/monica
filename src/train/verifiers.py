@@ -23,6 +23,7 @@ module's top-level import surface stays stdlib-only.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -400,6 +401,424 @@ class LspVerifier:
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# #339 -- Tool Schema Validation & When2Call Abstention Verifiers
+# --------------------------------------------------------------------------- #
+
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+TOOLS_OPEN = "<tools>"
+TOOLS_CLOSE = "</tools>"
+
+
+def extract_tools_from_text(text: str) -> Optional[List[dict]]:
+    """Extract declared tool schemas from a string containing `<tools>[...]</tools>`."""
+    if not text or TOOLS_OPEN not in text or TOOLS_CLOSE not in text:
+        return None
+    start = text.find(TOOLS_OPEN)
+    end = text.find(TOOLS_CLOSE, start)
+    if start == -1 or end == -1 or end <= start:
+        return None
+    payload = text[start + len(TOOLS_OPEN):end].strip()
+    try:
+        data = json.loads(payload)
+        if isinstance(data, list) and all(isinstance(t, dict) for t in data):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def check_json_schema_type(val: Any, expected_type: str | Sequence[str]) -> bool:
+    """Validate that `val` conforms to the JSON Schema `expected_type`."""
+    if isinstance(expected_type, (list, tuple)):
+        return any(check_json_schema_type(val, t) for t in expected_type)
+    if expected_type == "string":
+        return isinstance(val, str)
+    if expected_type == "integer":
+        return isinstance(val, int) and not isinstance(val, bool)
+    if expected_type == "number":
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+    if expected_type == "boolean":
+        return isinstance(val, bool)
+    if expected_type == "array":
+        return isinstance(val, list)
+    if expected_type == "object":
+        return isinstance(val, dict)
+    if expected_type == "null":
+        return val is None
+    return True
+
+
+def parse_tool_calls_with_diagnostics(text: str) -> Tuple[List[dict], List[str]]:
+    """Extract `<tool_call>{json}</tool_call>` blocks with explicit error diagnostics.
+
+    Returns `(parsed_calls, errors)`:
+      - `parsed_calls`: list of valid call dicts `{"name": str, "arguments": dict}`
+      - `errors`: list of syntax/formatting error descriptions (e.g. unclosed tags,
+        malformed JSON, non-object arguments).
+    """
+    calls: List[dict] = []
+    errors: List[str] = []
+    if not text:
+        return calls, errors
+
+    pos = 0
+    while True:
+        s = text.find(TOOL_CALL_OPEN, pos)
+        if s == -1:
+            if TOOL_CALL_CLOSE in text[pos:]:
+                errors.append("unmatched_tool_call_close_tag")
+            break
+        e = text.find(TOOL_CALL_CLOSE, s)
+        if e == -1:
+            errors.append("unclosed_tool_call_tag")
+            break
+        block = text[s + len(TOOL_CALL_OPEN):e].strip()
+        pos = e + len(TOOL_CALL_CLOSE)
+
+        if not block:
+            errors.append("empty_tool_call_block")
+            continue
+
+        try:
+            call = json.loads(block)
+        except (json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"json_syntax_error: {exc}")
+            continue
+
+        if not isinstance(call, dict):
+            errors.append(f"call_payload_not_dict: got {type(call).__name__}")
+            continue
+
+        if "name" not in call or not isinstance(call["name"], str) or not call["name"].strip():
+            errors.append("missing_or_invalid_tool_name")
+            continue
+
+        args = call.get("arguments")
+        if args is not None and not isinstance(args, dict):
+            errors.append(f"arguments_not_dict: got {type(args).__name__}")
+            continue
+
+        calls.append({
+            "name": call["name"].strip(),
+            "arguments": args if isinstance(args, dict) else {},
+        })
+
+    return calls, errors
+
+
+class When2CallAbstentionVerifier:
+    """Verifier for restraint / abstention queries answerable directly without tools (#339).
+
+    For queries where no external tool is needed (or where available tools are distractors),
+    rewards direct answers (+1.0) and penalizes redundant/spurious tool invocations (-1.0).
+    Empty, degenerate, or whitespace-only answers are also penalized (-1.0).
+    """
+
+    def __init__(
+        self,
+        *,
+        direct_answer_reward: float = 1.0,
+        spurious_call_reward: float = -1.0,
+        degenerate_reward: float = -1.0,
+        min_answer_chars: int = 2,
+    ) -> None:
+        self.direct_answer_reward = direct_answer_reward
+        self.spurious_call_reward = spurious_call_reward
+        self.degenerate_reward = degenerate_reward
+        self.min_answer_chars = min_answer_chars
+
+        self._n_samples = 0
+        self._n_abstain_success = 0
+        self._n_spurious_calls = 0
+        self._n_degenerate = 0
+        self._reward_total = 0.0
+
+    def reward(
+        self,
+        completion: str,
+        reference: Optional[str] = None,
+        *,
+        prompt: str = "",
+        **kwargs: Any,
+    ) -> float:
+        """Score one completion on abstention discipline.
+
+        Returns:
+          - `spurious_call_reward` (-1.0) if any tool call or tool tag was emitted
+          - `degenerate_reward` (-1.0) if output is empty/whitespace/too short
+          - `direct_answer_reward` (+1.0) if a non-tool direct answer was produced
+        """
+        self._n_samples += 1
+        completion_str = "" if completion is None else str(completion)
+
+        if TOOL_CALL_OPEN in completion_str or TOOL_CALL_CLOSE in completion_str:
+            self._n_spurious_calls += 1
+            self._reward_total += self.spurious_call_reward
+            return self.spurious_call_reward
+
+        trimmed = completion_str.strip()
+        if not trimmed or len(trimmed) < self.min_answer_chars:
+            self._n_degenerate += 1
+            self._reward_total += self.degenerate_reward
+            return self.degenerate_reward
+
+        self._n_abstain_success += 1
+        self._reward_total += self.direct_answer_reward
+        return self.direct_answer_reward
+
+    def telemetry(self) -> dict:
+        n = self._n_samples
+        return {
+            "n_samples": n,
+            "n_abstain_success": self._n_abstain_success,
+            "n_spurious_calls": self._n_spurious_calls,
+            "n_degenerate": self._n_degenerate,
+            "mean_reward": (self._reward_total / n) if n else 0.0,
+        }
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "When2CallAbstentionVerifier":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+class ToolSchemaVerifier:
+    """Deterministic tool-use verifier validating calls against declared JSON Schemas (#339).
+
+    Validates:
+      1. Valid JSON syntax in `<tool_call>` blocks.
+      2. Known tool name in active toolset (penalizes hallucinations).
+      3. All required arguments present.
+      4. Parameter types conform to schema definitions.
+      5. Handles When2Call abstention queries when direct answer is expected.
+    """
+
+    def __init__(
+        self,
+        tools: Optional[Sequence[dict]] = None,
+        *,
+        base_reward: float = 1.0,
+        syntax_error_reward: float = -1.0,
+        hallucination_reward: float = -1.0,
+        schema_error_reward: float = -1.0,
+        no_call_reward: float = -1.0,
+        abstention_reward: float = 1.0,
+        spurious_call_reward: float = -1.0,
+        partial_credit: bool = False,
+    ) -> None:
+        self.tools = list(tools) if tools is not None else None
+        self.base_reward = base_reward
+        self.syntax_error_reward = syntax_error_reward
+        self.hallucination_reward = hallucination_reward
+        self.schema_error_reward = schema_error_reward
+        self.no_call_reward = no_call_reward
+        self.abstention_reward = abstention_reward
+        self.spurious_call_reward = spurious_call_reward
+        self.partial_credit = partial_credit
+
+        self._abstention_verifier = When2CallAbstentionVerifier(
+            direct_answer_reward=abstention_reward,
+            spurious_call_reward=spurious_call_reward,
+            degenerate_reward=syntax_error_reward,
+        )
+
+        self._n_samples = 0
+        self._n_valid = 0
+        self._n_syntax_errors = 0
+        self._n_hallucinations = 0
+        self._n_missing_args = 0
+        self._n_type_errors = 0
+        self._n_no_calls = 0
+        self._n_abstentions_correct = 0
+        self._n_spurious_calls = 0
+        self._reward_total = 0.0
+
+    def _resolve_tools(
+        self,
+        tools_arg: Optional[Sequence[dict]],
+        prompt: str,
+    ) -> List[dict]:
+        if tools_arg is not None:
+            return list(tools_arg)
+        if self.tools is not None:
+            return self.tools
+        from_prompt = extract_tools_from_text(prompt)
+        if from_prompt is not None:
+            return from_prompt
+        return []
+
+    def validate_call(
+        self,
+        call: dict,
+        active_tools: Sequence[dict],
+    ) -> Tuple[bool, List[str], str]:
+        """Validate a single parsed tool call against active tool definitions.
+
+        Returns `(is_valid, error_list, primary_error_category)`:
+          - primary_error_category in {"clean", "hallucination", "missing_args", "type_error"}
+        """
+        name = call.get("name")
+        by_name = {t.get("name"): t for t in active_tools if isinstance(t, dict)}
+        tool = by_name.get(name)
+        if tool is None:
+            return False, [f"unknown tool {name!r}"], "hallucination"
+
+        errors: List[str] = []
+        category = "clean"
+
+        params = tool.get("parameters") or {}
+        required = params.get("required") or []
+        arguments = call.get("arguments") or {}
+
+        # 1. Required arguments presence
+        for req in required:
+            if req not in arguments:
+                errors.append(f"missing required argument {req!r} for tool {name!r}")
+                if category == "clean":
+                    category = "missing_args"
+
+        # 2. Parameter type validation
+        properties = params.get("properties") or {}
+        for arg_name, arg_val in arguments.items():
+            if arg_name in properties:
+                prop_schema = properties[arg_name]
+                expected_type = prop_schema.get("type")
+                if expected_type and not check_json_schema_type(arg_val, expected_type):
+                    errors.append(
+                        f"argument {arg_name!r}={arg_val!r} failed type check (expected {expected_type!r})"
+                    )
+                    if category == "clean":
+                        category = "type_error"
+                if expected_type == "array" and isinstance(arg_val, list):
+                    items_schema = prop_schema.get("items") or {}
+                    item_type = items_schema.get("type")
+                    if item_type:
+                        for idx, item in enumerate(arg_val):
+                            if not check_json_schema_type(item, item_type):
+                                errors.append(
+                                    f"item {idx} in {arg_name!r}={item!r} failed type check (expected {item_type!r})"
+                                )
+                                if category == "clean":
+                                    category = "type_error"
+
+        return len(errors) == 0, errors, category
+
+    def reward(
+        self,
+        completion: str,
+        reference: Optional[str] = None,
+        *,
+        prompt: str = "",
+        tools: Optional[Sequence[dict]] = None,
+        abstain: Optional[bool] = None,
+        category: Optional[str] = None,
+        **kwargs: Any,
+    ) -> float:
+        self._n_samples += 1
+        completion_str = "" if completion is None else str(completion)
+        active_tools = self._resolve_tools(tools, prompt)
+
+        is_abstain = False
+        if abstain is True or category in ("abstention", "relevance"):
+            is_abstain = True
+        elif abstain is None and reference is not None:
+            ref_str = str(reference).strip()
+            if ref_str.lower() == "abstain":
+                is_abstain = True
+            elif ref_str and (TOOL_CALL_OPEN not in ref_str) and not ref_str.startswith("{"):
+                is_abstain = True
+
+        if is_abstain:
+            r = self._abstention_verifier.reward(completion_str, reference=reference, prompt=prompt)
+            if r == self.abstention_reward:
+                self._n_abstentions_correct += 1
+            else:
+                self._n_spurious_calls += 1
+            self._reward_total += r
+            return r
+
+        calls, syntax_errors = parse_tool_calls_with_diagnostics(completion_str)
+
+        if syntax_errors:
+            self._n_syntax_errors += 1
+            self._reward_total += self.syntax_error_reward
+            return self.syntax_error_reward
+
+        if not calls:
+            self._n_no_calls += 1
+            self._reward_total += self.no_call_reward
+            return self.no_call_reward
+
+        all_valid = True
+        primary_issue = None
+        n_missing = 0
+        n_type = 0
+
+        for call in calls:
+            ok, call_errors, cat = self.validate_call(call, active_tools)
+            if not ok:
+                all_valid = False
+                if cat == "hallucination":
+                    self._n_hallucinations += 1
+                    primary_issue = "hallucination"
+                elif cat == "missing_args":
+                    self._n_missing_args += 1
+                    n_missing += len(call_errors)
+                    if primary_issue != "hallucination":
+                        primary_issue = "missing_args"
+                elif cat == "type_error":
+                    self._n_type_errors += 1
+                    n_type += len(call_errors)
+                    if primary_issue not in ("hallucination", "missing_args"):
+                        primary_issue = "type_error"
+
+        if all_valid:
+            self._n_valid += 1
+            self._reward_total += self.base_reward
+            return self.base_reward
+
+        if primary_issue == "hallucination":
+            r = self.hallucination_reward
+        elif self.partial_credit:
+            penalty = 0.25 * n_missing + 0.25 * n_type
+            r = max(self.base_reward - penalty, self.schema_error_reward)
+        else:
+            r = self.schema_error_reward
+
+        self._reward_total += r
+        return r
+
+    def telemetry(self) -> dict:
+        n = self._n_samples
+        return {
+            "n_samples": n,
+            "n_valid": self._n_valid,
+            "n_syntax_errors": self._n_syntax_errors,
+            "n_hallucinations": self._n_hallucinations,
+            "n_missing_args": self._n_missing_args,
+            "n_type_errors": self._n_type_errors,
+            "n_no_calls": self._n_no_calls,
+            "n_abstentions_correct": self._n_abstentions_correct,
+            "n_spurious_calls": self._n_spurious_calls,
+            "mean_reward": (self._reward_total / n) if n else 0.0,
+        }
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "ToolSchemaVerifier":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
 # Concurrency & Memoization (#341-#344 perf improvements)
 # --------------------------------------------------------------------------- #
 
@@ -421,7 +840,7 @@ class MemoizedVerifier:
         self._lock = threading.Lock()
 
     def reward(self, completion: str, reference: Optional[str] = None, *,
-               prompt: str = "") -> Optional[float]:
+               prompt: str = "", **kwargs: Any) -> Optional[float]:
         key = (prompt, str(completion), None if reference is None else str(reference))
         while True:
             with self._lock:
@@ -439,12 +858,15 @@ class MemoizedVerifier:
         r: Optional[float] = None
         try:
             if hasattr(self.target, "reward") and callable(self.target.reward):
-                r = self.target.reward(completion, reference, prompt=prompt)
+                r = self.target.reward(completion, reference, prompt=prompt, **kwargs)
             elif callable(self.target):
                 try:
-                    r = self.target(completion, reference, prompt=prompt)
+                    r = self.target(completion, reference, prompt=prompt, **kwargs)
                 except TypeError:
-                    r = self.target(completion, reference)
+                    try:
+                        r = self.target(completion, reference, prompt=prompt)
+                    except TypeError:
+                        r = self.target(completion, reference)
             else:
                 raise TypeError(f"cannot score with target {type(self.target).__name__}")
         finally:

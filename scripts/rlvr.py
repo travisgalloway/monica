@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.train.grpo import group_advantages, reward_stats
-from src.train.verifiers import (LspVerifier, MemoizedVerifier, exact_match_reward,
+from src.train.verifiers import (LspVerifier, MemoizedVerifier, ToolSchemaVerifier,
+                                 When2CallAbstentionVerifier, exact_match_reward,
                                  math_reward, score_rollouts)
 
 
@@ -63,7 +64,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -166,12 +167,22 @@ def main() -> None:
             raw_verifier, reward_fn = math_reward, None
         elif args.reward == "exact":
             raw_verifier, reward_fn = exact_match_reward, None
-        else:
+        elif args.reward == "lsp":
             raw_verifier = LspVerifier(kind=args.oracle, timeout_s=args.lsp_timeout_s,
                                        ignore_module_resolution=args.lsp_ignore_module_resolution,
                                        hatches=args.lsp_hatches, fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
+        elif args.reward == "tool-schema":
+            raw_verifier = ToolSchemaVerifier()
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "when2call":
+            raw_verifier = When2CallAbstentionVerifier()
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        else:
+            raise ValueError(f"unknown reward {args.reward}")
 
         if args.verifier_cache and raw_verifier is not None:
             verifier = MemoizedVerifier(raw_verifier)
@@ -199,7 +210,14 @@ def main() -> None:
         for step in range(args.steps):
             prob = problems[step % len(problems)]
             prompt_ids = list(tok.encode(prob["prompt"])) or [eos or 0]
-            step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"])
+            extra_kwargs = {}
+            if "tools" in prob:
+                extra_kwargs["tools"] = prob["tools"]
+            if "category" in prob:
+                extra_kwargs["category"] = prob["category"]
+            if "abstain" in prob:
+                extra_kwargs["abstain"] = prob["abstain"]
+            step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"], **extra_kwargs)
                               if verifier is not None else reward_fn)
             # Batched rollout generation: parallel prefill + concurrent decode across group_size
             p_batch = mx.repeat(mx.array([int(t) for t in prompt_ids])[None], args.group_size, axis=0)
@@ -249,6 +267,13 @@ def main() -> None:
                                 f"frac_hacked {t.get('n_hacked', 0) / n:.3f}  "
                                 f"frac_degenerate {t.get('n_degenerate', 0) / n:.3f}  "
                                 f"oracle_wall_frac {(t.get('wall_s', 0.0) / elapsed) if elapsed > 0 else 0.0:.3f}")
+                        if "n_valid" in t:
+                            line += (f"  frac_valid {t.get('n_valid', 0) / n:.3f}  "
+                                    f"frac_hallucinated {t.get('n_hallucinations', 0) / n:.3f}  "
+                                    f"frac_syntax_err {t.get('n_syntax_errors', 0) / n:.3f}")
+                        if "n_abstain_success" in t:
+                            line += (f"  frac_abstain {t.get('n_abstain_success', 0) / n:.3f}  "
+                                    f"frac_spurious {t.get('n_spurious_calls', 0) / n:.3f}")
                     if "cache_hit_rate" in t and (t.get("cache_hits", 0) + t.get("cache_misses", 0)) > 0:
                         line += f"  cache_hit {t['cache_hit_rate']:.2f}"
                 print(line)
