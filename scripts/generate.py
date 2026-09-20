@@ -290,6 +290,12 @@ def main() -> None:
                     help="number of candidate completions to generate and verify (default: 1)")
     ap.add_argument("--critic-weights", type=Path, default=None,
                     help="optional path to trained critic head weights .npz")
+    ap.add_argument("--template", choices=("auto", "chatml", "instruct"), default="auto",
+                    help="chat template format ('chatml' for Qwen ChatML with <|im_end|>, "
+                         "'instruct' for legacy Dolly ### Instruction:; 'auto' selects "
+                         "chatml when using qwen3/qwen25)")
+    ap.add_argument("--chat-eos", default=None,
+                    help="override chat EOS stop string (default: <|im_end|>)")
     args = ap.parse_args()
     if args.chat and args.interactive:
         ap.error("--chat and --interactive are different REPLs; pick one")
@@ -329,7 +335,21 @@ def main() -> None:
             f"tokenizer vocab {tok.vocab_size} exceeds model vocab {cfg.vocab_size} "
             f"({args.config}) — use --byte-fallback only with toy-scale configs.")
 
-    eos_id = getattr(tok, "eos_token_id", None)
+    from src.data import chat_template
+    from src.serve.generate import enforce_chat_eos_consistency, resolve_eos_ids
+
+    if args.template == "auto":
+        chat_template_mode = "chatml" if args.tokenizer in ("qwen3", "qwen25") else "instruct"
+    else:
+        chat_template_mode = args.template
+
+    if args.chat and chat_template_mode == "chatml":
+        enforce_chat_eos_consistency(tok, expected_chat_eos=args.chat_eos or chat_template.CHAT_EOS,
+                                    where="scripts/generate.py --chat")
+
+    resolved_eos = resolve_eos_ids(tok, chat_eos=args.chat_eos or chat_template.CHAT_EOS,
+                                   include_chat_eos=(chat_template_mode == "chatml"))
+    eos_id = resolved_eos if resolved_eos else getattr(tok, "eos_token_id", None)
     rng = np.random.default_rng(args.seed)
     sampler = partial(sampling.sample, temperature=args.temperature,
                       top_k=args.top_k, top_p=args.top_p, rng=rng,
@@ -465,10 +485,16 @@ def main() -> None:
             if not line.strip():
                 continue
             messages.append({"role": "user", "content": line})
-            # Prompt up to (and including) a trailing empty "### Response:" marker; the
-            # model fills in the answer. A first turn renders to format_prompt(line).
-            prompt = render(messages + [{"role": "assistant", "content": ""}])
-            reply = run(prompt, stop_marker=INSTRUCTION_MARKER)
+            if chat_template_mode == "chatml":
+                prompt = chat_template.render(messages, add_generation_prompt=True,
+                                              mode=reasoning_mode)
+                stop_marker = args.chat_eos or chat_template.CHAT_EOS
+            else:
+                prompt = render(messages + [{"role": "assistant", "content": ""}])
+                stop_marker = INSTRUCTION_MARKER
+            reply = run(prompt, stop_marker=stop_marker)
+            if chat_template_mode == "chatml" and reply.endswith(stop_marker):
+                reply = reply[:-len(stop_marker)].rstrip()
             messages.append({"role": "assistant", "content": reply.strip()})
     else:
         critic_head = None

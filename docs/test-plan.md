@@ -77,7 +77,7 @@ including 143 `tests/test_*.py` + `conftest.py` + 2 Swift native runners).
 
 | ID | Unit | Integration | E2E | Edge cases covered | Gaps |
 |----|------|-------------|-----|--------------------|------|
-| POST-1 | `test_sft_train_step.py`, `test_masked_ce.py` | `test_sft_train_step.py`, `test_cuda_post_training.py` | `test_sft_driver_e2e.py` | response masking in the loss | `scripts/sft.py` tested end to end on MLX (`test_sft_driver_e2e.py`); no CUDA-backend equivalent |
+| POST-1 | `test_sft_train_step.py`, `test_masked_ce.py`, `test_chat_eos_consistency.py` | `test_sft_train_step.py`, `test_cuda_post_training.py`, `test_instruct_sft.py` | `test_sft_driver_e2e.py` | response masking in the loss, prompt isolation, chat EOS consistency (SFT -> RL -> serving), masked val-perplexity tracking | `scripts/sft.py` tested end to end on MLX (`test_sft_driver_e2e.py`); no CUDA-backend equivalent |
 | POST-2 | `test_dpo_math.py` | `test_dpo_train_step.py`, `test_cuda_post_training.py` | none | reference-model logratio, beta | `scripts/dpo.py` untested end to end |
 | POST-3 | `test_grpo.py`, `test_build_rlvr_prompts.py`, `test_lsp_verifier.py`, `test_rlvr_concurrency.py`, `test_verifiers.py` | `test_grpo_train_step.py`, `test_verifiers.py`, `test_cuda_post_training.py` | none | group advantage, KL penalty, concurrent scoring, singleflight verifier memoization, fail-fast guards | `test_verifiers.py:39` gates real code execution behind `RUN_CODE_VERIFIER`, which **no CI job sets**, so the execution path never runs in the standard matrix |
 | POST-4 | none | `test_dpo_sources.py` (source label only, never invokes generation) | none | none | `scripts/gen_onpolicy_prefs.py` has zero test references anywhere |

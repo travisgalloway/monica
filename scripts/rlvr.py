@@ -106,6 +106,13 @@ def main() -> None:
     ap.add_argument("--byte-fallback", action="store_true", help="offline testing only")
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tokenizer", choices=("auto", "qwen3", "qwen25", "olmo", "starcoder2"),
+                    default="auto",
+                    help="tokenizer matching model config (default auto)")
+    ap.add_argument("--chat-eos", default=None,
+                    help="override chat EOS stop string (default: <|im_end|>)")
+    ap.add_argument("--enforce-chat-eos", action=argparse.BooleanOptionalAction, default=True,
+                    help="enforce chat EOS consistency SFT -> RL -> serving (default on)")
     args = ap.parse_args()
 
     # Fail fast BEFORE any model load — an --reward lsp run with no toolchain
@@ -183,7 +190,10 @@ def main() -> None:
     from src.serve.generate import generate
     from src.serve.sessions import SessionStore
     from src.serve.sampling import sample
-    from src.data.tokenize import ByteTokenizer, load_olmo_tokenizer
+    from src.data import chat_template
+    from src.data.tokenize import (ByteTokenizer, load_olmo_tokenizer, load_qwen3_tokenizer,
+                                   load_qwen25_tokenizer, load_starcoder2_tokenizer)
+    from src.serve.generate import enforce_chat_eos_consistency, resolve_eos_ids
     from src.train.moe_balance import attach_balancer, balancer_for_config
     from src.train.checkpoint import check_weight_keys, load_weights_dict
     import mlx.core as mx
@@ -199,8 +209,31 @@ def main() -> None:
     check_weight_keys(init_weights, model._portable_state_dict(),
                       where=f"--init {args.init}")
     model._load_portable(init_weights)
-    tok = ByteTokenizer() if args.byte_fallback else load_olmo_tokenizer(args.model_id)
+
+    tok_choice = args.tokenizer
+    if tok_choice == "auto":
+        tok_choice = "qwen25" if cfg.vocab_size > 65536 else "olmo"
+
+    if args.byte_fallback:
+        tok = ByteTokenizer()
+    elif tok_choice == "qwen3":
+        tok = load_qwen3_tokenizer(args.model_id)
+    elif tok_choice == "qwen25":
+        tok = load_qwen25_tokenizer(args.model_id)
+    elif tok_choice == "starcoder2":
+        tok = load_starcoder2_tokenizer(args.model_id)
+    else:
+        tok = load_olmo_tokenizer(args.model_id)
+
+    expected_chat_eos = args.chat_eos or chat_template.CHAT_EOS
+    if args.enforce_chat_eos and (tok_choice in ("qwen3", "qwen25") or args.chat_eos is not None):
+        enforce_chat_eos_consistency(tok, expected_chat_eos=expected_chat_eos,
+                                     where="scripts/rlvr.py")
+
+    eos_set = resolve_eos_ids(tok, chat_eos=expected_chat_eos, include_chat_eos=True)
     eos = getattr(tok, "eos_token_id", None)
+    if eos is None and eos_set:
+        eos = next(iter(eos_set))
     store = SessionStore(model)
     np_to = backend.to_numpy
     opt = backend.make_optimizer(model, args.lr)
@@ -452,9 +485,9 @@ def main() -> None:
                         continue
                     tk = sample(logits_np[k], temperature=args.temperature, top_k=args.top_k, rng=rngs[k])
                     batched_gens[k].append(tk)
-                    if eos is not None and tk == eos:
+                    if (eos is not None and tk == eos) or (eos_set and tk in eos_set):
                         finished[k] = True
-                        next_tokens.append(eos)
+                        next_tokens.append(tk)
                     else:
                         all_done = False
                         next_tokens.append(tk)

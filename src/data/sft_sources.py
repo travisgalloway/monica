@@ -24,7 +24,7 @@ from typing import Dict, Iterable, Iterator, List, Optional
 # Source -> license, for the clean-license accounting (CC-BY-SA flagged share-alike).
 SOURCE_LICENSES = {"oasst1": "apache-2.0", "flan": "apache-2.0",
                    "dolly": "cc-by-sa-3.0", "handauthored": "cc0", "ultrachat": "mit",
-                   "architecture": "cc0"}
+                   "architecture": "cc0", "code": "cc0"}
 
 
 def _tag(messages: List[dict], source: str) -> dict:
@@ -249,6 +249,114 @@ def architecture_records(max_examples: Optional[int] = None) -> Iterator[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Hand-authored code instruction & completion set (checked in, CC0) (#101)
+# --------------------------------------------------------------------------- #
+CODE_INSTRUCTION_RECORDS: List[List[dict]] = [
+    [
+        {"role": "system", "content": "You are a TypeScript code engine. Provide clean, type-safe implementations."},
+        {"role": "user", "content": "Implement a TypeScript generic function `chunkArray<T>(items: T[], size: number): T[][]` that partitions an array into sub-arrays of maximum length `size`. Throw RangeError if size <= 0."},
+        {"role": "assistant", "content": (
+            "```typescript\n"
+            "export function chunkArray<T>(items: T[], size: number): T[][] {\n"
+            "    if (size <= 0) {\n"
+            "        throw new RangeError(\"Chunk size must be greater than zero\");\n"
+            "    }\n"
+            "    const chunks: T[][] = [];\n"
+            "    for (let i = 0; i < items.length; i += size) {\n"
+            "        chunks.push(items.slice(i, i + size));\n"
+            "    }\n"
+            "    return chunks;\n"
+            "}\n"
+            "```"
+        )}
+    ],
+    [
+        {"role": "system", "content": "You are a coding assistant. Provide direct code completions without chain-of-thought reasoning."},
+        {"role": "user", "content": "Write a Python function `binary_search(arr: list[int], target: int) -> int` that returns the index of target in sorted arr, or -1 if not found."},
+        {"role": "assistant", "content": (
+            "```python\n"
+            "def binary_search(arr: list[int], target: int) -> int:\n"
+            "    \"\"\"Return the index of target in sorted arr, or -1 if not present.\"\"\"\n"
+            "    low = 0\n"
+            "    high = len(arr) - 1\n"
+            "    while low <= high:\n"
+            "        mid = (low + high) // 2\n"
+            "        if arr[mid] == target:\n"
+            "            return mid\n"
+            "        elif arr[mid] < target:\n"
+            "            low = mid + 1\n"
+            "        else:\n"
+            "            high = mid - 1\n"
+            "    return -1\n"
+            "```"
+        )}
+    ],
+    [
+        {"role": "user", "content": "In TypeScript, fix the type error in this snippet:\ninterface Config {\n    timeoutMs?: number;\n}\nfunction getTimeout(c: Config): number {\n    return c.timeoutMs;\n}"},
+        {"role": "assistant", "content": (
+            "The property `timeoutMs` is optional and could be `undefined`, which conflicts with the `number` return type. Use nullish coalescing to provide a default fallback:\n\n"
+            "```typescript\n"
+            "interface Config {\n"
+            "    timeoutMs?: number;\n"
+            "}\n\n"
+            "function getTimeout(c: Config, fallbackMs: number = 5000): number {\n"
+            "    return c.timeoutMs ?? fallbackMs;\n"
+            "}\n"
+            "```"
+        )},
+        {"role": "user", "content": "Extend Config to also allow an optional `retries` number, and update getTimeout to validate that timeoutMs > 0."},
+        {"role": "assistant", "content": (
+            "Here is the updated implementation with validation:\n\n"
+            "```typescript\n"
+            "interface Config {\n"
+            "    timeoutMs?: number;\n"
+            "    retries?: number;\n"
+            "}\n\n"
+            "function getTimeout(c: Config, fallbackMs: number = 5000): number {\n"
+            "    const timeout = c.timeoutMs ?? fallbackMs;\n"
+            "    if (timeout <= 0) {\n"
+            "        throw new RangeError(\"timeoutMs must be positive\");\n"
+            "    }\n"
+            "    return timeout;\n"
+            "}\n"
+            "```"
+        )}
+    ],
+    [
+        {"role": "system", "content": "You are a software architect. Write modular, testable TypeScript code."},
+        {"role": "user", "content": "Define a type-safe `Result<T, E>` algebraic data type in TypeScript with `ok` and `err` constructors and a `map` helper."},
+        {"role": "assistant", "content": (
+            "```typescript\n"
+            "export type Result<T, E> = \n"
+            "    | { ok: true; value: T }\n"
+            "    | { ok: false; error: E };\n\n"
+            "export function ok<T, E = never>(value: T): Result<T, E> {\n"
+            "    return { ok: true, value };\n"
+            "}\n\n"
+            "export function err<E, T = never>(error: E): Result<T, E> {\n"
+            "    return { ok: false, error };\n"
+            "}\n\n"
+            "export function mapResult<T, U, E>(result: Result<T, E>, fn: (value: T) => U): Result<U, E> {\n"
+            "    if (result.ok) {\n"
+            "        return ok(fn(result.value));\n"
+            "    }\n"
+            "    return result;\n"
+            "}\n"
+            "```"
+        )}
+    ]
+]
+
+
+def code_records(max_examples: Optional[int] = None) -> Iterator[dict]:
+    """Checked-in code instruction and multi-turn refactoring examples (always offline, CC0)."""
+    for i, messages in enumerate(CODE_INSTRUCTION_RECORDS):
+        if max_examples is not None and i >= max_examples:
+            break
+        yield _tag([dict(m) for m in messages], "code")
+
+
+# --------------------------------------------------------------------------- #
 # Aggregator + CLI
 # --------------------------------------------------------------------------- #
 _LOADERS = {
@@ -258,6 +366,7 @@ _LOADERS = {
     "handauthored": lambda n: handauthored_records(),
     "ultrachat": lambda n: load_ultrachat(max_examples=n),
     "architecture": lambda n: architecture_records(max_examples=n),
+    "code": lambda n: code_records(max_examples=n),
 }
 
 

@@ -21,6 +21,8 @@ mx = pytest.importorskip("mlx.core")
 import mlx.optimizers as optim
 
 from src.data import chat_template
+from src.data.instruct_sft import build_instruct_sft
+from src.data.sft_sources import code_records, handauthored_records
 from src.data.reasoning_sft import build_reasoning_sft
 from src.data.reasoning_traces import handauthored_trace_records
 from src.data.sft_corpus import resolve_sft_corpus
@@ -49,8 +51,11 @@ MAX_LEN = 1024               # keep every handauthored record (toy seq_len would
 
 @pytest.fixture(scope="module")
 def corpus(tmp_path_factory):
-    """The three artifacts under test: tool.jsonl, reasoning.jsonl and reasoning-packed/."""
+    """The artifacts under test: instruct.jsonl, tool.jsonl, reasoning.jsonl and reasoning-packed/."""
     root = tmp_path_factory.mktemp("shared")
+    instruct_manifest = build_instruct_sft(list(handauthored_records()) + list(code_records()),
+                                           root, tokenizer=TOKENIZER, byte_fallback=True,
+                                           seq_len=SEQ_LEN, max_seq_len=SEQ_LEN)
     tool_manifest = build_tool_sft(handauthored_tool_records(), root, tokenizer=TOKENIZER,
                                    byte_fallback=True, seq_len=SEQ_LEN, max_seq_len=SEQ_LEN)
     reasoning_manifest = build_reasoning_sft(handauthored_trace_records(), root,
@@ -58,7 +63,7 @@ def corpus(tmp_path_factory):
                                              seq_len=SEQ_LEN, chunk_align=64)
     return {"root": root,
             "tok_dir": root / "sft" / "tokenized" / tokenized_dir_name(TOKENIZER, SEQ_LEN),
-            "tool": tool_manifest, "reasoning": reasoning_manifest}
+            "instruct": instruct_manifest, "tool": tool_manifest, "reasoning": reasoning_manifest}
 
 
 @pytest.fixture(scope="module")
@@ -134,6 +139,19 @@ def _assert_trained(rows, out: Path, steps: int):
 # 1/2. the two masked forms train through scripts/sft.py, no manual conversion
 # --------------------------------------------------------------------------- #
 
+def test_instruct_form_trains(monkeypatch, tmp_path, corpus, base_weights):
+    """Acceptance: instruct SFT runs on the templated corpus; masked val-perplexity tracked (#101)."""
+    out = tmp_path / "run-instruct"
+    rows = _train_one_form(monkeypatch, corpus, base_weights, out, "instruct")
+    _assert_trained(rows, out, 20)
+    val_perplexities = [r["val_perplexity"] for r in rows if "val_perplexity" in r]
+    assert len(val_perplexities) >= 1
+    assert all(np.isfinite(p) and p > 0 for p in val_perplexities)
+    val_losses = [r["val_loss"] for r in rows if "val_loss" in r]
+    assert len(val_losses) >= 1
+    assert all(np.isfinite(l) and l > 0 for l in val_losses)
+
+
 def test_tool_form_trains(monkeypatch, tmp_path, corpus, base_weights):
     out = tmp_path / "run-tool"
     rows = _train_one_form(monkeypatch, corpus, base_weights, out, "tool")
@@ -147,11 +165,11 @@ def test_reasoning_form_trains(monkeypatch, tmp_path, corpus, base_weights):
 
 
 def test_mixed_forms_train(monkeypatch, tmp_path, corpus, base_weights):
-    """`--corpus-form reasoning tool` — the mixing branch, end to end."""
+    """`--corpus-form instruct reasoning tool` — the mixing branch, end to end (#101)."""
     out = tmp_path / "run-mixed"
     _run_driver(monkeypatch,
                 "--config", TOY_CFG, "--data", corpus["tok_dir"],
-                "--corpus-form", "reasoning", "tool", "--max-len", MAX_LEN,
+                "--corpus-form", "instruct", "reasoning", "tool", "--max-len", MAX_LEN,
                 "--init", base_weights, "--out", out, "--total-steps", 10,
                 "--batch-size", 2, "--grad-accum", 1, "--base-lr", 1e-3,
                 "--log-every", 1, "--eval-every", 10, "--ckpt-every", 10)
@@ -301,3 +319,21 @@ def test_tool_abstention_and_multicall_reach_a_training_step(tmp_path):
     step = make_sft_train_step(model, optim.AdamW(learning_rate=1e-3), grad_clip=1.0)
     out = step(model, [(inputs, targets, mask)], 1e-3)
     assert np.isfinite(out["loss"]) and out["loss"] > 0.0
+
+
+def test_instruct_response_masking(corpus):
+    """Verify response masking on instruct form: prompt tokens masked, responses trained through CHAT_EOS (#101)."""
+    cfg = load_config(TOY_CFG)
+    resolved = resolve_sft_corpus(corpus["tok_dir"], ["instruct"], max_len=MAX_LEN, val_frac=0.2)
+    records = resolved.train_records + resolved.val_records
+    loader = SFTLoader(corpus["tok_dir"], cfg.seq_len, len(records), shuffle=False,
+                       drop_last=False, vocab_size=cfg.vocab_size, records=records)
+    inputs, targets, mask = next(loader.epoch())
+    assert inputs.shape == targets.shape == mask.shape
+
+    tok = ByteTokenizer()
+    for rec in records:
+        trained = tok.decode([t for t, m in zip(rec["target_ids"], rec["loss_mask"]) if m])
+        untrained = tok.decode([t for t, m in zip(rec["target_ids"], rec["loss_mask"]) if not m])
+        assert trained.endswith(chat_template.CHAT_EOS)
+        assert "im_start|>user" in untrained or "im_start|>system" in untrained

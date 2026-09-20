@@ -60,3 +60,45 @@ def test_build_instruct_sft_end_to_end(tmp_path):
     inputs, targets, mask = next(loader.epoch())
     assert inputs.shape == targets.shape == mask.shape
     assert mask.sum() > 0
+
+
+def test_build_chat_sft_records_with_system_prompt():
+    tok = ByteTokenizer()
+    rows = [{
+        "messages": [
+            {"role": "system", "content": "You are a code completion engine."},
+            {"role": "user", "content": "function add(a: number, b: number): number {"},
+            {"role": "assistant", "content": "return a + b; }"}
+        ]
+    }]
+    recs = list(build_chat_sft_records(rows, tok))
+    assert len(recs) == 1
+    rec = recs[0]
+    trained = [rec["target_ids"][j] for j in range(len(rec["loss_mask"])) if rec["loss_mask"][j]]
+    untrained = [rec["target_ids"][j] for j in range(len(rec["loss_mask"])) if not rec["loss_mask"][j]]
+    
+    trained_str = tok.decode(trained)
+    untrained_str = tok.decode(untrained)
+    
+    # Assistant content + <|im_end|> are trained
+    assert "return a + b; }" in trained_str
+    assert trained_str.endswith(IM_END)
+    
+    # System prompt, user prompt, and assistant header are in untrained (loss_mask == 0)
+    assert "code completion engine" in untrained_str
+    assert "function add" in untrained_str
+    assert "code completion engine" not in trained_str
+    assert "function add" not in trained_str
+
+
+def test_build_instruct_sft_with_code_records(tmp_path):
+    from src.data.sft_sources import code_records
+    manifest = build_instruct_sft(code_records(), tmp_path,
+                                  tokenizer="qwen25", byte_fallback=True, seq_len=4096)
+    assert manifest["template"] == "qwen-chatml"
+    assert manifest["chat_eos"] == IM_END
+    assert manifest["n_records"] == len(list(code_records()))
+    assert manifest["sources"].get("code") == manifest["n_records"]
+
+    tok_dir = tmp_path / "sft" / "tokenized" / "qwen25-4k"
+    assert (tok_dir / "instruct.jsonl").exists()
