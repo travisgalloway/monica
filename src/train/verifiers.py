@@ -23,6 +23,7 @@ module's top-level import surface stays stdlib-only.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -63,13 +64,19 @@ def extract_final_number(s: str) -> Optional[float]:
         return None
 
 
-def math_reward(answer: str, gold: str, *, tol: float = 1e-6) -> float:
-    """1.0 if the final number in `answer` equals the gold answer within `tol`, else 0.0.
-    `gold` may be a bare number or a full solution string (its final number is used)."""
+def math_reward(answer: str, gold: str, *, tol: float = 1e-6, use_sympy: bool = True) -> float:
+    """1.0 if the final number in `answer` equals the gold answer within `tol`, or if
+    the expressions are symbolically equivalent via SymPy (#340), else 0.0.
+    `gold` may be a bare number or a full solution string."""
     a, g = extract_final_number(answer), extract_final_number(gold)
-    if a is None or g is None:
-        return 0.0
-    return 1.0 if abs(a - g) <= tol else 0.0
+    if a is not None and g is not None and abs(a - g) <= tol:
+        return 1.0
+    if use_sympy:
+        try:
+            return sympy_symbolic_reward(answer, gold, tol=tol)
+        except Exception:
+            return 0.0
+    return 0.0
 
 
 class CodeVerifier:
@@ -813,6 +820,765 @@ class ToolSchemaVerifier:
         pass
 
     def __enter__(self) -> "ToolSchemaVerifier":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+# --------------------------------------------------------------------------- #
+# #340 -- SymPy symbolic equivalence & Z3 constraint solver verifiers
+# --------------------------------------------------------------------------- #
+
+def _extract_boxed_content(text: str) -> Optional[str]:
+    """Extract contents of the last \boxed{...} tag, handling nested braces."""
+    idx = text.rfind(r"\boxed{")
+    if idx == -1:
+        return None
+    start = idx + len(r"\boxed{")
+    depth = 1
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i].strip()
+    return text[start:].strip()
+
+
+def extract_math_expression(s: str) -> str:
+    """Extract a target mathematical expression from candidate completion or reference.
+
+    Prefers:
+      1. Last \boxed{...} content
+      2. Text after #### marker (GSM8K format)
+      3. Explicit answer prefixes (e.g. 'Final Answer:', 'The answer is')
+      4. Last non-empty line
+    Preprocesses LaTeX fractions, square roots, multiplications, and strips formatting.
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    boxed = _extract_boxed_content(s)
+    if boxed is not None:
+        expr = boxed
+    elif "####" in s:
+        expr = s.split("####")[-1].strip()
+    else:
+        found_prefix = False
+        for prefix in (
+            "final answer:",
+            "final answer is:",
+            "the answer is:",
+            "the answer is",
+            "answer is:",
+            "answer:",
+        ):
+            idx = s.lower().rfind(prefix)
+            if idx != -1:
+                expr = s[idx + len(prefix):].strip()
+                found_prefix = True
+                break
+        if not found_prefix:
+            lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+            expr = lines[-1] if lines else s
+
+    expr = expr.rstrip(".!;")
+    expr = expr.replace("$", "").strip()
+
+    def frac_repl(match: re.Match) -> str:
+        return f"(({match.group(1)})/({match.group(2)}))"
+
+    while re.search(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", expr):
+        expr = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", frac_repl, expr)
+
+    expr = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", expr)
+    expr = re.sub(r"\\sqrt\[([^{}]+)\]\{([^{}]+)\}", r"((\2)**(1/(\1)))", expr)
+    expr = expr.replace(r"\cdot", "*").replace(r"\times", "*").replace(r"\div", "/")
+    expr = re.sub(r"(?<=\d),(?=\d)", "", expr)
+    return expr.strip()
+
+
+def sympy_symbolic_reward(
+    candidate: str,
+    reference: str,
+    *,
+    tol: float = 1e-6,
+    base_reward: float = 1.0,
+    failure_reward: float = 0.0,
+) -> float:
+    """Evaluate symbolic equivalence between candidate and reference expressions with SymPy (#340).
+
+    Handles equivalent fractions, radicals, algebraic polynomials, and equations:
+    - simplify(candidate - reference) == 0
+    - candidate.equals(reference)
+    - proportional linear/algebraic equations
+    """
+    if candidate is None or reference is None:
+        return failure_reward
+
+    c_raw, r_raw = str(candidate).strip(), str(reference).strip()
+    if not c_raw or not r_raw:
+        return failure_reward
+
+    if normalize_text(c_raw) == normalize_text(r_raw):
+        return base_reward
+
+    c_num, r_num = extract_final_number(c_raw), extract_final_number(r_raw)
+    if c_num is not None and r_num is not None and abs(c_num - r_num) <= tol:
+        return base_reward
+
+    c_clean = extract_math_expression(c_raw)
+    r_clean = extract_math_expression(r_raw)
+
+    if not c_clean or not r_clean:
+        return failure_reward
+
+    if normalize_text(c_clean) == normalize_text(r_clean):
+        return base_reward
+
+    try:
+        import sympy
+        from sympy.parsing.sympy_parser import (
+            convert_xor,
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+    except ImportError:
+        return base_reward if (c_num is not None and r_num is not None and abs(c_num - r_num) <= tol) else failure_reward
+
+    transformations = standard_transformations + (
+        implicit_multiplication_application,
+        convert_xor,
+    )
+
+    try:
+        if "=" in c_clean and "=" in r_clean:
+            cl, cr = c_clean.split("=", 1)
+            rl, rr = r_clean.split("=", 1)
+            cle = parse_expr(cl, transformations=transformations)
+            cre = parse_expr(cr, transformations=transformations)
+            rle = parse_expr(rl, transformations=transformations)
+            rre = parse_expr(rr, transformations=transformations)
+            diff_c = cle - cre
+            diff_r = rle - rre
+            if sympy.simplify(diff_c - diff_r) == 0:
+                return base_reward
+            ratio = sympy.simplify(diff_c / diff_r)
+            if ratio.is_number and ratio != 0:
+                return base_reward
+
+        if "=" in c_clean and "=" not in r_clean:
+            _, cr = c_clean.split("=", 1)
+            cre = parse_expr(cr, transformations=transformations)
+            refe = parse_expr(r_clean, transformations=transformations)
+            if sympy.simplify(cre - refe) == 0 or cre.equals(refe):
+                return base_reward
+
+        if "=" not in c_clean and "=" in r_clean:
+            _, rr = r_clean.split("=", 1)
+            cande = parse_expr(c_clean, transformations=transformations)
+            rre = parse_expr(rr, transformations=transformations)
+            if sympy.simplify(cande - rre) == 0 or cande.equals(rre):
+                return base_reward
+
+        c_expr = parse_expr(c_clean, transformations=transformations)
+        r_expr = parse_expr(r_clean, transformations=transformations)
+
+        diff = sympy.simplify(c_expr - r_expr)
+        if diff == 0:
+            return base_reward
+
+        if c_expr.equals(r_expr) or sympy.expand(c_expr) == sympy.expand(r_expr):
+            return base_reward
+
+        if not c_expr.free_symbols and not r_expr.free_symbols:
+            try:
+                c_val = float(sympy.N(c_expr))
+                r_val = float(sympy.N(r_expr))
+                if abs(c_val - r_val) <= tol:
+                    return base_reward
+            except Exception:
+                pass
+
+        return failure_reward
+    except Exception:
+        c_num_clean = extract_final_number(c_clean)
+        r_num_clean = extract_final_number(r_clean)
+        if c_num_clean is not None and r_num_clean is not None and abs(c_num_clean - r_num_clean) <= tol:
+            return base_reward
+        return failure_reward
+
+
+class SympyVerifier:
+    """In-memory symbolic equivalence verifier using SymPy (#340).
+
+    Replaces/enhances `math_reward` by parsing candidate and reference expressions
+    into SymPy trees and verifying `simplify(candidate - reference) == 0`.
+    Handles equivalent fractions (e.g. 1/2 vs 2/4), radicals (e.g. sqrt(8) vs 2*sqrt(2)),
+    polynomial expansions, and algebraic equation forms. Completely sandbox-free.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_reward: float = 1.0,
+        failure_reward: float = 0.0,
+        syntax_error_reward: float = 0.0,
+        tol: float = 1e-6,
+    ) -> None:
+        self.base_reward = base_reward
+        self.failure_reward = failure_reward
+        self.syntax_error_reward = syntax_error_reward
+        self.tol = tol
+
+        self._n_samples = 0
+        self._n_equivalent = 0
+        self._n_inequivalent = 0
+        self._n_syntax_errors = 0
+        self._reward_total = 0.0
+
+    def reward(
+        self,
+        completion: str,
+        reference: Optional[str] = None,
+        *,
+        prompt: str = "",
+        **kwargs: Any,
+    ) -> float:
+        self._n_samples += 1
+        if reference is None:
+            self._n_syntax_errors += 1
+            self._reward_total += self.syntax_error_reward
+            return self.syntax_error_reward
+
+        ref_str = str(reference)
+        comp_str = "" if completion is None else str(completion)
+
+        r = sympy_symbolic_reward(
+            comp_str,
+            ref_str,
+            tol=self.tol,
+            base_reward=self.base_reward,
+            failure_reward=self.failure_reward,
+        )
+
+        if r == self.base_reward:
+            self._n_equivalent += 1
+        elif r == self.failure_reward:
+            self._n_inequivalent += 1
+        else:
+            self._n_syntax_errors += 1
+
+        self._reward_total += r
+        return r
+
+    def telemetry(self) -> dict:
+        n = self._n_samples
+        return {
+            "n_samples": n,
+            "n_equivalent": self._n_equivalent,
+            "n_inequivalent": self._n_inequivalent,
+            "n_syntax_errors": self._n_syntax_errors,
+            "mean_reward": (self._reward_total / n) if n else 0.0,
+        }
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "SympyVerifier":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+def parse_candidate_assignments(text: str) -> Optional[dict[str, Any]]:
+    """Extract candidate variable assignments from completion text for Z3 verification.
+
+    Supports:
+      1. Tagged blocks: `<solution>{...}</solution>`, `<assignment>...</assignment>`
+      2. Markdown JSON code blocks: ```json {...} ```
+      3. Raw JSON object: `{...}`
+      4. SMT2 define-fun models: `(define-fun x () Int 3)`
+      5. Key-value lines: `x = 3`, `y = 7`, `P = True`
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    for tag in ("solution", "assignment", "model", "answer"):
+        m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+            break
+
+    m_code = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m_code:
+        try:
+            d = json.loads(m_code.group(1))
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+
+    m_json = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if m_json:
+        try:
+            d = json.loads(m_json.group(0))
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+
+    smt_matches = re.findall(
+        r"\(define-fun\s+([a-zA-Z0-9_]+)\s*\(\)\s*(?:Int|Bool|Real|String)\s+([^)]+)\)",
+        text,
+    )
+    if smt_matches:
+        d = {}
+        for var, val in smt_matches:
+            val = val.strip()
+            if val.lower() == "true":
+                d[var] = True
+            elif val.lower() == "false":
+                d[var] = False
+            else:
+                try:
+                    d[var] = int(val)
+                except ValueError:
+                    try:
+                        d[var] = float(val)
+                    except ValueError:
+                        d[var] = val
+        return d
+
+    kv_matches = re.findall(
+        r'\b([a-zA-Z_]\w*)\s*(?:=|:)\s*(-?\d+(?:\.\d+)?|true|false|"[^"]*"|\'[^\']*\')',
+        text,
+        re.IGNORECASE,
+    )
+    if kv_matches:
+        d = {}
+        for var, val in kv_matches:
+            val = val.strip("\"'")
+            if val.lower() == "true":
+                d[var] = True
+            elif val.lower() == "false":
+                d[var] = False
+            else:
+                try:
+                    d[var] = int(val)
+                except ValueError:
+                    try:
+                        d[var] = float(val)
+                    except ValueError:
+                        d[var] = val
+        return d
+
+    return None
+
+
+def _get_z3_ast_vars(expr: Any) -> set[str]:
+    """Extract all free uninterpreted variable names from a Z3 AST expression."""
+    import z3
+
+    vars_found: set[str] = set()
+
+    def rec(e: Any) -> None:
+        if z3.is_const(e) and e.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+            vars_found.add(str(e.decl().name()))
+        for ch in e.children():
+            rec(ch)
+
+    rec(expr)
+    return vars_found
+
+
+def parse_py_constraint(
+    expr_str: str,
+    vars_dict: dict[str, Any],
+    var_types: Optional[Mapping[str, str]] = None,
+) -> Any:
+    """Safely parse a Python constraint expression into a Z3 formula without eval."""
+    import z3
+
+    var_types = var_types or {}
+
+    def get_var(name: str, bool_context: bool = False) -> Any:
+        if name in vars_dict:
+            return vars_dict[name]
+        vtype = var_types.get(name)
+        if vtype == "bool" or (vtype is None and bool_context):
+            v = z3.Bool(name)
+        elif vtype == "real":
+            v = z3.Real(name)
+        elif vtype in ("string", "str"):
+            v = z3.String(name)
+        else:
+            v = z3.Int(name)
+        vars_dict[name] = v
+        return v
+
+    def visit(node: ast.AST, bool_context: bool = False) -> Any:
+        if isinstance(node, ast.Expression):
+            return visit(node.body, bool_context)
+        elif isinstance(node, ast.Name):
+            return get_var(node.id, bool_context)
+        elif isinstance(node, ast.Constant):
+            val = node.value
+            if isinstance(val, bool):
+                return z3.BoolVal(val)
+            elif isinstance(val, int):
+                return z3.IntVal(val)
+            elif isinstance(val, float):
+                return z3.RealVal(val)
+            elif isinstance(val, str):
+                return z3.StringVal(val)
+            return val
+        elif isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return z3.Not(visit(node.operand, bool_context=True))
+            elif isinstance(node.op, ast.USub):
+                return -visit(node.operand)
+            elif isinstance(node.op, ast.UAdd):
+                return visit(node.operand)
+        elif isinstance(node, ast.BinOp):
+            l = visit(node.left)
+            r = visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return l + r
+            elif isinstance(node.op, ast.Sub):
+                return l - r
+            elif isinstance(node.op, ast.Mult):
+                return l * r
+            elif isinstance(node.op, ast.Div):
+                return l / r
+            elif isinstance(node.op, ast.Mod):
+                return l % r
+        elif isinstance(node, ast.BoolOp):
+            vals = [visit(v, bool_context=True) for v in node.values]
+            if isinstance(node.op, ast.And):
+                return z3.And(*vals)
+            elif isinstance(node.op, ast.Or):
+                return z3.Or(*vals)
+        elif isinstance(node, ast.Compare):
+            l = visit(node.left)
+            conj = []
+            curr = l
+            for op, comp in zip(node.ops, node.comparators):
+                r = visit(comp)
+                if isinstance(op, ast.Eq):
+                    conj.append(curr == r)
+                elif isinstance(op, ast.NotEq):
+                    conj.append(curr != r)
+                elif isinstance(op, ast.Lt):
+                    conj.append(curr < r)
+                elif isinstance(op, ast.LtE):
+                    conj.append(curr <= r)
+                elif isinstance(op, ast.Gt):
+                    conj.append(curr > r)
+                elif isinstance(op, ast.GtE):
+                    conj.append(curr >= r)
+                curr = r
+            return z3.And(*conj) if len(conj) > 1 else conj[0]
+        elif isinstance(node, ast.Call):
+            fname = node.func.id if isinstance(node.func, ast.Name) else ""
+            args = [visit(a) for a in node.args]
+            if fname == "Distinct":
+                return z3.Distinct(*args)
+            elif fname == "And":
+                return z3.And(*args)
+            elif fname == "Or":
+                return z3.Or(*args)
+            elif fname == "Not":
+                return z3.Not(*args)
+            elif fname == "Implies":
+                return z3.Implies(*args)
+            elif fname == "Xor":
+                return z3.Xor(*args)
+            elif fname == "If":
+                return z3.If(*args)
+            elif fname == "Abs":
+                arg = args[0]
+                return z3.If(arg >= 0, arg, -arg)
+        raise ValueError(f"Unsupported AST node in constraint: {ast.dump(node)}")
+
+    tree = ast.parse(expr_str.strip(), mode="eval")
+    return visit(tree)
+
+
+class Z3Verifier:
+    """SMT constraint solver verifier for formal logic, scheduling, and SAT puzzles (#340).
+
+    Verifies candidate variable assignments satisfy problem constraints in <5ms.
+    Completely sandbox-free and executes in-memory with Z3.
+    """
+
+    def __init__(
+        self,
+        *,
+        constraints: Optional[Sequence[str] | str] = None,
+        var_types: Optional[Mapping[str, str]] = None,
+        timeout_ms: int = 50,
+        base_reward: float = 1.0,
+        failure_reward: float = -1.0,
+        syntax_error_reward: float = -1.0,
+        require_complete_assignment: bool = True,
+        partial_credit: bool = False,
+    ) -> None:
+        self.constraints = constraints
+        self.var_types = dict(var_types) if var_types else {}
+        self.timeout_ms = timeout_ms
+        self.base_reward = base_reward
+        self.failure_reward = failure_reward
+        self.syntax_error_reward = syntax_error_reward
+        self.require_complete_assignment = require_complete_assignment
+        self.partial_credit = partial_credit
+
+        self._n_samples = 0
+        self._n_satisfied = 0
+        self._n_unsat = 0
+        self._n_syntax_errors = 0
+        self._n_missing_vars = 0
+        self._n_timeouts = 0
+        self._solve_time_total_ms = 0.0
+        self._reward_total = 0.0
+
+    def _resolve_constraints(
+        self,
+        constraints_arg: Optional[Sequence[str] | str],
+        reference: Optional[str],
+        prompt: str,
+    ) -> Tuple[Optional[List[str] | str], Optional[dict]]:
+        """Resolve constraints and optional gold assignment from arguments, reference, or prompt."""
+        if constraints_arg is not None:
+            return constraints_arg, None
+        if self.constraints is not None:
+            return self.constraints, None
+
+        if "<constraints>" in prompt and "</constraints>" in prompt:
+            s = prompt.find("<constraints>") + len("<constraints>")
+            e = prompt.find("</constraints>", s)
+            block = prompt[s:e].strip()
+            try:
+                parsed = json.loads(block)
+                if isinstance(parsed, (list, str)):
+                    return parsed, None
+                if isinstance(parsed, dict) and "constraints" in parsed:
+                    return parsed["constraints"], parsed.get("solution")
+            except Exception:
+                lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+                return lines if lines else block, None
+
+        if reference is not None:
+            ref_str = str(reference).strip()
+            try:
+                data = json.loads(ref_str)
+                if isinstance(data, list):
+                    return data, None
+                if isinstance(data, dict):
+                    if "constraints" in data:
+                        return data["constraints"], data.get("solution") or data.get("assignment")
+                    return None, data
+            except Exception:
+                pass
+
+            if "(assert" in ref_str or "(declare-const" in ref_str:
+                return ref_str, None
+
+            lines = [ln.strip() for ln in ref_str.splitlines() if ln.strip()]
+            if len(lines) > 1 and any("==" in ln or "<" in ln or ">" in ln for ln in lines):
+                return lines, None
+            if len(lines) == 1 and any(op in lines[0] for op in ("==", "<", ">", "!=")):
+                return lines, None
+
+        return None, None
+
+    def reward(
+        self,
+        completion: str,
+        reference: Optional[str] = None,
+        *,
+        prompt: str = "",
+        constraints: Optional[Sequence[str] | str] = None,
+        var_types: Optional[Mapping[str, str]] = None,
+        **kwargs: Any,
+    ) -> float:
+        import time
+
+        try:
+            import z3
+        except ImportError:
+            raise RuntimeError("Z3Verifier requires z3-solver. Install with 'pip install z3-solver'.")
+
+        self._n_samples += 1
+        comp_str = "" if completion is None else str(completion)
+        candidate = parse_candidate_assignments(comp_str)
+
+        if candidate is None:
+            self._n_syntax_errors += 1
+            self._reward_total += self.syntax_error_reward
+            return self.syntax_error_reward
+
+        resolved_constraints, gold_assignment = self._resolve_constraints(
+            constraints, reference, prompt
+        )
+
+        if resolved_constraints is None and gold_assignment is not None:
+            if candidate == gold_assignment:
+                self._n_satisfied += 1
+                self._reward_total += self.base_reward
+                return self.base_reward
+            else:
+                self._n_unsat += 1
+                self._reward_total += self.failure_reward
+                return self.failure_reward
+
+        if resolved_constraints is None:
+            self._n_syntax_errors += 1
+            self._reward_total += self.syntax_error_reward
+            return self.syntax_error_reward
+
+        solver = z3.Solver()
+        solver.set("timeout", self.timeout_ms)
+
+        merged_types = dict(self.var_types)
+        if var_types:
+            merged_types.update(var_types)
+        for k, v in candidate.items():
+            if k not in merged_types:
+                if isinstance(v, bool):
+                    merged_types[k] = "bool"
+                elif isinstance(v, int):
+                    merged_types[k] = "int"
+                elif isinstance(v, float):
+                    merged_types[k] = "real"
+                elif isinstance(v, str):
+                    merged_types[k] = "string"
+
+        vars_dict: dict[str, Any] = {}
+        required_vars: set[str] = set()
+        c_list: List[Any] = []
+
+        try:
+            if isinstance(resolved_constraints, str) and (
+                "(assert" in resolved_constraints or "(declare-const" in resolved_constraints
+            ):
+                assertions = z3.parse_smt2_string(resolved_constraints)
+                for a in assertions:
+                    c_list.append(a)
+                    solver.add(a)
+                    required_vars.update(_get_z3_ast_vars(a))
+            else:
+                raw_constraints = (
+                    [resolved_constraints]
+                    if isinstance(resolved_constraints, str)
+                    else list(resolved_constraints)
+                )
+                for c_str in raw_constraints:
+                    ast_expr = parse_py_constraint(c_str, vars_dict, merged_types)
+                    c_list.append(ast_expr)
+                    solver.add(ast_expr)
+                    required_vars.update(_get_z3_ast_vars(ast_expr))
+        except Exception:
+            self._n_syntax_errors += 1
+            self._reward_total += self.syntax_error_reward
+            return self.syntax_error_reward
+
+        if self.require_complete_assignment:
+            missing = required_vars - set(candidate.keys())
+            if missing:
+                self._n_missing_vars += 1
+                self._reward_total += self.failure_reward
+                return self.failure_reward
+
+        t0 = time.perf_counter()
+        solver.push()
+        for var_name, val in candidate.items():
+            if var_name in vars_dict:
+                v_ast = vars_dict[var_name]
+            else:
+                vtype = merged_types.get(var_name, "int")
+                if vtype == "bool":
+                    v_ast = z3.Bool(var_name)
+                elif vtype == "real":
+                    v_ast = z3.Real(var_name)
+                elif vtype in ("string", "str"):
+                    v_ast = z3.String(var_name)
+                else:
+                    v_ast = z3.Int(var_name)
+                vars_dict[var_name] = v_ast
+
+            if isinstance(val, bool):
+                solver.add(v_ast == z3.BoolVal(val))
+            elif isinstance(val, int):
+                solver.add(v_ast == z3.IntVal(val))
+            elif isinstance(val, float):
+                solver.add(v_ast == z3.RealVal(val))
+            elif isinstance(val, str):
+                solver.add(v_ast == z3.StringVal(val))
+
+        status = solver.check()
+        solver.pop()
+        solve_ms = (time.perf_counter() - t0) * 1000.0
+        self._solve_time_total_ms += solve_ms
+
+        if status == z3.sat:
+            self._n_satisfied += 1
+            self._reward_total += self.base_reward
+            return self.base_reward
+        elif status == z3.unsat:
+            self._n_unsat += 1
+            if self.partial_credit and c_list:
+                passed = 0
+                for c_ast in c_list:
+                    s_sub = z3.Solver()
+                    s_sub.set("timeout", max(self.timeout_ms // len(c_list), 5))
+                    s_sub.add(c_ast)
+                    for var_name, val in candidate.items():
+                        v_ast = vars_dict[var_name]
+                        if isinstance(val, bool):
+                            s_sub.add(v_ast == z3.BoolVal(val))
+                        elif isinstance(val, int):
+                            s_sub.add(v_ast == z3.IntVal(val))
+                        elif isinstance(val, float):
+                            s_sub.add(v_ast == z3.RealVal(val))
+                        elif isinstance(val, str):
+                            s_sub.add(v_ast == z3.StringVal(val))
+                    if s_sub.check() == z3.sat:
+                        passed += 1
+                frac = passed / len(c_list)
+                r = self.failure_reward + frac * (self.base_reward - self.failure_reward)
+                self._reward_total += r
+                return r
+            else:
+                self._reward_total += self.failure_reward
+                return self.failure_reward
+        else:
+            self._n_timeouts += 1
+            self._reward_total += self.failure_reward
+            return self.failure_reward
+
+    def telemetry(self) -> dict:
+        n = self._n_samples
+        return {
+            "n_samples": n,
+            "n_satisfied": self._n_satisfied,
+            "n_unsat": self._n_unsat,
+            "n_syntax_errors": self._n_syntax_errors,
+            "n_missing_vars": self._n_missing_vars,
+            "n_timeouts": self._n_timeouts,
+            "mean_solve_time_ms": (self._solve_time_total_ms / n) if n else 0.0,
+            "mean_reward": (self._reward_total / n) if n else 0.0,
+        }
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "Z3Verifier":
         return self
 
     def __exit__(self, *exc_info: Any) -> None:

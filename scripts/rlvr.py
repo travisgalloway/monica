@@ -35,9 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.train.grpo import group_advantages, reward_stats
-from src.train.verifiers import (LspVerifier, MemoizedVerifier, ToolSchemaVerifier,
-                                 When2CallAbstentionVerifier, exact_match_reward,
-                                 math_reward, score_rollouts)
+from src.train.verifiers import (LspVerifier, MemoizedVerifier, SympyVerifier,
+                                 ToolSchemaVerifier, When2CallAbstentionVerifier,
+                                 Z3Verifier, exact_match_reward, math_reward,
+                                 score_rollouts)
 
 
 def collate_rollouts(rollouts, advantages, *, pad_id: int = 0):
@@ -64,7 +65,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -181,6 +182,14 @@ def main() -> None:
             raw_verifier = When2CallAbstentionVerifier()
             stack.enter_context(raw_verifier)
             reward_fn = None
+        elif args.reward == "sympy":
+            raw_verifier = SympyVerifier()
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "z3":
+            raw_verifier = Z3Verifier()
+            stack.enter_context(raw_verifier)
+            reward_fn = None
         else:
             raise ValueError(f"unknown reward {args.reward}")
 
@@ -217,6 +226,8 @@ def main() -> None:
                 extra_kwargs["category"] = prob["category"]
             if "abstain" in prob:
                 extra_kwargs["abstain"] = prob["abstain"]
+            if "constraints" in prob:
+                extra_kwargs["constraints"] = prob["constraints"]
             step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"], **extra_kwargs)
                               if verifier is not None else reward_fn)
             # Batched rollout generation: parallel prefill + concurrent decode across group_size
@@ -274,6 +285,10 @@ def main() -> None:
                         if "n_abstain_success" in t:
                             line += (f"  frac_abstain {t.get('n_abstain_success', 0) / n:.3f}  "
                                     f"frac_spurious {t.get('n_spurious_calls', 0) / n:.3f}")
+                        if "n_equivalent" in t:
+                            line += f"  frac_equiv {t.get('n_equivalent', 0) / n:.3f}"
+                        if "n_satisfied" in t:
+                            line += f"  frac_sat {t.get('n_satisfied', 0) / n:.3f}"
                     if "cache_hit_rate" in t and (t.get("cache_hits", 0) + t.get("cache_misses", 0)) > 0:
                         line += f"  cache_hit {t['cache_hit_rate']:.2f}"
                 print(line)
