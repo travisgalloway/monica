@@ -314,21 +314,30 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
 
 
 def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                         scaler=None, balancer=None) -> Callable:
+                         scaler=None, balancer=None,
+                         beta: float = 0.0, kl_estimator: str = "schulman") -> Callable:
     """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
 
-    `micro_batches` is a list of `(inputs, targets, mask, advantages)`: a batch of sampled
-    rollouts (mask = 1 on the generated/completion tokens) and their group-standardized
-    advantages (one per sequence, precomputed in the driver via `train.grpo.group_advantages`
-    from verifier rewards). The loss is `-mean(advantage * logpθ(completion))` — REINFORCE
-    with the GRPO group baseline; gradients flow through the policy only. Accumulation /
-    fp16 scaling / clipping are shared via `_accumulate_and_step`. `balancer` (#213) as in
-    `make_train_step`.
+    `micro_batches` is a list of `(inputs, targets, mask, advantages)` (or optionally
+    5-tuples with `ref_logp`): a batch of sampled rollouts (mask = 1 on the generated/
+    completion tokens) and their group-standardized advantages. If `beta > 0.0` and
+    `ref_logp` is provided, penalizes policy divergence from the reference model via KL
+    divergence (#103). The loss is `-mean(advantage * logp) + beta * mean(kl)`.
+    Accumulation / fp16 scaling / clipping are shared via `_accumulate_and_step`.
+    `balancer` (#213) as in `make_train_step`.
     """
-    def loss_fn(model, inputs, targets, mask, advantages):
+    def loss_fn(model, inputs, targets, mask, advantages, *extra):
         logp = _masked_seq_logprob(model, inputs, targets, mask)     # (B,)
         adv = mx.array(advantages).astype(mx.float32).reshape(-1)    # (B,)
         loss = -mx.mean(adv * logp)
+        if beta > 0.0 and len(extra) > 0 and extra[0] is not None:
+            ref_lp = mx.array(extra[0]).astype(mx.float32).reshape(-1)
+            diff = ref_lp - logp
+            if kl_estimator == "schulman":
+                kl = mx.exp(mx.clip(diff, -50.0, 50.0)) - diff - 1.0
+            else:
+                kl = -diff
+            loss = loss + beta * mx.mean(kl)
         return loss * scaler.scale if scaler else loss
 
     value_and_grad = nn.value_and_grad(model, loss_fn)

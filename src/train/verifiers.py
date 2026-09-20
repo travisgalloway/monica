@@ -82,6 +82,98 @@ def math_reward(answer: str, gold: str, *, tol: float = 1e-6, use_sympy: bool = 
     return 0.0
 
 
+
+class MathVerifier:
+    """Verifiable reward evaluator for GSM8K and MATH prompt sets (#103).
+
+    Fast-path exact numeric matching for GSM8K (numbers after '####') followed by
+    SymPy symbolic equivalence checking for MATH (fractions, radicals, polynomials,
+    algebraic equations, boxed content). Safe, deterministic, and sandbox-free.
+    """
+
+    def __init__(
+        self,
+        *,
+        use_sympy: bool = True,
+        tol: float = 1e-6,
+        fail_fast: bool = True,
+    ) -> None:
+        self.use_sympy = use_sympy
+        self.tol = tol
+        self.fail_fast = fail_fast
+        self._n_samples = 0
+        self._n_solved = 0
+        self._n_exact = 0
+        self._n_sympy = 0
+        self._n_failed = 0
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> "MathVerifier":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
+
+    def reward(
+        self,
+        completion: str,
+        reference: Optional[str] = None,
+        *,
+        prompt: str = "",
+        **kwargs: Any,
+    ) -> float:
+        if reference is None:
+            with self._lock:
+                self._n_samples += 1
+                self._n_failed += 1
+            return 0.0
+
+        ans_str = str(completion or "").strip()
+        gold_str = str(reference).strip()
+
+        with self._lock:
+            self._n_samples += 1
+
+        # Fast path: GSM8K / numeric exact match
+        a = extract_final_number(ans_str)
+        g = extract_final_number(gold_str)
+        if a is not None and g is not None and abs(a - g) <= self.tol:
+            with self._lock:
+                self._n_solved += 1
+                self._n_exact += 1
+            return 1.0
+
+        # Symbolic path: SymPy for MATH expressions (oxed{...}, fractions, equations)
+        if self.use_sympy:
+            try:
+                score = sympy_symbolic_reward(ans_str, gold_str, tol=self.tol)
+                if score >= 1.0:
+                    with self._lock:
+                        self._n_solved += 1
+                        self._n_sympy += 1
+                    return 1.0
+            except Exception:
+                pass
+
+        with self._lock:
+            self._n_failed += 1
+        return 0.0
+
+    def telemetry(self) -> dict:
+        with self._lock:
+            n = max(self._n_samples, 1)
+            return {
+                "n_samples": self._n_samples,
+                "n_solved": self._n_solved,
+                "n_exact": self._n_exact,
+                "n_sympy": self._n_sympy,
+                "n_failed": self._n_failed,
+                "frac_solved": self._n_solved / n,
+                "frac_exact": self._n_exact / n,
+                "frac_sympy": self._n_sympy / n,
+            }
+
+
 class CodeVerifier:
     """Run candidate code against a test suite, rewarding the **fraction of tests passing**
     (partial credit; use >=5 tests per problem so a thin suite can't be gamed — the main

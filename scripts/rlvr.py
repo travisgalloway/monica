@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from src.train.grpo import group_advantages, reward_stats
-from src.train.verifiers import (CppVerifier, KotlinVerifier, LspVerifier,
+from src.train.grpo import advantage_stats, compute_kl_penalty, group_advantages, kl_stats, reward_stats
+from src.train.verifiers import (CppVerifier, KotlinVerifier, LspVerifier, MathVerifier,
                                  MemoizedVerifier, RustVerifier, SwiftVerifier,
                                  SympyVerifier, ToolSchemaVerifier,
                                  When2CallAbstentionVerifier, Z3Verifier,
@@ -43,9 +43,9 @@ from src.train.verifiers import (CppVerifier, KotlinVerifier, LspVerifier,
                                  score_rollouts)
 
 
-def collate_rollouts(rollouts, advantages, *, pad_id: int = 0):
+def collate_rollouts(rollouts, advantages, ref_logp=None, *, pad_id: int = 0):
     """Pad a group of (prompt_ids, gen_ids) rollouts into a GRPO micro-batch
-    `(inputs, targets, mask, advantages)`; mask = 1 on the generated (completion) tokens
+    `(inputs, targets, mask, advantages)` (or 5-tuple with `ref_logp`); mask = 1 on the generated (completion) tokens
     so the GRPO loss only credits what the model produced."""
     fulls = [list(p) + list(g) for p, g in rollouts]
     glens = [len(g) for _, g in rollouts]
@@ -58,7 +58,10 @@ def collate_rollouts(rollouts, advantages, *, pad_id: int = 0):
         gen_mask[i, len(f) - gl:len(f)] = 1.0          # the trailing gl tokens are generated
     inputs, targets = full[:, :-1], full[:, 1:]
     mask = gen_mask[:, 1:]                              # target j is a gen token?
-    return inputs, targets, mask, np.asarray(advantages, dtype=np.float32)
+    adv_arr = np.asarray(advantages, dtype=np.float32)
+    if ref_logp is not None:
+        return inputs, targets, mask, adv_arr, np.asarray(ref_logp, dtype=np.float32)
+    return inputs, targets, mask, adv_arr
 
 
 def main() -> None:
@@ -113,6 +116,14 @@ def main() -> None:
                     help="override chat EOS stop string (default: <|im_end|>)")
     ap.add_argument("--enforce-chat-eos", action=argparse.BooleanOptionalAction, default=True,
                     help="enforce chat EOS consistency SFT -> RL -> serving (default on)")
+    ap.add_argument("--beta", type=float, default=0.0,
+                    help="KL penalty coefficient beta (default 0.0; >0 penalizes divergence from --ref)")
+    ap.add_argument("--ref", type=Path, default=None,
+                    help="reference model weights for KL penalty (default: --init)")
+    ap.add_argument("--track-kl", action=argparse.BooleanOptionalAction, default=False,
+                    help="track KL penalty diagnostics against reference model (default off)")
+    ap.add_argument("--kl-estimator", choices=("schulman", "log_ratio"), default="schulman",
+                    help="estimator for KL divergence (default: schulman)")
     args = ap.parse_args()
 
     # Fail fast BEFORE any model load — an --reward lsp run with no toolchain
@@ -242,8 +253,18 @@ def main() -> None:
     # into the routers, and enables load counting. `balancer=None` is a no-op on either
     # backend's make_grpo_train_step (#214).
     balancer = balancer_for_config(cfg)
-    grpo_step = backend.make_grpo_train_step(model, opt, balancer=balancer)
+    grpo_step = backend.make_grpo_train_step(model, opt, balancer=balancer,
+                                            beta=args.beta, kl_estimator=args.kl_estimator)
     attach_balancer(balancer, model)
+
+    ref_model = None
+    if args.beta > 0.0 or args.track_kl or args.ref is not None:
+        ref_weights_path = args.ref or args.init
+        ref_model = backend.model_cls(cfg)
+        ref_weights = load_weights_dict(str(ref_weights_path))
+        check_weight_keys(ref_weights, ref_model._portable_state_dict(),
+                          where=f"--ref {ref_weights_path}")
+        ref_model._load_portable(ref_weights)
 
     problems = [json.loads(ln) for ln in args.problems.read_text(encoding="utf-8").splitlines()
                 if ln.strip()]
@@ -259,7 +280,9 @@ def main() -> None:
     with contextlib.ExitStack() as stack:
         raw_verifier = None
         if args.reward == "math":
-            raw_verifier, reward_fn = math_reward, None
+            raw_verifier = MathVerifier(use_sympy=True, fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
         elif args.reward == "exact":
             raw_verifier, reward_fn = exact_match_reward, None
         elif args.reward == "lsp":
@@ -438,17 +461,35 @@ def main() -> None:
 
         run_start = time.monotonic()
 
+
+
+        latest_stats = {"mean_reward": 0.0, "frac_solved": 0.0}
+        latest_adv_stat = {"mean_adv": 0.0, "mean_abs_adv": 0.0}
+        latest_mean_kl = None
+        latest_metrics = {"loss": 0.0}
+
         def write_telemetry() -> None:
             elapsed = time.monotonic() - run_start
             t = verifier.telemetry() if verifier is not None else {}
             t["elapsed_wall_s"] = elapsed
             if "wall_s" in t:
                 t["oracle_wall_frac"] = (t["wall_s"] / elapsed) if elapsed > 0 else 0.0
+            t["grpo"] = {
+                "step": step if "step" in locals() else 0,
+                "loss": float(latest_metrics.get("loss", 0.0)),
+                "mean_reward": float(latest_stats.get("mean_reward", 0.0)),
+                "frac_solved": float(latest_stats.get("frac_solved", 0.0)),
+                "mean_adv": float(latest_adv_stat.get("mean_adv", 0.0)),
+                "mean_abs_adv": float(latest_adv_stat.get("mean_abs_adv", 0.0)),
+                "mean_kl": float(latest_mean_kl) if latest_mean_kl is not None else None,
+                "beta": args.beta,
+            }
             telemetry_path.write_text(json.dumps(t, indent=2), encoding="utf-8")
 
         for step in range(args.steps):
             prob = problems[step % len(problems)]
-            prompt_ids = list(tok.encode(prob["prompt"])) or [eos or 0]
+            prompt_text = prob.get("prompt") or prob.get("question") or ""
+            prompt_ids = list(tok.encode(prompt_text)) or [eos or 0]
             extra_kwargs = {}
             if "tools" in prob:
                 extra_kwargs["tools"] = prob["tools"]
@@ -466,7 +507,7 @@ def main() -> None:
                 extra_kwargs["language"] = prob["language"]
             if "runner" in prob:
                 extra_kwargs["runner"] = prob["runner"]
-            step_reward_fn = (partial(verifier.reward, prompt=prob["prompt"], **extra_kwargs)
+            step_reward_fn = (partial(verifier.reward, prompt=prompt_text, **extra_kwargs)
                               if verifier is not None else reward_fn)
             # Batched rollout generation: parallel prefill + concurrent decode across group_size
             p_batch = mx.repeat(mx.array([int(t) for t in prompt_ids])[None], args.group_size, axis=0)
@@ -497,16 +538,39 @@ def main() -> None:
                 logits_np = np_to(logits)
 
             rollouts = [(prompt_ids, g or [eos or 0]) for g in batched_gens]
-            ans_str = str(prob.get("answer", ""))
+            ans_str = str(prob.get("answer") if prob.get("answer") is not None else prob.get("solution", ""))
             decoded_completions = [tok.decode(g) for g in batched_gens]
             rewards = score_rollouts(step_reward_fn, decoded_completions, ans_str, executor=executor)
 
             adv = group_advantages([rewards])[0]            # (K,)
-            metrics = grpo_step(model, [collate_rollouts(rollouts, adv)], args.lr)
+            adv_stat = advantage_stats(adv)
+            latest_adv_stat = adv_stat
+
+            ref_logp = None
+            mean_kl = None
+            if ref_model is not None:
+                from src.model.mlx_train_step import _masked_seq_logprob
+                mb_in, mb_tgt, mb_mask, _ = collate_rollouts(rollouts, adv)
+                ref_lp_arr = _masked_seq_logprob(ref_model, mb_in, mb_tgt, mb_mask)
+                ref_logp = np_to(ref_lp_arr)
+                pol_lp_arr = _masked_seq_logprob(model, mb_in, mb_tgt, mb_mask)
+                pol_logp = np_to(pol_lp_arr)
+                k_stat = kl_stats(pol_logp, ref_logp, estimator=args.kl_estimator)
+                mean_kl = k_stat["mean_kl"]
+                latest_mean_kl = mean_kl
+
+            mb = collate_rollouts(rollouts, adv, ref_logp=ref_logp)
+            metrics = grpo_step(model, [mb], args.lr)
+            latest_metrics = metrics
+
             if step % args.log_every == 0:
                 stats = reward_stats(rewards)
+                latest_stats = stats
                 line = (f"step {step:4d}  loss {metrics['loss']:.4f}  "
-                       f"mean_reward {stats['mean_reward']:.3f}  solved {stats['frac_solved']:.3f}")
+                       f"mean_reward {stats['mean_reward']:.3f}  solved {stats['frac_solved']:.3f}  "
+                       f"mean_adv {adv_stat['mean_adv']:.3f}")
+                if mean_kl is not None:
+                    line += f"  mean_kl {mean_kl:.4f}"
                 if verifier is not None:
                     t = verifier.telemetry()
                     elapsed = time.monotonic() - run_start
@@ -527,6 +591,8 @@ def main() -> None:
                             line += f"  frac_equiv {t.get('n_equivalent', 0) / n:.3f}"
                         if "n_satisfied" in t:
                             line += f"  frac_sat {t.get('n_satisfied', 0) / n:.3f}"
+                        if "n_exact" in t:
+                            line += f"  frac_exact {t.get('n_exact', 0) / n:.3f}  frac_sympy {t.get('n_sympy', 0) / n:.3f}"
                     if "cache_hit_rate" in t and (t.get("cache_hits", 0) + t.get("cache_misses", 0)) > 0:
                         line += f"  cache_hit {t['cache_hit_rate']:.2f}"
                 print(line)
