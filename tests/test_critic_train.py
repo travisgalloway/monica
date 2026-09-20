@@ -282,16 +282,29 @@ def test_end_to_end_training_convergence_and_gates(tmp_path):
 def test_model_interface_forward_hidden():
     """Verify forward_hidden contract on ModelInterface across backends."""
     from src.model.blocks import load_config
-    from src.model.cuda_backend import CUDAMambaModel
-    from src.model.mlx_backend import MLXMambaModel
 
     cfg = load_config("config/toy.yaml")
-    mlx_model = MLXMambaModel(cfg)
-    cuda_model = CUDAMambaModel(cfg)
-
     tokens = np.random.randint(0, cfg.vocab_size, size=(2, 12)).astype(np.int32)
-    h_mlx = np.array(mlx_model.forward_hidden(tokens))
-    h_cuda = cuda_model.forward_hidden(tokens).detach().cpu().numpy()
+    tested = False
 
-    assert h_mlx.shape == (2, 12, cfg.d_model)
-    assert h_cuda.shape == (2, 12, cfg.d_model)
+    try:
+        from src.model.mlx_backend import MLXMambaModel
+        mlx_model = MLXMambaModel(cfg)
+        h_mlx = np.array(mlx_model.forward_hidden(tokens))
+        assert h_mlx.shape == (2, 12, cfg.d_model)
+        tested = True
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    try:
+        import torch
+        from src.model.cuda_backend import CUDAMambaModel
+        cuda_model = CUDAMambaModel(cfg)
+        h_cuda = cuda_model.forward_hidden(tokens).detach().cpu().numpy()
+        assert h_cuda.shape == (2, 12, cfg.d_model)
+        tested = True
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    if not tested:
+        pytest.skip("Neither mlx nor torch is available to test forward_hidden")

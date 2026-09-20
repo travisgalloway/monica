@@ -33,6 +33,8 @@
   "moe_impl": "auto",
   "fp8_experts": false,
   "long_ctx_factor": 1.0,
+  "mtp_depth": 0,
+  "mtp_loss_weight": 0.3,
   "critic_heads": null,
   "dt_min": 0.001,
   "dt_max": 0.1,
