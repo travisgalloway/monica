@@ -425,3 +425,37 @@ def test_evaluate_data_contracts_records_and_buckets():
         assert bucket in res["by_bucket"]
         assert res["by_bucket"][bucket]["n_instances"] == 2
         assert res["by_bucket"][bucket]["rank_top1_rate"] == 1.0
+
+
+def test_evaluate_refactoring_schema_and_metrics():
+    from src.eval.code_suite import REFACTORING_BUCKETS, evaluate_refactoring
+
+    test_cases = [
+        {
+            "id": "refactor-strat-clean",
+            "pattern": "strategy",
+            "code": "class S: pass\nclass A(S): pass",
+            "tests": "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)",
+            "expected_clean": True,
+        },
+        {
+            "id": "refactor-strat-faulty",
+            "pattern": "strategy",
+            "code": "class S: pass",
+            "tests": "import unittest\nclass T(unittest.TestCase):\n    def test_fail(self): self.assertTrue(False)",
+            "expected_clean": False,
+        },
+    ]
+
+    res = evaluate_refactoring(test_cases)
+    assert res["records"]
+    assert len(res["records"]) == 2
+    assert res["n_cases"] == 2
+    assert res["n_passed"] == 2
+    assert res["accuracy"] == 1.0
+
+    for rec in res["records"]:
+        assert tuple(sorted(rec)) == tuple(sorted(RECORD_FIELDS))
+        assert rec["suite"] == "refactoring"
+        assert rec["bucket"] in REFACTORING_BUCKETS
+        assert rec["rank_top1"] is True
