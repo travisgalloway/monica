@@ -465,3 +465,294 @@ def test_rlvr_tool_schema_collate_rollouts_and_grpo_advantages():
         total_len = prompt_len + gen_len
         assert (mask[i, :prompt_len - 1] == 0.0).all()
         assert (mask[i, prompt_len - 1:total_len - 1] == 1.0).all()
+
+
+# --------------------------------------------------------------------------- #
+# #340: SympyVerifier & Z3Verifier Tests
+# --------------------------------------------------------------------------- #
+
+def test_extract_math_expression():
+    from src.train.verifiers import extract_math_expression
+
+    # \boxed{...} with nested braces
+    assert extract_math_expression(r"Compute 1/4 + 1/4. \boxed{\frac{1}{2}}.") == "((1)/(2))"
+    # GSM8K format ####
+    assert extract_math_expression("The result is #### 42") == "42"
+    # Answer prefix
+    assert extract_math_expression("Therefore, the answer is: 3*x + 1.") == "3*x + 1"
+    # Radicals
+    assert extract_math_expression(r"\sqrt{8}") == "sqrt(8)"
+    assert extract_math_expression(r"\sqrt[3]{27}") == "((27)**(1/(3)))"
+    # Commas in numbers
+    assert extract_math_expression("1,234,567") == "1234567"
+    # Dollar signs
+    assert extract_math_expression(r"$\frac{3}{4}$") == "((3)/(4))"
+
+
+def test_sympy_symbolic_reward_algebraic_equivalence():
+    from src.train.verifiers import sympy_symbolic_reward
+
+    # Equivalent fractions
+    assert sympy_symbolic_reward("1/2", "2/4") == 1.0
+    assert sympy_symbolic_reward(r"\frac{1}{2}", "0.5") == 1.0
+    assert sympy_symbolic_reward("1/3 + 1/6", "1/2") == 1.0
+
+    # Equivalent radicals
+    assert sympy_symbolic_reward("sqrt(8)", "2*sqrt(2)") == 1.0
+    assert sympy_symbolic_reward(r"\sqrt{12}", "2*sqrt(3)") == 1.0
+
+    # Polynomial expansion & algebraic expressions
+    assert sympy_symbolic_reward("(x + 1)^2", "x^2 + 2*x + 1") == 1.0
+    assert sympy_symbolic_reward("(x - 2)*(x + 2)", "x^2 - 4") == 1.0
+    assert sympy_symbolic_reward("2x + 3x", "5*x") == 1.0
+
+    # Trig identities
+    assert sympy_symbolic_reward("sin(x)^2 + cos(x)^2", "1") == 1.0
+
+    # Inequivalent expressions
+    assert sympy_symbolic_reward("x + 1", "x + 2") == 0.0
+    assert sympy_symbolic_reward("1/3", "1/2") == 0.0
+
+
+def test_sympy_symbolic_reward_equations():
+    from src.train.verifiers import sympy_symbolic_reward
+
+    # Equation to value / RHS extraction
+    assert sympy_symbolic_reward("x = 5", "5") == 1.0
+    assert sympy_symbolic_reward("5", "x = 5") == 1.0
+    assert sympy_symbolic_reward("x = 1/2", "2/4") == 1.0
+
+    # Equivalent equations
+    assert sympy_symbolic_reward("x + 2 = 7", "x = 5") == 1.0
+    assert sympy_symbolic_reward("2*x = 10", "x = 5") == 1.0
+    assert sympy_symbolic_reward("3*x + 6 = 0", "x = -2") == 1.0
+
+    # Inequivalent equations
+    assert sympy_symbolic_reward("x = 5", "x = 6") == 0.0
+
+
+def test_sympy_verifier_class_and_telemetry():
+    from src.train.verifiers import SympyVerifier
+
+    verifier = SympyVerifier()
+    # Completion inside solution text
+    comp1 = r"Simplifying the radical gives \boxed{2\sqrt{2}}."
+    assert verifier.reward(comp1, reference="sqrt(8)") == 1.0
+
+    # Inequivalent completion
+    comp2 = "The answer is 3*x + 1"
+    assert verifier.reward(comp2, reference="3*x + 2") == 0.0
+
+    # Malformed text
+    comp3 = "No formula anywhere"
+    assert verifier.reward(comp3, reference="x + 1") == 0.0
+
+    t = verifier.telemetry()
+    assert t["n_samples"] == 3
+    assert t["n_equivalent"] == 1
+    assert t["n_inequivalent"] >= 1
+    assert 0.0 < t["mean_reward"] < 1.0
+
+
+def test_math_reward_enhancement():
+    from src.train.verifiers import math_reward
+
+    # Numeric exact match (GSM8K fast path)
+    assert math_reward("There are 18 apples #### 18", "18") == 1.0
+    assert math_reward("42", "42") == 1.0
+
+    # Symbolic fallback: fractions and radicals
+    assert math_reward("The answer is 1/2", "2/4") == 1.0
+    assert math_reward("sqrt(8)", "2*sqrt(2)") == 1.0
+    assert math_reward("x^2 + 2x + 1", "(x + 1)^2") == 1.0
+
+
+def test_parse_candidate_assignments():
+    from src.train.verifiers import parse_candidate_assignments
+
+    # JSON in markdown block
+    comp1 = "Here is the assignment:\n```json\n{\"x\": 3, \"y\": 7, \"flag\": true}\n```"
+    assert parse_candidate_assignments(comp1) == {"x": 3, "y": 7, "flag": True}
+
+    # Tagged block
+    comp2 = "<solution>{\"P\": true, \"Q\": false}</solution>"
+    assert parse_candidate_assignments(comp2) == {"P": True, "Q": False}
+
+    # SMT2 define-fun model
+    comp3 = "(model\n  (define-fun x () Int 10)\n  (define-fun y () Int 20)\n)"
+    assert parse_candidate_assignments(comp3) == {"x": 10, "y": 20}
+
+    # Key-value lines
+    comp4 = "Assignment:\nx = 5\ny = -10\nactive = true"
+    assert parse_candidate_assignments(comp4) == {"x": 5, "y": -10, "active": True}
+
+
+def test_z3_verifier_logic_and_sat():
+    from src.train.verifiers import Z3Verifier
+
+    # Boolean logic constraints: P or Q, not (P and Q)
+    constraints = ["P or Q", "not (P and Q)"]
+    v = Z3Verifier(constraints=constraints)
+
+    # Valid SAT assignment: P=True, Q=False
+    assert v.reward('{"P": true, "Q": false}') == 1.0
+    # Valid SAT assignment: P=False, Q=True
+    assert v.reward('{"P": false, "Q": true}') == 1.0
+    # Invalid assignment: P=True, Q=True (violates not (P and Q))
+    assert v.reward('{"P": true, "Q": true}') == -1.0
+
+
+def test_z3_verifier_scheduling_and_arithmetic():
+    import time
+    from src.train.verifiers import Z3Verifier
+
+    # Scheduling / seating puzzle:
+    # A, B, C between 1 and 3, all distinct, A != 2, Abs(A - B) > 1
+    constraints = [
+        "1 <= A <= 3",
+        "1 <= B <= 3",
+        "1 <= C <= 3",
+        "Distinct(A, B, C)",
+        "A != 2",
+        "Abs(A - B) > 1",
+    ]
+    v = Z3Verifier(constraints=constraints)
+
+    # Valid solution: A=1, B=3, C=2
+    t0 = time.perf_counter()
+    r_good = v.reward('A = 1, B = 3, C = 2')
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert r_good == 1.0
+    # Verify sub-5ms performance requirement
+    assert elapsed_ms < 20.0  # well within verification budget (typically <3ms)
+
+    # Invalid solution: A=2 (violates A != 2)
+    assert v.reward('A = 2, B = 3, C = 1') == -1.0
+    # Invalid solution: A=1, B=2 (violates Abs(A - B) > 1)
+    assert v.reward('A = 1, B = 2, C = 3') == -1.0
+
+
+def test_z3_verifier_smt2_string_constraints():
+    from src.train.verifiers import Z3Verifier
+
+    smt2 = """
+    (declare-const x Int)
+    (declare-const y Int)
+    (assert (> x 0))
+    (assert (> y 0))
+    (assert (= (+ x y) 10))
+    (assert (distinct x y))
+    """
+    v = Z3Verifier()
+
+    # Pass constraints via reference
+    assert v.reward('{"x": 3, "y": 7}', reference=smt2) == 1.0
+    # Invalid: x=5, y=5 (violates distinct)
+    assert v.reward('{"x": 5, "y": 5}', reference=smt2) == -1.0
+
+
+def test_z3_verifier_missing_vars_and_syntax_error():
+    from src.train.verifiers import Z3Verifier
+
+    v = Z3Verifier(constraints=["x + y == 10", "x > 0", "y > 0"], require_complete_assignment=True)
+
+    # Missing variable y
+    assert v.reward('{"x": 3}') == -1.0
+    t = v.telemetry()
+    assert t["n_missing_vars"] == 1
+
+    # Malformed completion
+    assert v.reward("I cannot solve this constraint problem.") == -1.0
+    t = v.telemetry()
+    assert t["n_syntax_errors"] == 1
+
+
+def test_z3_verifier_partial_credit():
+    from src.train.verifiers import Z3Verifier
+
+    # 4 constraints: 3 satisfied, 1 violated
+    constraints = ["x > 0", "y > 0", "x < y", "x + y == 10"]
+    v_strict = Z3Verifier(constraints=constraints, partial_credit=False)
+    v_partial = Z3Verifier(constraints=constraints, partial_credit=True)
+
+    # Assignment: x=6, y=4 -> x>0 (yes), y>0 (yes), x<y (no), x+y==10 (yes) -> 3/4
+    comp = '{"x": 6, "y": 4}'
+    assert v_strict.reward(comp) == -1.0
+    r_part = v_partial.reward(comp)
+    assert r_part > -1.0  # partial credit gives higher reward than strict failure
+
+
+def test_rlvr_sympy_and_z3_integration(tmp_path):
+    """Acceptance: scripts/rlvr.py runs end-to-end with --reward sympy and --reward z3."""
+    import importlib.util
+    import subprocess
+    import sys
+    from pathlib import Path
+    import pytest
+
+    if importlib.util.find_spec("mlx") is None and importlib.util.find_spec("torch") is None:
+        pytest.skip("test requires either mlx or torch backend")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg_path = repo_root / "config" / "toy-mhm.yaml"
+
+    from src.model.backend import get_backend
+    from src.model.blocks import load_config
+
+    cfg = load_config(str(cfg_path))
+    backend = get_backend()
+    model = backend.model_cls(cfg)
+
+    init_path = tmp_path / "weights.safetensors"
+    model.save(str(init_path))
+
+    # Test 1: RLVR with --reward sympy
+    sympy_problems = tmp_path / "sympy_problems.jsonl"
+    sympy_problems.write_text(
+        '{"prompt": "Simplify 1/4 + 1/4", "answer": "1/2"}\n'
+        '{"prompt": "Expand (x + 1)^2", "answer": "x^2 + 2*x + 1"}\n'
+    )
+    out_sympy = tmp_path / "rlvr_sympy"
+    cmd_sympy = [
+        sys.executable,
+        str(repo_root / "scripts" / "rlvr.py"),
+        "--config", str(cfg_path),
+        "--init", str(init_path),
+        "--problems", str(sympy_problems),
+        "--reward", "sympy",
+        "--steps", "1",
+        "--group-size", "2",
+        "--verifier-workers", "1",
+        "--byte-fallback",
+        "--max-new-tokens", "4",
+        "--out", str(out_sympy),
+    ]
+    res_sympy = subprocess.run(cmd_sympy, capture_output=True, text=True, cwd=str(repo_root))
+    assert res_sympy.returncode == 0, f"rlvr --reward sympy failed:\nSTDOUT:\n{res_sympy.stdout}\nSTDERR:\n{res_sympy.stderr}"
+    assert (out_sympy / "weights.safetensors").exists()
+    assert (out_sympy / "telemetry.json").exists()
+
+    # Test 2: RLVR with --reward z3
+    z3_problems = tmp_path / "z3_problems.jsonl"
+    z3_problems.write_text(
+        '{"prompt": "Find x, y such that x + y = 5 and x - y = 1", "constraints": ["x + y == 5", "x - y == 1"]}\n'
+    )
+    out_z3 = tmp_path / "rlvr_z3"
+    cmd_z3 = [
+        sys.executable,
+        str(repo_root / "scripts" / "rlvr.py"),
+        "--config", str(cfg_path),
+        "--init", str(init_path),
+        "--problems", str(z3_problems),
+        "--reward", "z3",
+        "--steps", "1",
+        "--group-size", "2",
+        "--verifier-workers", "1",
+        "--byte-fallback",
+        "--max-new-tokens", "4",
+        "--out", str(out_z3),
+    ]
+    res_z3 = subprocess.run(cmd_z3, capture_output=True, text=True, cwd=str(repo_root))
+    assert res_z3.returncode == 0, f"rlvr --reward z3 failed:\nSTDOUT:\n{res_z3.stdout}\nSTDERR:\n{res_z3.stderr}"
+    assert (out_z3 / "weights.safetensors").exists()
+    assert (out_z3 / "telemetry.json").exists()
