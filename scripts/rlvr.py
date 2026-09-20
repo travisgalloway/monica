@@ -35,9 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.train.grpo import group_advantages, reward_stats
-from src.train.verifiers import (LspVerifier, MemoizedVerifier, SympyVerifier,
-                                 ToolSchemaVerifier, When2CallAbstentionVerifier,
-                                 Z3Verifier, exact_match_reward, math_reward,
+from src.train.verifiers import (CppVerifier, KotlinVerifier, LspVerifier,
+                                 MemoizedVerifier, RustVerifier, SwiftVerifier,
+                                 SympyVerifier, ToolSchemaVerifier,
+                                 When2CallAbstentionVerifier, Z3Verifier,
+                                 exact_match_reward, math_reward,
                                  score_rollouts)
 
 
@@ -65,7 +67,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -116,6 +118,22 @@ def main() -> None:
                 "in eval_sets/ts_error_injection and `npm i -D typescript-language-server`; "
                 "for 'opengrep', install opengrep and put it on PATH "
                 "(see eval_sets/opengrep_rules/README.md).")
+    elif args.reward == "rust-static":
+        from src.train.verifiers.systems_mobile import resolve_rust_toolchain
+        if not resolve_rust_toolchain():
+            raise SystemExit("no toolchain for --reward rust-static (rustc / cargo required on PATH)")
+    elif args.reward in ("cpp-static", "c-static"):
+        from src.train.verifiers.systems_mobile import resolve_cpp_toolchain
+        if not resolve_cpp_toolchain():
+            raise SystemExit("no toolchain for --reward cpp-static (clang++ / g++ required on PATH)")
+    elif args.reward == "swift-static":
+        from src.train.verifiers.systems_mobile import resolve_swift_toolchain
+        if not resolve_swift_toolchain():
+            raise SystemExit("no toolchain for --reward swift-static (swiftc required on PATH)")
+    elif args.reward == "kotlin-static":
+        from src.train.verifiers.systems_mobile import resolve_kotlin_toolchain
+        if not resolve_kotlin_toolchain():
+            raise SystemExit("no toolchain for --reward kotlin-static (kotlinc required on PATH)")
 
     from src.model.backend import get_backend
     from src.model.blocks import load_config
@@ -188,6 +206,22 @@ def main() -> None:
             reward_fn = None
         elif args.reward == "z3":
             raw_verifier = Z3Verifier()
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "rust-static":
+            raw_verifier = RustVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("cpp-static", "c-static"):
+            raw_verifier = CppVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "swift-static":
+            raw_verifier = SwiftVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "kotlin-static":
+            raw_verifier = KotlinVerifier(fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
         else:
