@@ -1847,3 +1847,21 @@ from src.train.verifiers.cloud_infra import (
     resolve_shell_toolchain,
     resolve_terraform_toolchain,
 )
+
+# --------------------------------------------------------------------------- #
+# #346 -- RLVR: Clean Architecture Boundary Linters & Dependency DAG Verifiers
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.architecture import (
+    ArchAnalysisResult,
+    ArchRuleOracle,
+    ArchRuleVerifier,
+    ImportRecord,
+    Layer,
+    ModuleCoupling,
+    classify_file_layer,
+    detect_cycles_tarjan,
+    find_architecture_escape_hatches as find_arch_rule_escape_hatches,
+    parse_multi_file_source,
+    parse_python_imports,
+    parse_typescript_imports,
+)
