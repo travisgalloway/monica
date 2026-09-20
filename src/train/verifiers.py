@@ -1882,3 +1882,24 @@ from src.train.verifiers.refactoring import (
     find_refactoring_escape_hatches,
     parse_multi_file_source as parse_refactoring_source,
 )
+
+# --------------------------------------------------------------------------- #
+# #348 -- RLVR: Non-destructive DB migration replay & API breaking-change verifiers
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.schema_evolution import (
+    ContractDiffOracle,
+    ContractDiffVerifier,
+    MigrationReplayOracle,
+    MigrationReplayResult,
+    MigrationReplayVerifier,
+    ProtoSchema,
+    SchemaSnapshot,
+    check_zero_downtime_safety,
+    diff_openapi_specs,
+    diff_proto_schemas,
+    find_contract_diff_escape_hatches,
+    find_migration_escape_hatches,
+    parse_migration_scripts,
+    parse_proto_schema,
+    resolve_contract_diff_toolchains,
+)

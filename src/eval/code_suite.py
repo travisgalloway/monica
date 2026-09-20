@@ -1639,3 +1639,153 @@ def evaluate_refactoring(
         "by_bucket": summary["by_bucket"],
         "overall": summary["overall"],
     }
+
+# --------------------------------------------------------------------------------------- #
+# Database Migration Replay & API Contract Evolution Evaluation (#348)
+# --------------------------------------------------------------------------------------- #
+
+SCHEMA_EVOLUTION_BUCKETS: Tuple[str, ...] = (
+    "table_split",
+    "column_migration",
+    "indexing",
+    "zero_downtime_safety",
+    "contract_diff_openapi",
+    "contract_diff_protobuf",
+)
+
+
+def evaluate_schema_evolution(
+    test_cases: Sequence[dict],
+    *,
+    migration_verifier: Optional[Any] = None,
+    contract_verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against Database Migration Replay & API Contract Diff verifiers (#348).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `bucket`: task bucket ('table_split', 'column_migration', 'indexing',
+                 'zero_downtime_safety', 'contract_diff_openapi', 'contract_diff_protobuf')
+      - `code`: candidate completion (SQL migration string or updated API/Proto spec)
+      - `reference`: ground truth reference (spec or reference dict)
+      - `initial_schema`: optional initial DDL for migrations
+      - `seed_data`: optional pre-seeded database records
+      - `expected_records`: optional expected record assertions
+      - `allow_destructive`: optional flag for migrations
+      - `spec_type`: optional ('openapi' or 'protobuf') for contract diffs
+      - `expected_clean`: bool indicating if the test case is clean (reward == 1.0) vs faulty
+      - `prompt`: optional prompt string
+    """
+    if migration_verifier is None:
+        from ..train.verifiers.schema_evolution import MigrationReplayVerifier
+        migration_verifier = MigrationReplayVerifier()
+    if contract_verifier is None:
+        from ..train.verifiers.schema_evolution import ContractDiffVerifier
+        contract_verifier = ContractDiffVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        bucket = str(inst.get("bucket", "table_split"))
+        code = inst.get("code", "")
+        code_str = json.dumps(code) if isinstance(code, (dict, list)) else str(code)
+        reference = inst.get("reference")
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+
+        if bucket.startswith("contract_diff"):
+            spec_type = inst.get("spec_type")
+            if not spec_type:
+                spec_type = "protobuf" if "protobuf" in bucket else "openapi"
+            eval_res = contract_verifier.evaluate(
+                code_str,
+                reference=reference,
+                prompt=prompt,
+                spec_type=spec_type,
+            )
+            reward = float(eval_res["reward"])
+            is_clean = (reward == 1.0) and bool(eval_res.get("is_clean", False))
+            success = (is_clean == expected_clean)
+
+            records.append(
+                make_record(
+                    suite="schema_evolution",
+                    id=inst_id,
+                    bucket=bucket,
+                    distance=len(code_str),
+                    n_scored_tokens=len(code_str.split()) if code_str else 0,
+                    ce_nats=0.0 if is_clean else 1.0,
+                    token_accuracy=1.0 if success else 0.0,
+                    exact_match=1.0 if (reward == 1.0) else 0.0,
+                    rank_top1=success,
+                    mrr=1.0 if success else 0.0,
+                    meta={
+                        "bucket": bucket,
+                        "reward": reward,
+                        "expected_clean": expected_clean,
+                        "is_clean": is_clean,
+                        "success": success,
+                        "breaking_changes": len(eval_res.get("breaking_changes", [])),
+                        "additive_extensions": len(eval_res.get("additive_extensions", [])),
+                    },
+                )
+            )
+        else:
+            initial_schema = inst.get("initial_schema")
+            seed_data = inst.get("seed_data")
+            expected_records = inst.get("expected_records")
+            allow_destructive = inst.get("allow_destructive", False)
+
+            eval_res = migration_verifier.evaluate(
+                code,
+                reference=reference,
+                initial_schema=initial_schema,
+                seed_data=seed_data,
+                expected_records=expected_records,
+                prompt=prompt,
+                allow_destructive=allow_destructive,
+            )
+            reward = float(eval_res["reward"])
+            is_clean = (reward == 1.0) and bool(eval_res.get("is_clean", False))
+            success = (is_clean == expected_clean)
+
+            records.append(
+                make_record(
+                    suite="schema_evolution",
+                    id=inst_id,
+                    bucket=bucket,
+                    distance=len(code_str),
+                    n_scored_tokens=len(code_str.split()) if code_str else 0,
+                    ce_nats=0.0 if is_clean else 1.0,
+                    token_accuracy=1.0 if success else 0.0,
+                    exact_match=1.0 if (reward == 1.0) else 0.0,
+                    rank_top1=success,
+                    mrr=1.0 if success else 0.0,
+                    meta={
+                        "bucket": bucket,
+                        "reward": reward,
+                        "expected_clean": expected_clean,
+                        "is_clean": is_clean,
+                        "success": success,
+                        "forward_passed": eval_res.get("forward_passed", False),
+                        "data_integrity_passed": eval_res.get("data_integrity_passed", False),
+                        "rollback_passed": eval_res.get("rollback_passed", False),
+                        "schema_parity_passed": eval_res.get("schema_parity_passed", False),
+                    },
+                )
+            )
+
+    buckets_present = [b for b in SCHEMA_EVOLUTION_BUCKETS if any(r["bucket"] == b for r in records)] or list(SCHEMA_EVOLUTION_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }

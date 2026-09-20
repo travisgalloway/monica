@@ -133,6 +133,16 @@ Deterministic static analysis verifiers and probes evaluate repository-scale cro
 - **Compiler-Grounded Blast Radius Verifier**: Evaluates model predictions of impacted files and call-sites when function signatures or interface declarations mutate. Computes ground truth via headless compiler diagnostics (`tsc --noEmit` or `pyright`) and deterministic in-process AST static analysis. Rewards precision, recall, and F1 of predicted call-sites against exact compiler error locations (`TS2554: Expected N arguments`, file, line) in under 150ms.
 - **Anti-Goodhart & Degeneracy Guards**: `BlastRadiusVerifier` in `src/train/verifiers/repository_context.py` rejects empty, whitespace, and comment-only completions. Anti-Goodhart filters penalize escape hatches (`@ts-ignore`, `eval`) with a reward of -1.0. Benchmark evaluation is recorded through `evaluate_blast_radius` in `src/eval/code_suite.py`.
 
+### Database migration replay and API breaking-change verifiers (#348)
+
+Deterministic static analysis and in-memory relational replay verifiers grade database schema evolutions and API backward compatibility without external databases or container infrastructure:
+- **In-Memory Database Migration Replay**: Evaluates forward and rollback DDL migration scripts against pre-seeded records in ephemeral in-memory SQLite relational engines in under 50ms. Asserts 100% data integrity without silent data loss across table splits, column migrations, and index definitions.
+- **Rollback Schema Parity Gate**: Executes rollback (`down`) migrations and compares post-rollback schema snapshots against pre-migration DDL, asserting exact parity across tables, columns, constraints, and indices.
+- **Zero-Downtime Schema Safety Rules**: Rejects destructive operations violating Expand/Contract patterns (unmitigated `DROP TABLE`, `DROP COLUMN`, direct `RENAME COLUMN`, or `ADD COLUMN ... NOT NULL` without `DEFAULT` values).
+- **API Contract Breaking-Change Detection**: Detects breaking changes across OpenAPI specs (v3.0/v3.1) and Protobuf schemas (`proto2`/`proto3`). Forbids endpoint, method, and field removals, tag and type mutations, and tightening parameter requirements or nullability, while scoring non-breaking additive extensions.
+- **Telemetry and Unified Evaluators**: Provides `MigrationReplayVerifier` and `ContractDiffVerifier` in `src/train/verifiers/schema_evolution.py`, wires `--reward migration` and `--reward contract-diff` into `scripts/rlvr.py`, and records benchmark evaluations via `evaluate_schema_evolution` in `src/eval/code_suite.py`.
+
+
 ## Tool use (#102, optional)
 
 **What.** Emit a structured function call the runtime executes and feeds back, optionally in a
