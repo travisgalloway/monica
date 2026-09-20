@@ -179,3 +179,41 @@ def test_write_json_schema_matches_monica_bench_source_field(tmp_path):
     assert record["config"] == CFG
     assert len(record["rows"]) == 1
     assert record["rows"][0]["prefill_speedup"] > 0
+
+
+def test_arm_config_clears_moe_fields_for_attn_arm():
+    """Configs with moe_every (such as toy-moe.yaml or code-small-dense.yaml) must
+    cleanly convert to the full-attention transformer arm without failing validation
+    due to zero selected MoE layers."""
+    for path in ("config/toy-moe.yaml", "config/code-small-dense.yaml"):
+        cfg = load_config(path)
+        attn_cfg = arm_config(cfg, "attn")
+        assert attn_cfg.attn_every == 1
+        assert attn_cfg.moe_every is None
+        assert attn_cfg.n_attention_layers == attn_cfg.n_layers
+        assert attn_cfg.n_moe_layers == 0
+
+
+def test_hybrid_analytic_state_bytes_accounts_for_ssm_and_kv():
+    """In a hybrid model (e.g. toy-hybrid.yaml), the recurrent state includes both
+    the fixed-size SSM state of the Mamba layers and the length-dependent KV cache
+    of the attention layers."""
+    cfg = load_config("config/toy-hybrid.yaml")
+    ssm_cfg = arm_config(cfg, "ssm")
+    attn_cfg = arm_config(cfg, "attn")
+
+    # ssm arm has 2 mamba layers + 2 attention layers
+    assert ssm_cfg.n_attention_layers == 2
+    assert ssm_cfg.n_layers == 4
+
+    state_512 = analytic_state_bytes(ssm_cfg, 512)
+    state_1024 = analytic_state_bytes(ssm_cfg, 1024)
+    # The growth from 512 to 1024 is purely due to the 2 attention layers
+    delta = state_1024 - state_512
+    expected_kv_delta = 2 * (2 * ssm_cfg.n_attn_heads_resolved * ssm_cfg.attn_head_dim) * 512 * 4
+    assert delta == expected_kv_delta
+
+    # The full transformer arm (4 attention layers) grows twice as fast
+    attn_state_512 = analytic_state_bytes(attn_cfg, 512)
+    attn_state_1024 = analytic_state_bytes(attn_cfg, 1024)
+    assert (attn_state_1024 - attn_state_512) == 2 * delta

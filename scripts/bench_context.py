@@ -132,7 +132,16 @@ def arm_config(cfg, arm: str):
         raise ValueError(f"unknown arm {arm!r}, expected one of {ARMS}")
     if arm == "ssm":
         return cfg
-    c = dataclasses.replace(cfg, attn_every=1)
+    c = dataclasses.replace(
+        cfg,
+        attn_every=1,
+        moe_every=None,
+        n_experts=None,
+        top_k=None,
+        moe_d_ff=None,
+        moe_balance_rate=None,
+        fp8_experts=False,
+    )
     c.validate()
     return c
 
@@ -142,17 +151,27 @@ def analytic_state_bytes(cfg, length: int) -> int:
 
     Pure-Mamba configs (`attn_every` unset — the ssm arm): `per_session_state_bytes`
     (src/serve/sessions.py) is exact and independent of `length` — the "constant memory
-    per token" claim #104 exists to demonstrate. That function only models Mamba
-    layers, so it is not meaningful for the attn arm; there we compute the KV cache
-    size directly (`AttentionBlock.step` caches (k, v), each (B, H, T, Dh) fp32,
-    growing by one token per step), which DOES grow linearly with `length`.
+    per token" claim #104 exists to demonstrate. For hybrid configs (where some layers
+    are attention and some are SSM) or pure-attention configs, we sum the constant SSM
+    recurrent state across Mamba layers and the linear KV cache across attention layers.
     """
-    from src.serve.sessions import per_session_state_bytes
+    from src.serve.sessions import _BYTES_PER
 
-    if cfg.n_attention_layers == 0:
-        return per_session_state_bytes(cfg, conservative_fp32=False)
-    n_attn_layers = cfg.n_attention_layers
-    return n_attn_layers * 2 * cfg.n_attn_heads_resolved * cfg.attn_head_dim * length * 4
+    bytes_per = _BYTES_PER.get(cfg.precision, 4)
+    n_ssm_layers = sum(1 for i in range(cfg.n_layers) if not cfg.is_attention_layer(i) and not cfg.is_moe_layer(i))
+    ssm_floats_per_layer = (cfg.d_conv - 1) * cfg.d_inner + cfg.n_heads * cfg.head_dim * cfg.d_state
+    ssm_bytes = n_ssm_layers * ssm_floats_per_layer * bytes_per
+
+    if cfg.n_attention_layers > 0:
+        if cfg.use_mla:
+            kv_floats_per_tok = cfg.mla_latent_dim_resolved + cfg.mla_rope_dim_resolved
+        else:
+            kv_floats_per_tok = 2 * cfg.n_attn_heads_resolved * cfg.attn_head_dim
+        kv_bytes = cfg.n_attention_layers * kv_floats_per_tok * length * 4
+    else:
+        kv_bytes = 0
+
+    return ssm_bytes + kv_bytes
 
 
 def _prefill_sequential(model, mx, tokens, length: int, state):
@@ -321,17 +340,28 @@ def _print_table(rows: list[dict]) -> None:
     ssm_rows = [r for r in rows if r["arm"] == "ssm"]
     attn_rows = [r for r in rows if r["arm"] == "attn"]
     if ssm_rows and attn_rows:
-        ssm_state = ssm_rows[0]["state_bytes"]
-        print(f"\n[summary] ssm state is flat at {ssm_state / 2**20:.3f} MB across all "
-              f"swept lengths (architecture-constant); attn state grows from "
-              f"{attn_rows[0]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[0]['length']}) "
-              f"to {attn_rows[-1]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[-1]['length']}).")
+        if ssm_rows[0]["state_bytes"] == ssm_rows[-1]["state_bytes"]:
+            ssm_state = ssm_rows[0]["state_bytes"]
+            print(f"\n[summary] ssm state is flat at {ssm_state / 2**20:.3f} MB across all "
+                  f"swept lengths (architecture-constant); attn state grows from "
+                  f"{attn_rows[0]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[0]['length']}) "
+                  f"to {attn_rows[-1]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[-1]['length']}).")
+        else:
+            print(f"\n[summary] ssm (hybrid) state grows from "
+                  f"{ssm_rows[0]['state_bytes'] / 2**20:.3f} MB (L={ssm_rows[0]['length']}) "
+                  f"to {ssm_rows[-1]['state_bytes'] / 2**20:.3f} MB (L={ssm_rows[-1]['length']}); "
+                  f"attn (full transformer) state grows from "
+                  f"{attn_rows[0]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[0]['length']}) "
+                  f"to {attn_rows[-1]['state_bytes'] / 2**20:.3f} MB (L={attn_rows[-1]['length']}).")
+
         # A 10% margin keeps this from firing on ordinary measurement jitter (batch-1
         # decode timing is noisy run to run) — it should flag a real, sustained
         # degradation, not the first length where attn happens to measure slightly slower.
         margin = 1.10
-        ssm_peak, ssm_decode = ssm_rows[0]["peak_gb"], ssm_rows[0]["decode_tok_s"]
+        ssm_by_len = {r["length"]: r for r in ssm_rows}
         for r in attn_rows:
+            ssm_r = ssm_by_len.get(r["length"], ssm_rows[0])
+            ssm_peak, ssm_decode = ssm_r["peak_gb"], ssm_r["decode_tok_s"]
             if r["peak_gb"] > margin * ssm_peak or r["decode_tok_s"] < ssm_decode / margin:
                 print(f"[summary] crossover: at length={r['length']}, attn peak memory "
                       f"({r['peak_gb']:.3f} GB) or decode tok/s ({r['decode_tok_s']:,.1f}) "

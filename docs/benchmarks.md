@@ -74,7 +74,45 @@ are real **developer Apple Silicon** numbers.
 | `config/poc-small.yaml` | ~97M | peak memory (prefill+decode, length 512) | 0.812 GB | **developer Apple Silicon** (M1 Pro), same run |
 | `config/poc-small.yaml` | ~97M | decode, exact M7 protocol (32 warmup, 256 measured, batch 1) | 127.5 tok/s | **developer Apple Silicon** (M1 Pro), `scripts/bench_train_step.py --mode decode` — directly comparable to the cited 94.7 tok/s poc-scale (`config/poc.yaml`, ~127M today, possibly ~205M as measured — see next row) M7 record; poc-small is ~97M, smaller, hence faster |
 | `config/poc.yaml` | ~127M | decode, exact M7 protocol | 94.7 tok/s | **developer Apple Silicon** (M1 Pro) — the pre-#170 M7 record cited in `docs/design/14-inference-engine.md`; not re-measured in this run, and predates the poc/poc-qwen split, so the measured config may have carried the larger Qwen vocab (~205M) |
-| `config/poc-small.yaml` | ~97M | context-length sweep, `attn` arm / crossover point | — | **not yet measured** — command: `.venv/bin/python scripts/bench_context.py --config config/poc-small.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 64 --json out.json` |
+| `config/poc-small.yaml` | ~97M | context-length sweep, `attn` arm / crossover point | crossover at L=1024 (sequential decode 150.5 vs 110.0 tok/s; parallel prefill 7,982.8 vs 2,041.1 tok/s at L=2048, 3.9x speedup) | **developer Apple Silicon** (M1 Pro), `scripts/bench_context.py --config config/poc-small.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 64` |
+
+### Context-length scaling: Mamba-2 vs same-size transformer baseline (#104)
+
+Context-length scaling and sustained decode throughput on developer Apple Silicon (Apple M1 Pro, 32 GB unified memory), comparing Mamba-2 architectures against equivalent-sized transformer baselines (`attn_every=1`).
+
+#### Pure Mamba-2 vs transformer (`config/poc-small.yaml`, ~97M)
+
+Measured via `scripts/bench_context.py --config config/poc-small.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 64 --prefill-mode both`:
+
+| Arm | Context Length | Sequential Prefill (tok/s) | Parallel Prefill (tok/s) | Decode (tok/s) | Peak Memory (GB) | Recurrent State (MB) |
+|---|---|---|---|---|---|---|
+| `ssm` | 512 | 147.6 | 3,879.7 | 142.5 | 0.760 | 0.891 |
+| `ssm` | 1024 | 149.1 | 10,343.1 | 153.0 | 1.016 | 0.891 |
+| `ssm` | 2048 | 149.2 | 7,982.8 | 153.8 | 1.551 | 0.891 |
+| `attn` | 512 | 160.5 | 12,969.5 | 148.9 | 0.991 | 48.000 |
+| `attn` | 1024 | 147.6 | 9,111.7 | 126.3 | 2.123 | 96.000 |
+| `attn` | 2048 | 86.6 | 2,041.1 | 45.3 | 1.984 | 192.000 |
+
+Observations and crossover point:
+- **Recurrent state scaling**: The SSM state remains constant at 0.891 MB across all context lengths. The transformer key-value cache expands linearly from 48.0 MB at length 512 to 192.0 MB at length 2048 (215 times larger than the SSM state).
+- **Throughput crossover**: At context length 512, the transformer achieves competitive decode throughput (148.9 tok/s vs 142.5 tok/s). By context length 1024, transformer decode throughput degrades 15% (126.3 tok/s vs 153.0 tok/s). By context length 2048, transformer decode throughput drops to 45.3 tok/s (a 70% decrease, making Mamba-2 3.4 times faster), while parallel prefill throughput drops to 2,041.1 tok/s (making Mamba-2 3.9 times faster).
+
+#### Mamba-2 hybrid MoE/dense vs transformer (`config/code-small-dense.yaml`, ~232M)
+
+Measured via `scripts/bench_context.py --config config/code-small-dense.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 32 --prefill-mode parallel`:
+
+| Arm | Context Length | Parallel Prefill (tok/s) | Decode (tok/s) | Peak Memory (GB) | Recurrent State (MB) |
+|---|---|---|---|---|---|
+| `ssm` (hybrid) | 512 | 3,348.9 | 74.0 | 1.496 | 24.674 |
+| `ssm` (hybrid) | 1024 | 3,442.7 | 71.1 | 2.198 | 45.674 |
+| `ssm` (hybrid) | 2048 | 2,962.9 | 65.5 | 3.330 | 87.674 |
+| `attn` (transformer) | 512 | 4,002.8 | 57.4 | 1.524 | 168.000 |
+| `attn` (transformer) | 1024 | 2,784.2 | 43.0 | 3.104 | 336.000 |
+| `attn` (transformer) | 2048 | 1,677.1 | 35.8 | 3.395 | 672.000 |
+
+Observations and crossover point:
+- **Recurrent state scaling**: The hybrid architecture restricts attention to 12.5% of layers (`attn_every: 8`). At length 2048, hybrid state occupies 87.67 MB, compared to 672.00 MB for the full transformer baseline (a 7.67-fold reduction).
+- **Throughput crossover**: Sustained decode throughput on the hybrid model stays above 65 tok/s across 2048 tokens. The transformer baseline falls from 57.4 tok/s at length 512 to 35.8 tok/s at length 2048 (making the hybrid model 1.83 times faster). In parallel prefill, the hybrid model maintains 2,962.9 tok/s at length 2048 versus 1,677.1 tok/s for the transformer (a 1.77-fold throughput lead).
 
 ## Scale MoE pretraining runs (M12: #222 small MoE, #223 Large A)
 
@@ -96,9 +134,8 @@ Training throughput targets and cloud execution modeling for the scale MoE miles
   Python/MLX row above. These are the only rows in this document that can honestly be called a
   "local-hardware win" per CLAUDE.md's POC success criterion.
 - **Not yet measured**: every poc-scale Swift-engine row (prefill/decode/memory, fp and
-  quantized) — blocked on a developer machine with Xcode installed running `swift run
-  monica-bench --config Benchmarks/configs/poc.config.json ...`; and the Python attn-arm
-  context-length sweep at poc-small scale.
+  quantized), blocked on a developer machine with Xcode installed running `swift run
+  monica-bench --config Benchmarks/configs/poc.config.json ...`.
 - **RunPod cloud profiles**: Scale MoE pretraining rows (#222, #223) represent analytical throughput models calibrated against datacenter GPU specifications. They are not local measurements.
 
 `monica-bench --baseline Benchmarks/baselines.json [--tolerance 0.15] [--strict]` is how a future
