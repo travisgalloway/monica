@@ -62,3 +62,32 @@ def test_zero_advantage_gives_no_update():
     assert out["loss"] == 0.0
     after = _flat(model)
     assert all(np.allclose(a, b) for a, b in zip(before, after))        # no gradient -> no change
+
+
+def test_grpo_loss_with_kl_penalty_updates_policy():
+    cfg = load_config(TOY_CFG)
+    mx.random.seed(42)
+    model = MLXMambaModel(cfg)
+    batch = _batch(cfg, seed=42)
+
+    # Compute reference log-probs
+    logp = np.array(_masked_seq_logprob(model, batch[0], batch[1], batch[2]))
+    ref_logp = logp + 0.1  # slightly different reference distribution
+    beta = 0.05
+
+    # 5-element batch: (inputs, targets, mask, adv, ref_logp)
+    batch_5 = (batch[0], batch[1], batch[2], batch[3], ref_logp)
+
+    from src.train.grpo import compute_kl_penalty
+    kl = compute_kl_penalty(logp, ref_logp, estimator="schulman")
+    ref_loss = float(-np.mean(batch[3] * logp) + beta * np.mean(kl))
+
+    before = _flat(model)
+    opt = optim.AdamW(learning_rate=1e-3)
+    step = make_grpo_train_step(model, opt, beta=beta)
+    out = step(model, [batch_5], 1e-3)
+
+    assert np.isfinite(out["loss"])
+    assert np.isclose(out["loss"], ref_loss, rtol=1e-3, atol=1e-3)
+    after = _flat(model)
+    assert any(not np.allclose(a, b) for a, b in zip(before, after))

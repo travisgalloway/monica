@@ -320,23 +320,39 @@ def make_dpo_train_step(policy_model, ref_model, optimizer, *, beta: float = 0.1
 
 
 def make_grpo_train_step(model, optimizer, *, grad_clip: float = 1.0,
-                         scaler=None, balancer=None, load_reduce=None) -> Callable:
+                         scaler=None, balancer=None, load_reduce=None,
+                         beta: float = 0.0, kl_estimator: str = "schulman") -> Callable:
     """Build a GRPO `train_step(model, micro_batches, lr) -> dict`.
 
-    `micro_batches` is a list of `(inputs, targets, mask, advantages)`: sampled rollouts
-    (mask = 1 on the completion tokens) and their group-standardized advantages (one per
-    sequence, precomputed via `train.grpo.group_advantages`). The loss is
-    `-mean(advantage * logpθ(completion))` — REINFORCE with the GRPO group baseline.
+    `micro_batches` is a list of `(inputs, targets, mask, advantages)` (or optionally
+    5-tuples with `ref_logp`): sampled rollouts (mask = 1 on the completion tokens)
+    and their group-standardized advantages (one per sequence, precomputed via
+    `train.grpo.group_advantages`). If `beta > 0.0` and `ref_logp` is provided,
+    penalizes policy divergence from the reference model via KL divergence (#103).
+    The loss is `-mean(advantage * logp) + beta * mean(kl)`.
     `balancer` (#213/#214) and `load_reduce` (#271) as in `make_train_step`.
     """
     params = list(model.parameters())
 
     def _loss(mb) -> torch.Tensor:
-        inputs, targets, mask, advantages = mb
+        inputs = mb[0]
+        targets = mb[1]
+        mask = mb[2]
+        advantages = mb[3]
         logp = _masked_seq_logprob(model, inputs, targets, mask)     # (B,)
         adv = torch.as_tensor(np.asarray(advantages), dtype=torch.float32,
                               device=logp.device).reshape(-1)        # (B,)
-        return -(adv * logp).mean()
+        loss = -(adv * logp).mean()
+        if beta > 0.0 and len(mb) > 4 and mb[4] is not None:
+            ref_lp = torch.as_tensor(np.asarray(mb[4]), dtype=torch.float32,
+                                     device=logp.device).reshape(-1)
+            diff = ref_lp - logp
+            if kl_estimator == "schulman":
+                kl = torch.exp(torch.clamp(diff, -50.0, 50.0)) - diff - 1.0
+            else:
+                kl = -diff
+            loss = loss + beta * kl.mean()
+        return loss
 
     def train_step(model, micro_batches, lr: float) -> dict:
         return _accumulate_and_step(model, optimizer, params, _loss, micro_batches, lr,

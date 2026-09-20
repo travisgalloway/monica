@@ -1,0 +1,23 @@
+{
+  "seed": 0,
+  "val_fraction": 0.2,
+  "sources": [
+    "eval_sets/math/gsm8k.jsonl",
+    "eval_sets/math/math.jsonl"
+  ],
+  "n_train": 16,
+  "n_val": 4,
+  "per_class_counts": {
+    "gsm8k": {
+      "train": 8,
+      "val": 2
+    },
+    "math": {
+      "train": 8,
+      "val": 2
+    }
+  },
+  "train_ids_sha256": "19f7422b06fec440d032022c33f00da4593a9d628739bb5f89c92fb8367d57dd",
+  "val_ids_sha256": "83386def4dc1f380121455542540af251f2ff9bc48b6e7a60d1ed2c1a4c78984",
+  "manifest_sha256": "7676619510ad7812d1ddb67ffdc28de2ae6b0f714e812718b5749f470187a732"
+}

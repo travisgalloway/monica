@@ -756,3 +756,29 @@ def test_rlvr_sympy_and_z3_integration(tmp_path):
     assert res_z3.returncode == 0, f"rlvr --reward z3 failed:\nSTDOUT:\n{res_z3.stdout}\nSTDERR:\n{res_z3.stderr}"
     assert (out_z3 / "weights.safetensors").exists()
     assert (out_z3 / "telemetry.json").exists()
+
+
+def test_math_verifier_gsm8k_and_math():
+    from src.train.verifiers import MathVerifier
+
+    mv = MathVerifier(use_sympy=True)
+
+    # 1. GSM8K format (#### marker)
+    assert mv.reward("Step 1: 2 + 2 = 4.\n#### 4", "#### 4") == 1.0
+    assert mv.reward("The answer is 42.", "#### 42") == 1.0
+    assert mv.reward("Answer: 1,234", "#### 1234") == 1.0
+    assert mv.reward("Step 1: 2 + 2 = 5.\n#### 5", "#### 4") == 0.0
+
+    # 2. MATH boxed format
+    assert mv.reward("Therefore, x = \\boxed{7}.", "\\boxed{7}") == 1.0
+    assert mv.reward("We find \\boxed{x^2 - 1}", "\\boxed{(x - 1)*(x + 1)}") == 1.0
+    assert mv.reward("The area is \\boxed{\\frac{1}{2}}.", "\\boxed{0.5}") == 1.0
+    assert mv.reward("x = \\boxed{10}", "\\boxed{7}") == 0.0
+
+    # 3. Telemetry
+    t = mv.telemetry()
+    assert t["n_samples"] == 8
+    assert t["n_solved"] == 6
+    assert t["n_exact"] >= 3
+    assert t["n_sympy"] >= 1
+    assert t["frac_solved"] == 6 / 8

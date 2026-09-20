@@ -1,0 +1,10 @@
+{"id": "math-synth-001", "prompt": "Solve for $x$: $3x + 7 = 22$.", "answer": "Subtracting 7 gives $3x = 15$, so $x = \\boxed{5}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-002", "prompt": "What is the area of a right triangle with base 6 and height 8?", "answer": "The area is $\\frac{1}{2} \\times 6 \\times 8 = \\boxed{24}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-003", "prompt": "Expand and simplify the algebraic expression: $(x + 3)(x - 3)$.", "answer": "Using the difference of squares, $(x+3)(x-3) = \\boxed{x^2 - 9}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-004", "prompt": "Find the positive root of the quadratic equation $x^2 - 4x - 12 = 0$.", "answer": "Factoring gives $(x - 6)(x + 2) = 0$. The positive root is $x = \\boxed{6}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-005", "prompt": "What is the value of $\\sqrt{144} + \\sqrt{25}$?", "answer": "We have $12 + 5 = \\boxed{17}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-006", "prompt": "Evaluate the fraction $\\frac{3}{4} + \\frac{2}{3}$.", "answer": "Common denominator is 12: $\\frac{9}{12} + \\frac{8}{12} = \\boxed{\\frac{17}{12}}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-007", "prompt": "What is the remainder when 47 is divided by 5?", "answer": "Since $47 = 5 \\times 9 + 2$, the remainder is $\\boxed{2}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-008", "prompt": "If $f(x) = 2x^2 - 3x + 1$, compute $f(3)$.", "answer": "$f(3) = 2(3^2) - 3(3) + 1 = 2(9) - 9 + 1 = 18 - 9 + 1 = \\boxed{10}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-009", "prompt": "Find the slope of the line passing through $(1, 2)$ and $(4, 8)$.", "answer": "Slope $m = \\frac{8 - 2}{4 - 1} = \\frac{6}{3} = \\boxed{2}$.", "error_class": "math", "domain": "math"}
+{"id": "math-synth-010", "prompt": "What is the sum of the interior angles of a pentagon in degrees?", "answer": "Formula is $(n - 2) \\times 180^\\circ$. For $n = 5$, $(5 - 2) \\times 180 = 3 \\times 180 = \\boxed{540}$.", "error_class": "math", "domain": "math"}

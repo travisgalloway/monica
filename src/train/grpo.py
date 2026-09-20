@@ -11,7 +11,7 @@ graph (advantages precomputed here, in the driver).
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -29,17 +29,81 @@ def group_advantages(rewards: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return (r - mean) / (std + eps)
 
 
+def compute_kl_penalty(logp: np.ndarray, ref_logp: np.ndarray,
+                       estimator: str = "schulman") -> np.ndarray:
+    """Compute per-sequence KL penalty D_KL(policy || ref).
+
+    Estimators:
+    - 'schulman' (default; DeepSeek-R1 / Open-R1 unbiased non-negative estimator):
+        diff = ref_logp - logp
+        kl = exp(diff) - diff - 1
+    - 'log_ratio' / 'k1':
+        kl = logp - ref_logp
+    """
+    lp = np.asarray(logp, dtype=np.float64)
+    ref_lp = np.asarray(ref_logp, dtype=np.float64)
+    diff = ref_lp - lp
+    if estimator == "schulman":
+        # exp(ref - pol) - (ref - pol) - 1 >= 0
+        clipped = np.clip(diff, -50.0, 50.0)
+        return np.exp(clipped) - diff - 1.0
+    elif estimator in ("log_ratio", "k1"):
+        return -diff
+    else:
+        raise ValueError(f"unknown KL estimator {estimator!r}; expected 'schulman' or 'log_ratio'")
+
+
 def grpo_loss_from_logprobs(logp: np.ndarray, advantages: np.ndarray,
-                            ) -> Tuple[float, float]:
-    """GRPO policy-gradient loss `-mean(advantage * logp)` + the mean |advantage| diagnostic.
+                            ref_logp: Optional[np.ndarray] = None,
+                            beta: float = 0.0,
+                            *,
+                            kl_estimator: str = "schulman") -> Tuple[float, float]:
+    """GRPO policy-gradient loss `-mean(advantage * logp) + beta * kl` + the mean |advantage| diagnostic.
 
     `logp` and `advantages` are the same shape (per-sample sequence log-prob and its
-    group-standardized advantage). Returns `(loss, mean_abs_advantage)`.
+    group-standardized advantage). If `ref_logp` is provided and `beta > 0.0`, regularizes policy
+    drift away from the reference model via KL penalty. Returns `(loss, mean_abs_advantage)`.
     """
     logp = np.asarray(logp, dtype=np.float64)
     adv = np.asarray(advantages, dtype=np.float64)
-    loss = float(-np.mean(adv * logp))
+    pg_loss = float(-np.mean(adv * logp))
+    if ref_logp is not None and beta > 0.0:
+        kl = compute_kl_penalty(logp, ref_logp, estimator=kl_estimator)
+        loss = pg_loss + float(beta * np.mean(kl))
+    else:
+        loss = pg_loss
     return loss, float(np.mean(np.abs(adv)))
+
+
+def advantage_stats(advantages: np.ndarray) -> dict:
+    """Group advantage diagnostics for logging and stability monitoring.
+
+    Reports mean advantage (centered near 0), mean absolute advantage,
+    standard deviation, and min/max bounds.
+    """
+    adv = np.asarray(advantages, dtype=np.float64)
+    if adv.size == 0:
+        return {"mean_adv": 0.0, "mean_abs_adv": 0.0, "std_adv": 0.0, "min_adv": 0.0, "max_adv": 0.0}
+    return {
+        "mean_adv": float(adv.mean()),
+        "mean_abs_adv": float(np.mean(np.abs(adv))),
+        "std_adv": float(adv.std()),
+        "min_adv": float(adv.min()),
+        "max_adv": float(adv.max()),
+    }
+
+
+def kl_stats(logp: np.ndarray, ref_logp: np.ndarray,
+             estimator: str = "schulman") -> dict:
+    """KL penalty diagnostics for monitoring policy drift against the reference model."""
+    kl = compute_kl_penalty(logp, ref_logp, estimator=estimator)
+    if kl.size == 0:
+        return {"mean_kl": 0.0, "max_kl": 0.0, "min_kl": 0.0}
+    return {
+        "mean_kl": float(kl.mean()),
+        "max_kl": float(kl.max()),
+        "min_kl": float(kl.min()),
+    }
 
 
 def reward_stats(rewards: np.ndarray) -> dict:
