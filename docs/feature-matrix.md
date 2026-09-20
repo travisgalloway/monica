@@ -56,7 +56,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | MODEL-6 | A person can sparse-upcycle a dense checkpoint to MoE | done | n/a | n/a | n/a | Shipped | #214 | design/13 |
 | MODEL-7 | A person can size a config and estimate its train time | done | done | n/a | n/a | Shipped | — | design/07 |
 | MODEL-8 | A person can quantize a checkpoint | done | done | n/a | done | Shipped | #196 | design/14 |
-| MODEL-9 | A person can target the POC to MVP configuration matrix (100M Mac, 1B CUDA, 4B MVP) | done | done | done | done | Shipped | #272 | design/16 |
+| MODEL-9 | A person can target the POC to MVP configuration matrix (100M Mac, 1B CUDA, 4B MVP) | done | done | done | done | Shipped | #272, #222, #223 | design/16 |
 | MODEL-10 | A person can serve with Native FP16/BF16 and Mixed Precision W4 + KV8 | done | done | done | done | Shipped | #168 | design/16 |
 
 ## Training

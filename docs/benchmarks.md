@@ -76,6 +76,16 @@ are real **developer Apple Silicon** numbers.
 | `config/poc.yaml` | ~127M | decode, exact M7 protocol | 94.7 tok/s | **developer Apple Silicon** (M1 Pro) — the pre-#170 M7 record cited in `docs/design/14-inference-engine.md`; not re-measured in this run, and predates the poc/poc-qwen split, so the measured config may have carried the larger Qwen vocab (~205M) |
 | `config/poc-small.yaml` | ~97M | context-length sweep, `attn` arm / crossover point | — | **not yet measured** — command: `.venv/bin/python scripts/bench_context.py --config config/poc-small.yaml --arms ssm,attn --lengths 512,1024,2048 --decode-tokens 64 --json out.json` |
 
+## Scale MoE pretraining runs (M12: #222 small MoE, #223 Large A)
+
+Training throughput targets and cloud execution modeling for the scale MoE milestones.
+
+| Run | Architecture | Scale (Total / Active) | Target Hardware | Projected Throughput | Provenance |
+|---|---|---|---|---|---|
+| MHM-P4 (#222) | `config/code-small-moe.yaml` | 685M / 345M | 1x NVIDIA A40 (48GB) | ~300,000 tok/s | **RunPod cloud profile** (`scripts/run_small_moe.py --cloud-spec`), single-card baseline |
+| MHM-P5 (#223) | `config/code-large-a.yaml` | 3.88B / 710M | 4x NVIDIA A100-SXM4 (80GB) | ~900,000 tok/s | **RunPod cloud profile** (`scripts/run_large_moe.py --cloud-spec`), FSDP2 + EP=4 cluster |
+| MHM-P5 (#223) | `config/code-large-a.yaml` | 3.88B / 710M | 4x NVIDIA H100-SXM5 (80GB) | ~2,000,000 tok/s | **RunPod cloud profile** (`scripts/run_large_moe.py --cloud-spec`), Hopper NVLink cluster |
+
 ## Which numbers came from where — summary
 
 - **CI runner (GitHub-hosted `macos-latest`, `xcodebuild`)**: the Swift-engine prefill row
@@ -89,6 +99,7 @@ are real **developer Apple Silicon** numbers.
   quantized) — blocked on a developer machine with Xcode installed running `swift run
   monica-bench --config Benchmarks/configs/poc.config.json ...`; and the Python attn-arm
   context-length sweep at poc-small scale.
+- **RunPod cloud profiles**: Scale MoE pretraining rows (#222, #223) represent analytical throughput models calibrated against datacenter GPU specifications. They are not local measurements.
 
 `monica-bench --baseline Benchmarks/baselines.json [--tolerance 0.15] [--strict]` is how a future
 run flags a regression against a captured baseline (matching on machine id — architecture, hw
