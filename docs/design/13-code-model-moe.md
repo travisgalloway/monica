@@ -554,6 +554,18 @@ The supervision arm under the SSI axis (SSI-P3-T1/T2), sharing the #225 M5 anti-
 - **SSI measurement contract compliance (#225 M1–M5).** Declares and validates 11 arms (`build_diagnostic_supervision_arms`) satisfying M1 (one variable per arm), M2 (≥3 seeds), M4 (availability-vs-use null arm with `signal_used=False` for every treatment arm), and M5 (shared escape-hatch gate).
 - **Core modules & driver.** `src/train/diagnostic_supervision.py`, `scripts/eval_diagnostic_supervision.py`, and `make_contrastive_sft_train_step` on MLX/CUDA backends.
 
+### #342 — RLVR: Data Engineering, Contracts & Query Verifiers (SQL, Data/Tensors, OpenAPI, GraphQL, Protobuf, Clean Architecture)
+
+Extends the RLVR verifier suite beyond programming language diagnostics into data engineering, schema specifications, and architectural invariants. Implements six domain verifiers, integrated into `scripts/rlvr.py` and evaluated in `src/eval/code_suite.py` under `RECORD_FIELDS`:
+
+- **Relational SQL (Postgres, MySQL, SQLite, DuckDB).** Employs AST parsing and deterministic DML execution in SQLite in-memory databases. Validates column projections, index usage, and syntax correctness. Anti-Goodhart rules reject cartesian joins without explicit join predicates and unconstrained wildcard projections (`SELECT *`).
+- **Data & ML Pipelines (Pandas, Polars, PyTorch).** Uses an AST visitor to verify tensor dimensional transformations, shape contracts, and dataframe column operations. Anti-Goodhart rules penalize row-wise iterations (`iterrows`, `itertuples`), unconstrained dynamic shape calls (`view(-1)` without validation), and untyped object data types (`object`).
+- **API Contracts (OpenAPI v3.1 & JSON Schema).** Validates OpenAPI specifications against official meta-schemas. Confirms that path parameters map to declared route parameters and verifies 2xx response definitions. Anti-Goodhart rules reject untyped payload objects and unconstrained string schemas that omit length, format, or pattern bounds.
+- **GraphQL Contracts.** Parses Schema Definition Language (SDL) schemas. Enforces query depth constraints to prevent circular query expansion. Anti-Goodhart rules reject ambiguous untyped scalar declarations such as `scalar Any`.
+- **Protobuf & gRPC.** Verifies Protocol Buffer schemas for field tag uniqueness and valid range boundaries (tags between 1 and 536,870,911, excluding reserved range 19000 to 19999). Evaluates backward compatibility by detecting breaking deletions or tag type changes. Anti-Goodhart rules reject missing explicit field tags and unreserved deleted fields.
+- **Clean Architecture Boundary Linter.** Audits dependency flows across presentation, application, and domain layers. Verifies that domain entities remain decoupled from infrastructure frameworks, web libraries, and ORM engines. Anti-Goodhart rules detect dynamic import circumventions using `__import__` or `importlib`.
+- **Driver and Unified Evaluator.** Provides `DataContractsVerifier` to route inputs to individual oracles automatically. Exposes `--reward sql`, `--reward data-pipeline`, `--reward openapi`, `--reward graphql`, `--reward protobuf`, `--reward clean-architecture`, and `--reward data-contracts` in `scripts/rlvr.py`. Supports benchmark reporting via `evaluate_data_contracts` in `src/eval/code_suite.py`.
+
 ### Why SSI is secondary — the recorded assessment
 
 The LSP-in-the-loop experiment (design record + measurement in

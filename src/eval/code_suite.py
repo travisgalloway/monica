@@ -675,3 +675,89 @@ def evaluate_repo_recall(model, files: Sequence[dict], encode: Callable[[str], S
         "by_bucket": summary["by_bucket"],
         "overall": summary["overall"],
     }
+
+# --------------------------------------------------------------------------------------- #
+# Data Engineering, Contracts & Query Verifier Evaluation (#342)
+# --------------------------------------------------------------------------------------- #
+
+DATA_CONTRACT_BUCKETS: Tuple[str, ...] = (
+    "sql",
+    "data_pipeline",
+    "openapi",
+    "graphql",
+    "protobuf",
+    "clean_architecture",
+)
+
+
+def evaluate_data_contracts(
+    test_cases: Sequence[dict],
+    *,
+    verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against data engineering, contract & query verifiers (#342).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `contract`: contract name ('sql', 'data_pipeline', 'openapi', 'graphql', 'protobuf', 'clean_architecture')
+      - `code`: candidate code/spec text
+      - `reference`: optional reference code/spec or query for equivalence checks
+      - `expected_clean`: bool indicating if the test case is clean (reward == 1.0) vs faulty/hacked
+
+    Emits records conforming to RECORD_FIELDS:
+      suite='data_contracts', bucket=contract, distance=len(code), etc.
+    Returns summary dict with per-bucket and overall statistics.
+    """
+    if verifier is None:
+        from ..train.verifiers.data_contracts import DataContractsVerifier
+        verifier = DataContractsVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        contract = str(inst.get("contract", "sql"))
+        code = str(inst.get("code", ""))
+        reference = inst.get("reference")
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+
+        reward = verifier.reward(code, reference=reference, prompt=prompt, contract=contract)
+        is_clean = (reward is not None and reward == 1.0)
+        success = (is_clean == expected_clean)
+
+        records.append(
+            make_record(
+                suite="data_contracts",
+                id=inst_id,
+                bucket=contract,
+                distance=len(code),
+                n_scored_tokens=len(code.split()) if code else 0,
+                ce_nats=0.0 if is_clean else 1.0,
+                token_accuracy=1.0 if success else 0.0,
+                exact_match=1.0 if (reward == 1.0) else 0.0,
+                rank_top1=success,
+                mrr=1.0 if success else 0.0,
+                meta={
+                    "contract": contract,
+                    "reward": reward,
+                    "expected_clean": expected_clean,
+                    "is_clean": is_clean,
+                    "success": success,
+                },
+            )
+        )
+
+    buckets_present = [b for b in DATA_CONTRACT_BUCKETS if any(r["bucket"] == b for r in records)] or list(DATA_CONTRACT_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }

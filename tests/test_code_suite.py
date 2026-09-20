@@ -321,3 +321,107 @@ def test_repo_recall_records_conform_to_shared_schema_and_buckets():
         assert rec["n_scored_tokens"] > 0
     assert set(res["by_bucket"]) == {"topological", "random"}
     assert res["topo_top1_accuracy"] > res["random_top1_accuracy"]
+
+
+def test_evaluate_data_contracts_records_and_buckets():
+    from src.eval.code_suite import DATA_CONTRACT_BUCKETS, evaluate_data_contracts
+
+    test_cases = [
+        # SQL clean & faulty
+        {
+            "id": "sql-clean-1",
+            "contract": "sql",
+            "code": "SELECT id, name FROM users WHERE id > 0;",
+            "expected_clean": True,
+        },
+        {
+            "id": "sql-cartesian-1",
+            "contract": "sql",
+            "code": "SELECT * FROM users, orders;",
+            "expected_clean": False,
+        },
+        # Data Pipeline clean & faulty
+        {
+            "id": "pipe-clean-1",
+            "contract": "data_pipeline",
+            "code": "import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]})\nout = df[['a']]",
+            "expected_clean": True,
+        },
+        {
+            "id": "pipe-iter-1",
+            "contract": "data_pipeline",
+            "code": "for idx, row in df.iterrows():\n    print(row)",
+            "expected_clean": False,
+        },
+        # OpenAPI clean & faulty
+        {
+            "id": "openapi-clean-1",
+            "contract": "openapi",
+            "code": "openapi: 3.1.0\ninfo:\n  title: T\n  version: 1.0\npaths:\n  /users:\n    get:\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema:\n                type: string\n                maxLength: 100",
+            "expected_clean": True,
+        },
+        {
+            "id": "openapi-untyped-1",
+            "contract": "openapi",
+            "code": "openapi: 3.1.0\ninfo:\n  title: T\n  version: 1.0\npaths:\n  /users:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema: {}",
+            "expected_clean": False,
+        },
+        # GraphQL clean & faulty
+        {
+            "id": "graphql-clean-1",
+            "contract": "graphql",
+            "code": "type User {\n  id: ID!\n  name: String!\n}",
+            "expected_clean": True,
+        },
+        {
+            "id": "graphql-any-1",
+            "contract": "graphql",
+            "code": "scalar Any\ntype User {\n  payload: Any\n}",
+            "expected_clean": False,
+        },
+        # Protobuf clean & faulty
+        {
+            "id": "proto-clean-1",
+            "contract": "protobuf",
+            "code": 'syntax = "proto3";\nmessage User {\n  string id = 1;\n  string name = 2;\n}',
+            "expected_clean": True,
+        },
+        {
+            "id": "proto-missing-1",
+            "contract": "protobuf",
+            "code": 'syntax = "proto3";\nmessage User {\n  string id;\n}',
+            "expected_clean": False,
+        },
+        # Clean Architecture clean & faulty
+        {
+            "id": "arch-clean-1",
+            "contract": "clean_architecture",
+            "code": "class Entity:\n    def __init__(self, id: str):\n        self.id = id",
+            "expected_clean": True,
+        },
+        {
+            "id": "arch-leaky-1",
+            "contract": "clean_architecture",
+            "code": "from fastapi import FastAPI\napp = FastAPI()",
+            "expected_clean": False,
+        },
+    ]
+
+    res = evaluate_data_contracts(test_cases)
+
+    assert res["records"]
+    assert len(res["records"]) == 12
+    assert res["n_cases"] == 12
+    assert res["n_passed"] == 12
+    assert res["accuracy"] == 1.0
+
+    for rec in res["records"]:
+        assert tuple(sorted(rec)) == tuple(sorted(RECORD_FIELDS))
+        assert rec["suite"] == "data_contracts"
+        assert rec["bucket"] in DATA_CONTRACT_BUCKETS
+        assert rec["rank_top1"] is True
+
+    for bucket in DATA_CONTRACT_BUCKETS:
+        assert bucket in res["by_bucket"]
+        assert res["by_bucket"][bucket]["n_instances"] == 2
+        assert res["by_bucket"][bucket]["rank_top1_rate"] == 1.0
