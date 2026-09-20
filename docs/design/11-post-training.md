@@ -93,6 +93,16 @@ reward loop) and require **≥5 tests per coding problem** (thin suites get game
 only **problems + verifiers**, not reference solutions — the model generates, the verifier judges —
 so problems whose reference solutions came from a restricted model are still usable.
 
+### Data engineering, contracts, and query verifiers (#342)
+
+Verifiable reward functions extend beyond unit tests and math solvers into structural domain contracts:
+- **Relational SQL**: Evaluates query syntax via AST analysis and executes deterministic DML transactions in SQLite in-memory databases. Penalizes cartesian joins without join predicates and unconstrained wildcard queries (`SELECT *`).
+- **Data and ML pipelines**: Inspects dataframe and tensor pipelines across Pandas, Polars, and PyTorch. Validates schema column selections and tensor dimensional transformations while penalizing row iterations (`iterrows`) and untyped object columns.
+- **API contracts**: Enforces OpenAPI v3.1 and JSON Schema specifications. Verifies path parameter bindings and 2xx responses while rejecting untyped payloads and unconstrained string schemas.
+- **GraphQL**: Validates Schema Definition Language types and fields, rejecting unbounded query depths and untyped scalars (`scalar Any`).
+- **Protobuf and gRPC**: Ensures field tag uniqueness, valid tag ranges (1 to 536,870,911, excluding reserved range 19000 to 19999), and backward compatibility across message revisions.
+- **Clean architecture boundaries**: Analyzes domain-driven architecture, enforcing layered flow from presentation down to domain entities while forbidding infrastructure or web framework imports inside core business logic.
+
 ## Tool use (#102, optional)
 
 **What.** Emit a structured function call the runtime executes and feeds back, optionally in a

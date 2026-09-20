@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("config/poc.yaml"))
     ap.add_argument("--init", type=Path, required=True, help="checkpoint weights (SFT base)")
     ap.add_argument("--problems", type=Path, required=True, help="JSONL {prompt, answer}")
-    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static"), default="math")
+    ap.add_argument("--reward", choices=("math", "exact", "lsp", "tool-schema", "when2call", "sympy", "z3", "rust-static", "cpp-static", "c-static", "swift-static", "kotlin-static", "sql", "data-pipeline", "pipeline", "openapi", "graphql", "protobuf", "clean-architecture", "architecture", "data-contracts"), default="math")
     ap.add_argument("--oracle", choices=("ts", "opengrep", "both"), default="ts",
                     help="--reward lsp only: diagnostic oracle (persistent TS-LSP by "
                          "default; #278's ~350ms didChange debounce makes 'both' costly "
@@ -134,6 +134,20 @@ def main() -> None:
         from src.train.verifiers.systems_mobile import resolve_kotlin_toolchain
         if not resolve_kotlin_toolchain():
             raise SystemExit("no toolchain for --reward kotlin-static (kotlinc required on PATH)")
+    elif args.reward == "sql":
+        from src.train.verifiers.data_contracts import resolve_sql_toolchain
+        resolve_sql_toolchain()
+    elif args.reward == "protobuf":
+        from src.train.verifiers.data_contracts import resolve_protobuf_toolchain
+        resolve_protobuf_toolchain()
+    elif args.reward == "openapi":
+        from src.train.verifiers.data_contracts import resolve_openapi_toolchain
+        resolve_openapi_toolchain()
+    elif args.reward == "graphql":
+        from src.train.verifiers.data_contracts import resolve_graphql_toolchain
+        resolve_graphql_toolchain()
+    elif args.reward in ("data-pipeline", "pipeline", "clean-architecture", "architecture", "data-contracts"):
+        pass
 
     from src.model.backend import get_backend
     from src.model.blocks import load_config
@@ -222,6 +236,41 @@ def main() -> None:
             reward_fn = None
         elif args.reward == "kotlin-static":
             raw_verifier = KotlinVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "sql":
+            from src.train.verifiers.data_contracts import SqlVerifier
+            raw_verifier = SqlVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("data-pipeline", "pipeline"):
+            from src.train.verifiers.data_contracts import DataPipelineVerifier
+            raw_verifier = DataPipelineVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "openapi":
+            from src.train.verifiers.data_contracts import OpenApiVerifier
+            raw_verifier = OpenApiVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "graphql":
+            from src.train.verifiers.data_contracts import GraphQLVerifier
+            raw_verifier = GraphQLVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "protobuf":
+            from src.train.verifiers.data_contracts import ProtobufVerifier
+            raw_verifier = ProtobufVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward in ("clean-architecture", "architecture"):
+            from src.train.verifiers.data_contracts import CleanArchitectureVerifier
+            raw_verifier = CleanArchitectureVerifier(fail_fast=args.fail_fast)
+            stack.enter_context(raw_verifier)
+            reward_fn = None
+        elif args.reward == "data-contracts":
+            from src.train.verifiers.data_contracts import DataContractsVerifier
+            raw_verifier = DataContractsVerifier(fail_fast=args.fail_fast)
             stack.enter_context(raw_verifier)
             reward_fn = None
         else:

@@ -1736,3 +1736,36 @@ from src.train.verifiers.systems_mobile import (
     resolve_rust_toolchain,
     resolve_swift_toolchain,
 )
+
+# --------------------------------------------------------------------------- #
+# #342 -- Data Engineering, Contracts & Query Verifiers
+# --------------------------------------------------------------------------- #
+from src.train.verifiers.data_contracts import (
+    ArchitectureBoundaryVerifier,
+    BaseContractVerifier,
+    CleanArchitectureOracle,
+    CleanArchitectureVerifier,
+    DataContractsVerifier,
+    DataPipelineOracle,
+    DataPipelineVerifier,
+    GraphQLContractOracle,
+    GraphQLVerifier,
+    OpenApiContractOracle,
+    OpenApiVerifier,
+    ProtobufContractOracle,
+    ProtobufVerifier,
+    SqliteMemoryOracle,
+    SqlStaticVerifier,
+    SqlVerifier,
+    find_architecture_escape_hatches,
+    find_data_pipeline_escape_hatches,
+    find_graphql_escape_hatches,
+    find_openapi_escape_hatches,
+    find_protobuf_escape_hatches,
+    find_sql_escape_hatches,
+    resolve_graphql_toolchain,
+    resolve_openapi_toolchain,
+    resolve_protobuf_toolchain,
+    resolve_spectral_toolchain,
+    resolve_sql_toolchain,
+)
