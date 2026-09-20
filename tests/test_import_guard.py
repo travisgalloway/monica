@@ -77,6 +77,8 @@ PORTABLE_MODULES = [
     "src.train.grpo",
     "src.train.verifiers",
     "src.train.verifiers.data_contracts",
+    "src.train.verifiers.systems_mobile",
+    "src.train.verifiers.web_backend",
     "src.train.diagnostic_supervision",
     "src.train.critic_train",
     "src.train.schedule",

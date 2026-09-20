@@ -761,3 +761,92 @@ def evaluate_data_contracts(
         "by_bucket": summary["by_bucket"],
         "overall": summary["overall"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Web & Backend Application Stack Suite (#343)
+# --------------------------------------------------------------------------- #
+
+WEB_BACKEND_BUCKETS: Tuple[str, ...] = (
+    "typescript_web",
+    "python_web",
+    "go_web",
+    "java_web",
+    "csharp_web",
+    "php_web",
+    "ruby_web",
+)
+
+
+def evaluate_web_backend(
+    test_cases: Sequence[dict],
+    *,
+    verifier: Optional[Any] = None,
+) -> dict:
+    """Evaluate completions against Web & Backend application stack verifiers (#343).
+
+    Each test case in `test_cases` is a dict containing:
+      - `id`: unique case identifier
+      - `stack`: stack name ('typescript_web', 'python_web', 'go_web', 'java_web', 'csharp_web', 'php_web', 'ruby_web')
+      - `code`: candidate code text
+      - `reference`: optional reference code
+      - `expected_clean`: bool indicating if the test case is clean (reward == 1.0) vs faulty/hacked
+      - `prompt`: optional prompt string prefix
+
+    Emits records conforming to RECORD_FIELDS:
+      suite='web_backend', bucket=stack, distance=len(code), etc.
+    Returns summary dict with per-bucket and overall statistics.
+    """
+    if verifier is None:
+        from ..train.verifiers.web_backend import WebBackendVerifier
+        verifier = WebBackendVerifier()
+
+    records: List[dict] = []
+    for inst in test_cases:
+        inst_id = str(inst.get("id", "case"))
+        stack = str(inst.get("stack", "typescript_web"))
+        code = str(inst.get("code", ""))
+        reference = inst.get("reference")
+        expected_clean = bool(inst.get("expected_clean", True))
+        prompt = str(inst.get("prompt", ""))
+
+        reward = verifier.reward(code, reference=reference, prompt=prompt, stack=stack)
+        is_clean = (reward is not None and reward == 1.0)
+        success = (is_clean == expected_clean)
+
+        records.append(
+            make_record(
+                suite="web_backend",
+                id=inst_id,
+                bucket=stack,
+                distance=len(code),
+                n_scored_tokens=len(code.split()) if code else 0,
+                ce_nats=0.0 if is_clean else 1.0,
+                token_accuracy=1.0 if success else 0.0,
+                exact_match=1.0 if (reward == 1.0) else 0.0,
+                rank_top1=success,
+                mrr=1.0 if success else 0.0,
+                meta={
+                    "stack": stack,
+                    "reward": reward,
+                    "expected_clean": expected_clean,
+                    "is_clean": is_clean,
+                    "success": success,
+                },
+            )
+        )
+
+    buckets_present = [b for b in WEB_BACKEND_BUCKETS if any(r["bucket"] == b for r in records)] or list(WEB_BACKEND_BUCKETS)
+    summary = summarize_bucketed(records, buckets_present)
+    total = len(records)
+    passed = sum(1 for r in records if r["rank_top1"])
+    accuracy = (passed / total) if total else 0.0
+
+    return {
+        "records": records,
+        "accuracy": accuracy,
+        "n_cases": total,
+        "n_passed": passed,
+        "by_bucket": summary["by_bucket"],
+        "overall": summary["overall"],
+    }

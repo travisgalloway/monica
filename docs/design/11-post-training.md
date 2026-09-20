@@ -103,6 +103,18 @@ Verifiable reward functions extend beyond unit tests and math solvers into struc
 - **Protobuf and gRPC**: Ensures field tag uniqueness, valid tag ranges (1 to 536,870,911, excluding reserved range 19000 to 19999), and backward compatibility across message revisions.
 - **Clean architecture boundaries**: Analyzes domain-driven architecture, enforcing layered flow from presentation down to domain entities while forbidding infrastructure or web framework imports inside core business logic.
 
+### Web and backend application stack verifiers (#343)
+
+Deterministic static analysis verifiers grade completions across web and enterprise backend application stacks without executing untrusted binaries:
+- **TypeScript, React, Next.js, and NestJS**: Evaluates JSX and TypeScript structures. Verifies hook dependency rules, directive boundaries (`'use client'` and `'use server'`), NestJS dependency injection integrity, and route parameter typing. Penalizes suppression hacks (`as any`, `@ts-ignore`, `@ts-expect-error`, empty JSX fragments, and empty event handlers).
+- **Python Web (FastAPI, Pydantic, Django ORM)**: Uses AST inspection to enforce Pydantic field schemas, validates FastAPI route path parameter bindings against function signatures, checks Django model relationships (`on_delete` specifications and `related_name`), and ensures migration determinism. Penalizes `# type: ignore`, bare `dict` returns, and empty handler bodies.
+- **Go Web and Microservices**: Enforces struct tag syntax, unhandled error return detection, and goroutine leak patterns (unbounded loops without context cancellation guards). Penalizes `_ = err`, empty `select{}`, and panic-only stubs.
+- **Java and Spring Boot 3**: Inspects Spring Bean injection, favoring constructor injection over field injection. Validates Jakarta Persistence entity mappings (`@Entity` primary key `@Id` and relationship mappings) and nullability annotations. Penalizes empty catch blocks and raw types.
+- **C# and ASP.NET Core**: Validates Minimal API route parameter bindings, Entity Framework model configurations, and nullable reference annotations. Penalizes `#pragma warning disable`, `dynamic` escapes, and null-forgiving bypasses.
+- **PHP and Laravel**: Enforces strict typing declarations (`declare(strict_types=1)`), Eloquent relationship return types (`: HasMany`, `: BelongsTo`), and Service Provider contracts. Penalizes `@phpstan-ignore` and untyped parameters.
+- **Ruby and Rails**: Validates block balance, Rails model validation declarations, and Sorbet typed signatures (`sig { ... }`). Penalizes `# rubocop:disable` and `T.untyped`.
+- **Driver and Unified Evaluator**: Provides `WebBackendVerifier` with stack auto-detection, exposes reward flags in `scripts/rlvr.py`, and records benchmark evaluation through `evaluate_web_backend` in `src/eval/code_suite.py`.
+
 ## Tool use (#102, optional)
 
 **What.** Emit a structured function call the runtime executes and feeds back, optionally in a
