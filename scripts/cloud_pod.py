@@ -776,11 +776,13 @@ def main() -> None:
         print(f"{'Template':<12} {'GPU':<28} {'Disk/Vol':<10} {'CUDA':<8} {'Cost/hr':<9} {'Description'}")
         print("-" * 105)
         for key, tmpl in POD_TEMPLATES.items():
+            disk_str = f"{tmpl['disk_gb']}/{tmpl['volume_gb']}GB"
+            cost_str = f"${tmpl['approx_hourly_cost']:.2f}"
             print(
                 f"{key:<12} {tmpl['gpu']:<28} "
-                f"{f'{tmpl["disk_gb"]}/{tmpl["volume_gb"]}GB':<10} "
+                f"{disk_str:<10} "
                 f"{tmpl['cuda_version']:<8} "
-                f"{f'${tmpl["approx_hourly_cost"]:.2f}':<9} "
+                f"{cost_str:<9} "
                 f"{tmpl['description']}"
             )
         return
