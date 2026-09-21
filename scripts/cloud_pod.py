@@ -522,18 +522,31 @@ class RunPodClient:
             }
             return self.execute_rest("v1/pods", method="POST", body=body)
 
+        env_items = []
+        if isinstance(env, dict):
+            for k, v in env.items():
+                env_items.append(f"{{ key: {json.dumps(str(k))}, value: {json.dumps(str(v))} }}")
+        elif isinstance(env, list):
+            for item in env:
+                if isinstance(item, dict):
+                    k = item.get("key", "")
+                    v = item.get("value", "")
+                    env_items.append(f"{{ key: {json.dumps(str(k))}, value: {json.dumps(str(v))} }}")
+        env_graphql = "[" + ", ".join(env_items) + "]"
+
         mutation = f"""
         mutation {{
             podFindAndDeployOnDemand(input: {{
                 name: "{name}",
                 imageName: "{image_name}",
                 gpuTypeId: "{gpu_type_id}",
+                gpuCount: 1,
                 cloudType: {cloud_type},
                 volumeInGb: {volume_in_gb},
                 containerDiskInGb: {container_disk_in_gb},
                 startSsh: true,
                 ports: "{ports}",
-                env: {json.dumps(env or {})}
+                env: {env_graphql}
             }}) {{
                 id
                 name
@@ -543,7 +556,7 @@ class RunPodClient:
         }}
         """
         res = self.execute_graphql(mutation)
-        return res.get("data", {}).get("podFindAndDeployOnDemand", {})
+        return res.get("data", {}).get("podFindAndDeployOnDemand", {}) or {}
 
 
 def watch_pod(
