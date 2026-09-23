@@ -244,6 +244,7 @@ class SandboxedCodeVerifier:
         cmd: List[str],
         cwd: Path,
         timeout: float,
+        limit_address_space: bool = True,
     ) -> ExecutionResultRaw:
         """Execute command in subprocess with process group isolation and resource bounds."""
         env = {
@@ -265,6 +266,8 @@ class SandboxedCodeVerifier:
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 1))
             except Exception:
                 pass
+            if not limit_address_space:
+                return
             try:
                 import resource
                 resource.setrlimit(resource.RLIMIT_AS, (self.memory_limit_bytes, self.memory_limit_bytes))
@@ -310,6 +313,10 @@ class SandboxedCodeVerifier:
         duration = time.monotonic() - t0
 
         if "out of memory" in stderr.lower() or "allocation failed" in stderr.lower():
+            mem_exceeded = True
+        # Under RLIMIT_AS (enforced on Linux, not macOS) Python raises MemoryError instead of
+        # growing past the RSS poll, and pytest reports it on stdout.
+        if "MemoryError" in stdout or "MemoryError" in stderr:
             mem_exceeded = True
 
         return ExecutionResultRaw(
@@ -448,14 +455,18 @@ class SandboxedCodeVerifier:
             cmd.extend(["--require", "./_sandbox_guard.cjs"])
 
         cmd.extend(["--experimental-strip-types", "--test", str(test_file.name)])
-        raw = self._execute_subproc(cmd, sandbox_dir, timeout)
+        # V8 reserves GBs of virtual address space at startup, so RLIMIT_AS aborts node before
+        # any test runs; --max-old-space-size and the RSS poll bound its memory instead.
+        raw = self._execute_subproc(cmd, sandbox_dir, timeout, limit_address_space=False)
 
         passed = 0
         failed = 0
-        m_pass = re.search(r"ℹ pass (\d+)", raw.stdout)
+        # node:test prints the spec summary ("ℹ pass N") on a TTY or newer node, and TAP
+        # ("# pass N") when piped on node <= 22.
+        m_pass = re.search(r"^(?:ℹ|#) pass (\d+)", raw.stdout, re.MULTILINE)
         if m_pass:
             passed = int(m_pass.group(1))
-        m_fail = re.search(r"ℹ fail (\d+)", raw.stdout)
+        m_fail = re.search(r"^(?:ℹ|#) fail (\d+)", raw.stdout, re.MULTILINE)
         if m_fail:
             failed = int(m_fail.group(1))
 

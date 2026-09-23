@@ -152,8 +152,17 @@ def test_execute_upcycle_dry_run():
 
 def test_synthetic_weight_upcycle(tmp_path):
     """Verify weight transformation replicates dense FFN to 64 experts and creates zero-down shared expert."""
-    src_cfg = load_config(str(DEFAULT_DENSE_CONFIG))
-    dst_cfg = load_config(str(DEFAULT_MOE_CONFIG))
+    import dataclasses
+    import yaml
+
+    # Shrink the width-only fields: at full Large A width this test wrote ~15 GB and took
+    # 255 s of the macOS suite's 720 s budget (#315). Depth, attention/MoE placement and
+    # expert count stay at the real configs' values, so the transform is exercised unchanged.
+    shrink = dict(d_model=64, head_dim=16, vocab_size=256, moe_d_ff=64, n_layers=16)
+    src_cfg = dataclasses.replace(load_config(str(DEFAULT_DENSE_CONFIG)), **shrink)
+    dst_cfg = dataclasses.replace(load_config(str(DEFAULT_MOE_CONFIG)), **shrink)
+    dst_cfg_path = tmp_path / "large_a_small_width.yaml"
+    dst_cfg_path.write_text(yaml.safe_dump(dst_cfg.to_dict()))
 
     # Construct synthetic weights dict matching expected keys
     rng = np.random.default_rng(42)
@@ -166,9 +175,10 @@ def test_synthetic_weight_upcycle(tmp_path):
     save_weights(dense_weights, str(dense_path), config=src_cfg)
 
     upcycle_out = tmp_path / "upcycled_large_a.safetensors"
-    res = execute_upcycle(dense_path, DEFAULT_MOE_CONFIG, out_path=upcycle_out, dry_run=False)
+    res = execute_upcycle(dense_path, dst_cfg_path, out_path=upcycle_out, dry_run=False)
 
     assert res["status"] == "compatible"
+    assert res["dst_config"]["n_experts"] == 64
     assert upcycle_out.exists()
     assert (tmp_path / "upcycled_large_a.safetensors.config.json").exists()
     assert (tmp_path / "upcycled_large_a.safetensors.upcycle.json").exists()

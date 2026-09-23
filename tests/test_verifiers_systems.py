@@ -471,7 +471,8 @@ def test_cpp_verifier_real_toolchain():
 
 @pytest.mark.skipif(resolve_swift_toolchain() is None, reason="swiftc not installed on host")
 def test_swift_verifier_real_toolchain():
-    v = SwiftVerifier()
+    # A cold swiftc module cache on a CI runner exceeds the 10-s default typecheck timeout.
+    v = SwiftVerifier(timeout_s=120.0)
     clean = v.reward("func add(a: Int, b: Int) -> Int { return a + b }\n")
     broken = v.reward("func broken() -> Int { return \"hello\" }\n")
     assert clean > broken

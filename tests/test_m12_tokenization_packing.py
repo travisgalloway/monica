@@ -30,6 +30,12 @@ def monica_tokenize():
 
 
 @pytest.fixture(scope="module")
+def datatrove():
+    # run_corpus_pipeline drives datatrove, which lives in the py3.11 .venv-dt, not the main env.
+    return pytest.importorskip("datatrove", reason="datatrove not installed (runs in .venv-dt)")
+
+
+@pytest.fixture(scope="module")
 def tokenizer_json():
     tfile = find_default_tokenizer()
     if tfile is None:
@@ -85,7 +91,7 @@ def test_m12_poc_sample_shards_manifest_and_loader():
     assert targets.shape == (2, manifest["seq_len"])
 
 
-def test_m12_spm_mode_in_repo_packing(monica_tokenize, tokenizer_json, tmp_path):
+def test_m12_spm_mode_in_repo_packing(datatrove, monica_tokenize, tokenizer_json, tmp_path):
     """Verify that SPM mode in repo packing emits <|fim_suffix|> before <|fim_prefix|> (#358)."""
     repo_manifest = tmp_path / "spm_repo.jsonl"
     repo_manifest.write_text(json.dumps({
@@ -140,7 +146,7 @@ export function calculateFinalTotal(price: number, discountRate: number, taxRate
     assert np.where(toks == 3)[0][0] < np.where(toks == 1)[0][0], "SPM suffix must precede prefix"
 
 
-def test_m12_joint_mode_in_repo_packing(monica_tokenize, tokenizer_json, tmp_path):
+def test_m12_joint_mode_in_repo_packing(datatrove, monica_tokenize, tokenizer_json, tmp_path):
     """Verify joint FIM mode produces both PSM and SPM documents (#358)."""
     repo_manifest = tmp_path / "joint_repo.jsonl"
     files = []
@@ -181,7 +187,7 @@ def test_m12_joint_mode_in_repo_packing(monica_tokenize, tokenizer_json, tmp_pat
     assert (toks == 3).sum() > 0
 
 
-def test_m12_dag_topological_sorting_in_build_corpus(monica_tokenize, tokenizer_json, tmp_path):
+def test_m12_dag_topological_sorting_in_build_corpus(datatrove, monica_tokenize, tokenizer_json, tmp_path):
     """Verify that DAG topological sorting places imported interfaces before consumers (#359)."""
     repo_dir = tmp_path / "my_project"
     repo_dir.mkdir()
