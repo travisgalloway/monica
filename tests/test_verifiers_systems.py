@@ -449,7 +449,7 @@ def test_verifier_on_error_behavior():
 
 @pytest.mark.skipif(resolve_rust_toolchain() is None, reason="rustc / cargo not installed on host")
 def test_rust_verifier_real_toolchain():
-    v = RustVerifier()
+    v = RustVerifier(timeout_s=120.0)  # cold compiler start on a CI runner exceeds the 10-s default
     clean = v.reward("pub fn add(a: i32, b: i32) -> i32 { a + b }\n")
     broken = v.reward("pub fn broken() -> i32 { let x = true; x }\n")
     assert clean > broken
@@ -460,7 +460,7 @@ def test_rust_verifier_real_toolchain():
 
 @pytest.mark.skipif(resolve_cpp_toolchain() is None, reason="clang++ not installed on host")
 def test_cpp_verifier_real_toolchain():
-    v = CppVerifier()
+    v = CppVerifier(timeout_s=120.0)  # cold compiler start on a CI runner exceeds the 10-s default
     clean = v.reward("int add(int a, int b) { return a + b; }\n")
     broken = v.reward("int broken() { return \"hello\"; }\n")
     assert clean > broken
@@ -483,7 +483,7 @@ def test_swift_verifier_real_toolchain():
 
 @pytest.mark.skipif(resolve_kotlin_toolchain() is None, reason="kotlinc not installed on host")
 def test_kotlin_verifier_real_toolchain():
-    v = KotlinVerifier()
+    v = KotlinVerifier(timeout_s=120.0)  # cold compiler start on a CI runner exceeds the 10-s default
     clean = v.reward("fun add(a: Int, b: Int): Int = a + b\n")
     broken = v.reward("fun broken(): Int = \"hello\"\n")
     assert clean > broken
