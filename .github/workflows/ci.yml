@@ -232,6 +232,8 @@ jobs:
         #    whose target hardware is Linux/CUDA. The genuinely macOS-specific item in
         #    the test_cuda_* family, test_cuda_parity.py::test_forward_step_parity_mps,
         #    lives in a file that is NOT ignored. See docs/design/03-conformance.md#322.
+        #  * tests/test_cuda_compile.py: also a duplicate of `cuda-cpu` (same glob, no
+        #    macOS- or MPS-specific case). It cost 73s of a 734s suite on PR #448's run.
         #
         # The budget guard is the point of #315: `timeout-minutes` alone kills the job with
         # no explanation, and an unexplained kill reads as flake. This measures its own wall
@@ -255,7 +257,8 @@ jobs:
           START=$SECONDS
           set +e
           pytest -q -rs --ignore=tests/test_backend_parity.py \
-                        --ignore=tests/test_cuda_distributed.py --durations=25
+                        --ignore=tests/test_cuda_distributed.py \
+                        --ignore=tests/test_cuda_compile.py --durations=25
           STATUS=$?
           set -e
           ELAPSED=$(( SECONDS - START ))
