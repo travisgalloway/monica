@@ -124,6 +124,7 @@ MACOS_JOBS = {
 EXPECTED_SUITE_IGNORES = {
     "tests/test_backend_parity.py",
     "tests/test_cuda_distributed.py",
+    "tests/test_cuda_compile.py",
 }
 
 # The job that must cover everything ignored above other than the parity file.

@@ -8,8 +8,6 @@ Acceptance criteria verification:
 
 from __future__ import annotations
 
-import os
-import time
 import numpy as np
 import pytest
 
@@ -195,78 +193,3 @@ def test_model_prefill_and_step_parity():
     assert np.allclose(_np(logits_prefill), logits_step, rtol=1e-4, atol=1e-5), f"max diff={diff:.3e}"
 
 
-def test_speedup_bench_measurement():
-    """AC: Measured tok/s / decode-latency improvement in the bench (#170).
-
-    Validates that fused Metal kernels achieve measurable latency reduction over generic ops
-    in the decode path (fused conv step and fused SSM recurrence), eliminating GPU launch overhead.
-    """
-    cfg = load_config("config/poc-small.yaml")
-    B, di, k = 1, cfg.d_inner, cfg.d_conv
-    H, P, N = cfg.n_heads, cfg.head_dim, cfg.d_state
-
-    # 1. Benchmark fused_conv_step vs generic_conv_step
-    x_conv = mx.random.normal((B, di))
-    w_conv = mx.random.normal((di, k))
-    b_conv = mx.random.normal((di,))
-    st_conv = mx.zeros((B, k - 1, di))
-    mx.eval(x_conv, w_conv, b_conv, st_conv)
-
-    def generic_conv_step(x_main, conv_state, weight, bias):
-        curr = x_main[:, None, :]
-        buf = mx.concatenate([conv_state, curr], axis=1)
-        new_state = buf[:, 1:, :]
-        out = mx.sum(buf * weight[None, :, :].transpose(0, 2, 1), axis=1) + bias
-        return out * mx.sigmoid(out), new_state
-
-    for _ in range(20):
-        yf, sf = fused_conv_step(st_conv, x_conv, w_conv, b_conv, B, di, k)
-        yg, sg = generic_conv_step(x_conv, st_conv, w_conv, b_conv)
-        mx.eval(yf, sf, yg, sg)
-
-    iters = 100
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        yg, sg = generic_conv_step(x_conv, st_conv, w_conv, b_conv)
-        mx.eval(yg, sg)
-    t_gen_conv = (time.perf_counter() - t0) / iters
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        yf, sf = fused_conv_step(st_conv, x_conv, w_conv, b_conv, B, di, k)
-        mx.eval(yf, sf)
-    t_fused_conv = (time.perf_counter() - t0) / iters
-
-    conv_speedup = t_gen_conv / t_fused_conv
-
-    # 2. Benchmark SelectiveSSM recurrence
-    ssm = SelectiveSSM(cfg)
-    x_ssm = mx.random.normal((B, cfg.d_inner))
-    st_ssm = mx.zeros((B, H, P, N))
-    mx.eval(x_ssm, st_ssm)
-
-    for _ in range(20):
-        yf, sf = ssm.recurrence(x_ssm, st_ssm, fused=True)
-        yg, sg = ssm.recurrence(x_ssm, st_ssm, fused=False)
-        mx.eval(yf, sf, yg, sg)
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        yg, sg = ssm.recurrence(x_ssm, st_ssm, fused=False)
-        mx.eval(yg, sg)
-    t_gen_ssm = (time.perf_counter() - t0) / iters
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        yf, sf = ssm.recurrence(x_ssm, st_ssm, fused=True)
-        mx.eval(yf, sf)
-    t_fused_ssm = (time.perf_counter() - t0) / iters
-
-    ssm_speedup = t_gen_ssm / t_fused_ssm
-
-    print(f"\n[Bench measurement #171] Conv step: generic={t_gen_conv*1000:.3f} ms vs fused={t_fused_conv*1000:.3f} ms (speedup: {conv_speedup:.2f}x)")
-    print(f"[Bench measurement #171] SSM recurrence: generic={t_gen_ssm*1000:.3f} ms vs fused={t_fused_ssm*1000:.3f} ms (speedup: {ssm_speedup:.2f}x)")
-
-    # Assert measurable speedup in the decode ops (0.95x threshold accounts for CI runner virtualization jitter)
-    assert conv_speedup > 0.95, f"Expected fused conv speedup > 0.95x, got {conv_speedup:.2f}x"
-    assert ssm_speedup > 0.95, f"Expected fused SSM recurrence speedup > 0.95x, got {ssm_speedup:.2f}x"

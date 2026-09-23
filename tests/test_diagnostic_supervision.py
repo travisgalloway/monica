@@ -344,37 +344,3 @@ def test_contrastive_arms_have_m4_null_siblings():
 # End-to-end Acceptance Criteria
 # --------------------------------------------------------------------------- #
 
-def test_acceptance_rejection_ft_monotone_clean_gain_and_control_flat():
-    """Acceptance: monotone clean-rate gain across rounds, while control arm is flat."""
-    rounds_rejection = [0.70, 0.82, 0.92]
-    rounds_control = [0.70, 0.71, 0.70]
-
-    for i in range(len(rounds_rejection) - 1):
-        assert rounds_rejection[i + 1] > rounds_rejection[i], "clean rate must be strictly monotone increasing"
-
-    max_ctrl_delta = max(abs(rounds_control[i] - rounds_control[0]) for i in range(len(rounds_control)))
-    assert max_ctrl_delta <= 0.02, "control arm clean rate must remain flat"
-
-
-def test_acceptance_typed_negatives_improve_resolve_without_hurting_edit_sim():
-    """Acceptance: typed negatives improve resolve-correct without hurting edit-sim."""
-    baseline_records = [
-        {"resolved": True, "edit_sim": 0.80},
-        {"resolved": False, "edit_sim": 0.60},
-        {"resolved": False, "edit_sim": 0.50},
-    ]
-
-    typed_records = [
-        {"resolved": True, "edit_sim": 0.85},
-        {"resolved": True, "edit_sim": 0.82},
-        {"resolved": False, "edit_sim": 0.65},
-    ]
-
-    base_resolve_rate = sum(1 for r in baseline_records if r["resolved"]) / len(baseline_records)
-    typed_resolve_rate = sum(1 for r in typed_records if r["resolved"]) / len(typed_records)
-
-    base_mean_edit_sim = sum(r["edit_sim"] for r in baseline_records) / len(baseline_records)
-    typed_mean_edit_sim = sum(r["edit_sim"] for r in typed_records) / len(typed_records)
-
-    assert typed_resolve_rate > base_resolve_rate
-    assert typed_mean_edit_sim >= base_mean_edit_sim

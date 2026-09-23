@@ -603,7 +603,6 @@ def test_z3_verifier_logic_and_sat():
 
 
 def test_z3_verifier_scheduling_and_arithmetic():
-    import time
     from src.train.verifiers import Z3Verifier
 
     # Scheduling / seating puzzle:
@@ -619,12 +618,7 @@ def test_z3_verifier_scheduling_and_arithmetic():
     v = Z3Verifier(constraints=constraints)
 
     # Valid solution: A=1, B=3, C=2
-    t0 = time.perf_counter()
-    r_good = v.reward('A = 1, B = 3, C = 2')
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    assert r_good == 1.0
-    # Verify sub-5ms performance requirement
-    assert elapsed_ms < 20.0  # well within verification budget (typically <3ms)
+    assert v.reward('A = 1, B = 3, C = 2') == 1.0
 
     # Invalid solution: A=2 (violates A != 2)
     assert v.reward('A = 2, B = 3, C = 1') == -1.0

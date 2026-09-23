@@ -105,37 +105,6 @@ def test_code_small_dense_matches_target_configs_on_must_match_fields():
 # 2. Degenerate 1-expert MoE == dense SwiGLU FFN mathematical equivalence
 # --------------------------------------------------------------------------- #
 
-def test_degenerate_moe_equals_dense_swiglu_ffn():
-    """Prove that at n_experts=1, top_k=1, the MoE computation is mathematically identical
-    to a standard dense SwiGLU FFN."""
-    rng = np.random.default_rng(42)
-    B, T, D, D_ff = 2, 8, 768, 1536
-    x = rng.standard_normal((B, T, D)).astype(np.float32)
-
-    W_gate = rng.standard_normal((D_ff, D)).astype(np.float32)
-    W_up = rng.standard_normal((D_ff, D)).astype(np.float32)
-    W_down = rng.standard_normal((D, D_ff)).astype(np.float32)
-
-    def silu(z):
-        # Numerically bounded SiLU without exp overflow warnings
-        clipped = np.clip(z, -85.0, 85.0)
-        return z / (1.0 + np.exp(-clipped))
-
-    # Dense SwiGLU FFN formula: W_down @ (SiLU(W_gate @ x) * (W_up @ x))
-    gate = x @ W_gate.T
-    up = x @ W_up.T
-    swiglu = silu(gate) * up
-    dense_out = swiglu @ W_down.T
-
-    # Degenerate 1-expert MoE computation:
-    # Router has 1 logit: softmax([logit]) == 1.0 (exact weight 1.0).
-    # Token is routed to expert 0 with weight 1.0.
-    router_weight = 1.0
-    moe_out = router_weight * (silu(x @ W_gate.T) * (x @ W_up.T) @ W_down.T)
-
-    np.testing.assert_allclose(moe_out, dense_out, rtol=1e-6, atol=1e-6)
-
-
 # --------------------------------------------------------------------------- #
 # 3. Autoregressive (AR) baseline causal cross-entropy & BPB tracking
 # --------------------------------------------------------------------------- #

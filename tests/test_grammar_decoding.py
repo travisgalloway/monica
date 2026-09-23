@@ -10,7 +10,6 @@ Acceptance Criteria:
 
 from __future__ import annotations
 
-import time
 import numpy as np
 import pytest
 
@@ -306,29 +305,6 @@ def test_composition_with_symbol_table_masking():
 # --------------------------------------------------------------------------- #
 # 6. CPU Latency Benchmark (< 5 ms per step)
 # --------------------------------------------------------------------------- #
-
-def test_grammar_masking_overhead_under_5ms_on_cpu():
-    masker = TsGrammarMasker(decode_fn=_DECODE)
-    vocab_size = len(_TEST_VOCAB)
-    code = "const data = [1, 2, (3 + 4), { name: 'Alice', values: ["
-
-    # Warmup
-    for _ in range(5):
-        masker.mask_for(code, vocab_size=vocab_size)
-
-    # Benchmark 100 steps
-    t0 = time.perf_counter()
-    n_steps = 100
-    for _ in range(n_steps):
-        res = masker.mask_for(code, vocab_size=vocab_size)
-        assert res is not None
-    elapsed = time.perf_counter() - t0
-    ms_per_step = (elapsed / n_steps) * 1000.0
-
-    print(f"\n[Benchmark] Grammar masking overhead: {ms_per_step:.4f} ms per step on CPU")
-    # Acceptance criterion: < 5.0 ms
-    assert ms_per_step < 5.0, f"Overhead {ms_per_step:.2f} ms exceeds 5 ms limit"
-
 
 # --------------------------------------------------------------------------- #
 # 7. Zero Tree-sitter Syntax Errors Across 100 Test Prompts

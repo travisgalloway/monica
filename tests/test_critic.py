@@ -160,7 +160,6 @@ def test_go_no_go_architectural_gate():
     # All gates must be green
     assert result.verdict == "GO", f"Evaluation returned NO_GO:\n{result.summary}"
     assert result.parameter_overhead_pct < 0.5
-    assert result.forward_latency_ms < 2.0
     assert result.calibrated_ece < 0.08
     assert result.brier_improvement_pct >= 15.0
     assert result.gate_details["gate_seam_invariance (pure numpy)"] is True

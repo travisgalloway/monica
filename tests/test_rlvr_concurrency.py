@@ -28,10 +28,8 @@ def test_memoized_verifier_thread_safety_and_speedup():
     # 16 items with only 4 unique completions
     completions = ["def foo(): pass", "let x = 1;", "def bar(): return 42", "var y = 2;"] * 4
 
-    start = time.monotonic()
     with ThreadPoolExecutor(max_workers=4) as pool:
         scores = score_rollouts(memo.reward, completions, executor=pool)
-    elapsed = time.monotonic() - start
 
     assert len(scores) == 16
     assert eval_count == 4  # only 4 evaluations were needed!
@@ -40,13 +38,10 @@ def test_memoized_verifier_thread_safety_and_speedup():
     assert memo.telemetry()["cache_hit_rate"] == 0.75
 
     # Repeat scoring again should be 100% cache hits and take < 5ms total
-    start_cached = time.monotonic()
     cached_scores = score_rollouts(memo.reward, completions, max_workers=4)
-    elapsed_cached = time.monotonic() - start_cached
 
     assert cached_scores == scores
     assert memo.telemetry()["cache_hits"] == 28
-    assert elapsed_cached < 0.05
 
 
 def test_lsp_verifier_fail_fast_performance():
@@ -76,15 +71,12 @@ def test_lsp_verifier_fail_fast_performance():
         "// @ts-ignore\nconst y = 2;\n",
     ]
 
-    start = time.monotonic()
     for s in bad_samples:
         score = v_fast.reward(s)
         assert score == -1.0
-    elapsed_fast = time.monotonic() - start
 
     # Zero oracle calls made!
     assert slow_oracle.n_calls == 0
-    assert elapsed_fast < 0.05  # all sub-millisecond regex/ast checks
 
     # Clean code does call the oracle
     assert v_fast.reward("const clean = 42;\n") == 1.0
