@@ -15,7 +15,7 @@ Status is one of `Planned`, `In progress`, `Shipped`, `Deprecated` — nothing e
 meaning *partially done*; that state lives in the per-layer columns. A capability reaches
 `Shipped` only when its full definition of done passes.
 
-Last audited 2026-09-19 (`/closure-audit`, whole repo).
+Last audited 2026-09-23 (`/audit`, whole repo).
 
 ## Data pipeline
 
@@ -27,12 +27,13 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | DATA-4 | A person can split a packed corpus into train/val | done | n/a | n/a | n/a | Shipped | — | design/04 |
 | DATA-5 | A person can sync a corpus to and from R2/S3 | done | n/a | n/a | n/a | Shipped | — | infrastructure |
 | DATA-6 | A person can build a scale corpus with datatrove | done | n/a | n/a | n/a | Shipped | #193 | design/08 |
-| DATA-7 | A person can build the TS LSP-clean Stack-v2 corpus | done | n/a | n/a | n/a | In progress | #252 | design/08 |
+| DATA-7 | A person can build the TS LSP-clean Stack-v2 corpus | done | n/a | n/a | n/a | In progress | #252, #418, #419, #420 | design/08 |
 | DATA-8 | A person can build an SFT corpus (instruct/reasoning/tool) and train on it | done | n/a | n/a | n/a | Shipped | #306 | design/11 |
 | DATA-9 | A person can build a DPO preference set | done | n/a | n/a | n/a | Shipped | — | design/11 |
 | DATA-10 | A person can build a decontamination blocklist | done | n/a | n/a | n/a | Shipped | — | design/08 |
 | DATA-11 | A person can sweep vocab size against a sample | done | n/a | n/a | n/a | Shipped | #251 | design/08 |
 | DATA-12 | A person can train with FIM and a length curriculum | done | done | done | done | Shipped | #216 | design/13 |
+| DATA-13 | A person can pack repository context by import-graph topological sort | done | n/a | n/a | done | Shipped | #359 | design/13 |
 
 ## Native tokenizer (`swift/`)
 
@@ -43,6 +44,8 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | TOK-3 | A person gets bit-identical tokenizer output on macOS and Linux | n/a | n/a | n/a | done | Shipped | #246 | design/13 |
 | TOK-4 | A person can ingest Parquet in the pack path | n/a | n/a | n/a | done | Shipped | #247 | design/13 |
 | TOK-5 | A person can pack FIM-transformed shards natively | n/a | n/a | n/a | done | Shipped | #215 | design/13 |
+| TOK-6 | A person can pack shards with Suffix-Prefix-Middle and joint FIM sampling natively | n/a | n/a | n/a | done | Shipped | #358, #370 | design/13 |
+| TOK-7 | A person gets isolated newline tokens and seeded indentation tokens from the native tokenizer | n/a | n/a | n/a | done | Shipped | #357 | design/13 |
 
 ## Model and the seam
 
@@ -58,6 +61,11 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | MODEL-8 | A person can quantize a checkpoint | done | done | n/a | done | Shipped | #196 | design/14 |
 | MODEL-9 | A person can target the POC to MVP configuration matrix (100M Mac, 1B CUDA, 4B MVP) | done | done | done | done | Shipped | #272, #222, #223 | design/16 |
 | MODEL-10 | A person can serve with Native FP16/BF16 and Mixed Precision W4 + KV8 | done | done | done | done | Shipped | #168 | design/16 |
+| MODEL-11 | A person can attach an auxiliary decision-critic head to a backbone's hidden states | done | done | done | n/a | Shipped | #386 | design/13 |
+| MODEL-12 | A person can configure a hybrid layer to use Multi-Head Latent Attention instead of plain MHA | done | done | done | n/a | Shipped | #355 | design/13 |
+| MODEL-13 | A person can train with sequential Multi-Token Prediction and a speculative head | done | done | done | n/a | Shipped | #356 | design/13 |
+| MODEL-14 | A person can run an architecture ablation sweep and an AR-harness ablation comparison | done | done | done | n/a | Shipped | #219, #200, #201 | design/13 |
+| MODEL-15 | A person gets a fused Metal SSD-scan/conv kernel on the MLX backend | n/a | done | n/a | n/a | In progress | #171, #443 | design/14 |
 
 ## Training
 
@@ -72,6 +80,8 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | TRAIN-7 | A person can shard a run across GPUs (FSDP2 + expert-parallel) | done | n/a | done | n/a | Shipped | #271 | design/13 |
 | TRAIN-8 | A person can train with 8-bit moments and fp8 expert GEMMs | n/a | n/a | done | n/a | Shipped | #240 | design/13 |
 | TRAIN-9 | A person can read structured progress from a run | done | n/a | n/a | n/a | Shipped | — | design/05 |
+| TRAIN-10 | A person can run a frozen-backbone training and calibration pipeline for the decision critic | done | n/a | n/a | n/a | Shipped | #387 | design/13 |
+| TRAIN-11 | A person can run a WSD decay-phase general-knowledge replay buffer alongside the code corpus | done | n/a | n/a | n/a | Shipped | #364 | design/05 |
 
 ## Post-training
 
@@ -79,7 +89,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 |----|-----------|----------|-----|------|-------|--------|-------|--------|
 | POST-1 | A person can run supervised fine-tuning | done | done | done | done | Shipped | #195, #101 | design/11 |
 | POST-2 | A person can run DPO | done | done | done | n/a | Shipped | — | design/11 |
-| POST-3 | A person can run GRPO/RLVR against a verifier reward | done | done | done | n/a | Shipped | #230 | design/11 |
+| POST-3 | A person can run GRPO/RLVR against a verifier reward | done | done | done | n/a | Shipped | #230, #339, #340, #341, #342, #343, #344, #345, #346, #347, #348, #361, #439 | design/11 |
 | POST-4 | A person can generate on-policy preference pairs | done | done | n/a | n/a | Shipped | — | design/11 |
 
 ## Serving
@@ -91,6 +101,9 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | SERVE-3 | A person can rewind a session to a turn boundary and branch | done | done | none | none | Shipped | #305, #318 | design/14 |
 | SERVE-4 | A person can constrain decoding to an allowed id set | done | done | done | done | Shipped | #226 | design/12 |
 | SERVE-5 | A person can decode speculatively | done | done | n/a | done | Shipped | #172 | design/14 |
+| SERVE-6 | A person can filter speculative-decode drafts and Best-of-N candidates with the critic before an LSP oracle call | done | done | done | n/a | Shipped | #388 | design/13 |
+| SERVE-7 | A person can generate under an adaptive dual-mode gate that suppresses reasoning during inline FIM | done | done | done | n/a | Shipped | #362 | design/11 |
+| SERVE-8 | A person can constrain decoding to a Tree-sitter grammar for TypeScript and Python | done | done | done | n/a | Shipped | #360 | design/12 |
 
 ## Evaluation
 
@@ -108,6 +121,9 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | EVAL-10 | A person can check quantization parity | done | done | n/a | done | Shipped | #196 | design/14 |
 | EVAL-11 | A person can hold SSI results to the measurement contract | done | n/a | n/a | n/a | Shipped | #225 | design/15 |
 | EVAL-12 | A person can evaluate against the TS error-injection set | done | n/a | n/a | n/a | Shipped | #224 | design/15 |
+| EVAL-13 | A person can run a technical-prose and general-knowledge recall probe | done | n/a | n/a | n/a | Shipped | #363 | design/06 |
+| EVAL-14 | A person can measure a local-hardware headline metric, Mamba-2 hybrid vs a same-size transformer | done | done | n/a | n/a | Shipped | #104 | benchmarks |
+| EVAL-15 | A person can measure MoE expert specialization and routing overlap for non-code domains | done | n/a | n/a | n/a | Shipped | #365 | design/13 |
 
 ## LSP / structural-signal integration
 
@@ -123,6 +139,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | LSP-8 | A person can execute generated code and capture the result | done | n/a | n/a | n/a | Shipped | — | design/12 |
 | LSP-9 | A person can run the LSP harness natively, no Python runtime | n/a | n/a | n/a | done | Shipped | #197 | design/13 |
 | LSP-10 | A person can get TS diagnostics without the LSP client debounce | done | n/a | n/a | none | Shipped | #279 | design/12 |
+| LSP-11 | A person can compare a discrete-diffusion generation path against the autoregressive path | done | n/a | n/a | n/a | Shipped | #204 | design/12 |
 
 ## Swift engine (`swift/engine/`)
 
@@ -135,7 +152,7 @@ Last audited 2026-09-19 (`/closure-audit`, whole repo).
 | ENGINE-5 | A person can read mixing matrices and hidden states in Swift | n/a | n/a | n/a | done | Shipped | — | design/14 |
 | ENGINE-6 | A person gets Swift/MLX parity gated at real poc scale † | n/a | done | n/a | done | Shipped | #267 | design/14 |
 | ENGINE-7 | A person can round-trip a checkpoint Swift to Python | done | done | n/a | done | Shipped | #196 | design/14 |
-| ENGINE-8 | A person gets a fused Metal SSD-scan/conv kernel | n/a | n/a | n/a | none | Planned | #171 | design/14 |
+| ENGINE-8 | A person gets a fused Metal SSD-scan/conv kernel in the Swift engine (`swift/engine/`) | n/a | n/a | n/a | none | Planned | #171 | design/14 |
 | ENGINE-9 | A person can decode speculatively in the Swift engine | n/a | n/a | n/a | done | Shipped | #172 | design/14 |
 | ENGINE-10 | A person can trust a checked-in parity oracle was not silently corrupted † | done | done | n/a | n/a | Shipped | #298 | design/14 |
 
@@ -149,6 +166,18 @@ the caveat is about how much a single green run is worth. ENGINE-10's double-exp
 what gets *committed* as an oracle and does nothing for a test process that corrupts mid-run.
 Measured rates, the mitigation's limits, and the rerun policy (never regenerate an oracle to make a
 red gate green) are in `docs/design/14-inference-engine.md` §§D1–D6.
+
+## Agent harness
+
+| ID | Capability | Portable | MLX | CUDA | Swift | Status | Issue | Design |
+|----|-----------|----------|-----|------|-------|--------|-------|--------|
+| AGENT-1 | A person can run an autonomous multi-turn ReAct coding-agent loop with anti-spin circuit breakers | done | n/a | n/a | n/a | Shipped | #349 | design/17 |
+| AGENT-2 | A person can run staged context compaction (soft elision, hard summarization) on a long agent session | done | n/a | n/a | n/a | Shipped | #350 | design/17 |
+| AGENT-3 | A person can run the agent loop under deterministic safety gates (read-before-write, post-edit diagnostics, workspace containment) | done | n/a | n/a | n/a | Shipped | #351 | design/17 |
+| AGENT-4 | A person can drive the agent loop with capability-adaptive planning scaffolding | done | n/a | n/a | n/a | Shipped | #352 | design/17 |
+| AGENT-5 | A person can execute agent tools and RLVR verifiers inside a containerized sandbox | done | n/a | n/a | n/a | Shipped | #353 | design/18 |
+| AGENT-6 | A person can give the agent loop native web tools (web_search, fetch_web_page) with SSRF guards | done | n/a | n/a | n/a | Shipped | #366, #367, #368 | design/17 |
+| AGENT-7 | A person can run an autonomous coding-agent benchmark harness (POC and MVP runs) | done | n/a | n/a | n/a | Shipped | #371 | design/17 |
 
 ## Conformance
 
