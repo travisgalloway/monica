@@ -299,3 +299,132 @@ Format: date, `file:line`, what was seen, what task surfaced it, rough severity.
 - [2026-09-19] `src/data/storage.py:54`, Cloudflare R2 rejects boto3 S3 clients configured with default
   AWS `us-east-1` region endpoints. Resolved by defaulting `region_name` to `"auto"`. Found during R2
   sync integration. Severity: operational, resolved.
+
+- [2026-09-23] `scripts/ablation_sweep.py:1`, the #219 ablation sweep CLI, whose closed issue says
+  its output is the winning config for the #222/#223 runs, is referenced in no Makefile, CI
+  workflow, or `design/13` discussion outside its own file and test. Found during /audit closure
+  pass A (A-01). Severity: reachability, non-blocking.
+
+- [2026-09-23] `scripts/eval_critic_gate.py:1`, the standalone Go/No-Go gate CLI for the auxiliary
+  decision critic head is referenced nowhere outside its own docstring, and re-verifies the same
+  five gates on synthetic random data rather than `train_critic.py`'s real cached output. Found
+  during /audit closure pass A (A-02). Severity: reachability, non-blocking.
+
+- [2026-09-23] `config/toy-mhm.yaml:1`, the toy config sized for the ratified MHM 49,152-vocab
+  tokenizer is loaded only by four test files and appears in no script, Makefile, CI target, or
+  doc. Found during /audit closure pass A (A-04). Severity: reachability, non-blocking.
+
+- [2026-09-23] `src/model/metal_kernels.py:28`, the `MONICA_DISABLE_METAL_FAST` escape hatch is
+  read but never set or documented anywhere outside its own source line. Found during /audit
+  closure pass A (A-05). Severity: doc hygiene, low.
+
+- [2026-09-23] `scripts/build_corpus.py:44`, the `MONICA_TOKENIZE` override for the
+  `monica-tokenize` binary path is read but never set or documented anywhere outside its own
+  source line. Found during /audit closure pass A (A-06). Severity: doc hygiene, low.
+
+- [2026-09-23] `scripts/cloud_pod.py:110`, the `RUNPOD_SSH_KEY` override for `get_ssh_key()` is
+  read but never set or documented anywhere, despite `docs/runbooks/cuda-vm-e2e-plan.md`
+  documenting other `cloud_pod.py` env knobs in detail. Found during /audit closure pass A (A-07).
+  Severity: doc hygiene, low.
+
+- [2026-09-23] `src/data/r2_sync.py:58`, `AWS_DEFAULT_REGION` (default `"auto"`, the R2 convention)
+  is read in `r2_sync.py` and `cloud_pod.py` but, unlike `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
+  appears in no doc anywhere. Found during /audit closure pass A (A-08). Severity: doc hygiene, low.
+
+- [2026-09-23] `src/data/sft_sources.py:382`, the #76 clean-license SFT sourcing layer (OASST1,
+  Dolly, FLAN, hand-authored, code, architecture loaders) is imported only by its own tests. The
+  shipped SFT driver `scripts/sft.py` imports `sft_corpus`/`sft_loader` instead, so the sourcing
+  layer never reaches the trained model. Found during /audit closure pass A (A-09). Severity:
+  reachability, non-blocking.
+
+- [2026-09-23] `tests/test_m12_tokenization_packing.py:44`, `tests/test_corpus.py:135`, both
+  DATA-7 sample-shard manifest tests skip when `data/mhm_sample_shards` is absent, and no CI job
+  runs `scripts/build_corpus.py --pack` to produce it. The #252 manifest-schema assertions
+  (`language_mix`, `filter_rate`, `decontamination.applied`) never execute in CI. Found during
+  /audit closure pass B (B-01). Severity: coverage, medium.
+
+- [2026-09-23] `tests/test_sandbox_execution.py:386`, `test_live_docker_smoke` is the file's one
+  live-container smoke test. It skips in every CI job because no hosted runner has Docker, the same
+  shape as the already-parked CUDA/MPS/toolchain tiers. Found during /audit closure pass B (B-02).
+  Severity: coverage, non-blocking.
+
+- [2026-09-23] `issue #420` (also #418, #419), milestone 13 "Corpus Tokenization" decomposes into
+  #418 (extract) then #419 (filter/clean) then #420 (tokenize/pack). Nothing is a usable, trainable
+  shard corpus until #420 lands, two enabler issues deep. Found during /audit closure pass E
+  (E-26). Severity: decomposition, non-blocking.
+
+- [2026-09-23] `issue #429`, milestone 16 "Harness" issue #429 (failure-mode telemetry, LSP
+  debounce tuning, timeout/recovery fixes) is a bugfix/hardening pass over #427 and #428, matching
+  the named integration-and-polish anti-pattern rather than a new capability. Found during /audit
+  closure pass E (E-27). Severity: decomposition, non-blocking.
+
+- [2026-09-23] `issue #432` (also #430, #431), milestone 17 "MVP Train" decomposes into #430
+  (orchestrate) then #431 (checkpoint durability) then #432 (finalize/consolidate weights). #431's
+  checkpoint-sync work is logically needed during #430's multi-week run, not sequenced after it,
+  and nothing is a loadable `weights.safetensors` until #432. Found during /audit closure pass E
+  (E-28). Severity: decomposition, non-blocking.
+
+- [2026-09-23] `issue #228`, "Part of #198" (line 5) is the only dependency-shaped reference in the
+  body. A strict `Depends on`/`Blocked by`/`Blocks`/`Requires` parser finds no relationship for
+  this issue at all, though #198 is closed. Found during /audit closure pass E (E-30). Severity:
+  dependency clarity, low.
+
+- [2026-09-23] `issue #202`, "Part of #198" (line 5) is the only dependency-shaped reference in the
+  body, the same gap as E-30. Found during /audit closure pass E (E-31). Severity: dependency
+  clarity, low.
+
+- [2026-09-23] `issue #203`, "Part of #198" (line 5) is the only dependency-shaped reference in the
+  body, the same gap as E-30. Found during /audit closure pass E (E-32). Severity: dependency
+  clarity, low.
+
+- [2026-09-23] `issue #205`, "Part of #198" (line 5) is the only dependency-shaped reference in the
+  body, the same gap as E-30. Found during /audit closure pass E (E-33). Severity: dependency
+  clarity, low.
+
+- [2026-09-23] `docs/design/07-configs-and-decisions.md:163-168`, the doc calls tied embeddings
+  "not a tuning knob but a requirement," but `MambaConfig.validate()` carries no check enforcing
+  `tie_embeddings`. Found during /audit design pass D1 (DSN-e91b320f). Severity: doc-unimplemented,
+  low.
+
+- [2026-09-23] `src/data/shard.py:116`, `pack_atomic` writes each shard file and the manifest
+  directly to its final name, with no temp-file-and-rename step, and `open_shard` falls back
+  silently to the default dtype when the manifest is missing. Found during /audit design pass D2
+  (DSN-f2d65e43). Severity: read-modify-write-race, low.
+
+- [2026-09-23] `docs/benchmarks.md` (issue #223), #223's val-perplexity/grad-norm/BPB checklist
+  item has no supporting `runs/large-a/` artifact. Covered by the same ticket as REQ-279eefd9.
+  Found during /audit requirements pass R1 (REQ-98111e6a). Severity: criterion-unmet, high.
+
+- [2026-09-23] `docs/benchmarks.md` (issue #223), #223's own body states the checkpoint-resume
+  kill-and-resume rehearsal "has not happened" as of its 2026-08-08 update, and no later artifact
+  shows it did. Found during /audit requirements pass R1 (REQ-efef865e). Severity: criterion-unmet,
+  medium.
+
+- [2026-09-23] `tests/test_serve_critic.py` (issue #388), the 70%-pruning-rate test hand-supplies
+  critic probability values, eight of ten chosen below the threshold by construction, rather than
+  running the trained critic head on real generations. Found during /audit requirements pass R1
+  (REQ-36d2b0da). Severity: criterion-untested, medium.
+
+- [2026-09-23] `tests/test_serve_critic.py` (issue #388), the three-times latency-speedup test
+  skips seven of eight mock LSP calls by construction, from a hand-picked probability list. Found
+  during /audit requirements pass R1 (REQ-51785ec1). Severity: criterion-untested, medium.
+
+- [2026-09-23] `scripts/cache_critic_features.py` (issue #387), the recorded calibration run
+  reports an ECE of 0.0 and an AUC-ROC of 1.0 on 22 held-out samples, but every negative label is
+  the same hardcoded syntax-error string contrasted against clean labels. Found during /audit
+  requirements pass R1 (REQ-c798238d). Severity: criterion-untested, medium.
+
+- [2026-09-23] `tests/test_cuda_fp8.py` (issue #240), the bf16-versus-fp8 forward-equivalence
+  acceptance test needs real Hopper-or-later hardware and skips in every CI job, including
+  `cuda-cpu`. Found during /audit requirements pass R1 (REQ-9424bdf5). Severity: criterion-untested,
+  medium.
+
+- [2026-09-23] `tests/test_grammar_decoding.py` (issue #360), the 100-prompt zero-syntax-error test
+  builds completions with a hand-written deterministic string-closer rather than the model's real
+  `sample()`/`generate()` loop under grammar constraints. Found during /audit requirements pass R1
+  (REQ-7bd2e6ac). Severity: criterion-untested, medium.
+
+- [2026-09-23] `swift/Sources/MonicaTokenizer/Pretokenizer.swift` (issue #357), the claimed 5%
+  tokenization compression-ratio improvement on indentation-heavy TypeScript files has no recorded
+  before/after measurement anywhere in `swift/`, `docs/`, or `results/`. Found during /audit
+  requirements pass R1 (REQ-f465e57b). Severity: criterion-untested, medium.
