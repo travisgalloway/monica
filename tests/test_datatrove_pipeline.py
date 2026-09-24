@@ -175,3 +175,101 @@ def test_run_corpus_pipeline_sample_end_to_end(tmp_path):
     va_loader = PackedLoader(Path(res["split"]["val_bin"]), seq_len=64, batch_size=1, shuffle=False)
     assert len(tr_loader) >= 1
     assert len(va_loader) >= 1
+
+
+def test_stack_v2_reader_enforces_license_and_tags_metadata():
+    """Verify stack_v2_reader gates on permissive licenses and tags TypeScript metadata (#418)."""
+    rows = [
+        {"blob_id": "b1", "detected_licenses": ["MIT"], "text": "const x: number = 1;", "repo_name": "repo1", "path": "src/x.ts"},
+        {"blob_id": "b2", "detected_licenses": ["GPL-3.0"], "text": "const y: number = 2;", "repo_name": "repo2", "path": "src/y.ts"},
+        {"blob_id": "b3", "detected_licenses": ["Apache-2.0"], "text": "const z: number = 3;", "repo_name": "repo3", "path": "src/z.ts", "is_vendor": True},
+        {"blob_id": "b4", "detected_licenses": ["BSD-3-Clause"], "text": "const w: number = 4;", "repo_name": "repo4", "path": "src/w.ts"},
+    ]
+    reader = dt.stack_v2_reader(rows=rows, lang="typescript")
+    docs = list(reader.run())
+
+    # b2 (GPL-3.0) and b3 (vendor) dropped; b1 (MIT) and b4 (BSD-3-Clause) kept
+    assert len(docs) == 2
+    assert docs[0].id == "stack_v2/b1"
+    assert docs[0].metadata["source"] == "stack-v2"
+    assert docs[0].metadata["lang"] == "typescript"
+    assert docs[0].metadata["license"] == "mit"
+    assert docs[0].metadata["is_code"] is True
+
+    assert docs[1].id == "stack_v2/b4"
+    assert docs[1].metadata["license"] == "bsd-3-clause"
+
+
+def test_essential_web_reader_tags_metadata():
+    """Verify essential_web_reader yields prose documents with en/odc-by metadata (#418)."""
+    rows = [
+        {"id": "ew1", "text": "This is a clean informative web article about astronomy.", "url": "https://example.com/astro"},
+        {"id": "ew2", "text": "", "url": "https://example.com/empty"},
+        {"id": "ew3", "text": "Another detailed essay on modern distributed systems.", "url": "https://example.com/dist"},
+    ]
+    reader = dt.essential_web_reader(rows=rows)
+    docs = list(reader.run())
+
+    # ew2 is empty, skipped
+    assert len(docs) == 2
+    assert docs[0].id == "essential_web/ew1"
+    assert docs[0].metadata["source"] == "essential-web"
+    assert docs[0].metadata["lang"] == "en"
+    assert docs[0].metadata["license"] == "odc-by"
+    assert docs[0].metadata["is_code"] is False
+    assert docs[0].metadata["url"] == "https://example.com/astro"
+
+
+def test_run_raw_extraction_end_to_end(tmp_path):
+    """Verify run_raw_extraction outputs uncompressed .jsonl and manifest.json with source breakdown (#418)."""
+    stack_rows = [
+        {"blob_id": "ts_01", "detected_licenses": ["MIT"], "text": "export interface Config { timeout: number; }\n", "repo_name": "config-mod", "path": "index.ts"},
+        {"blob_id": "ts_02", "detected_licenses": ["Apache-2.0"], "text": "export function run(): void { console.log('ok'); }\n", "repo_name": "run-mod", "path": "run.ts"},
+    ]
+    ew_rows = [
+        {"id": "doc_01", "text": "Fundamental principles of reactive state management in modern web architecture.\n", "url": "https://blog.example.com/reactive"},
+    ]
+
+    out_dir = tmp_path / "raw_out"
+    manifest = dt.run_raw_extraction(
+        out_uri=str(out_dir),
+        stack_v2_rows=stack_rows,
+        essential_web_rows=ew_rows,
+        logging_dir=str(tmp_path / "logs"),
+    )
+
+    # Verify manifest fields
+    assert manifest["document_count"] == 3
+    assert manifest["total_volume_bytes"] > 0
+    assert manifest["compression"] == "none"
+    assert "stack-v2" in manifest["source_breakdown"]
+    assert "essential-web" in manifest["source_breakdown"]
+
+    assert manifest["source_breakdown"]["stack-v2"]["document_count"] == 2
+    assert manifest["source_breakdown"]["stack-v2"]["primary_language"] == "typescript"
+
+    assert manifest["source_breakdown"]["essential-web"]["document_count"] == 1
+    assert manifest["source_breakdown"]["essential-web"]["primary_language"] == "en"
+
+    # Verify uncompressed JSONL files exist directly under out_dir
+    manifest_file = out_dir / "manifest.json"
+    assert manifest_file.exists()
+    disk_manifest = json.loads(manifest_file.read_text())
+    assert disk_manifest["document_count"] == 3
+
+    shard_files = list(out_dir.glob("*.jsonl"))
+    assert len(shard_files) == 2  # stack_v2_00000.jsonl and essential_web_00000.jsonl
+    for sf in shard_files:
+        assert not str(sf).endswith(".gz")
+
+
+def test_r2_folder_configuration(monkeypatch):
+    """Verify _folder helper configures region_name auto and custom endpoint for R2 URIs (#418)."""
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://test.r2.cloudflarestorage.com")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    spec = dt._folder("s3://monica-training/data/raw")
+    assert isinstance(spec, tuple)
+    assert spec[0] == "s3://monica-training/data/raw"
+    assert spec[1]["client_kwargs"]["endpoint_url"] == "https://test.r2.cloudflarestorage.com"
+    assert spec[1]["client_kwargs"]["region_name"] == "auto"

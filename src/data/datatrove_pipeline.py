@@ -28,7 +28,7 @@ is absent.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import storage
 from .corpus import Record
@@ -50,10 +50,19 @@ def _folder(uri):
     """A datatrove output_folder spec for an fsspec URI. For `s3://` inject the R2 endpoint from the
     env (key/secret come from `AWS_*` via s3fs); local paths pass through unchanged."""
     if str(uri).startswith("s3://"):
+        import os
         from .r2_sync import r2_endpoint
         endpoint = r2_endpoint()
         if endpoint:
-            return (str(uri), {"client_kwargs": {"endpoint_url": endpoint}})
+            return (
+                str(uri),
+                {
+                    "client_kwargs": {
+                        "endpoint_url": endpoint,
+                        "region_name": os.environ.get("AWS_DEFAULT_REGION", "auto"),
+                    }
+                },
+            )
     return str(uri)
 
 
@@ -237,3 +246,492 @@ def run_minhash_dedup(cleaned_uri, base_uri, *, kind: str = "local", tasks: int 
                         JsonlWriter(output_folder=_folder(out))],
                        f"{logging_dir}/filter", kind=kind, tasks=tasks, workers=workers, depends=s3)
     s4.run()
+
+
+def _download_swh_blob(blob_id: str, src_encoding: str = "utf-8", s3_client=None, s3_fs=None) -> str:
+    """Fetch and gzip-decompress a blob from Software Heritage S3 (#418)."""
+    if s3_client is not None:
+        from .stack_v2 import download_contents
+        return download_contents(blob_id, src_encoding, s3_client=s3_client)
+
+    import gzip
+    if s3_fs is None:
+        import s3fs
+        s3_fs = s3fs.S3FileSystem(
+            anon=True,
+            client_kwargs={"region_name": "us-east-1", "endpoint_url": "https://s3.amazonaws.com"},
+        )
+    with s3_fs.open(f"softwareheritage/content/{blob_id}", "rb") as f:
+        body = gzip.decompress(f.read())
+    return body.decode(src_encoding, errors="replace")
+
+
+def stack_v2_reader(
+    *,
+    limit: int = -1,
+    config: str = "TypeScript",
+    lang: str = "typescript",
+    files: Optional[Sequence[str]] = None,
+    rows: Optional[Iterable[Dict[str, Any]]] = None,
+    s3_client=None,
+    s3_fs=None,
+    batch_size: int = 1000,
+    threads: int = 16,
+):
+    """A Datatrove reader over Stack v2 metadata + Software Heritage S3 content (#418).
+    Enforces permissive license filtering before fetching content, and tags documents
+    with language, license, repo, and blob metadata."""
+    from datatrove.pipeline.readers.base import BaseReader
+    from datatrove.data import Document
+    from .filters import is_permissive, normalize_license
+
+    class StackV2Reader(BaseReader):
+        name = "📚 Stack v2"
+
+        def __init__(self, limit: int = -1, skip: int = 0):
+            super().__init__(limit=limit, skip=skip)
+            self.limit = limit
+            self._s3_fs = s3_fs
+
+        def run(self, data=None, rank: int = 0, world_size: int = 1):
+            if data:
+                yield from data
+
+            nonlocal s3_fs
+            if s3_fs is None and s3_client is None and rows is None:
+                import s3fs
+                self._s3_fs = s3fs.S3FileSystem(
+                    anon=True,
+                    client_kwargs={"region_name": "us-east-1", "endpoint_url": "https://s3.amazonaws.com"},
+                )
+
+            count = 0
+            if rows is not None:
+                for i, row in enumerate(rows):
+                    if world_size > 1 and (i % world_size) != rank:
+                        continue
+                    if self.limit >= 0 and count >= self.limit:
+                        break
+
+                    licenses = row.get("detected_licenses") or row.get("license") or []
+                    if isinstance(licenses, str):
+                        licenses = [licenses]
+                    lic = normalize_license(licenses[0] if licenses else "")
+                    if not is_permissive(lic):
+                        continue
+                    if row.get("is_vendor") or row.get("is_generated"):
+                        continue
+
+                    if "text" in row:
+                        text = row["text"]
+                    elif "content" in row:
+                        text = row["content"]
+                    elif "blob_id" in row:
+                        try:
+                            text = _download_swh_blob(
+                                row["blob_id"],
+                                row.get("src_encoding") or "utf-8",
+                                s3_client=s3_client,
+                                s3_fs=self._s3_fs,
+                            )
+                        except Exception:
+                            self.stat_update("fetch_failed")
+                            continue
+                    else:
+                        continue
+
+                    doc = Document(
+                        text=text,
+                        id=f"stack_v2/{row.get('blob_id', i)}",
+                        metadata={
+                            "source": "stack-v2",
+                            "lang": lang,
+                            "license": lic,
+                            "is_code": True,
+                            "repo": row.get("repo_name", ""),
+                            "path": row.get("path", ""),
+                            "blob_id": row.get("blob_id", ""),
+                        },
+                    )
+                    self.update_doc_stats(doc)
+                    self.stat_update("documents")
+                    count += 1
+                    yield doc
+                return
+
+            import pyarrow.parquet as pq
+            import fsspec
+            from concurrent.futures import ThreadPoolExecutor
+            from .vocab_sample import metadata_ok, STACK_V2_REPO
+
+            target_files = list(files) if files else None
+            if not target_files:
+                fs_hf = fsspec.filesystem("hf")
+                lang_dir = f"{STACK_V2_REPO}/data/{config}"
+                target_files = sorted(
+                    p for p in fs_hf.ls(lang_dir, detail=False) if p.endswith(".parquet")
+                )
+
+            shard_files = target_files[rank::world_size] if world_size > 1 else target_files
+            columns = [
+                "blob_id", "src_encoding", "detected_licenses", "length_bytes",
+                "is_vendor", "is_generated", "path", "repo_name"
+            ]
+
+            def _fetch_row(r):
+                try:
+                    blob = r["blob_id"]
+                    t = _download_swh_blob(
+                        blob,
+                        r.get("src_encoding") or "utf-8",
+                        s3_client=s3_client,
+                        s3_fs=self._s3_fs,
+                    )
+                    return r, t
+                except Exception:
+                    return r, None
+
+            for pf_path in shard_files:
+                if self.limit >= 0 and count >= self.limit:
+                    break
+                try:
+                    if str(pf_path).startswith("datasets/"):
+                        pf_obj = fsspec.filesystem("hf").open(pf_path)
+                    else:
+                        pf_obj = pf_path
+                    pf = pq.ParquetFile(pf_obj)
+                except Exception as e:
+                    self.stat_update(f"open_failed_{type(e).__name__}")
+                    continue
+
+                for batch in pf.iter_batches(batch_size=batch_size, columns=columns):
+                    if self.limit >= 0 and count >= self.limit:
+                        break
+                    batch_rows = [r for r in batch.to_pylist() if metadata_ok(r)]
+                    if not batch_rows:
+                        continue
+
+                    with ThreadPoolExecutor(max_workers=threads) as pool:
+                        results = pool.map(_fetch_row, batch_rows)
+                        for r, text in results:
+                            if self.limit >= 0 and count >= self.limit:
+                                break
+                            if not text:
+                                self.stat_update("fetch_failed")
+                                continue
+                            licenses = r.get("detected_licenses") or []
+                            lic = normalize_license(licenses[0] if licenses else "")
+                            blob_id = r["blob_id"]
+                            doc = Document(
+                                text=text,
+                                id=f"stack_v2/{blob_id}",
+                                metadata={
+                                    "source": "stack-v2",
+                                    "lang": lang,
+                                    "license": lic,
+                                    "is_code": True,
+                                    "repo": r.get("repo_name", ""),
+                                    "path": r.get("path", ""),
+                                    "blob_id": blob_id,
+                                },
+                            )
+                            self.update_doc_stats(doc)
+                            self.stat_update("documents")
+                            count += 1
+                            yield doc
+
+    return StackV2Reader(limit=limit)
+
+
+def essential_web_reader(
+    *,
+    limit: int = -1,
+    files: Optional[Sequence[str]] = None,
+    rows: Optional[Iterable[Dict[str, Any]]] = None,
+    batch_size: int = 1000,
+):
+    """A Datatrove reader over Essential-Web v1.0 prose corpus (#418)."""
+    from datatrove.pipeline.readers.base import BaseReader
+    from datatrove.data import Document
+
+    class EssentialWebReader(BaseReader):
+        name = "🌐 Essential-Web"
+
+        def __init__(self, limit: int = -1, skip: int = 0):
+            super().__init__(limit=limit, skip=skip)
+            self.limit = limit
+
+        def run(self, data=None, rank: int = 0, world_size: int = 1):
+            if data:
+                yield from data
+
+            count = 0
+            if rows is not None:
+                for i, row in enumerate(rows):
+                    if world_size > 1 and (i % world_size) != rank:
+                        continue
+                    if self.limit >= 0 and count >= self.limit:
+                        break
+
+                    text = row.get("text", "")
+                    if not text or not text.strip():
+                        continue
+
+                    doc = Document(
+                        text=text,
+                        id=f"essential_web/{row.get('id', i)}",
+                        metadata={
+                            "source": "essential-web",
+                            "lang": "en",
+                            "license": "odc-by",
+                            "is_code": False,
+                            "url": row.get("url", ""),
+                        },
+                    )
+                    self.update_doc_stats(doc)
+                    self.stat_update("documents")
+                    count += 1
+                    yield doc
+                return
+
+            import pyarrow.parquet as pq
+            import fsspec
+            from .vocab_sample import ESSENTIAL_WEB_DIR
+
+            target_files = list(files) if files else None
+            if not target_files:
+                fs_hf = fsspec.filesystem("hf")
+                target_files = sorted(
+                    p for p in fs_hf.ls(ESSENTIAL_WEB_DIR, detail=False) if p.endswith(".parquet")
+                )
+
+            shard_files = target_files[rank::world_size] if world_size > 1 else target_files
+            for pf_path in shard_files:
+                if self.limit >= 0 and count >= self.limit:
+                    break
+                try:
+                    if str(pf_path).startswith("datasets/"):
+                        pf_obj = fsspec.filesystem("hf").open(pf_path)
+                    else:
+                        pf_obj = pf_path
+                    pf = pq.ParquetFile(pf_obj)
+                except Exception as e:
+                    self.stat_update(f"open_failed_{type(e).__name__}")
+                    continue
+
+                col_candidates = [c for c in ("id", "text", "url") if c in pf.schema.names]
+                for batch in pf.iter_batches(batch_size=batch_size, columns=col_candidates):
+                    if self.limit >= 0 and count >= self.limit:
+                        break
+                    batch_rows = batch.to_pylist()
+                    for row in batch_rows:
+                        if self.limit >= 0 and count >= self.limit:
+                            break
+                        text = row.get("text", "")
+                        if not text or not text.strip():
+                            continue
+
+                        doc_id = str(row.get("id") or f"{count}")
+                        doc = Document(
+                            text=text,
+                            id=f"essential_web/{doc_id}",
+                            metadata={
+                                "source": "essential-web",
+                                "lang": "en",
+                                "license": "odc-by",
+                                "is_code": False,
+                                "url": row.get("url", ""),
+                            },
+                        )
+                        self.update_doc_stats(doc)
+                        self.stat_update("documents")
+                        count += 1
+                        yield doc
+
+    return EssentialWebReader(limit=limit)
+
+
+def composite_reader(readers: list):
+    """A Datatrove reader chaining multiple readers in sequence (#418)."""
+    from datatrove.pipeline.readers.base import BaseReader
+
+    class CompositeReader(BaseReader):
+        name = "🔗 CompositeReader"
+
+        def __init__(self, readers_list):
+            super().__init__()
+            self.readers_list = readers_list
+
+        def run(self, data=None, rank: int = 0, world_size: int = 1):
+            if data:
+                yield from data
+            for r in self.readers_list:
+                yield from r.run(rank=rank, world_size=world_size)
+
+    return CompositeReader(readers)
+
+
+def raw_extraction_pipeline(
+    reader,
+    out_uri: str,
+    *,
+    output_filename: str = "${rank}.jsonl",
+) -> list:
+    """A Datatrove pipeline for raw document extraction (#418):
+    reader -> JsonlWriter(output_folder=_folder(out_uri), output_filename=output_filename, compression=None).
+    Emits raw uncompressed .jsonl files."""
+    from datatrove.pipeline.writers import JsonlWriter
+
+    return [
+        reader,
+        JsonlWriter(
+            output_folder=_folder(out_uri),
+            output_filename=output_filename,
+            compression=None,
+        ),
+    ]
+
+
+def generate_extraction_manifest(out_uri: str) -> dict:
+    """Scan emitted uncompressed .jsonl shards in out_uri and write manifest.json recording
+    total volume, document count, and source breakdown (#418)."""
+    import json
+    import time
+    from .r2_sync import _fs_for
+
+    fs, root = _fs_for(out_uri)
+    root = root.rstrip("/")
+
+    total_volume_bytes = 0
+    total_docs = 0
+    source_breakdown = {}
+    shards_found = []
+
+    try:
+        found_files = fs.find(root)
+    except Exception:
+        found_files = []
+
+    for fpath in sorted(found_files):
+        fname = fpath.rsplit("/", 1)[-1]
+        if not fname.endswith(".jsonl") or fname == "manifest.json":
+            continue
+        shards_found.append(fname)
+        with fs.open(fpath, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                total_docs += 1
+                line_bytes = len(line.encode("utf-8"))
+                total_volume_bytes += line_bytes
+
+                try:
+                    doc_data = json.loads(line)
+                except Exception:
+                    continue
+
+                md = doc_data.get("metadata") or {}
+                source = md.get("source") or ("stack-v2" if "stack_v2" in fname else "essential-web" if "essential_web" in fname else "unknown")
+                lang = md.get("lang") or ("typescript" if source == "stack-v2" else "en")
+                lic = md.get("license") or ("mit" if source == "stack-v2" else "odc-by")
+
+                if source not in source_breakdown:
+                    source_breakdown[source] = {
+                        "document_count": 0,
+                        "total_bytes": 0,
+                        "languages": {},
+                        "licenses": {},
+                        "files": set(),
+                    }
+                st = source_breakdown[source]
+                st["document_count"] += 1
+                st["total_bytes"] += line_bytes
+                st["languages"][lang] = st["languages"].get(lang, 0) + 1
+                st["licenses"][lic] = st["licenses"].get(lic, 0) + 1
+                st["files"].add(fname)
+
+    formatted_breakdown = {}
+    for src, info in sorted(source_breakdown.items()):
+        formatted_breakdown[src] = {
+            "document_count": info["document_count"],
+            "total_bytes": info["total_bytes"],
+            "primary_language": max(info["languages"].items(), key=lambda x: x[1])[0] if info["languages"] else "unknown",
+            "languages": info["languages"],
+            "licenses": info["licenses"],
+            "files": sorted(info["files"]),
+        }
+
+    manifest = {
+        "total_volume_bytes": total_volume_bytes,
+        "total_bytes": total_volume_bytes,
+        "total_documents": total_docs,
+        "document_count": total_docs,
+        "source_breakdown": formatted_breakdown,
+        "sources": formatted_breakdown,
+        "shards": shards_found,
+        "compression": "none",
+        "format": "jsonl",
+        "destination_uri": str(out_uri),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    manifest_json = json.dumps(manifest, indent=2)
+    manifest_path = f"{root}/manifest.json"
+    if str(out_uri).startswith("s3://"):
+        fs.pipe(manifest_path, manifest_json.encode("utf-8"))
+    else:
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            mf.write(manifest_json)
+
+    return manifest
+
+
+def run_raw_extraction(
+    out_uri: str = "s3://monica-training/data/raw",
+    *,
+    stack_v2_limit: int = 1000,
+    essential_web_limit: int = 1000,
+    executor_kind: str = "local",
+    tasks: int = 1,
+    workers: int = 1,
+    logging_dir: str | None = None,
+    stack_v2_rows=None,
+    essential_web_rows=None,
+    stack_v2_files=None,
+    essential_web_files=None,
+    s3_client=None,
+    s3_fs=None,
+) -> dict:
+    """Run the Datatrove ingestion pipeline to pull and extract raw uncompressed source
+    documents (Stack v2 TypeScript subset + Essential-Web) to out_uri (Cloudflare R2 or local)
+    and emit the document manifest recording volume and source breakdown (#418)."""
+    import os
+    import time
+
+    logging_dir = str(logging_dir or f"/tmp/monica_raw_extraction_logs_{int(time.time())}")
+    os.makedirs(logging_dir, exist_ok=True)
+
+    if stack_v2_limit != 0:
+        s_reader = stack_v2_reader(
+            limit=stack_v2_limit,
+            rows=stack_v2_rows,
+            files=stack_v2_files,
+            s3_client=s3_client,
+            s3_fs=s3_fs,
+        )
+        s_pipe = raw_extraction_pipeline(s_reader, out_uri, output_filename="stack_v2_${rank}.jsonl")
+        s_exec = make_executor(s_pipe, f"{logging_dir}/stack_v2", kind=executor_kind, tasks=tasks, workers=workers)
+        s_exec.run()
+
+    if essential_web_limit != 0:
+        ew_reader = essential_web_reader(
+            limit=essential_web_limit,
+            rows=essential_web_rows,
+            files=essential_web_files,
+        )
+        ew_pipe = raw_extraction_pipeline(ew_reader, out_uri, output_filename="essential_web_${rank}.jsonl")
+        ew_exec = make_executor(ew_pipe, f"{logging_dir}/essential_web", kind=executor_kind, tasks=tasks, workers=workers)
+        ew_exec.run()
+
+    manifest = generate_extraction_manifest(out_uri)
+    return manifest
