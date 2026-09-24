@@ -90,6 +90,7 @@ PORTABLE_MODULES = [
     "src.train.moe_balance",
     "src.train.parallel",
     "src.train.upcycle",
+    "src.train.dense_poc_run",
     "src.train.small_moe_run",
     "src.train.large_moe_run",
     "src.train.loop",

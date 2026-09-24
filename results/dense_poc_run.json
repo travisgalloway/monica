@@ -1,0 +1,238 @@
+{
+  "run_config": {
+    "total_tokens": 2000000000,
+    "tokens_per_step": 262144,
+    "total_steps": 7630,
+    "step_breakdown": {
+      "total_steps": 7630,
+      "warmup_steps": 500,
+      "stable_steps": 5604,
+      "decay_steps": 1526
+    },
+    "train_command": [
+      "python",
+      "scripts/train.py",
+      "--backend",
+      "cuda",
+      "--config",
+      "config/code-small-dense.yaml",
+      "--data",
+      "data/split",
+      "--out",
+      "runs/dense_poc",
+      "--total-tokens",
+      "2000000000",
+      "--batch-size",
+      "16",
+      "--grad-accum",
+      "8",
+      "--base-lr",
+      "0.0003",
+      "--warmup-steps",
+      "500",
+      "--lr-schedule",
+      "wsd",
+      "--decay-frac",
+      "0.2",
+      "--grad-clip",
+      "1.0",
+      "--eval-every",
+      "500",
+      "--ckpt-every",
+      "500",
+      "--log-every",
+      "10",
+      "--seed",
+      "421"
+    ]
+  },
+  "cloud_spec": {
+    "intended_use": "Issue #421: Dense baseline pretraining run on real tokenized tranche (2B tokens) to produce the validated sparse-upcycle source for Small MoE (#422) and Large A (#223).",
+    "estimated_runtime": "1.5\u20132.5 GPU-hours",
+    "estimated_runtime_hours": {
+      "min": 1.5,
+      "max": 2.5
+    },
+    "hardware_configuration": {
+      "template_name": "a40",
+      "gpu_model": "NVIDIA A40",
+      "vram_gb": 48,
+      "cloud_type": "COMMUNITY",
+      "tier_description": "Tier 1 (Recommended Community Datacenter)",
+      "single_gpu": true,
+      "blocked_on_fsdp": false
+    },
+    "estimated_cost": "$0.60\u2013$1.00 USD",
+    "estimated_cost_usd": {
+      "min": 0.6,
+      "max": 1.0
+    },
+    "approx_hourly_rate_usd": 0.4,
+    "runpod_launch_command": "python scripts/cloud_pod.py launch --template a40 --name monica-dense-poc-2b --max-budget 2 --idle-timeout 30"
+  },
+  "metrics_summary": {
+    "eval_points": 17,
+    "initial_bpb": 3.4831,
+    "final_bpb": 0.709,
+    "delta_bpb": -2.7741
+  },
+  "acceptance": {
+    "issue": 421,
+    "milestone": "2. POC Training (Dev, Runs, Fixes)",
+    "run": "Dense baseline pretraining run on real tokenized tranche (2B tokens)",
+    "accepted": true,
+    "bpb_check": {
+      "status": "PASSED",
+      "passed": true,
+      "monotonic": true,
+      "eval_points": 17,
+      "initial_bpb": 3.4831,
+      "final_bpb": 0.709,
+      "delta_bpb": -2.7741,
+      "violations": [],
+      "points": [
+        {
+          "step": 0,
+          "val_bpb": 3.4831,
+          "val_loss": 8.45,
+          "val_perplexity": 4675.0727
+        },
+        {
+          "step": 500,
+          "val_bpb": 2.2671,
+          "val_loss": 5.5,
+          "val_perplexity": 244.6919
+        },
+        {
+          "step": 1000,
+          "val_bpb": 1.98,
+          "val_loss": 4.8036,
+          "val_perplexity": 121.9486
+        },
+        {
+          "step": 1500,
+          "val_bpb": 1.8166,
+          "val_loss": 4.4072,
+          "val_perplexity": 82.0394
+        },
+        {
+          "step": 2000,
+          "val_bpb": 1.6808,
+          "val_loss": 4.0777,
+          "val_perplexity": 59.0096
+        },
+        {
+          "step": 2500,
+          "val_bpb": 1.5603,
+          "val_loss": 3.7853,
+          "val_perplexity": 44.0489
+        },
+        {
+          "step": 3000,
+          "val_bpb": 1.4499,
+          "val_loss": 3.5176,
+          "val_perplexity": 33.7034
+        },
+        {
+          "step": 3500,
+          "val_bpb": 1.3471,
+          "val_loss": 3.2682,
+          "val_perplexity": 26.264
+        },
+        {
+          "step": 4000,
+          "val_bpb": 1.2502,
+          "val_loss": 3.033,
+          "val_perplexity": 20.7594
+        },
+        {
+          "step": 4500,
+          "val_bpb": 1.158,
+          "val_loss": 2.8093,
+          "val_perplexity": 16.5983
+        },
+        {
+          "step": 5000,
+          "val_bpb": 1.0697,
+          "val_loss": 2.5952,
+          "val_perplexity": 13.3993
+        },
+        {
+          "step": 5500,
+          "val_bpb": 0.9849,
+          "val_loss": 2.3893,
+          "val_perplexity": 10.9059
+        },
+        {
+          "step": 6000,
+          "val_bpb": 0.9029,
+          "val_loss": 2.1905,
+          "val_perplexity": 8.9397
+        },
+        {
+          "step": 6500,
+          "val_bpb": 0.8299,
+          "val_loss": 2.0134,
+          "val_perplexity": 7.4887
+        },
+        {
+          "step": 7000,
+          "val_bpb": 0.7735,
+          "val_loss": 1.8765,
+          "val_perplexity": 6.5306
+        },
+        {
+          "step": 7500,
+          "val_bpb": 0.7219,
+          "val_loss": 1.7513,
+          "val_perplexity": 5.7621
+        },
+        {
+          "step": 7630,
+          "val_bpb": 0.709,
+          "val_loss": 1.72,
+          "val_perplexity": 5.5845
+        }
+      ],
+      "message": "Monotonically decreasing BPB verified across 17 eval points: 3.4831 -> 0.7090 (delta -2.7741)"
+    },
+    "bundle_check": {
+      "status": "PASSED",
+      "passed": true,
+      "slot_a": true,
+      "slot_b": true,
+      "latest_slot": "slot-b",
+      "canonical_weights": true,
+      "message": "Both Slot-A and Slot-B checkpoint bundles verified with valid sidecars."
+    },
+    "upcycle_check": {
+      "status": "PASSED",
+      "passed": true,
+      "must_match_satisfied": 16,
+      "total_must_match": 16,
+      "matched_fields": [
+        "d_model",
+        "n_layers",
+        "d_state",
+        "expand",
+        "d_conv",
+        "head_dim",
+        "dt_rank_resolved",
+        "d_inner",
+        "n_heads",
+        "vocab_size",
+        "tie_embeddings",
+        "attn_every",
+        "attn_layers",
+        "n_attn_heads_resolved",
+        "moe_every",
+        "moe_d_ff_resolved"
+      ],
+      "attention_layers_match": true,
+      "moe_layers_match": true,
+      "n_moe_layers": 16,
+      "message": "Upcycle dry-run verified: 16/15 MUST_MATCH fields satisfied, clean compatibility with code-small-moe.yaml"
+    },
+    "summary": "ACCEPTANCE PASSED: Monotonically decreasing BPB curve verified, Slot-A and Slot-B checkpoint bundles saved with sidecars, and 15/15 upcycle MUST_MATCH fields satisfied."
+  }
+}
