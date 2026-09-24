@@ -1139,6 +1139,11 @@ def run_pretokenization(
                 resolved_prettier_argv = resolve_prettier()
             except Exception:
                 resolved_prettier_argv = None
+            if resolved_prettier_argv is None:
+                import shutil
+                glob_p = shutil.which("prettier")
+                if glob_p:
+                    resolved_prettier_argv = [glob_p]
 
     # 4. Clean pipeline
     pipeline = clean_pipeline(
