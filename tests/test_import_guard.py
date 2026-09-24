@@ -109,6 +109,7 @@ PORTABLE_MODULES = [
     "src.eval.code_needle",
     "src.eval.domain_bpb",
     "src.eval.moe_routing",
+    "src.eval.routing_poc_run",
     "src.eval.external_sets",
     "src.eval.olmes_adapter",
     "src.eval.bfcl_adapter",

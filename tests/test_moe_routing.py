@@ -8,10 +8,20 @@ import numpy as np
 import pytest
 
 from src.data.pack import pack_ids
-from src.eval.moe_routing import (cross_domain_collapse_check, domain_category,
-                                  expert_histograms, format_routing_report,
-                                  histogram_overlap, inter_category_overlap_matrix,
-                                  kill_check, specialization_report)
+from src.eval.moe_routing import (
+    cross_domain_collapse_check,
+    domain_category,
+    expert_histograms,
+    expert_histograms_from_batches,
+    format_routing_report,
+    histogram_overlap,
+    inter_category_overlap_matrix,
+    kill_check,
+    specialization_report,
+    verify_expert_starvation,
+    verify_routing_specialization,
+    verify_uniform_collapse,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,3 +368,165 @@ def test_cross_domain_collapse_warmup_status():
     assert alert["status"] == "WARMUP"
     assert alert["triggered"] is False
     assert "WARMUP" in alert["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Batch extraction, starvation, and routing specialization verification (#423)
+# --------------------------------------------------------------------------- #
+
+def test_expert_histograms_from_batches_empty_domains_raises():
+    model = _FakeModel([[[1.0]]])
+    with pytest.raises(ValueError, match="no domains"):
+        expert_histograms_from_batches(model, {})
+
+
+def test_expert_histograms_from_batches_no_moe_raises():
+    model = _FakeModel([[]])  # no MoE layers
+    with pytest.raises(ValueError, match="no MoE layers"):
+        expert_histograms_from_batches(model, {"d": [np.zeros((2, 8))]})
+
+
+def test_expert_histograms_from_batches_zero_counts_raises():
+    model = _FakeModel([[[1.0, 1.0]], [[0.0, 0.0]]])
+    with pytest.raises(ValueError, match="every expert count is zero"):
+        expert_histograms_from_batches(model, {"d": [np.zeros((2, 8))]})
+
+
+def test_expert_histograms_from_batches_empty_batch_is_none():
+    model = _FakeModel([[[1.0, 1.0]], [[10.0, 5.0]]])
+    out = expert_histograms_from_batches(model, {"empty": [], "active": [np.zeros((2, 8))]})
+    assert out["empty"] is None
+    assert out["active"] == [[10.0, 5.0]]
+
+
+def test_expert_histograms_from_batches_returns_scripted():
+    model = _FakeModel([[[1.0]], [[8.0, 2.0]], [[3.0, 7.0]]])
+    batches = {
+        "ts": [np.ones((2, 4)), np.ones((2, 4))],
+        "math": [np.ones((2, 4))],
+    }
+    out = expert_histograms_from_batches(model, batches)
+    assert out == {"math": [[8.0, 2.0]], "ts": [[3.0, 7.0]]}
+    assert model.counting is True
+
+
+def test_expert_histograms_delegates_to_batch_handler():
+    model = _FakeModel([[[1.0]], [[8.0, 2.0]], [[3.0, 7.0]]])
+    batches = {
+        "ts": [np.ones((2, 4))],
+        "math": [np.ones((2, 4))],
+    }
+    out = expert_histograms(model, batches)
+    assert out == {"math": [[8.0, 2.0]], "ts": [[3.0, 7.0]]}
+
+
+def test_verify_expert_starvation_blind_on_empty():
+    res = verify_expert_starvation({})
+    assert res["status"] == "BLIND"
+    assert res["passed"] is False
+
+
+def test_verify_expert_starvation_detects_starvation():
+    # 2 layers, 4 experts. Expert 3 has 0 tokens across all domains.
+    hists = {
+        "ts": [[10, 10, 10, 0], [10, 10, 10, 0]],
+        "math": [[5, 5, 5, 0], [5, 5, 5, 0]],
+    }
+    res = verify_expert_starvation(hists, min_tokens_per_expert=1)
+    assert res["status"] == "FAILED"
+    assert res["passed"] is False
+    assert (0, 3) in res["starved_experts"]
+    assert (1, 3) in res["starved_experts"]
+
+
+def test_verify_expert_starvation_passes_when_all_experts_active():
+    hists = {
+        "ts": [[10, 10, 0, 0]],
+        "math": [[0, 0, 10, 10]],
+    }
+    # Domain specialization: TS uses 0,1 and math uses 2,3 -> across both, all 4 experts receive 10 tokens!
+    res = verify_expert_starvation(hists, min_tokens_per_expert=1)
+    assert res["status"] == "PASSED"
+    assert res["passed"] is True
+    assert len(res["starved_experts"]) == 0
+    assert res["min_tokens_observed"] == 10
+
+
+def test_verify_uniform_collapse_blind():
+    res = verify_uniform_collapse({})
+    assert res["status"] == "BLIND"
+    assert res["passed"] is False
+
+
+def test_verify_uniform_collapse_detects_collapse():
+    report = {
+        "by_pair": {"math|typescript": {"mean": 0.98, "per_layer": [0.98]}},
+        "code_vs_noncode_overlap": 0.98,
+        "mean_overlap": 0.98,
+    }
+    res = verify_uniform_collapse(report, max_overlap_threshold=0.95)
+    assert res["status"] == "FAILED"
+    assert res["passed"] is False
+    assert res["collapsed"] is True
+
+
+def test_verify_uniform_collapse_passes_on_specialization():
+    report = {
+        "by_pair": {"math|typescript": {"mean": 0.65, "per_layer": [0.65]}},
+        "code_vs_noncode_overlap": 0.65,
+        "mean_overlap": 0.65,
+    }
+    res = verify_uniform_collapse(report, max_overlap_threshold=0.95)
+    assert res["status"] == "PASSED"
+    assert res["passed"] is True
+    assert res["collapsed"] is False
+
+
+def test_verify_routing_specialization_passes_acceptance_criteria():
+    hists = {
+        "typescript": [[20, 20, 5, 5]],
+        "math": [[5, 5, 20, 20]],
+    }
+    # TS: [0.4, 0.4, 0.1, 0.1], Math: [0.1, 0.1, 0.4, 0.4] -> overlap = 0.40 < 0.90
+    res = verify_routing_specialization(hists, kill_pair=("typescript", "math"), kill_threshold=0.90)
+    assert res["status"] == "PASSED"
+    assert res["passed"] is True
+    assert res["specializing"] is True
+    assert res["kill_triggered"] is False
+    assert res["kill_verdict"] == "NEGATIVE"
+    assert res["overlap"] == pytest.approx(0.40)
+
+
+def test_verify_routing_specialization_fails_when_kill_triggered():
+    hists = {
+        "typescript": [[20, 20, 5, 5]],
+        "math": [[20, 20, 5, 5]],
+    }
+    # Identical -> overlap 1.00 >= 0.90 -> kill triggered
+    res = verify_routing_specialization(hists, kill_pair=("typescript", "math"), kill_threshold=0.90)
+    assert res["status"] == "FAILED"
+    assert res["passed"] is False
+    assert res["kill_triggered"] is True
+    assert res["kill_verdict"] == "TRIGGERED"
+
+
+def test_verify_routing_specialization_blind_when_pair_missing():
+    hists = {
+        "typescript": [[10, 10]],
+        "prose": [[10, 10]],
+    }
+    res = verify_routing_specialization(hists, kill_pair=("typescript", "math"))
+    assert res["status"] == "BLIND"
+    assert res["passed"] is False
+
+
+def test_format_routing_report_with_verification():
+    hists = {
+        "typescript": [[20, 20, 5, 5]],
+        "math": [[5, 5, 20, 20]],
+    }
+    report = specialization_report(hists)
+    verif = verify_routing_specialization(hists)
+    text = format_routing_report(report, kill=verif["kill_check"], verification=verif)
+    assert "math|typescript" in text
+    assert "specialization verification: [PASSED]" in text
