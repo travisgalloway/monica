@@ -645,6 +645,12 @@ def run_corpus_pipeline(
         reader = dt.jsonl_reader(str(temp_input), limit=limit)
     elif source == "fineweb-edu":
         reader = dt.fineweb_edu_reader(limit=limit, split=split)
+    elif source == "stack-v2":
+        reader = dt.stack_v2_reader(limit=limit)
+    elif source == "essential-web":
+        reader = dt.essential_web_reader(limit=limit)
+    elif source == "pretrain-extract":
+        reader = dt.composite_reader([dt.stack_v2_reader(limit=limit), dt.essential_web_reader(limit=limit)])
     elif source in ("sample", "jsonl"):
         sample_path = find_default_sample(from_jsonl)
         if sample_path is None or not Path(sample_path).exists():
@@ -841,8 +847,14 @@ def run_corpus_pipeline(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample", "repo"), default="sample",
-                    help="corpus source (fineweb-edu, local jsonl, sample mixture, or repo; #70/#252/#370)")
+    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample", "repo", "stack-v2", "essential-web", "pretrain-extract"), default="sample",
+                    help="corpus source (fineweb-edu, local jsonl, sample mixture, repo, stack-v2, essential-web, or pretrain-extract; #70/#252/#370/#418)")
+    ap.add_argument("--extract-raw", action="store_true",
+                    help="extract raw uncompressed documents to <out> with manifest (#418)")
+    ap.add_argument("--stack-v2-limit", type=int, default=1000,
+                    help="max Stack v2 documents to extract (default 1000; -1 for no cap)")
+    ap.add_argument("--essential-web-limit", type=int, default=1000,
+                    help="max Essential-Web documents to extract (default 1000; -1 for no cap)")
     ap.add_argument("--from-jsonl", default=None,
                     help="path to input JSONL file or directory (for --source jsonl or sample)")
     ap.add_argument("--from-repo", default=None,
@@ -897,6 +909,21 @@ def main() -> None:
     ap.add_argument("--tokenize-bin", default=None,
                     help="path to monica-tokenize binary")
     args = ap.parse_args()
+
+    if args.extract_raw or args.source == "pretrain-extract":
+        from src.data import datatrove_pipeline as dt
+        manifest = dt.run_raw_extraction(
+            out_uri=args.out,
+            stack_v2_limit=args.stack_v2_limit if args.source != "essential-web" else 0,
+            essential_web_limit=args.essential_web_limit if args.source != "stack-v2" else 0,
+            executor_kind=args.executor,
+            tasks=args.tasks,
+            workers=args.workers,
+            logging_dir=args.logging_dir,
+        )
+        print(f"Raw extraction completed -> {args.out}")
+        print(f"Total documents: {manifest.get('document_count', 0)}, Total volume: {manifest.get('total_volume_bytes', 0)} bytes")
+        return
 
     run_corpus_pipeline(
         source=args.source,
