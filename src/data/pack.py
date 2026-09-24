@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -99,9 +99,21 @@ def packed_dtype(path: Path) -> np.dtype:
     return np.dtype(DTYPE)
 
 
-def packed_n_bytes(path: Path) -> int | None:
-    """UTF-8 byte count recorded in `<name>.meta.json`, or None if absent (legacy/np path)."""
-    meta_path = Path(path).with_suffix(".meta.json")
+def packed_n_bytes(path: Path | str) -> int | None:
+    """UTF-8 byte count recorded in `<name>.meta.json` or manifest.json, or None if absent."""
+    path = Path(path)
+    if path.is_dir():
+        mf = path / "manifest.json"
+        if mf.exists():
+            v = json.loads(mf.read_text())
+            val = v.get("n_bytes") or v.get("total_raw_bytes") or v.get("total_volume_bytes")
+            return int(val) if val is not None else None
+        return None
+    if path.name == "manifest.json":
+        v = json.loads(path.read_text())
+        val = v.get("n_bytes") or v.get("total_raw_bytes") or v.get("total_volume_bytes")
+        return int(val) if val is not None else None
+    meta_path = path.with_suffix(".meta.json")
     if meta_path.exists():
         v = json.loads(meta_path.read_text()).get("n_bytes")
         return int(v) if v is not None else None
@@ -123,9 +135,134 @@ def set_packed_n_bytes(path: Path, n_bytes: int) -> None:
     meta_path.write_text(json.dumps(meta))
 
 
-def open_packed(path: Path) -> np.memmap:
-    """Memory-map a packed file read-only at the dtype its sidecar records (uint16 legacy)."""
+class ShardedTokenArray:
+    """Memory-mapped array across multiple token shards with zero in-memory buffering.
+
+    Exposes a unified 1D array interface (shape, dtype, slicing) over a sequence of
+    memory-mapped .bin shard files. Slices are read directly from the OS page cache
+    without copying or buffering the full shard data into process memory.
+    """
+
+    def __init__(self, shards: Sequence[Path | str], dtype: np.dtype | str = DTYPE,
+                 shard_lengths: Optional[Sequence[int]] = None,
+                 manifest: Optional[dict] = None):
+        self.shard_paths = [Path(p) for p in shards]
+        self.dtype = np.dtype(dtype)
+        self.manifest = manifest
+        self._mmaps: list[np.memmap] = []
+        self._lengths: list[int] = []
+
+        for idx, p in enumerate(self.shard_paths):
+            if not p.exists():
+                raise FileNotFoundError(f"Shard file not found: {p}")
+            n = shard_lengths[idx] if shard_lengths is not None else None
+            m = np.memmap(p, dtype=self.dtype, mode="r", shape=(n,) if n is not None else None)
+            self._mmaps.append(m)
+            self._lengths.append(int(m.shape[0]))
+
+        self._offsets = np.zeros(len(self._lengths) + 1, dtype=np.int64)
+        self._offsets[1:] = np.cumsum(self._lengths)
+        self._total_tokens = int(self._offsets[-1])
+        self.shape = (self._total_tokens,)
+
+    @property
+    def size(self) -> int:
+        return self._total_tokens
+
+    @property
+    def ndim(self) -> int:
+        return 1
+
+    @property
+    def itemsize(self) -> int:
+        return self.dtype.itemsize
+
+    @property
+    def nbytes(self) -> int:
+        return self._total_tokens * self.itemsize
+
+    def __len__(self) -> int:
+        return self._total_tokens
+
+    def close(self) -> None:
+        for m in self._mmaps:
+            if hasattr(m, "_mmap") and m._mmap is not None:
+                m._mmap.close()
+
+    def __getitem__(self, item) -> np.ndarray | int | np.integer:
+        if isinstance(item, slice):
+            start, stop, step = item.indices(self._total_tokens)
+            if step != 1:
+                indices = range(start, stop, step)
+                return np.asarray([self[i] for i in indices], dtype=self.dtype)
+            if start >= stop:
+                return np.empty(0, dtype=self.dtype)
+
+            from bisect import bisect_right
+            start_shard = bisect_right(self._offsets, start) - 1
+            stop_shard = bisect_right(self._offsets, stop - 1) - 1
+
+            if start_shard == stop_shard:
+                local_start = start - self._offsets[start_shard]
+                local_stop = stop - self._offsets[start_shard]
+                return self._mmaps[start_shard][local_start:local_stop]
+
+            parts = []
+            for s_idx in range(start_shard, stop_shard + 1):
+                s_off = self._offsets[s_idx]
+                e_off = self._offsets[s_idx + 1]
+                p_start = max(start, s_off) - s_off
+                p_stop = min(stop, e_off) - s_off
+                parts.append(self._mmaps[s_idx][p_start:p_stop])
+            return np.concatenate(parts)
+
+        if isinstance(item, (int, np.integer)):
+            idx = int(item)
+            if idx < 0:
+                idx += self._total_tokens
+            if idx < 0 or idx >= self._total_tokens:
+                raise IndexError(f"index {item} out of bounds for axis 0 with size {self._total_tokens}")
+            from bisect import bisect_right
+            s_idx = bisect_right(self._offsets, idx) - 1
+            local_idx = idx - self._offsets[s_idx]
+            return self._mmaps[s_idx][local_idx]
+
+        raise TypeError(f"Invalid index type: {type(item)}")
+
+
+def open_packed(path: Path | str | Sequence[Path | str]) -> np.memmap | ShardedTokenArray:
+    """Memory-map a packed file or shard directory read-only at the dtype its sidecar records (uint16 legacy)."""
+    if isinstance(path, (list, tuple)):
+        return ShardedTokenArray(path)
+
     path = Path(path)
+    if path.is_dir():
+        manifest_path = path / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            dtype = np.dtype(manifest.get("dtype", "uint16"))
+            shards_info = manifest.get("shards", [])
+            if shards_info:
+                shard_paths = [path / f"{s['name']}.bin" for s in shards_info]
+                shard_lengths = [s.get("n_tokens") for s in shards_info]
+                return ShardedTokenArray(shard_paths, dtype=dtype, shard_lengths=shard_lengths, manifest=manifest)
+        bin_files = sorted(path.glob("part-*.bin")) or sorted(path.glob("*.bin"))
+        if not bin_files:
+            raise FileNotFoundError(f"No .bin shard files found in directory {path}")
+        return ShardedTokenArray(bin_files)
+
+    if path.name == "manifest.json":
+        manifest = json.loads(path.read_text())
+        parent_dir = path.parent
+        dtype = np.dtype(manifest.get("dtype", "uint16"))
+        shards_info = manifest.get("shards", [])
+        if shards_info:
+            shard_paths = [parent_dir / f"{s['name']}.bin" for s in shards_info]
+            shard_lengths = [s.get("n_tokens") for s in shards_info]
+            return ShardedTokenArray(shard_paths, dtype=dtype, shard_lengths=shard_lengths, manifest=manifest)
+        bin_files = sorted(parent_dir.glob("part-*.bin")) or sorted(parent_dir.glob("*.bin"))
+        return ShardedTokenArray(bin_files, dtype=dtype, manifest=manifest)
+
     meta_path = path.with_suffix(".meta.json")
     n = None
     dtype = np.dtype(DTYPE)

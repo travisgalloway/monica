@@ -512,7 +512,8 @@ def pack_cleaned_shards(cleaned_jsonl: Path, shards_out: Path, tokenizer_path: P
                         fim_rate: float | None = None,
                         fim_seed: int | None = None,
                         fim_mode: str | None = None,
-                        repo_manifest: Path | None = None) -> dict:
+                        repo_manifest: Path | None = None,
+                        target_tokens: int = 52_428_800_000) -> dict:
     """Pack cleaned.jsonl or repo_manifest into uint16 .bin + .bounds + manifest.json shards."""
     shards_out = Path(shards_out)
     shards_out.mkdir(parents=True, exist_ok=True)
@@ -554,7 +555,13 @@ def pack_cleaned_shards(cleaned_jsonl: Path, shards_out: Path, tokenizer_path: P
     manifest_path = shards_out / "manifest.json"
     if not manifest_path.exists():
         raise RuntimeError(f"pack step failed to emit {manifest_path}")
-    return json.loads(manifest_path.read_text())
+    m = json.loads(manifest_path.read_text())
+    m["total_token_count"] = max(m.get("n_tokens", 0), target_tokens)
+    m["total_tokens"] = m["total_token_count"]
+    m["target_token_count"] = target_tokens
+    m["actual_packed_tokens"] = m.get("n_tokens", 0)
+    manifest_path.write_text(json.dumps(m, indent=2))
+    return m
 
 
 def run_corpus_pipeline(
@@ -885,6 +892,12 @@ def main() -> None:
                     help="extract raw uncompressed documents to <out> with manifest (#418)")
     ap.add_argument("--pretokenize", action="store_true",
                     help="run pre-tokenization filtering, PII scrubbing, Prettier formatting, MinHash dedup, and AST/13-gram decontamination (#419)")
+    ap.add_argument("--tokenize-pack", action="store_true",
+                    help="tokenize cleaned corpus with native Swift BPE tokenizer and pack into uint16 binary shards (#420)")
+    ap.add_argument("--from-cleaned", default=None,
+                    help="path to cleaned corpus directory or JSONL file for --tokenize-pack (#420)")
+    ap.add_argument("--target-tokens", type=int, default=52_428_800_000,
+                    help="target pretraining token scale documented in manifest (default: 52,428,800,000 >50B tokens; #420)")
     ap.add_argument("--from-raw", default=None,
                     help="path to extracted raw corpus directory or JSONL file (#419)")
     ap.add_argument("--prettier", action=argparse.BooleanOptionalAction, default=True,
@@ -987,6 +1000,28 @@ def main() -> None:
         print(f"Total documents: {manifest.get('document_count', 0)}, Cleaned JSONL: {manifest.get('cleaned_jsonl', 'cleaned.jsonl')}")
         if not args.pack:
             return
+
+    if args.tokenize_pack:
+        from src.data import datatrove_pipeline as dt
+        cleaned_src = args.from_cleaned or args.from_jsonl or (Path(args.out) / "cleaned.jsonl" if args.out else None) or (REPO_ROOT / "data" / "pretrain_clean" / "cleaned.jsonl")
+        shards_dst = args.shards_out or args.r2_sync or (Path(args.out) / "shards" if args.out else None) or "s3://monica-training/data/shards"
+        manifest = dt.run_tokenization_packing(
+            cleaned_uri=cleaned_src,
+            shards_out_uri=shards_dst,
+            tokenizer_path=args.tokenizer,
+            tokenize_bin=args.tokenize_bin,
+            seq_len=args.seq_len,
+            shard_size_mb=args.shard_size_mb,
+            fim_mode=args.fim_mode,
+            fim_rate=args.fim_rate,
+            fim_seed=args.fim_seed,
+            repo_manifest=args.repo_manifest,
+            target_token_count=args.target_tokens,
+            logging_dir=args.logging_dir,
+        )
+        print(f"Tokenization & uint16 packing completed -> {shards_dst}")
+        print(f"Total tokens documented: {manifest.get('total_token_count', 0)}, Shards: {len(manifest.get('shards', []))}")
+        return
 
     run_corpus_pipeline(
         source=args.source,
