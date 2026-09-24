@@ -29,9 +29,6 @@ def resolve_prettier() -> Optional[List[str]]:
     `eval_sets/ts_error_injection/package.json`) plus `node` on PATH."""
     if LOCAL_PRETTIER.exists() and shutil.which("node") is not None:
         return [str(LOCAL_PRETTIER)]
-    global_prettier = shutil.which("prettier")
-    if global_prettier is not None:
-        return [global_prettier]
     return None
 
 
