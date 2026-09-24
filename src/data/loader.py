@@ -11,7 +11,7 @@ its own array type inside `forward`.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence, Union
 
 import numpy as np
 
@@ -19,13 +19,16 @@ from .pack import open_packed, packed_n_bytes
 
 
 class PackedLoader:
-    def __init__(self, packed_path: Path, seq_len: int, batch_size: int,
+    def __init__(self, packed_path: Union[Path, str, Sequence[Union[Path, str]]],
+                 seq_len: int, batch_size: int,
                  shuffle: bool = True, seed: int = 0, drop_last: bool = True,
                  vocab_size: Optional[int] = None):
-        self.path = packed_path
+        self.path = Path(packed_path) if isinstance(packed_path, (str, Path)) else [Path(p) for p in packed_path]
         self.data = open_packed(packed_path)
         self.n_tokens = int(self.data.shape[0])      # full packed token count (all tokens)
-        self.n_bytes = packed_n_bytes(packed_path)    # UTF-8 bytes if recorded, else None (#192)
+        self.n_bytes = packed_n_bytes(packed_path) if isinstance(packed_path, (str, Path)) else None
+        self.manifest = getattr(self.data, "manifest", None)
+        self.shards = getattr(self.data, "shard_paths", None)
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -41,6 +44,13 @@ class PackedLoader:
                 f"packed file {self.path} too small for one chunk: {self.data.shape[0]} tokens "
                 f"< stride {self.stride} (seq_len={self.seq_len} + 1)"
             )
+
+    def close(self) -> None:
+        """Close open file handles / memory maps."""
+        if hasattr(self.data, "close"):
+            self.data.close()
+        elif hasattr(self.data, "_mmap") and self.data._mmap is not None:
+            self.data._mmap.close()
 
     def _chunk(self, idx: int) -> np.ndarray:
         start = idx * self.stride
