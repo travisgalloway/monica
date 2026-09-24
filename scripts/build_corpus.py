@@ -577,6 +577,8 @@ def run_corpus_pipeline(
     drop_minified: bool = False,
     drop_autogen: bool = False,
     scrub: bool = True,
+    prettier: bool = True,
+    prettier_argv: Optional[List[str]] = None,
     decontam: bool = True,
     decontam_file: Path | str | None = None,
     dedup: bool = False,
@@ -694,6 +696,7 @@ def run_corpus_pipeline(
     pipeline = dt.clean_pipeline(
         reader, str(out_dir), quality=quality, license_filter=license_filter,
         drop_minified=drop_minified, drop_autogen=drop_autogen, scrub=scrub,
+        prettier=prettier, prettier_argv=prettier_argv,
         decontaminator=decon)
     executor = dt.make_executor(pipeline, str(logging_dir / "clean"), kind=executor_kind,
                                 tasks=tasks, workers=workers)
@@ -703,9 +706,10 @@ def run_corpus_pipeline(
 
     # 4. Optional MinHash dedup
     text_dir = cleaned_dir
+    dedup_info = {"applied": False}
     if dedup:
         dedup_dir = out_dir / "dedup"
-        dt.run_minhash_dedup(str(cleaned_dir), str(dedup_dir),
+        dedup_info = dt.run_minhash_dedup(str(cleaned_dir), str(dedup_dir),
                              kind=executor_kind, tasks=tasks, workers=workers,
                              logging_dir=str(logging_dir / "dedup"))
         text_dir = dedup_dir / "deduplicated"
@@ -742,10 +746,17 @@ def run_corpus_pipeline(
         "drop_rate": round(n_dropped / n_source, 4) if n_source > 0 else 0.0,
     }
 
+    # Verify zero decontamination overlap if decontaminator is active
+    overlap_count = 0
+    if decon is not None:
+        overlap_count, _ = dt.verify_zero_decontamination_overlap(cleaned_jsonl, decon)
+
     decontam_info = {
         "applied": decon is not None,
         "blocklist": str(decontam_path.relative_to(REPO_ROOT)) if decontam_path and decontam_path.is_relative_to(REPO_ROOT) else str(decontam_path) if decontam_path else None,
         "eval_sets": ["eval_sets/humaneval_ts", "eval_sets/ts_error_injection"] if decon is not None else [],
+        "overlap_count": overlap_count,
+        "zero_overlap_verified": (overlap_count == 0) and (decon is not None),
     }
 
     result = {
@@ -755,8 +766,29 @@ def run_corpus_pipeline(
         "total_bytes": total_bytes,
         "language_mix": lang_mix,
         "filter_rate": filter_rate,
+        "clean_rate": filter_rate,
+        "deduplication": dedup_info,
         "decontamination": decontam_info,
+        "prettier": {"applied": prettier},
     }
+
+    # Write manifest.json unconditionally (#419)
+    manifest = {
+        "source": source,
+        "cleaned_jsonl": cleaned_jsonl.name,
+        "document_count": n_cleaned,
+        "total_documents": n_cleaned,
+        "total_volume_bytes": total_bytes,
+        "clean_rate": filter_rate,
+        "filter_rate": filter_rate,
+        "deduplication": dedup_info,
+        "decontamination": decontam_info,
+        "prettier": {"applied": prettier},
+        "language_mix": lang_mix,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    result["manifest"] = manifest
 
     # 6. Packing
     if pack:
@@ -847,10 +879,16 @@ def run_corpus_pipeline(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample", "repo", "stack-v2", "essential-web", "pretrain-extract"), default="sample",
-                    help="corpus source (fineweb-edu, local jsonl, sample mixture, repo, stack-v2, essential-web, or pretrain-extract; #70/#252/#370/#418)")
+    ap.add_argument("--source", choices=("fineweb-edu", "jsonl", "sample", "repo", "stack-v2", "essential-web", "pretrain-extract", "raw"), default="sample",
+                    help="corpus source (fineweb-edu, local jsonl, sample mixture, repo, stack-v2, essential-web, pretrain-extract, or raw; #70/#252/#370/#418/#419)")
     ap.add_argument("--extract-raw", action="store_true",
                     help="extract raw uncompressed documents to <out> with manifest (#418)")
+    ap.add_argument("--pretokenize", action="store_true",
+                    help="run pre-tokenization filtering, PII scrubbing, Prettier formatting, MinHash dedup, and AST/13-gram decontamination (#419)")
+    ap.add_argument("--from-raw", default=None,
+                    help="path to extracted raw corpus directory or JSONL file (#419)")
+    ap.add_argument("--prettier", action=argparse.BooleanOptionalAction, default=True,
+                    help="apply Prettier formatting to standardize syntax and minimize token entropy (#419)")
     ap.add_argument("--stack-v2-limit", type=int, default=1000,
                     help="max Stack v2 documents to extract (default 1000; -1 for no cap)")
     ap.add_argument("--essential-web-limit", type=int, default=1000,
@@ -892,7 +930,7 @@ def main() -> None:
     ap.add_argument("--decontam-file", default=None,
                     help="custom text file of eval-benchmark lines to strip (13/7-gram overlap)")
     # Stage-4 dedup
-    ap.add_argument("--dedup", action="store_true", help="run cross-source MinHash dedup after clean")
+    ap.add_argument("--dedup", action=argparse.BooleanOptionalAction, default=None, help="run cross-source MinHash dedup after clean (default: True for --pretokenize, False otherwise)")
     # Stage-5 tokenization & packing
     ap.add_argument("--pack", action="store_true",
                     help="tokenize and pack cleaned docs into .bin + .bounds + manifest.json shards")
@@ -925,6 +963,31 @@ def main() -> None:
         print(f"Total documents: {manifest.get('document_count', 0)}, Total volume: {manifest.get('total_volume_bytes', 0)} bytes")
         return
 
+    if args.pretokenize:
+        from src.data import datatrove_pipeline as dt
+        raw_src = args.from_raw or args.from_jsonl or (REPO_ROOT / "data" / "raw")
+        manifest = dt.run_pretokenization(
+            input_uri=str(raw_src),
+            out_uri=str(args.out),
+            decontam=args.decontam if args.decontam else True,
+            decontam_file=args.decontam_file,
+            dedup=args.dedup if args.dedup is not None else True,
+            prettier=args.prettier,
+            scrub=args.scrub,
+            quality=args.quality,
+            license_filter=args.license_filter,
+            drop_minified=args.drop_minified,
+            drop_autogen=args.drop_autogen,
+            executor_kind=args.executor,
+            tasks=args.tasks,
+            workers=args.workers,
+            logging_dir=args.logging_dir,
+        )
+        print(f"Pre-tokenization completed -> {args.out}")
+        print(f"Total documents: {manifest.get('document_count', 0)}, Cleaned JSONL: {manifest.get('cleaned_jsonl', 'cleaned.jsonl')}")
+        if not args.pack:
+            return
+
     run_corpus_pipeline(
         source=args.source,
         out_dir=args.out,
@@ -940,9 +1003,10 @@ def main() -> None:
         drop_minified=args.drop_minified,
         drop_autogen=args.drop_autogen,
         scrub=args.scrub,
+        prettier=args.prettier,
         decontam=args.decontam or (args.decontam_file is not None),
         decontam_file=args.decontam_file,
-        dedup=args.dedup,
+        dedup=args.dedup if args.dedup is not None else False,
         pack=args.pack,
         tokenizer=args.tokenizer,
         shards_out=args.shards_out,

@@ -29,6 +29,9 @@ is absent.
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 from . import storage
 from .corpus import Record
@@ -110,7 +113,11 @@ def _custom_blocks(thresholds: QualityThresholds = DEFAULT_THRESHOLDS):
             self._decon = decontaminator
 
         def filter(self, doc):
-            return not self._decon.contaminated(doc.text)
+            is_contam = self._decon.contaminated(doc.text)
+            if is_contam:
+                self.stat_update("dropped_decontam")
+                return False
+            return True
 
     class SecretScrubber(PipelineStep):
         """Mapper: redact secrets/PII in place (`filters.scrub_secrets`), tag count in metadata."""
@@ -128,9 +135,40 @@ def _custom_blocks(thresholds: QualityThresholds = DEFAULT_THRESHOLDS):
                     self.stat_update("secrets_scrubbed", value=n)
                 yield doc
 
-    return {"LicenseFilter": LicenseFilter, "QualityFilter": QualityFilter,
-            "MinifiedAutogenFilter": MinifiedAutogenFilter,
-            "DecontaminationFilter": DecontaminationFilter, "SecretScrubber": SecretScrubber}
+    class PrettierFormatter(PipelineStep):
+        """Mapper: format TypeScript / JavaScript code with prettier to standardize syntax and minimize token entropy (#419)."""
+        name = "💅 prettier"
+
+        def __init__(self, prettier_argv: Optional[List[str]] = None, parser: str = "typescript", **kw):
+            super().__init__(**kw)
+            self._prettier_argv = prettier_argv
+            self._parser = parser
+
+        def run(self, data, rank: int = 0, world_size: int = 1):
+            from src.lsp.prettier import format_source, resolve_prettier
+            argv = self._prettier_argv if self._prettier_argv is not None else resolve_prettier()
+            for doc in data:
+                rec = to_record(doc)
+                from .filters import is_code_record
+                lang = (doc.metadata or {}).get("lang", "") or getattr(rec, "lang", "")
+                if argv is not None and (lang in ("typescript", "javascript", "ts", "js", "tsx", "jsx") or (is_code_record(rec) and not lang)):
+                    formatted = format_source(doc.text, argv, parser=self._parser)
+                    if formatted != doc.text:
+                        doc.text = formatted
+                        if doc.metadata is None:
+                            doc.metadata = {}
+                        doc.metadata["prettier_formatted"] = True
+                        self.stat_update("formatted_docs")
+                yield doc
+
+    return {
+        "LicenseFilter": LicenseFilter,
+        "QualityFilter": QualityFilter,
+        "MinifiedAutogenFilter": MinifiedAutogenFilter,
+        "DecontaminationFilter": DecontaminationFilter,
+        "SecretScrubber": SecretScrubber,
+        "PrettierFormatter": PrettierFormatter,
+    }
 
 
 def fineweb_edu_reader(*, limit: int = -1, streaming: bool = True, split: str = "train"):
@@ -163,10 +201,11 @@ def jsonl_reader(path, *, limit: int = -1, text_key: str = "text",
 
 def clean_pipeline(reader, out_uri, *, quality: bool = False, license_filter: bool = False,
                    drop_minified: bool = False, drop_autogen: bool = False, scrub: bool = False,
+                   prettier: bool = False, prettier_argv: Optional[List[str]] = None,
                    decontaminator=None, thresholds: QualityThresholds = DEFAULT_THRESHOLDS,
                    output_filename: str = "${rank}.jsonl.gz",
                    compression: str | None = "gzip") -> list:
-    """Stages 2–5 as a datatrove pipeline: reader -> enabled filters/scrub -> cleaned JSONL shards
+    """Stages 2–5 as a datatrove pipeline: reader -> enabled filters/scrub/prettier/decontam -> cleaned JSONL shards
     under `<out_uri>/cleaned`. `out_uri` is a `storage.py` class root (`file://` local,
     `s3://monica-training/...` on a pod). Filters are opt-in, mirroring `corpus.build_corpus`."""
     from datatrove.pipeline.writers import JsonlWriter
@@ -179,10 +218,12 @@ def clean_pipeline(reader, out_uri, *, quality: bool = False, license_filter: bo
         steps.append(blocks["QualityFilter"]())
     if drop_minified or drop_autogen:
         steps.append(blocks["MinifiedAutogenFilter"]())
-    if decontaminator is not None:
-        steps.append(blocks["DecontaminationFilter"](decontaminator))
     if scrub:
         steps.append(blocks["SecretScrubber"]())
+    if prettier:
+        steps.append(blocks["PrettierFormatter"](prettier_argv=prettier_argv))
+    if decontaminator is not None:
+        steps.append(blocks["DecontaminationFilter"](decontaminator))
     cleaned_dir = f"{str(out_uri).rstrip('/')}/cleaned"
     steps.append(JsonlWriter(output_folder=_folder(cleaned_dir), output_filename=output_filename,
                              compression=compression))
@@ -213,14 +254,19 @@ def minhash_config(*, num_buckets: int = 14, hashes_per_bucket: int = 8, precisi
 
 
 def run_minhash_dedup(cleaned_uri, base_uri, *, kind: str = "local", tasks: int = 1,
-                      workers: int = 1, config=None, logging_dir=None) -> None:
+                      workers: int = 1, config=None, logging_dir=None) -> dict:
     """The standard datatrove 4-stage cross-source MinHash dedup, run end to end over the cleaned
     JSONL at `cleaned_uri`. Intermediates + the deduplicated output live under `base_uri`:
-    `signatures/ buckets/ remove_ids/ deduplicated/`. Each stage `depends=` the previous one."""
+    `signatures/ buckets/ remove_ids/ deduplicated/`. Each stage `depends=` the previous one.
+    Returns deduplication statistics dict recording document and repository metrics (#419)."""
+    import glob
+    import gzip
+    import json
     from datatrove.pipeline.dedup import (MinhashDedupBuckets, MinhashDedupCluster,
                                           MinhashDedupFilter, MinhashDedupSignature)
     from datatrove.pipeline.readers import JsonlReader
     from datatrove.pipeline.writers import JsonlWriter
+    from .r2_sync import _fs_for
 
     cfg = config or minhash_config()
     base = str(base_uri).rstrip("/")
@@ -246,6 +292,59 @@ def run_minhash_dedup(cleaned_uri, base_uri, *, kind: str = "local", tasks: int 
                         JsonlWriter(output_folder=_folder(out))],
                        f"{logging_dir}/filter", kind=kind, tasks=tasks, workers=workers, depends=s3)
     s4.run()
+
+    # Collect deduplication statistics across files and repositories (#419)
+    fs, root_base = _fs_for(base)
+    out_dir = f"{root_base}/deduplicated"
+    removed_dir = f"{root_base}/removed"
+
+    def _scan_folder(folder):
+        count = 0
+        repos = set()
+        try:
+            files = fs.find(folder) if hasattr(fs, "find") else glob.glob(f"{folder}/**/*.jsonl*", recursive=True)
+        except Exception:
+            files = glob.glob(f"{folder}/**/*.jsonl*", recursive=True)
+        for fp in files:
+            fname = str(fp)
+            if not fname.endswith(".jsonl") and not fname.endswith(".jsonl.gz"):
+                continue
+            try:
+                open_fn = gzip.open if fname.endswith(".gz") else open
+                with fs.open(fp, "rt", encoding="utf-8") if hasattr(fs, "open") and str(base).startswith("s3://") else open_fn(fp, "rt", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            count += 1
+                            try:
+                                d = json.loads(line)
+                                r = (d.get("metadata") or {}).get("repo") or d.get("repo")
+                                if r:
+                                    repos.add(r)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        return count, repos
+
+    n_after, repos_after = _scan_folder(out_dir)
+    n_dropped, repos_removed = _scan_folder(removed_dir)
+    repos_before = repos_after | repos_removed
+    n_before = n_after + n_dropped
+    drop_rate = round(n_dropped / n_before, 4) if n_before > 0 else 0.0
+    duplicate_repos_removed = len(repos_before - repos_after)
+
+    return {
+        "applied": True,
+        "method": "minhash_lsh",
+        "n_before_dedup": n_before,
+        "n_after_dedup": n_after,
+        "dropped_duplicates": n_dropped,
+        "drop_rate": drop_rate,
+        "repos_before_dedup": len(repos_before),
+        "repos_after_dedup": len(repos_after),
+        "duplicate_repos_removed": duplicate_repos_removed,
+        "duplicate_files_removed": n_dropped,
+    }
 
 
 def _download_swh_blob(blob_id: str, src_encoding: str = "utf-8", s3_client=None, s3_fs=None) -> str:
@@ -734,4 +833,434 @@ def run_raw_extraction(
         ew_exec.run()
 
     manifest = generate_extraction_manifest(out_uri)
+    return manifest
+
+
+def load_eval_decontaminator(
+    blocklist_path: str | Path | None = None,
+    eval_sets: Optional[Sequence[str]] = None,
+    ngram_sizes: Tuple[int, ...] = (13, 7),
+    prettier_argv: Optional[List[str]] = None,
+) -> Tuple[Any, Optional[Path], List[str]]:
+    """Load or build a Decontaminator targeting evaluation benchmarks (humaneval_ts and ts_error_injection) (#419).
+
+    If blocklist_path is provided and exists, reads the n-gram lines directly.
+    Otherwise, inspects eval_sets (defaulting to eval_sets/humaneval_ts and eval_sets/ts_error_injection)
+    and constructs a Decontaminator from their prompts, test fixtures, and gold completions,
+    optionally applying Prettier syntax normalization to code benchmarks so that AST matches are captured.
+    """
+    import json
+    from .dedup import Decontaminator
+
+    target_eval_sets = list(eval_sets) if eval_sets is not None else [
+        "eval_sets/humaneval_ts",
+        "eval_sets/ts_error_injection",
+    ]
+
+    resolved_path = None
+    if blocklist_path is not None:
+        p = Path(blocklist_path)
+        if p.exists():
+            resolved_path = p
+    elif (REPO_ROOT / "eval_sets/decontam/blocklist.txt").exists():
+        resolved_path = REPO_ROOT / "eval_sets/decontam/blocklist.txt"
+
+    if resolved_path is not None and resolved_path.exists():
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            decon = Decontaminator.from_texts((line.rstrip("\n") for line in f if line.strip()), ngram_sizes=ngram_sizes)
+        return decon, resolved_path, target_eval_sets
+
+    # Build dynamically from evaluation sets
+    texts: List[str] = []
+    p_argv = prettier_argv
+    if p_argv is None:
+        try:
+            from src.lsp.prettier import resolve_prettier
+            p_argv = resolve_prettier()
+        except Exception:
+            p_argv = None
+
+    for es in target_eval_sets:
+        p = REPO_ROOT / es
+        if not p.exists():
+            p = Path(es)
+        if not p.exists():
+            continue
+
+        jsonl_files = [p] if p.is_file() else sorted(p.glob("*.jsonl"))
+        for jf in jsonl_files:
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        for field in ("prompt", "tests", "gold_completion", "suffix", "answer", "text"):
+                            val = row.get(field)
+                            if val and isinstance(val, str) and len(val.split()) >= min(ngram_sizes):
+                                texts.append(val)
+                                if p_argv is not None and ("ts" in jf.name or "typescript" in str(jf)):
+                                    try:
+                                        from src.lsp.prettier import format_source
+                                        fmt = format_source(val, p_argv)
+                                        if fmt != val and len(fmt.split()) >= min(ngram_sizes):
+                                            texts.append(fmt)
+                                    except Exception:
+                                        pass
+            except Exception:
+                continue
+
+    decon = Decontaminator.from_texts(texts, ngram_sizes=ngram_sizes)
+    return decon, resolved_path, target_eval_sets
+
+
+def verify_zero_decontamination_overlap(
+    cleaned_path: str | Path,
+    decontaminator: Any,
+) -> Tuple[int, List[str]]:
+    """Assert zero 13-gram/7-gram overlap between cleaned corpus and evaluation benchmarks (#419).
+    Returns (overlap_count, samples)."""
+    import json
+    cleaned_path = Path(cleaned_path)
+    if not cleaned_path.exists():
+        return 0, []
+
+    overlap_count = 0
+    samples: List[str] = []
+    with open(cleaned_path, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                doc = json.loads(line)
+            except Exception:
+                continue
+            text = doc.get("text", "")
+            if text and decontaminator.contaminated(text):
+                overlap_count += 1
+                if len(samples) < 5:
+                    samples.append(f"doc_{idx}: {text[:80]}...")
+    return overlap_count, samples
+
+
+def generate_pretokenization_manifest(
+    out_uri: str,
+    *,
+    n_source: int,
+    cleaned_jsonl_name: str = "cleaned.jsonl",
+    filter_stats: Optional[Dict[str, Any]] = None,
+    dedup_stats: Optional[Dict[str, Any]] = None,
+    decontam_stats: Optional[Dict[str, Any]] = None,
+    scrub_stats: Optional[Dict[str, Any]] = None,
+    prettier_stats: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Generate manifest.json recording volume, clean rate, MinHash deduplication statistics,
+    and verified zero-overlap decontamination metrics (#419)."""
+    import json
+    import time
+    from .r2_sync import _fs_for
+
+    fs, root = _fs_for(str(out_uri))
+    root = root.rstrip("/")
+    cleaned_file = f"{root}/{cleaned_jsonl_name}"
+
+    total_volume_bytes = 0
+    total_docs = 0
+    lang_counts: Dict[str, int] = {}
+    lang_bytes: Dict[str, int] = {}
+    source_counts: Dict[str, int] = {}
+    source_bytes: Dict[str, int] = {}
+
+    if fs.exists(cleaned_file):
+        with fs.open(cleaned_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                total_docs += 1
+                b = len(line.encode("utf-8"))
+                total_volume_bytes += b
+                try:
+                    doc = json.loads(line)
+                except Exception:
+                    continue
+                md = doc.get("metadata") or {}
+                lang = doc.get("lang") or md.get("lang") or ("typescript" if "ts" in doc.get("id", "") else "unknown")
+                source = md.get("source") or ("stack-v2" if "stack_v2" in doc.get("id", "") else "essential-web" if "essential_web" in doc.get("id", "") else "unknown")
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+                lang_bytes[lang] = lang_bytes.get(lang, 0) + b
+                source_counts[source] = source_counts.get(source, 0) + 1
+                source_bytes[source] = source_bytes.get(source, 0) + b
+
+    formatted_lang_mix = {}
+    for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
+        b = lang_bytes[lang]
+        formatted_lang_mix[lang] = {
+            "docs": count,
+            "bytes": b,
+            "pct_docs": round(100.0 * count / total_docs, 2) if total_docs else 0.0,
+            "pct_bytes": round(100.0 * b / total_volume_bytes, 2) if total_volume_bytes else 0.0,
+        }
+
+    formatted_source_breakdown = {}
+    for src, count in sorted(source_counts.items(), key=lambda x: -x[1]):
+        b = source_bytes[src]
+        formatted_source_breakdown[src] = {
+            "document_count": count,
+            "total_bytes": b,
+            "pct_docs": round(100.0 * count / total_docs, 2) if total_docs else 0.0,
+        }
+
+    n_dropped = max(0, n_source - total_docs)
+    drop_rate = round(n_dropped / n_source, 4) if n_source > 0 else 0.0
+
+    clean_rate = {
+        "n_source": n_source,
+        "n_cleaned": total_docs,
+        "n_dropped": n_dropped,
+        "drop_rate": drop_rate,
+    }
+    if filter_stats:
+        clean_rate.update(filter_stats)
+
+    manifest = {
+        "total_volume_bytes": total_volume_bytes,
+        "total_bytes": total_volume_bytes,
+        "total_documents": total_docs,
+        "document_count": total_docs,
+        "cleaned_jsonl": cleaned_jsonl_name,
+        "clean_rate": clean_rate,
+        "filter_rate": clean_rate,
+        "deduplication": dedup_stats or {"applied": False},
+        "decontamination": decontam_stats or {"applied": False},
+        "pii_scrubbing": scrub_stats or {"applied": False},
+        "prettier": prettier_stats or {"applied": False},
+        "language_mix": formatted_lang_mix,
+        "source_breakdown": formatted_source_breakdown,
+        "destination_uri": str(out_uri),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    manifest_json = json.dumps(manifest, indent=2)
+    manifest_path = f"{root}/manifest.json"
+    if str(out_uri).startswith("s3://"):
+        fs.pipe(manifest_path, manifest_json.encode("utf-8"))
+    else:
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            mf.write(manifest_json)
+
+    return manifest
+
+
+def run_pretokenization(
+    input_uri: str | Path | None = None,
+    out_uri: str | Path = "data/pretrain_clean",
+    *,
+    decontam: bool = True,
+    decontam_file: str | Path | None = None,
+    eval_sets: Optional[Sequence[str]] = None,
+    dedup: bool = True,
+    prettier: bool = True,
+    prettier_argv: Optional[List[str]] = None,
+    scrub: bool = True,
+    quality: bool = True,
+    license_filter: bool = True,
+    drop_minified: bool = True,
+    drop_autogen: bool = True,
+    executor_kind: str = "local",
+    tasks: int = 1,
+    workers: int = 1,
+    logging_dir: str | Path | None = None,
+    raw_docs: Optional[Sequence[Dict[str, Any]]] = None,
+    minhash_cfg=None,
+) -> dict:
+    """Run the complete pre-tokenization filtering, PII scrubbing, Prettier formatting,
+    AST decontamination, and MinHash deduplication pipeline (#419).
+
+    Outputs cleaned text corpus (`cleaned.jsonl`) with manifest metrics (`manifest.json`)
+    recording clean-rate and deduplication statistics, with verified zero decontamination overlap.
+    """
+    import glob
+    import gzip
+    import json
+    import os
+    import time
+    from pathlib import Path
+    from .r2_sync import _fs_for
+
+    out_uri_str = str(out_uri)
+    fs, root = _fs_for(out_uri_str)
+    root = root.rstrip("/")
+    if not out_uri_str.startswith("s3://"):
+        os.makedirs(root, exist_ok=True)
+
+    logging_dir = str(logging_dir or f"{root}/logs")
+    os.makedirs(logging_dir, exist_ok=True)
+
+    # 1. Source ingestion
+    n_source_known = None
+    if raw_docs is not None:
+        n_source_known = len(raw_docs)
+        raw_in_path = f"{root}/raw_input.jsonl"
+        with open(raw_in_path, "w", encoding="utf-8") as wf:
+            for doc in raw_docs:
+                wf.write(json.dumps(doc) + "\n")
+        reader = jsonl_reader(raw_in_path)
+    elif input_uri is not None:
+        reader = jsonl_reader(str(input_uri))
+    else:
+        raise ValueError("Must provide either input_uri or raw_docs")
+
+    # 2. Decontamination setup
+    decon = None
+    decontam_blocklist_path = None
+    target_eval_sets = ["eval_sets/humaneval_ts", "eval_sets/ts_error_injection"]
+    if decontam:
+        decon, decontam_blocklist_path, target_eval_sets = load_eval_decontaminator(
+            blocklist_path=decontam_file,
+            eval_sets=eval_sets,
+            prettier_argv=prettier_argv,
+        )
+
+    # 3. Prettier setup
+    resolved_prettier_argv = None
+    if prettier:
+        if prettier_argv is not None:
+            resolved_prettier_argv = prettier_argv
+        else:
+            try:
+                from src.lsp.prettier import resolve_prettier
+                resolved_prettier_argv = resolve_prettier()
+            except Exception:
+                resolved_prettier_argv = None
+
+    # 4. Clean pipeline
+    pipeline = clean_pipeline(
+        reader,
+        out_uri_str,
+        quality=quality,
+        license_filter=license_filter,
+        drop_minified=drop_minified,
+        drop_autogen=drop_autogen,
+        scrub=scrub,
+        prettier=prettier,
+        prettier_argv=resolved_prettier_argv,
+        decontaminator=decon,
+    )
+
+    clean_log = f"{logging_dir}/clean"
+    executor = make_executor(pipeline, clean_log, kind=executor_kind, tasks=tasks, workers=workers)
+    executor.run()
+
+    cleaned_dir = f"{root}/cleaned"
+
+    # 5. MinHash deduplication
+    text_dir = cleaned_dir
+    dedup_stats = {"applied": False}
+    if dedup:
+        dedup_dir = f"{root}/dedup"
+        dedup_log = f"{logging_dir}/dedup"
+        dedup_stats = run_minhash_dedup(
+            cleaned_dir,
+            dedup_dir,
+            kind=executor_kind,
+            tasks=tasks,
+            workers=workers,
+            config=minhash_cfg,
+            logging_dir=dedup_log,
+        )
+        text_dir = f"{dedup_dir}/deduplicated"
+
+    # 6. Consolidate into cleaned.jsonl
+    cleaned_jsonl = Path(f"{root}/cleaned.jsonl")
+    surviving_docs = []
+    pattern = f"{text_dir}/**/*.jsonl*"
+    matched_files = sorted(glob.glob(pattern, recursive=True))
+
+    docs_scrubbed_count = 0
+    secrets_scrubbed_count = 0
+    formatted_docs_count = 0
+
+    with open(cleaned_jsonl, "w", encoding="utf-8") as wf:
+        for fp in matched_files:
+            open_fn = gzip.open if fp.endswith(".gz") else open
+            with open_fn(fp, "rt", encoding="utf-8") as rf:
+                for line in rf:
+                    if not line.strip():
+                        continue
+                    doc = json.loads(line)
+                    text = doc.get("text", "")
+                    if not text:
+                        continue
+
+                    # Explicit zero-overlap check: drop any doc that fails decontamination
+                    if decon is not None and decon.contaminated(text):
+                        continue
+
+                    md = doc.get("metadata") or {}
+                    if md.get("secrets_scrubbed", 0) > 0:
+                        docs_scrubbed_count += 1
+                        secrets_scrubbed_count += md.get("secrets_scrubbed", 0)
+                    if md.get("prettier_formatted"):
+                        formatted_docs_count += 1
+
+                    surviving_docs.append(doc)
+                    wf.write(json.dumps({"text": text, "id": doc.get("id"), "metadata": md}) + "\n")
+
+    # 7. Verification of zero decontamination overlap
+    overlap_count = 0
+    if decon is not None:
+        overlap_count, _ = verify_zero_decontamination_overlap(cleaned_jsonl, decon)
+        assert overlap_count == 0, f"Decontamination leak detected: {overlap_count} docs overlapped eval benchmarks!"
+
+    # 8. Extract stats
+    n_source = n_source_known
+    if n_source is None:
+        stats_file = Path(f"{clean_log}/stats.json")
+        if stats_file.exists():
+            try:
+                stats_data = json.loads(stats_file.read_text())
+                for step in stats_data:
+                    if "READER" in step.get("name", ""):
+                        doc_stats = step.get("stats", {}).get("documents", {})
+                        if isinstance(doc_stats, dict) and "total" in doc_stats:
+                            n_source = int(doc_stats["total"])
+                        elif "documents" in step.get("stats", {}):
+                            n_source = int(step["stats"]["documents"])
+                        break
+            except Exception:
+                pass
+    if n_source is None:
+        n_source = len(surviving_docs)
+
+    decontam_info = {
+        "applied": decon is not None,
+        "blocklist": str(decontam_blocklist_path.relative_to(REPO_ROOT)) if decontam_blocklist_path and decontam_blocklist_path.is_relative_to(REPO_ROOT) else str(decontam_blocklist_path) if decontam_blocklist_path else None,
+        "eval_sets": target_eval_sets if decon is not None else [],
+        "ngram_sizes": [13, 7] if decon is not None else [],
+        "overlap_count": overlap_count,
+        "zero_overlap_verified": (overlap_count == 0) and (decon is not None),
+    }
+
+    scrub_info = {
+        "applied": scrub,
+        "docs_scrubbed": docs_scrubbed_count,
+        "secrets_scrubbed": secrets_scrubbed_count,
+    }
+
+    prettier_info = {
+        "applied": prettier and (resolved_prettier_argv is not None),
+        "formatted_docs": formatted_docs_count,
+    }
+
+    # 9. Generate manifest
+    manifest = generate_pretokenization_manifest(
+        out_uri_str,
+        n_source=n_source,
+        cleaned_jsonl_name="cleaned.jsonl",
+        dedup_stats=dedup_stats,
+        decontam_stats=decontam_info,
+        scrub_stats=scrub_info,
+        prettier_stats=prettier_info,
+    )
+
     return manifest
