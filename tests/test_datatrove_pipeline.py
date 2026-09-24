@@ -273,3 +273,154 @@ def test_r2_folder_configuration(monkeypatch):
     assert spec[0] == "s3://monica-training/data/raw"
     assert spec[1]["client_kwargs"]["endpoint_url"] == "https://test.r2.cloudflarestorage.com"
     assert spec[1]["client_kwargs"]["region_name"] == "auto"
+
+
+def test_clean_pipeline_with_prettier_formats_code(tmp_path):
+    """Verify that PrettierFormatter standardizes syntax and tags metadata (#419)."""
+    from src.lsp.prettier import resolve_prettier
+    prettier_argv = resolve_prettier()
+    if prettier_argv is None:
+        pytest.skip("Prettier not installed on host")
+
+    docs = [
+        {"text": "const   x : number = 1 ;", "id": "code1", "metadata": {"lang": "typescript", "license": "mit", "is_code": True}},
+        {"text": GOOD, "id": "text1", "metadata": {"lang": "en", "license": "odc-by", "is_code": False}},
+    ]
+    out = tmp_path / "prettier_out"
+    pipe = dt.clean_pipeline(_reader(tmp_path, docs), out, prettier=True, prettier_argv=prettier_argv)
+    dt.make_executor(pipe, tmp_path / "logs", kind="local", tasks=1, workers=1).run()
+
+    kept = {d["id"]: d for d in _read_out(f"{out}/cleaned")}
+    assert "code1" in kept and "text1" in kept
+    assert kept["code1"]["text"] == "const x: number = 1;\n"
+    assert kept["code1"]["metadata"].get("prettier_formatted") is True
+    assert kept["text1"]["text"] == GOOD
+
+
+def test_run_pretokenization_end_to_end(tmp_path):
+    """Verify pre-tokenization filtering, PII scrubbing, AST decontamination,
+    MinHash deduplication, Prettier formatting, and manifest generation (#419)."""
+    humaneval_path = Path(__file__).resolve().parents[1] / "eval_sets/humaneval_ts/humaneval_ts.jsonl"
+    with open(humaneval_path, encoding="utf-8") as f:
+        humaneval_prompt = json.loads(f.readline())["prompt"]
+
+    ts_error_path = Path(__file__).resolve().parents[1] / "eval_sets/ts_error_injection/eval.jsonl"
+    with open(ts_error_path, encoding="utf-8") as f:
+        ts_error_prompt = json.loads(f.readline())["prompt"]
+
+    raw_docs = [
+        # 1. Clean TypeScript doc needing Prettier formatting
+        {
+            "id": "ts_clean_01",
+            "text": "export   interface   MatrixTransform2D  { scaleX : number ; scaleY : number ; skewAngleRad : number ; }\nexport   function  computeAffineDeterminant( transform : MatrixTransform2D ) : number { const factor = transform.scaleX * transform.scaleY ; return factor ; }\n" * 3,
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True, "repo": "matrix-geom", "source": "stack-v2"},
+        },
+        # 2. Contaminated with humaneval_ts
+        {
+            "id": "contam_humaneval",
+            "text": humaneval_prompt,
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True, "repo": "benchmark-copy", "source": "stack-v2"},
+        },
+        # 3. Contaminated with ts_error_injection
+        {
+            "id": "contam_ts_error",
+            "text": ts_error_prompt,
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True, "repo": "ts-errors-copy", "source": "stack-v2"},
+        },
+        # 4. Secret / PII bearing doc
+        {
+            "id": "secret_doc",
+            "text": SECRET,
+            "metadata": {"lang": "en", "license": "odc-by", "is_code": False, "source": "essential-web"},
+        },
+        # 5. Duplicate files across two repos: repo_dup1 and repo_dup2
+        {
+            "id": "dup_file_1",
+            "text": "export interface UserProfile {\n    id: string;\n    name: string;\n    email: string;\n}\n" * 4,
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True, "repo": "repo_dup1", "source": "stack-v2"},
+        },
+        {
+            "id": "dup_file_2",
+            "text": "export interface UserProfile {\n    id: string;\n    name: string;\n    email: string;\n}\n" * 4,
+            "metadata": {"lang": "typescript", "license": "mit", "is_code": True, "repo": "repo_dup2", "source": "stack-v2"},
+        },
+        # 6. GPL code dropped by license filter
+        {
+            "id": "gpl_code",
+            "text": "export function gplUtil() { return 42; }\n" * 4,
+            "metadata": {"lang": "typescript", "license": "gpl-3.0", "is_code": True, "repo": "gpl-repo", "source": "stack-v2"},
+        },
+        # 7. Junk text dropped by quality filter
+        {
+            "id": "junk_text",
+            "text": "!@#$%^&*()_+ " * 20,
+            "metadata": {"lang": "en", "license": "odc-by", "is_code": False, "source": "essential-web"},
+        },
+    ]
+
+    out_dir = tmp_path / "pretoken_out"
+    manifest = dt.run_pretokenization(
+        raw_docs=raw_docs,
+        out_uri=str(out_dir),
+        decontam=True,
+        dedup=True,
+        prettier=True,
+        scrub=True,
+        quality=True,
+        license_filter=True,
+        logging_dir=str(tmp_path / "pretoken_logs"),
+    )
+
+    # 1. Output files exist
+    cleaned_file = out_dir / "cleaned.jsonl"
+    manifest_file = out_dir / "manifest.json"
+    assert cleaned_file.exists()
+    assert manifest_file.exists()
+
+    # 2. Manifest metrics
+    assert manifest["document_count"] > 0
+    assert manifest["total_volume_bytes"] > 0
+    assert manifest["clean_rate"]["n_source"] == len(raw_docs)
+    assert manifest["clean_rate"]["n_cleaned"] == manifest["document_count"]
+    assert manifest["clean_rate"]["drop_rate"] > 0
+
+    # 3. Acceptance criterion: Zero decontamination overlap
+    assert manifest["decontamination"]["applied"] is True
+    assert manifest["decontamination"]["zero_overlap_verified"] is True
+    assert manifest["decontamination"]["overlap_count"] == 0
+    assert "eval_sets/humaneval_ts" in manifest["decontamination"]["eval_sets"]
+    assert "eval_sets/ts_error_injection" in manifest["decontamination"]["eval_sets"]
+
+    # 4. Acceptance criterion: Documented clean-rate and deduplication statistics in manifest
+    assert manifest["deduplication"]["applied"] is True
+    assert manifest["deduplication"]["dropped_duplicates"] >= 1
+    assert manifest["deduplication"]["duplicate_repos_removed"] >= 1
+    assert "drop_rate" in manifest["deduplication"]
+    assert "repos_before_dedup" in manifest["deduplication"]
+    assert "repos_after_dedup" in manifest["deduplication"]
+
+    # 5. PII scrubbing verified
+    assert manifest["pii_scrubbing"]["applied"] is True
+    assert manifest["pii_scrubbing"]["secrets_scrubbed"] >= 1
+
+    # 6. Verify contents of cleaned.jsonl
+    cleaned_lines = [json.loads(line) for line in cleaned_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    cleaned_ids = {doc.get("id") for doc in cleaned_lines}
+
+    # Contaminated docs dropped
+    assert "contam_humaneval" not in cleaned_ids
+    assert "contam_ts_error" not in cleaned_ids
+    # GPL and junk dropped
+    assert "gpl_code" not in cleaned_ids
+    assert "junk_text" not in cleaned_ids
+    # Deduplication eliminated one of the duplicates
+    assert not ("dup_file_1" in cleaned_ids and "dup_file_2" in cleaned_ids)
+
+    # Secret doc scrubbed
+    secret_record = next(doc for doc in cleaned_lines if doc.get("id") == "secret_doc")
+    assert FAKE_AWS_KEY not in secret_record["text"]
+    assert "[AWS_KEY]" in secret_record["text"]
+
+    # Prettier formatted code
+    ts_clean_record = next(doc for doc in cleaned_lines if doc.get("id") == "ts_clean_01")
+    assert "export interface MatrixTransform2D {" in ts_clean_record["text"]
