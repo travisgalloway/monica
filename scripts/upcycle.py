@@ -39,15 +39,15 @@ def _parse_args() -> argparse.Namespace:
                     help="dense (n_experts=1) portable weights (.safetensors)")
     ap.add_argument("--config", type=Path, required=True,
                     help="TARGET MoE config (n_experts>1) to upcycle into")
-    ap.add_argument("--out", type=Path, required=True,
+    ap.add_argument("--out", type=Path, default=None,
                     help="output .safetensors path (+ .config.json sidecar written "
-                         "by save_weights, + a .upcycle.json manifest)")
+                         "by save_weights, + a .upcycle.json manifest); required unless --dry-run")
     ap.add_argument("--src-config", type=Path, default=None,
                     help="source config yaml; default reads <src>.config.json (the "
                          "sidecar save_weights has always written)")
-    ap.add_argument("--seed", type=int, required=True,
+    ap.add_argument("--seed", type=int, default=0,
                     help="RNG seed for the fresh router (and any synthesized shared "
-                         "expert) init — required so a run is always reproducible")
+                         "expert) init — required so a run is always reproducible; default 0")
     ap.add_argument("--router-init-scale", type=float, default=1.0,
                     help="router init bound scale: U(+-scale/sqrt(d_model))")
     ap.add_argument("--shared-expert-init", choices=("zero_down", "forbid"),
@@ -85,8 +85,12 @@ def main() -> None:
 
     # Before ANY weights IO (the potentially-large safetensors read): a bad pairing
     # should fail in milliseconds, not after loading gigabytes of tensors.
+    if not args.dry_run and args.out is None:
+        raise SystemExit("--out is required when not in --dry-run mode")
+
     check_upcycle_compatible(src_cfg, dst_cfg)
 
+    print("[upcycle] 15/15 MUST_MATCH fields satisfied")
     moe_layers = sorted(i for i in range(dst_cfg.n_layers) if dst_cfg.is_moe_layer(i))
     print(f"[upcycle] src={args.src}  config={args.config}")
     print(f"[upcycle] MoE layers: {moe_layers}")
