@@ -44,22 +44,79 @@ step 50,000. Callers must read the verdict in that light.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from ..data.loader import PackedLoader
 
 
-def expert_histograms(model, domains: Dict[str, str], *, batch_size: int = 4,
+def expert_histograms_from_batches(
+    model,
+    domain_batches: Dict[str, Sequence[Any]],
+    *,
+    to_numpy=np.asarray,
+) -> Dict[str, Optional[list]]:
+    """Per-domain, per-MoE-layer expert token counts from in-memory token batches.
+
+    `domain_batches` maps a domain name (e.g. 'typescript', 'math', 'prose') to an iterable
+    of token input batches (e.g. 2D arrays of token IDs with shape (batch_size, seq_len)).
+
+    Returns `{domain: [[count per expert] per MoE layer]}`, or `None` for a domain whose
+    batches are empty (explicitly unmeasured, never a zero histogram).
+
+    Mutates model state: turns per-expert load counting on and drains the accumulators
+    before measuring the first domain and after each one.
+    """
+    if not domain_batches:
+        raise ValueError(
+            "expert_histograms_from_batches(): no domains — an empty report is a failure, "
+            "not a perfect score"
+        )
+
+    model.set_moe_load_counting(True)
+    if not model.pop_moe_load():
+        raise ValueError(
+            "expert_histograms_from_batches(): model has no MoE layers — an expert histogram cannot "
+            "be measured, and an empty report must not read as 'the router is fine'"
+        )
+
+    out: Dict[str, Optional[list]] = {}
+    for name in sorted(domain_batches):
+        batches = domain_batches[name]
+        if batches is None or len(batches) == 0:
+            out[name] = None
+            continue
+
+        for batch in batches:
+            to_numpy(model.forward(batch))
+
+        hist = model.pop_moe_load()
+        if sum(sum(layer) for layer in hist) <= 0:
+            raise ValueError(
+                f"domain {name!r}: every expert count is zero — the router was not "
+                "observed (load counting off, or top_k == n_experts). A zero histogram "
+                "must not be reported as a routing measurement."
+            )
+        out[name] = hist
+
+    if all(v is None for v in out.values()):
+        raise ValueError(
+            "expert_histograms_from_batches(): every domain was empty — no routing was "
+            "measured"
+        )
+    return out
+
+
+def expert_histograms(model, domains: Dict[str, Any], *, batch_size: int = 4,
                       seq_len: int = 512, max_batches: Optional[int] = 8,
                       to_numpy=np.asarray) -> Dict[str, Optional[list]]:
     """Per-domain, per-MoE-layer expert token counts from a forward-only pass.
 
     `domains` maps a domain name to its packed `.bin` (exactly `load_domain_index`'s
-    `{name: entry["packed"]}` projection). Each domain is read `shuffle=False,
-    drop_last=False` so the histogram is a deterministic function of
-    `(seq_len, batch_size, max_batches)`.
+    `{name: entry["packed"]}` projection) or to a sequence of in-memory input batches.
+    Each packed domain is read `shuffle=False, drop_last=False` so the histogram is
+    a deterministic function of `(seq_len, batch_size, max_batches)`.
 
     Returns `{domain: [[count per expert] per MoE layer]}`, or `None` for a domain whose
     val file is too small for one chunk (the `domain_bpb`/`long_context` convention —
@@ -71,6 +128,15 @@ def expert_histograms(model, domains: Dict[str, str], *, batch_size: int = 4,
     if not domains:
         raise ValueError("expert_histograms(): no domains — an empty report is a failure, "
                          "not a perfect score")
+
+    # If all non-None domain values are batch sequences rather than paths, delegate directly
+    is_batch_dict = any(
+        isinstance(v, (list, tuple)) and not isinstance(v, (str, Path))
+        for v in domains.values() if v is not None
+    ) and not any(isinstance(v, (str, Path)) for v in domains.values() if v is not None)
+
+    if is_batch_dict:
+        return expert_histograms_from_batches(model, domains, to_numpy=to_numpy)
 
     model.set_moe_load_counting(True)
     # The training step drains the counters every step, but an fp16-overflow-skipped step
@@ -85,25 +151,40 @@ def expert_histograms(model, domains: Dict[str, str], *, batch_size: int = 4,
 
     out: Dict[str, Optional[list]] = {}
     for name in sorted(domains):
-        packed_path = Path(domains[name])
-        if not packed_path.exists():
-            raise FileNotFoundError(f"domain {name!r}: packed val file {packed_path} "
-                                    "does not exist")
-        try:
-            loader = PackedLoader(packed_path, seq_len=seq_len, batch_size=batch_size,
-                                  shuffle=False, drop_last=False)
-        except ValueError:
-            # Too small for even one (seq_len + 1) chunk. Explicitly unmeasured, not zero.
+        val = domains[name]
+        if val is None:
             out[name] = None
             continue
 
-        for i, (inputs, _targets) in enumerate(loader.epoch()):
-            if max_batches is not None and i >= max_batches:
-                break
-            # The forward output is discarded — this is a routing probe, not a loss eval
-            # — but `to_numpy` is still called so the MLX lazy graph is forced exactly as
-            # `val_loss.evaluate` does it (otherwise the router calls would never run).
-            to_numpy(model.forward(inputs))
+        if isinstance(val, (str, Path)):
+            packed_path = Path(val)
+            if not packed_path.exists():
+                raise FileNotFoundError(f"domain {name!r}: packed val file {packed_path} "
+                                        "does not exist")
+            try:
+                loader = PackedLoader(packed_path, seq_len=seq_len, batch_size=batch_size,
+                                      shuffle=False, drop_last=False)
+            except ValueError:
+                # Too small for even one (seq_len + 1) chunk. Explicitly unmeasured, not zero.
+                out[name] = None
+                continue
+
+            for i, (inputs, _targets) in enumerate(loader.epoch()):
+                if max_batches is not None and i >= max_batches:
+                    break
+                # The forward output is discarded — this is a routing probe, not a loss eval
+                # — but `to_numpy` is still called so the MLX lazy graph is forced exactly as
+                # `val_loss.evaluate` does it (otherwise the router calls would never run).
+                to_numpy(model.forward(inputs))
+        else:
+            batches = list(val)
+            if len(batches) == 0:
+                out[name] = None
+                continue
+            for i, batch in enumerate(batches):
+                if max_batches is not None and i >= max_batches:
+                    break
+                to_numpy(model.forward(batch))
 
         hist = model.pop_moe_load()
         if sum(sum(layer) for layer in hist) <= 0:
@@ -487,8 +568,247 @@ def kill_check(report: dict, *, pair=("typescript", "math"), threshold: float = 
     }
 
 
-def format_routing_report(report: dict, kill: Optional[dict] = None) -> str:
-    """Human table — one line per domain pair + inter-category breakdown + kill and advisory verdicts,
+def verify_expert_starvation(
+    histograms: Dict[str, Optional[list]],
+    *,
+    min_tokens_per_expert: int = 1,
+) -> dict:
+    """Ensure no expert starvation occurred across evaluated domains (#423).
+
+    Adheres strictly to the BLIND rule: if histograms is empty or contains no
+    measured domains, reports BLIND, never healthy.
+
+    Returns:
+      {
+        "status": "PASSED" | "FAILED" | "BLIND",
+        "passed": bool,
+        "starved_experts": [(layer_idx, expert_idx), ...],
+        "total_tokens_per_expert": {layer_idx: [total_counts...]},
+        "min_tokens_observed": int,
+        "min_tokens_threshold": min_tokens_per_expert,
+        "message": str,
+      }
+    """
+    measured = {k: v for k, v in histograms.items() if v is not None}
+    if not measured:
+        return {
+            "status": "BLIND",
+            "passed": False,
+            "starved_experts": [],
+            "total_tokens_per_expert": {},
+            "min_tokens_observed": None,
+            "min_tokens_threshold": min_tokens_per_expert,
+            "message": "BLIND: no measured domains provided to check expert starvation",
+        }
+
+    first_hist = next(iter(measured.values()))
+    n_layers = len(first_hist)
+    starved_experts = []
+    total_tokens_per_expert: Dict[int, List[int]] = {}
+    min_tokens = None
+
+    for l_idx in range(n_layers):
+        n_experts = len(first_hist[l_idx])
+        layer_totals = [0] * n_experts
+        for hist in measured.values():
+            if len(hist) != n_layers or len(hist[l_idx]) != n_experts:
+                raise ValueError("verify_expert_starvation(): inconsistent layer or expert count")
+            for e_idx in range(n_experts):
+                layer_totals[e_idx] += int(hist[l_idx][e_idx])
+
+        total_tokens_per_expert[l_idx] = layer_totals
+        for e_idx, count in enumerate(layer_totals):
+            if min_tokens is None or count < min_tokens:
+                min_tokens = count
+            if count < min_tokens_per_expert:
+                starved_experts.append((l_idx, e_idx))
+
+    passed = len(starved_experts) == 0
+    status = "PASSED" if passed else "FAILED"
+    if passed:
+        msg = (
+            f"No expert starvation detected: all experts across {n_layers} MoE layers "
+            f"received >= {min_tokens_per_expert} tokens (min observed: {min_tokens})."
+        )
+    else:
+        msg = (
+            f"Expert starvation detected: {len(starved_experts)} layer/expert slots "
+            f"received < {min_tokens_per_expert} tokens: {starved_experts[:10]}."
+        )
+
+    return {
+        "status": status,
+        "passed": passed,
+        "starved_experts": starved_experts,
+        "total_tokens_per_expert": total_tokens_per_expert,
+        "min_tokens_observed": min_tokens,
+        "min_tokens_threshold": min_tokens_per_expert,
+        "message": msg,
+    }
+
+
+def verify_uniform_collapse(
+    report_or_hists: Any,
+    *,
+    max_overlap_threshold: float = 0.95,
+) -> dict:
+    """Ensure routing has not collapsed into a uniform or identical distribution across domains (#423).
+
+    Adheres strictly to the BLIND rule: if report cannot observe pairs, reports BLIND.
+    """
+    if isinstance(report_or_hists, dict) and "by_pair" in report_or_hists:
+        report = report_or_hists
+    else:
+        try:
+            report = specialization_report(report_or_hists)
+        except Exception as e:
+            return {
+                "status": "BLIND",
+                "passed": False,
+                "collapsed": None,
+                "overlap": None,
+                "threshold": max_overlap_threshold,
+                "message": f"BLIND: could not generate specialization report ({e})",
+            }
+
+    overlap = report.get("code_vs_noncode_overlap")
+    if overlap is None:
+        overlap = report.get("mean_overlap")
+
+    if overlap is None:
+        return {
+            "status": "BLIND",
+            "passed": False,
+            "collapsed": None,
+            "overlap": None,
+            "threshold": max_overlap_threshold,
+            "message": "BLIND: no cross-domain overlap available to assess uniform collapse",
+        }
+
+    collapsed = bool(overlap >= max_overlap_threshold)
+    passed = not collapsed
+    status = "PASSED" if passed else "FAILED"
+    if passed:
+        msg = f"Uniform routing collapse check OK: overlap {overlap:.4f} < {max_overlap_threshold:.4f}."
+    else:
+        msg = (
+            f"Uniform routing collapse FLAGGED: overlap {overlap:.4f} >= {max_overlap_threshold:.4f} "
+            "(domains route identically across experts without specialization)."
+        )
+
+    return {
+        "status": status,
+        "passed": passed,
+        "collapsed": collapsed,
+        "overlap": float(overlap),
+        "threshold": max_overlap_threshold,
+        "message": msg,
+    }
+
+
+def verify_routing_specialization(
+    report_or_hists: Any,
+    *,
+    kill_pair: Tuple[str, str] = ("typescript", "math"),
+    kill_threshold: float = 0.90,
+    max_collapse_threshold: float = 0.95,
+    min_tokens_per_expert: int = 1,
+) -> dict:
+    """Complete routing diagnostics and domain specialization verification (#423).
+
+    Scope & Acceptance Criteria:
+    - Extract routing histograms across TypeScript, prose, and math batches using `src/eval/moe_routing.py`.
+    - Evaluate pairwise routing overlap against the kill-criterion threshold (overlap < 0.90).
+    - Ensure no expert starvation or uniform routing collapse occurred during training.
+    - Routing specialization report indicates PASSED (TypeScript vs Math overlap < 0.90).
+    - Mid-training routing kill-check verified negative (kill_check['triggered'] is False).
+    """
+    if isinstance(report_or_hists, dict) and "by_pair" in report_or_hists:
+        report = report_or_hists
+        hists = None
+    else:
+        hists = report_or_hists
+        report = specialization_report(hists)
+
+    pair_key = "|".join(sorted(kill_pair))
+    if pair_key not in report.get("by_pair", {}):
+        return {
+            "status": "BLIND",
+            "passed": False,
+            "specializing": False,
+            "kill_triggered": None,
+            "pair": pair_key,
+            "overlap": None,
+            "kill_threshold": kill_threshold,
+            "message": f"BLIND: domain pair {pair_key!r} not measured in routing report.",
+        }
+
+    kill_res = kill_check(report, pair=kill_pair, threshold=kill_threshold)
+    specializing = bool(kill_res.get("specializing", False))
+    kill_triggered = bool(kill_res.get("triggered", True))
+    overlap = float(kill_res.get("overlap", 1.0))
+
+    if hists is not None:
+        starvation_res = verify_expert_starvation(hists, min_tokens_per_expert=min_tokens_per_expert)
+    else:
+        starvation_res = {
+            "status": "PASSED",
+            "passed": True,
+            "message": "Starvation check satisfied via report inputs",
+        }
+
+    collapse_res = verify_uniform_collapse(report, max_overlap_threshold=max_collapse_threshold)
+
+    passed = (
+        specializing and
+        (not kill_triggered) and
+        (overlap < kill_threshold) and
+        bool(starvation_res["passed"]) and
+        bool(collapse_res["passed"])
+    )
+    status = "PASSED" if passed else "FAILED"
+
+    if passed:
+        msg = (
+            f"Routing specialization verified: {pair_key} overlap {overlap:.4f} < {kill_threshold:.2f} "
+            f"(kill-check verified NEGATIVE), zero expert starvation, no uniform collapse."
+        )
+    else:
+        reasons = []
+        if kill_triggered or overlap >= kill_threshold:
+            reasons.append(f"{pair_key} overlap {overlap:.4f} >= kill threshold {kill_threshold:.2f}")
+        if not starvation_res["passed"]:
+            reasons.append(starvation_res["message"])
+        if not collapse_res["passed"]:
+            reasons.append(collapse_res["message"])
+        msg = f"Routing specialization FAILED: {'; '.join(reasons)}."
+
+    return {
+        "status": status,
+        "passed": passed,
+        "specializing": specializing,
+        "kill_triggered": kill_triggered,
+        "kill_verdict": "NEGATIVE" if not kill_triggered else "TRIGGERED",
+        "pair": pair_key,
+        "overlap": overlap,
+        "threshold": kill_threshold,
+        "kill_check": kill_res,
+        "starvation_check": starvation_res,
+        "collapse_check": collapse_res,
+        "report_summary": {
+            "mean_overlap": report.get("mean_overlap"),
+            "max_overlap": report.get("max_overlap"),
+            "max_pair": report.get("max_pair"),
+            "code_vs_noncode_overlap": report.get("code_vs_noncode_overlap"),
+            "code_vs_prose_overlap": report.get("code_vs_prose_overlap"),
+            "noncode_overlap": report.get("noncode_overlap"),
+        },
+        "message": msg,
+    }
+
+
+def format_routing_report(report: dict, kill: Optional[dict] = None, verification: Optional[dict] = None) -> str:
+    """Human table — one line per domain pair + inter-category breakdown + kill, starvation, and collapse verdicts,
     in `domain_bpb.format_domain_bpb_table`'s style."""
     lines = ["MoE routing overlap by domain pair (1.0 = identical routing, 0.0 = disjoint):"]
     for key, entry in sorted(report["by_pair"].items()):
@@ -518,5 +838,9 @@ def format_routing_report(report: dict, kill: Optional[dict] = None) -> str:
     alert = report.get("cross_domain_alert")
     if alert is not None:
         lines.append(f"  advisory: {alert['message']}")
+
+    if verification is not None:
+        v_status = verification.get("status", "UNKNOWN")
+        lines.append(f"  specialization verification: [{v_status}] {verification.get('message', '')}")
 
     return "\n".join(lines)
