@@ -187,15 +187,22 @@ def fineweb_edu_reader(*, limit: int = -1, streaming: bool = True, split: str = 
 
 
 def jsonl_reader(path, *, limit: int = -1, text_key: str = "text",
-                 id_key: str = "id", default_metadata: dict | None = None):
+                 id_key: str = "id", default_metadata: dict | None = None,
+                 glob_pattern: str | None = None):
     """A datatrove reader over a local JSONL file or directory of JSONL files."""
     from datatrove.pipeline.readers import JsonlReader
+    pat = glob_pattern
+    if pat is None:
+        p_str = str(path)
+        if not p_str.endswith(".jsonl") and not p_str.endswith(".jsonl.gz"):
+            pat = "*.jsonl*"
     return JsonlReader(
         data_folder=str(path),
         limit=limit,
         text_key=text_key,
         id_key=id_key,
         default_metadata=default_metadata,
+        glob_pattern=pat,
     )
 
 
@@ -1132,6 +1139,11 @@ def run_pretokenization(
                 resolved_prettier_argv = resolve_prettier()
             except Exception:
                 resolved_prettier_argv = None
+            if resolved_prettier_argv is None:
+                import shutil
+                glob_p = shutil.which("prettier")
+                if glob_p:
+                    resolved_prettier_argv = [glob_p]
 
     # 4. Clean pipeline
     pipeline = clean_pipeline(
